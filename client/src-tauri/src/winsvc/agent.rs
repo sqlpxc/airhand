@@ -63,8 +63,12 @@ pub fn run(args: &[String]) -> i32 {
     config::keep_file();
     let hub = status::new_hub();
     let host = HostService::start(hub.clone());
-    let autostart = Arc::new(watch::Sender::new(config::settings().autostart));
-    tauri::async_runtime::spawn(super::ipc::serve(hub, host.commands(), autostart));
+    let agent = super::ipc::Agent {
+        cmds: host.commands(),
+        autostart: Arc::new(watch::Sender::new(config::settings().autostart)),
+        gate: host.gate().clone(),
+    };
+    tauri::async_runtime::spawn(super::ipc::serve(hub, agent));
 
     if handles.is_empty() {
         // 手动运行（调试）：一直运行到进程被结束

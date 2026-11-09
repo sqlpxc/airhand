@@ -6,7 +6,9 @@
 
 - The clipboard syncs text only, not files
 - Audio flows from host to controller only; the controller's microphone isn't forwarded. Audio is captured after the volume control, so a muted host sends silence
-- The relay server can see the session streams (TLS terminates at the server), so run it on a machine you trust (see [Security](security.md))
+- Sessions are end-to-end encrypted, so the relay can't see their content, but it still knows who connected to whom, when, and how much traffic flowed (see [Security](security.md#end-to-end-encryption))
+- The web console is where end-to-end encryption ends: the machine running it can see the picture
+- On the first connection to a computer its identity is whatever was seen then (like SSH): only the pairing code (or comparing the safety code) proves nobody is impersonating it
 
 ## Windows
 
@@ -39,6 +41,7 @@
 
 Host (sharing the phone):
 
+- No pairing code: someone new is either asked about (with the safety code) or let in on the control code alone, if "Ask before someone connects" is off. Allowed controllers are only remembered until sharing stops
 - Each time sharing starts, screen recording must be confirmed on the phone (a system rule), and sharing can't resume by itself after the system kills the app
 - Remote control uses accessibility gestures, so apps that handle touches themselves (games…) may react less precisely
 - Typing only works in regular text fields (arrow keys and Tab need Android 13+)

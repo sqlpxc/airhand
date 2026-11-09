@@ -65,6 +65,9 @@ const en: Record<MsgKey, Msg> = {
   "connect.code": "Control code",
   "connect.quality": "Quality",
   "connect.clear": "Clear",
+  "connect.pairing": "Pairing code",
+  "connect.pairingHint": "The 6-digit pairing code in the remote computer's tray menu. Once paired, that computer remembers this one",
+  "connect.trustNew": "Trust the new identity and connect",
   "connect.customQuality": "Custom quality",
 
   "devices.title": "My devices",
@@ -151,6 +154,10 @@ const en: Record<MsgKey, Msg> = {
   "session.lost": "Connection lost",
   "session.ended": "Session ended",
   "session.reconnect": "Reconnect",
+  "session.trustNew": "Trust the new identity and reconnect",
+  "session.pairAndReconnect": "Pair and reconnect",
+  "session.safety": "Safety code {code}",
+  "session.safetyHint": "End-to-end encrypted. If the remote computer's tray shows the same safety code, nobody is in between",
   "session.close": "Close",
   "session.reconnecting": "Reconnecting…",
   "session.connecting": "Connecting…",
@@ -246,6 +253,15 @@ const en: Record<MsgKey, Msg> = {
   "problem.hostBusy": "The remote computer has reached its session limit",
   "problem.serverTimeout": "The server didn't respond in time",
   "problem.hostOffline": "The remote computer is offline",
+  "problem.hostKeyChanged":
+    "The remote computer's identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Trust the new identity only once you've confirmed it was reinstalled",
+  "problem.pairingRequired": "First connection to this computer: enter its pairing code, shown in the Airhand tray menu on that computer",
+  "problem.pairingFailed": "Wrong pairing code, check the one in the remote computer's tray menu",
+  "problem.pairingUnavailable": "The remote computer paused pairing (too many wrong codes): ask its user to pick a new pairing code in the tray menu",
+  "problem.peerIncompatible": (p) =>
+    Number(p.peer) > Number(p.ours)
+      ? "Incompatible with the remote computer: it's newer, please update Airhand on this computer"
+      : "Incompatible with the remote computer: it's older, ask its user to update Airhand",
   "problem.hostEnded": "The remote computer ended the session",
   "problem.hostUnresponsive": "The remote computer stopped responding",
   "problem.kicked": "The remote user disconnected you",

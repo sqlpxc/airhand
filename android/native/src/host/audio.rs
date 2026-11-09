@@ -136,7 +136,7 @@ mod tests {
 
     fn notice(rx: &mut mpsc::Receiver<Bytes>) -> Notice {
         let b = rx.try_recv().unwrap();
-        match framing::decode::<HostMsg>(&b[4..]).unwrap() {
+        match framing::decode_known::<HostMsg>(&b[4..]).unwrap() {
             HostMsg::Notice(n) => n,
             other => panic!("{other:?}"),
         }

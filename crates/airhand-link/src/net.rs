@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airhand_proto::framing::{read_msg, write_msg};
-use airhand_proto::signal::{ClientMsg, ServerMsg};
-use airhand_proto::{ALPN, MAX_SIGNAL_MSG, PROTOCOL_VERSION, Role};
+use airhand_proto::framing::{read_frame, write_frame};
+use airhand_proto::signal::{ClientHello, ServerHello};
+use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
@@ -190,6 +190,9 @@ pub struct Signal {
     pub conn: Connection,
     pub send: SendStream,
     pub recv: RecvStream,
+    /// 和服务器商定的信令版本，双方都支持的信令能力位（见 `airhand_proto::signal` 的"版本握手"）
+    pub version: u16,
+    pub features: Features,
     /// 保持 Endpoint 存活
     _endpoint: Endpoint,
 }
@@ -385,47 +388,55 @@ async fn handshake(cfg: &LinkConfig, role: Role, mismatch: Arc<AtomicBool>) -> R
     let expected = cfg.expected();
     let (endpoint, conn, fp) = connect_any(&cfg.server, addrs, sni, expected, mismatch).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(
-        &mut send,
-        &ClientMsg::Hello {
-            version: PROTOCOL_VERSION,
-            role,
-            name: cfg.name.clone(),
-            os: cfg.os.clone(),
-        },
-    )
-    .await?;
+    let hello = ClientHello::new(role, cfg.name.clone(), cfg.os.clone());
+    write_frame(&mut send, &hello.encode()).await?;
     let mut buf = Vec::new();
-    let resp: Option<ServerMsg> = tokio::time::timeout(
+    let got = tokio::time::timeout(
         Duration::from_secs(8),
-        read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf),
+        read_frame(&mut recv, MAX_SIGNAL_MSG, &mut buf),
     )
     .await
     .map_err(|_| anyhow!("server handshake timed out"))??;
+    if !got {
+        bail!("the server closed the connection during the handshake");
+    }
+    let resp = ServerHello::decode(&buf).context("unexpected answer from the server")?;
     // 对方说的是 Airhand 的协议（版本对不上也算）：第一次连接的话，记下它的指纹
-    if let (
-        Trust::FirstUse(store),
-        None,
-        Some(ServerMsg::Welcome { .. } | ServerMsg::Incompatible { .. }),
-    ) = (&cfg.trust, expected, &resp)
-    {
+    if let (Trust::FirstUse(store), None) = (&cfg.trust, expected) {
         info!(server = %cfg.server, fingerprint = %format_fingerprint(&fp), "first connection to this server, remembering its certificate");
         store.save(&cfg.server, fp);
     }
     match resp {
-        Some(ServerMsg::Welcome { .. }) => Ok(Signal {
-            conn,
-            send,
-            recv,
-            _endpoint: endpoint,
-        }),
-        Some(ServerMsg::Incompatible { server_version }) => Err(Problem::Incompatible {
-            server: server_version,
-            client: PROTOCOL_VERSION,
+        ServerHello::Welcome { version, features } => {
+            anyhow::ensure!(
+                (SIGNAL_MIN..=SIGNAL_VERSION).contains(&version),
+                "the server chose signal version {version}, which we can't speak"
+            );
+            Ok(Signal {
+                conn,
+                send,
+                recv,
+                version,
+                features: features.common(hello.features),
+                _endpoint: endpoint,
+            })
         }
-        .into()),
-        Some(other) => bail!("unexpected message from the server: {other:?}"),
-        None => bail!("the server closed the connection during the handshake"),
+        ServerHello::Incompatible { min, max } => Err(incompatible(min, max).into()),
+    }
+}
+
+/// 服务器能说 `min..=max`，和本端没有交集：谁太旧了（`server` 比 `client` 大就是客户端该更新）
+fn incompatible(min: u16, max: u16) -> Problem {
+    if max < SIGNAL_MIN {
+        Problem::Incompatible {
+            server: max,
+            client: SIGNAL_MIN,
+        }
+    } else {
+        Problem::Incompatible {
+            server: min,
+            client: SIGNAL_VERSION,
+        }
     }
 }
 

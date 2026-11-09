@@ -69,9 +69,13 @@ const WAIT_CHECK_MS = 60_000;
 const NO_SERVER_RETRY_MS = 5_000;
 /**
  * 服务器的明确回答：自动重试只会被当成在猜控制码。
- * kicked：重连凭证作废了（对方断开过所有控制端，或者换了控制码），连上过的会话不再自动重连（见 connect）
+ * kicked：重连凭证作废了（对方断开过所有控制端，或者换了控制码），连上过的会话不再自动重连（见 connect）。
+ * 端到端握手的问题要用户决定：对方的身份变了（信任新的身份？）、要配对码、版本不兼容
  */
-const GIVE_UP = new Set<Problem["kind"]>(["codeNotFound", "rateLimited", "invalidCode", "notController", "kicked"]);
+const GIVE_UP = new Set<Problem["kind"]>([
+  "codeNotFound", "rateLimited", "invalidCode", "notController", "kicked",
+  "hostKeyChanged", "pairingRequired", "pairingFailed", "pairingUnavailable", "peerIncompatible",
+]);
 /** 与服务器（网页版还有控制端服务）的连接断了：等重新连上再试，不计入重试次数 */
 const NO_SERVER = new Set<Problem["kind"]>(["notConnected", "serverLost", "serverUnreachable", "consoleLost"]);
 
@@ -133,6 +137,12 @@ export class RemoteSession {
   private readonly codeNum: number;
   /** 重连凭证：连上过就有，重连时带上（对方换了控制码就作废） */
   private resume: ResumeToken | null = null;
+  /** 对方的端到端加密公钥：我的设备里记着的，或者第一次连上时记下的；之后只认它（对不上是 hostKeyChanged） */
+  hostKey: string | null = null;
+  /** 安全码（连上之后才有）：对方托盘里显示的是同一个 */
+  safety: string | null = null;
+  /** 下一次连接用的配对码（用户刚输入的），连上之后就不要了 */
+  private pairing: string | null = null;
   /** 最近一次开始连接、最近一次收到对方上线通知的时刻 */
   private attemptAt = 0;
   private onlineAt = -1;
@@ -175,7 +185,12 @@ export class RemoteSession {
    * `saved`：我的设备里记着的这台电脑。带着上次的重连凭证连，对方不在线时等它上线（见 [`open`]），
    * 连上之前标签上就显示它的名字
    */
-  constructor(code: string, settings: QualitySettings, saved?: { resume: ResumeToken | null; name: string; os: string }) {
+  constructor(
+    code: string,
+    settings: QualitySettings,
+    saved?: { resume: ResumeToken | null; name: string; os: string; hostKey?: string | null },
+    pairing?: string | null,
+  ) {
     this.code = code;
     this.codeNum = Number(code.replace(/\D/g, ""));
     this.settings = settings;
@@ -183,7 +198,9 @@ export class RemoteSession {
       this.resume = saved.resume;
       this.hostName = saved.name;
       this.hostOs = saved.os;
+      this.hostKey = saved.hostKey ?? null;
     }
+    this.pairing = pairing ?? null;
     this.canvas = document.createElement("canvas");
     this.canvas.className = "remote-canvas";
     this.canvas.tabIndex = 0;
@@ -258,7 +275,13 @@ export class RemoteSession {
     let info;
     const sent = this.effectiveSettings();
     try {
-      info = await api.connect(this.code, this.resume, sent, sink, this.clipboardSync);
+      info = await api.connect(
+        this.code,
+        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing },
+        sent,
+        sink,
+        this.clipboardSync,
+      );
     } catch (e) {
       // A Closed event already decided whether to retry. An old failure must
       // not overwrite that decision, or restart a deliberately declined call.
@@ -272,6 +295,10 @@ export class RemoteSession {
       return;
     }
     this.resume = info.resume;
+    // 第一次连上（或者用户信任了新的身份）：记下对方的公钥，之后只认它；配对码用过了
+    this.hostKey = info.hostKey;
+    this.safety = info.safety;
+    this.pairing = null;
     this.connectedOnce = true;
     this.sid = info.sid;
     this.hostName = info.hostName;
@@ -384,6 +411,21 @@ export class RemoteSession {
   serverConnected() {
     const kind = this.closedReason?.kind;
     if (this.state === "waiting" || (this.state === "reconnecting" && kind && NO_SERVER.has(kind))) this.retryNow();
+  }
+
+  /**
+   * 对方的身份变了（hostKeyChanged），用户确认是对方重装了之后：忘掉记着的公钥，重新连（记下新的）。
+   * 不会自动这样做：也可能是有人在冒充对方
+   */
+  trustNewIdentity() {
+    this.hostKey = null;
+    this.reconnect();
+  }
+
+  /** 对方要求配对码（pairingRequired / pairingFailed）：带着用户输入的配对码重新连 */
+  pairWith(pairing: string) {
+    this.pairing = pairing.replace(/\D/g, "");
+    this.reconnect();
   }
 
   /** 手动重连（关闭状态下） */

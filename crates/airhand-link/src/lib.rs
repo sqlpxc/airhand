@@ -2,6 +2,7 @@
 //!
 //! * [`net`]：QUIC 连接、证书固定、版本握手、断线重连；
 //! * [`transport`]：会话的三条流（控制、画面、声音）；
+//! * [`secure`]：端到端加密：设备的身份密钥、控制通道上的握手、每一帧的加解密；
 //! * [`controller`]：控制端服务与会话。与界面无关：界面的命令是 [`controller::Command`]，
 //!   画面和事件交给 [`controller::SessionUi`]；
 //! * [`host`]：被控端与服务器的连接和会话的三条流（采集、编码、注入输入由各平台自己做）；
@@ -13,6 +14,7 @@ pub mod flow;
 pub mod host;
 pub mod net;
 mod problem;
+pub mod secure;
 pub mod tasks;
 pub mod transport;
 

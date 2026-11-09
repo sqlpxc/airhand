@@ -11,12 +11,17 @@ license = "MIT"
 airhand-proto = { path = "../airhand-proto" }
 anyhow = "1"
 bytes = "1"
+curve25519-dalek = "4"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.9"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+# risky-raw-split：取出 Noise 的两把密钥，再派生每条通道、每个方向各自的密钥（见 src/secure.rs）
+snow = { version = "0.10", features = ["risky-raw-split"] }
+spake2 = "0.4"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

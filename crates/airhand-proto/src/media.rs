@@ -8,7 +8,8 @@
 //! 交给界面（WebView / 浏览器 / Android）：  头（24 字节）| 负载
 //! ```
 //!
-//! 控制端读到一个包后只看一眼头（统计、校验），不解码、不拷贝，原样交给界面；
+//! 线上的包是加密的（见 [`crate::handshake`] 的"之后的每一帧"）：控制端读到一个包后原地解密，只看一眼头（统计、校验），
+//! 不解码、不拷贝，原样交给界面；
 //! 界面按同一个格式解析（`client/src/lib/media.ts`、`android/.../controller/Protocol.kt` 里的 `Media`，
 //! 三边都用 `crates/airhand-link/tests/protocol.json` 里的样例检查）。
 //! 光标形状走控制流（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor)），控制端把它转成同样格式的光标包。
@@ -196,10 +197,11 @@ pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
     buf
 }
 
-/// 线上的一个媒体包：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好
+/// 线上的一个媒体包（加密之前）：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
+/// 多留了认证标签的容量：原地加密时不用重新分配（画面包可能有几 MiB）
 pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
     let len = HEADER_LEN + payload.iter().map(|p| p.len()).sum::<usize>();
-    let mut buf = Vec::with_capacity(4 + len);
+    let mut buf = Vec::with_capacity(4 + len + crate::handshake::TAG_LEN);
     buf.extend_from_slice(&(len as u32).to_le_bytes());
     buf.extend_from_slice(header);
     for p in payload {

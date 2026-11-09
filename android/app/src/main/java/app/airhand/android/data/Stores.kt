@@ -84,6 +84,11 @@ data class Settings(
     val requireApproval: Boolean = true,
     /** 已经看过的手势说明（trackpad / touch / tv） */
     val tipsSeen: Set<String> = emptySet(),
+    /**
+     * 本机的端到端加密身份：64 位十六进制的私钥（X25519，见 Rust 的 `airhand_link::secure::Identity`）。
+     * 做被控端和做控制端用同一个；配对过的电脑靠它认出本机。空字符串表示还没有（见 [SettingsStore.identity]）
+     */
+    val identity: String = "",
 ) {
     /** 为现在的服务器记下的指纹（换了服务器就不算） */
     val learnedFp: String? get() = trustedFp.takeIf { it.isNotBlank() && trustedServer.trim() == server.trim() }
@@ -107,6 +112,7 @@ data class Settings(
         .put("navKeys", navKeys)
         .put("requireApproval", requireApproval)
         .put("tipsSeen", JSONArray(tipsSeen.toList()))
+        .put("identity", identity)
 
     companion object {
         fun parse(o: JSONObject): Settings {
@@ -127,6 +133,7 @@ data class Settings(
                 navKeys = o.optBoolean("navKeys", d.navKeys),
                 requireApproval = o.optBoolean("requireApproval", d.requireApproval),
                 tipsSeen = if (tips == null) emptySet() else (0 until tips.length()).map { tips.getString(it) }.toSet(),
+                identity = o.optString("identity", ""),
             )
         }
     }
@@ -160,6 +167,22 @@ class SettingsStore(context: Context) {
     /** 告诉对方的本机名称 */
     fun deviceName(): String = value.deviceName.trim().ifEmpty { systemName }
 
+    /** 本机的端到端加密身份（传给 Rust 的 `identity`）。还没有就生成一个并保存：X25519 的私钥就是 32 个随机字节 */
+    @Synchronized
+    fun identity(): String {
+        value.identity.takeIf { it.length == 64 }?.let { return it }
+        val bytes = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        val hex = bytes.joinToString("") { "%02x".format(it) }
+        update { it.copy(identity = hex) }
+        return hex
+    }
+
+    /** Rust 生成了身份（没有传给它时的 identity 事件）：还没有的话记下来 */
+    @Synchronized
+    fun learnIdentity(key: String) {
+        if (value.identity.length != 64 && key.length == 64) update { it.copy(identity = key) }
+    }
+
     companion object {
         fun defaultDeviceName(context: Context): String {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
@@ -186,6 +209,8 @@ data class SavedDevice(
     /** 重连凭证（32 位十六进制）：对方不在线时可以等它上线，不算猜码 */
     val resume: String? = null,
     val lastUsed: Long = 0,
+    /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
+    val hostKey: String? = null,
 ) {
     fun title(): String = alias?.takeIf { it.isNotBlank() } ?: hostName.takeIf { it.isNotBlank() } ?: ""
 
@@ -196,6 +221,7 @@ data class SavedDevice(
         .put("hostOs", hostOs)
         .put("resume", resume ?: JSONObject.NULL)
         .put("lastUsed", lastUsed)
+        .put("hostKey", hostKey ?: JSONObject.NULL)
 
     companion object {
         fun parse(o: JSONObject) = SavedDevice(
@@ -205,6 +231,7 @@ data class SavedDevice(
             hostOs = o.optString("hostOs"),
             resume = o.optStringOrNull("resume"),
             lastUsed = o.optLong("lastUsed"),
+            hostKey = o.optStringOrNull("hostKey"),
         )
     }
 }
@@ -231,15 +258,16 @@ class DeviceStore(context: Context) {
 
     fun get(code: String): SavedDevice? = _flow.value.firstOrNull { it.code == code }
 
-    /** 连上了：记下（或者更新）这台设备 */
+    /** 连上了：记下（或者更新）这台设备。`hostKey` 是这次确认过的对方公钥（第一次连上、或者用户信任了新的身份） */
     @Synchronized
-    fun connected(code: String, hostName: String, hostOs: String, resume: String) {
+    fun connected(code: String, hostName: String, hostOs: String, resume: String, hostKey: String?) {
         val old = get(code)
         val d = (old ?: SavedDevice(code)).copy(
             hostName = hostName.ifBlank { old?.hostName ?: "" },
             hostOs = hostOs.ifBlank { old?.hostOs ?: "" },
             resume = resume,
             lastUsed = System.currentTimeMillis(),
+            hostKey = hostKey?.takeIf { it.isNotBlank() } ?: old?.hostKey,
         )
         set(_flow.value.filter { it.code != code } + d)
     }

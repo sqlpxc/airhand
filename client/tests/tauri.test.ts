@@ -27,7 +27,11 @@ test("desktop ACK follows WebView receipt and handles frames before connect repl
   // 沙箱里建的对象原型不同，按 JSON 比较
   const call = (i: number) => JSON.parse(JSON.stringify(calls[i]));
   let received = 0;
-  const connected = sandbox.backend.connect("123456", null, {}, { packet() { received++; }, event() {} }, true);
+  const opts = { resume: null, hostKey: "ab".repeat(32), pairing: "482913" };
+  const connected = sandbox.backend.connect("123456", opts, {}, { packet() { received++; }, event() {} }, true);
+  // 记下的对方公钥、配对码原样交给 Rust 的 ctrl_connect（参数名是 camelCase，Tauri 转成 snake_case）
+  assert.equal(calls[0][1].hostKey, opts.hostKey);
+  assert.equal(calls[0][1].pairing, opts.pairing);
   const pkt = new ArrayBuffer(24);
   const dv = new DataView(pkt); dv.setUint8(0, 1); dv.setUint32(4, 9, true);
   assert.equal(calls.length, 1);

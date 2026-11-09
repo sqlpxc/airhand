@@ -1,12 +1,13 @@
 //! 被控端的单个远控会话（对应桌面版的 `client/src-tauri/src/host/session.rs`，三条流的收发用
 //! [`airhand_link::host::HostSession`]，两边一样）。
 //!
-//! 手机默认要先请坐在它面前的人同意（见 `airhand_proto::session` 的模块说明）：
+//! 手机默认要先请坐在它面前的人同意（见 `airhand_proto::session` 的模块说明）。认不认识这个控制端看的是它在
+//! 端到端握手里的公钥（服务器冒充不了），握手由 [`HostSession::open`] 做，让不让进来由 [`Shared`] 的 `Gate` 决定：
 //!
 //! ```text
-//! 等控制端的 Hello（最多 2 秒）─┬─ 本次共享里同意过这台控制端 ──────────────┐
-//!                              └─ AwaitingApproval → 问本机用户（最多 60 秒）─┼─ 同意 → Hello、画面……
-//!                                                                          └─ 拒绝 / 没人理 → Bye
+//! 端到端握手 ─┬─ 本次共享里同意过这台控制端 / 不用同意 ─────────────────────────┐
+//!            └─ AwaitingApproval → 问本机用户（显示安全码，最多 60 秒）─┼─ 同意 → Hello、画面……
+//!                                                                    └─ 拒绝 / 没人理 → Bye
 //! ```
 //!
 //! 同意之前只回应 Ping、记下画质和声音设置，不发画面、不执行任何输入。
@@ -14,37 +15,31 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use airhand_link::host::{HostSession, PEER_TIMEOUT};
+use airhand_link::host::{Admission, HostSession, Incoming, PEER_TIMEOUT};
 use airhand_proto::session::{
     ByeReason, ControllerMsg, HostHello, HostMsg, Notice, Platform, QualitySettings,
 };
 use anyhow::Result;
-use quinn::Connection;
 use serde_json::json;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 
 use super::{Shared, audio, video};
-
-/// 等控制端报上自己的标识（它是会话流上的第一条消息，通常马上就到）
-const HELLO_WAIT: Duration = Duration::from_secs(2);
 /// 本机用户这么久没有回应连接请求就当作拒绝
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 本机用户同意之前会话所处的阶段
-enum Gate {
-    /// 等控制端的 Hello，好知道是不是同意过的设备
-    WaitHello,
+enum Phase {
     /// 正在问本机用户
     Asking(oneshot::Receiver<bool>),
     /// 已同意（或者不需要同意）
     Open,
 }
 
-async fn decided(gate: &mut Gate) -> bool {
-    match gate {
-        Gate::Asking(rx) => rx.await.unwrap_or(false),
-        _ => std::future::pending().await,
+async fn decided(phase: &mut Phase) -> bool {
+    match phase {
+        Phase::Asking(rx) => rx.await.unwrap_or(false),
+        Phase::Open => std::future::pending().await,
     }
 }
 
@@ -71,36 +66,40 @@ impl Drop for SessionGuard {
     }
 }
 
-pub async fn run(
-    conn: Connection,
-    session_id: u64,
-    mut kick: watch::Receiver<ByeReason>,
-    shared: Arc<Shared>,
-) -> Result<()> {
+pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
+    let session_id = inc.session_id;
     let guard = SessionGuard {
         shared: shared.clone(),
         id: session_id,
     };
-    let mut io = HostSession::open(&conn, session_id, video::QUEUE, audio::QUEUE).await?;
+    // 端到端握手：控制端是谁（公钥）、要不要问本机用户，由 Shared 的 Gate 决定
+    let (mut io, admitted) = HostSession::open(&inc, video::QUEUE, audio::QUEUE, &*shared).await?;
+    let mut kick = inc.kick;
+    // 列表里换成控制端在加密握手里报的名称，加上安全码（问本机用户时一起显示）
+    shared.update_controller(session_id, |c| {
+        if !admitted.name.is_empty() {
+            c.name = admitted.name.clone();
+        }
+        c.safety = Some(admitted.safety.clone());
+    });
     let ctl = io.ctl.clone();
     let mut bcast = shared.broadcast.subscribe();
 
     // 同意之前收到的设置，同意之后再生效
     let mut settings: Option<QualitySettings> = None;
     let mut want_audio = false;
-    let mut device: Option<[u8; 16]> = None;
-    let mut gate = Gate::WaitHello;
-    let mut deadline = Some(tokio::time::Instant::now() + HELLO_WAIT);
+    let mut phase = Phase::Open;
+    let mut deadline: Option<tokio::time::Instant> = None;
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     let mut last_msg = Instant::now();
 
     // 同意之后（或者不需要同意时）：开始正常的会话
-    let open = |gate: &mut Gate,
+    let open = |phase: &mut Phase,
                 deadline: &mut Option<tokio::time::Instant>,
                 settings: Option<QualitySettings>,
                 want_audio: bool|
      -> Result<()> {
-        *gate = Gate::Open;
+        *phase = Phase::Open;
         *deadline = None;
         shared.take_pending(session_id);
         shared.update_controller(session_id, |c| {
@@ -147,40 +146,33 @@ pub async fn run(
         Ok(())
     };
 
-    if !shared.approval_required() {
-        open(&mut gate, &mut deadline, None, false)?;
-    }
-
-    // 问本机用户：告诉控制端在等，等结果
-    let ask = |gate: &mut Gate, deadline: &mut Option<tokio::time::Instant>| -> Result<()> {
+    if admitted.admission == Admission::NeedsApproval {
+        // 问本机用户：告诉控制端在等，等结果
         let (tx, rx) = oneshot::channel();
         shared.add_pending(session_id, tx);
         shared.update_controller(session_id, |c| c.pending = true);
-        *gate = Gate::Asking(rx);
-        *deadline = Some(tokio::time::Instant::now() + APPROVAL_TIMEOUT);
-        info!(session_id, "asking the local user to allow the connection");
-        ctl.send(&HostMsg::AwaitingApproval)
-    };
+        phase = Phase::Asking(rx);
+        deadline = Some(tokio::time::Instant::now() + APPROVAL_TIMEOUT);
+        info!(session_id, safety = %admitted.safety, "asking the local user to allow the connection");
+        ctl.send(&HostMsg::AwaitingApproval)?;
+    } else {
+        if admitted.admission == Admission::Known {
+            info!(
+                session_id,
+                "this controller was allowed before during this sharing"
+            );
+        }
+        open(&mut phase, &mut deadline, None, false)?;
+    }
 
     let result: Result<()> = async {
         loop {
-            let is_open = matches!(gate, Gate::Open);
+            let is_open = matches!(phase, Phase::Open);
             tokio::select! {
                 msg = io.incoming.recv() => {
                     let Some(msg) = msg else { break };
                     last_msg = Instant::now();
                     match msg {
-                        ControllerMsg::Hello(h) => {
-                            device = Some(h.device);
-                            if matches!(gate, Gate::WaitHello) {
-                                if shared.is_trusted(&h.device) {
-                                    info!(session_id, "this controller was allowed before during this sharing");
-                                    open(&mut gate, &mut deadline, settings.take(), want_audio)?;
-                                } else {
-                                    ask(&mut gate, &mut deadline)?;
-                                }
-                            }
-                        }
                         ControllerMsg::Ping { t } => ctl.send(&HostMsg::Pong { t })?,
                         ControllerMsg::Settings(s) if !is_open => settings = Some(s),
                         ControllerMsg::Audio { enabled } if !is_open => want_audio = enabled,
@@ -207,28 +199,22 @@ pub async fn run(
                         }
                     }
                 }
-                allow = decided(&mut gate) => {
+                allow = decided(&mut phase) => {
                     if allow {
                         info!(session_id, "the local user allowed the connection");
-                        if let Some(d) = device {
-                            shared.trust(d);
-                        }
-                        open(&mut gate, &mut deadline, settings.take(), want_audio)?;
+                        shared.trust(admitted.key);
+                        open(&mut phase, &mut deadline, settings.take(), want_audio)?;
                     } else {
                         info!(session_id, "the local user declined the connection");
                         ctl.send(&HostMsg::Bye(ByeReason::Declined))?;
                         break;
                     }
                 }
-                _ = until(deadline) => match gate {
-                    // 控制端没报上标识（不应该发生）：当作没见过的设备
-                    Gate::WaitHello => ask(&mut gate, &mut deadline)?,
-                    _ => {
-                        info!(session_id, "nobody answered the connection request");
-                        ctl.send(&HostMsg::Bye(ByeReason::Unanswered))?;
-                        break;
-                    }
-                },
+                _ = until(deadline) => {
+                    info!(session_id, "nobody answered the connection request");
+                    ctl.send(&HostMsg::Bye(ByeReason::Unanswered))?;
+                    break;
+                }
                 _ = kick.changed() => {
                     let reason = *kick.borrow_and_update();
                     info!(session_id, ?reason, "the local user disconnected the controller");

@@ -10,6 +10,8 @@
 //!   之后只认它（见 [`trust`]）
 //! * `AIRHAND_SERVER_TRUST`    没有设置 `AIRHAND_SERVER_FP` 时，记下的指纹存在这个文件里。默认放在 `AIRHAND_WEB_CERT`
 //!   所在的目录（`server-trust.txt`）；都没有设置时只记在内存里，重启后重新记
+//! * `AIRHAND_WEB_IDENTITY`    网页控制台的端到端加密身份存在这个文件里（见 [`identity`]）。默认放在 `AIRHAND_WEB_CERT`
+//!   所在的目录（`controller-key.txt`）；都没有设置时只记在内存里，重启后配对过的电脑要重新配对
 //! * `AIRHAND_NAME`            被控端托盘里显示的控制端名称，默认 `Airhand Web`
 //! * `AIRHAND_WEB_LISTEN`      监听地址（TCP），默认 `0.0.0.0:8080`。同一个端口同时支持 HTTP 和 HTTPS
 //! * `AIRHAND_WEB_PASSWORD`    访问密码（浏览器弹出登录框，用户名随意）；不设置则不需要密码
@@ -23,6 +25,7 @@
 mod auth;
 mod console;
 mod http;
+mod identity;
 mod tls;
 mod trust;
 
@@ -106,9 +109,14 @@ async fn main() -> Result<()> {
             "AIRHAND_WEB_PASSWORD is not set: anyone who can reach this port can use the console (a control code is still needed for each computer)"
         );
     }
+    let identity_file = env("AIRHAND_WEB_IDENTITY").map(PathBuf::from).or_else(|| {
+        env("AIRHAND_WEB_CERT")
+            .and_then(|c| Some(Path::new(&c).parent()?.join("controller-key.txt")))
+    });
     let app = Arc::new(http::App {
         link: Arc::new(link),
         auth: password.map(auth::Auth::new),
+        identity: identity::load(identity_file.as_deref()),
     });
     let router = http::router(app.clone(), &root);
     let listener = tokio::net::TcpListener::bind(listen)

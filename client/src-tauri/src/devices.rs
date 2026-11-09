@@ -9,7 +9,11 @@
 //! last_used = 2026-11-08T10:20:30Z
 //! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "H264" }
 //! resume = "q83vEjRWeJCrze8SNFZ4kA=="
+//! host_key = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 //! ```
+//!
+//! `host_key` 是那台电脑的端到端加密公钥（第一次连上时记下，见 `airhand_link::controller` 的"端到端加密"）：
+//! 之后只认它，对不上就警告。是公钥，不用加密。
 //!
 //! 控制码能直接控制那台电脑，相当于钥匙：
 //! * Windows：config.toml 在安装目录里，本机的所有账户都能读，所以 `code` 用**当前用户**的 DPAPI 加密，
@@ -52,6 +56,9 @@ pub struct Device {
     /// 重连凭证：对方不在线时等它上线，不算猜码
     #[serde(default)]
     pub resume: Option<ResumeToken>,
+    /// 对方的端到端加密公钥（64 位十六进制）
+    #[serde(default)]
+    pub host_key: Option<String>,
     /// 最后一次连接的时间（Unix 毫秒）
     #[serde(default)]
     pub last_used: i64,
@@ -80,8 +87,15 @@ pub fn normalize(mut list: Vec<Device>) -> Vec<Device> {
         d.name = clip(&d.name);
         d.os = clip(&d.os);
         d.alias = d.alias.as_deref().map(clip).filter(|a| !a.is_empty());
+        d.host_key = d.host_key.as_deref().and_then(host_key);
     }
     list
+}
+
+/// 64 位十六进制的公钥（小写）；不像样的不要
+fn host_key(s: &str) -> Option<String> {
+    let k = s.trim().to_ascii_lowercase();
+    airhand_link::secure::unhex32(&k).map(|_| k)
 }
 
 // ───────────────────────────── 读 ─────────────────────────────
@@ -130,6 +144,7 @@ fn from_table(t: &Table) -> Option<Device> {
             _ => 0,
         },
         quality: t.get("quality").and_then(quality_from),
+        host_key: t.get("host_key").and_then(Item::as_str).and_then(host_key),
     })
 }
 
@@ -224,6 +239,9 @@ pub fn to_table(d: &Device) -> Option<Table> {
     if let Some(r) = &d.resume {
         t["resume"] = toml_edit::value(STANDARD.encode(r));
     }
+    if let Some(k) = d.host_key.as_deref().and_then(host_key) {
+        t["host_key"] = toml_edit::value(k);
+    }
     Some(t)
 }
 
@@ -231,7 +249,7 @@ pub fn to_table(d: &Device) -> Option<Table> {
 // last_used 写成 TOML 的日期时间（UTC），人也看得懂。不为这点功能引入日期库：公历换算用的是
 // Howard Hinnant 的 days_from_civil / civil_from_days
 
-fn to_millis(d: &Datetime) -> Option<i64> {
+pub(crate) fn to_millis(d: &Datetime) -> Option<i64> {
     let date = d.date?;
     let (y, m, day) = (i64::from(date.year), i64::from(date.month), i64::from(date.day));
     let y = if m <= 2 { y - 1 } else { y };
@@ -251,7 +269,7 @@ fn to_millis(d: &Datetime) -> Option<i64> {
     Some(((days * 24 + h) * 60 + min - offset_min) * 60_000 + s * 1000)
 }
 
-fn from_millis(ms: i64) -> Option<Datetime> {
+pub(crate) fn from_millis(ms: i64) -> Option<Datetime> {
     if ms <= 0 {
         return None;
     }
@@ -302,6 +320,7 @@ mod tests {
                 adaptive: true,
                 codec: Codec::H265,
             }),
+            host_key: Some("ab".repeat(32)),
         }
     }
 
@@ -325,7 +344,7 @@ mod tests {
         let t = to_table(&d).unwrap();
         assert_eq!(from_table(&t), Some(d.clone()));
         // 没有可选项的也行
-        let bare = Device { alias: None, os: String::new(), resume: None, quality: None, last_used: 0, ..d };
+        let bare = Device { alias: None, os: String::new(), resume: None, quality: None, last_used: 0, host_key: None, ..d };
         assert_eq!(from_table(&to_table(&bare).unwrap()), Some(bare));
     }
 

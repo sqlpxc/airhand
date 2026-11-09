@@ -10,25 +10,37 @@ export { fmtCode } from "./devices";
 /** 新建连接标签里正在连的会话（关掉这个标签就放弃） */
 let pending: RemoteSession | null = null;
 
+/** 怎么连：配对码（对方要求配对时）、信任对方的新身份（对方的身份变了，用户确认了是重装） */
+export interface OpenOptions {
+  pairing?: string | null;
+  trustNew?: boolean;
+}
+
 /**
  * 连接控制码为 `code` 的电脑，在新建连接标签里显示进度和错误，连上后这个标签变成会话标签。
  * 已经有这台电脑的标签：切过去（断开了就重新连接）。
  */
-export async function openSession(code: string, settings: QualitySettings): Promise<void> {
+export async function openSession(code: string, settings: QualitySettings, opts: OpenOptions = {}): Promise<void> {
   const st = store.get();
   const dup = st.sessions.find((s) => s.code === code);
   if (dup) {
     if (st.view === "new") store.closeDraft();
     store.setView(dup.id);
-    if (dup.state === "closed") dup.reconnect();
+    if (dup.state === "closed") {
+      if (opts.trustNew) dup.trustNewIdentity();
+      else if (opts.pairing) dup.pairWith(opts.pairing);
+      else dup.reconnect();
+    }
     return;
   }
   if (!st.draft) store.newTab();
   if (store.get().draft?.busy) return;
   store.patchDraft({ digits: code.split(""), busy: true, error: null });
-  // 我的设备里有：带着上次的重连凭证连（对方不在线时等它上线，而不是报错），连上之前就显示它的名字
-  const saved = st.devices.find((d) => d.code === code);
-  const s = new RemoteSession(code, settings, saved);
+  // 我的设备里有：带着上次的重连凭证连（对方不在线时等它上线，而不是报错），连上之前就显示它的名字；
+  // 只认记着的对方公钥（用户确认过对方重装了的话不带它，连上之后记下新的）
+  const found = st.devices.find((d) => d.code === code);
+  const saved = found && opts.trustNew ? { ...found, hostKey: null } : found;
+  const s = new RemoteSession(code, settings, saved, opts.pairing);
   pending = s;
   try {
     await s.open();
@@ -116,7 +128,14 @@ function setDevices(list: SavedDevice[]) {
 
 /** 连上了：记下这台电脑（名字、系统、重连凭证、画质、时间） */
 export function rememberSession(s: RemoteSession) {
-  const seen = { code: s.code, name: s.hostName, os: s.hostOs, resume: s.resumeToken, quality: s.settings };
+  const seen = {
+    code: s.code,
+    name: s.hostName,
+    os: s.hostOs,
+    resume: s.resumeToken,
+    quality: s.settings,
+    hostKey: s.hostKey,
+  };
   setDevices(devices.remember(store.get().devices, seen, Date.now()));
 }
 

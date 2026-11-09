@@ -3,10 +3,14 @@
 //! 服务器只做三件事：
 //! 1. 为被控端分配 6 位控制码（断线重连可取回原控制码；保存了控制码的被控端一直为它保留，见 [`crate::codes`]）；
 //! 2. 控制端按控制码发起会话时通知被控端；
-//! 3. 把双方的会话流配对后，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音，见 `airhand_proto::datagram`）
-//!    按开头的会话 ID 在两端之间原样转发（[`Route`]）。
+//! 3. 把双方的会话流按 `(会话 ID, 通道)` 配对后，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音，见
+//!    `airhand_proto::datagram`）按开头的会话 ID 在两端之间原样转发（[`Route`]）。
 //!
-//! 服务器从不解析画面/输入数据。
+//! 服务器从不解析会话内容：会话是端到端加密的（见 `airhand_proto::handshake`），服务器只看会话头里的会话 ID、
+//! 通道编号和优先级。会话有几条通道、每条是什么，服务器都不管（只限制数量，`airhand_proto::MAX_LANES`）：
+//! 控制通道（0 号）两端都到了，会话就开始；它结束了，整个会话结束。所以会话层加通道、改格式都不用升级服务器。
+//!
+//! 版本握手见 `airhand_proto::signal` 的"版本握手"：服务器接受一个区间的信令版本，不要求相等。
 //!
 //! 防暴力猜码：控制码不存在算一次猜错（[`FAIL_LIMIT`]），并且晚 400 ms 回答。控制码存在、但被控端还没准备好
 //! （正在注册、正在断开）时回答得一模一样（也算猜错、也晚回答），不能靠回答的快慢看出控制码存在。
@@ -27,14 +31,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use airhand_proto::framing::{read_msg, write_msg};
+use airhand_proto::framing::{read_frame, read_msg, write_frame, write_msg};
 use airhand_proto::signal::{
-    ClientMsg, ConnectError, Peer, Reclaim, ResumeToken, ServerMsg, SessionGrant,
+    ClientHello, ClientMsg, ConnectError, Peer, Reclaim, ResumeToken, ServerHello, ServerMsg,
+    SessionGrant,
 };
 use airhand_proto::{
-    CODE_MAX, CODE_MIN, MAX_SIGNAL_MSG, PROTOCOL_VERSION, Role, SessionHeader, datagram,
+    CODE_MAX, CODE_MIN, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION, SessionHeader, datagram,
+    features,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use quinn::{RecvStream, SendStream, VarInt};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -344,6 +350,12 @@ impl Limiter {
     }
 }
 
+type Stream = (SendStream, RecvStream);
+
+/// 两端都到了的一条通道：`(通道编号, 被控端的流, 控制端的流)`
+type LanePair = (u8, Stream, Stream);
+
+/// 一个会话：从服务器批准开始，到控制通道结束为止
 struct Pending {
     host_conn: u64,
     ctrl_conn: u64,
@@ -351,9 +363,16 @@ struct Pending {
     host_link: quinn::Connection,
     ctrl_link: quinn::Connection,
     created: Instant,
-    host_streams: [Option<(SendStream, RecvStream)>; 3],
-    ctrl_streams: [Option<(SendStream, RecvStream)>; 3],
-    slot: SlotGuard,
+    /// 只有一端到了的通道，在等另一端
+    half: HashMap<u8, (Role, Stream)>,
+    /// 已经配好的通道（第 i 位是 i 号通道）：同一条通道不能再开
+    paired: u8,
+    /// 两端都到了、在等控制通道的通道（会话还没开始）
+    ready: Vec<LanePair>,
+    /// 会话开始了（控制通道两端都到了）：之后配好的通道交给它（[`Broker::run_session`]）
+    live: Option<mpsc::UnboundedSender<LanePair>>,
+    /// 会话开始时交给 [`Broker::run_session`]
+    slot: Option<SlotGuard>,
     label: String,
 }
 
@@ -439,18 +458,21 @@ impl Broker {
             tick.tick().await;
             let now = Instant::now();
             self.reserved.lock().unwrap().retain(|_, r| r.until > now);
+            // 控制通道一直没配上的会话（开始了的会话由 run_session 自己清理）
             let expired: Vec<Pending> = {
                 let mut p = self.pending.lock().unwrap();
                 let ids: Vec<u64> = p
                     .iter()
-                    .filter(|(_, v)| now - v.created > PENDING_TTL)
+                    .filter(|(_, v)| v.live.is_none() && now - v.created > PENDING_TTL)
                     .map(|(k, _)| *k)
                     .collect();
                 ids.into_iter().filter_map(|id| p.remove(&id)).collect()
             };
             for p in expired {
                 debug!("session pairing timed out: {}", p.label);
-                for (mut s, mut r) in p.host_streams.into_iter().chain(p.ctrl_streams).flatten() {
+                let halves = p.half.into_values().map(|(_, s)| s);
+                let pairs = p.ready.into_iter().flat_map(|(_, a, b)| [a, b]);
+                for (mut s, mut r) in halves.chain(pairs) {
                     let _ = s.reset(VarInt::from_u32(1));
                     let _ = r.stop(VarInt::from_u32(1));
                 }
@@ -542,45 +564,29 @@ impl Broker {
             .await
             .context("timed out waiting for the control stream")??;
         let mut buf = Vec::new();
-        let hello: ClientMsg = timeout(
+        let got = timeout(
             HANDSHAKE_TIMEOUT,
-            read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf),
+            read_frame(&mut recv, MAX_SIGNAL_MSG, &mut buf),
         )
         .await
-        .context("timed out waiting for Hello")??
-        .ok_or_else(|| anyhow!("peer closed the stream"))?;
-        let ClientMsg::Hello {
-            version,
-            role,
-            name,
-            os,
-        } = hello
-        else {
-            bail!("the first message must be Hello");
-        };
-        let name: String = name.chars().take(64).collect();
-        let os: String = os.chars().take(64).collect();
-        if version != PROTOCOL_VERSION {
-            info!(%peer, version, "rejected client: protocol version mismatch");
-            write_msg(
-                &mut send,
-                &ServerMsg::Incompatible {
-                    server_version: PROTOCOL_VERSION,
-                },
-            )
-            .await?;
+        .context("timed out waiting for Hello")??;
+        if !got {
+            bail!("peer closed the stream");
+        }
+        // 版本握手（见 airhand_proto::signal 的"版本握手"）：任何版本的客户端都能读出它的开头
+        let hello = ClientHello::decode(&buf).context("the first message must be Hello")?;
+        let role = hello.role;
+        let name: String = hello.name.chars().take(64).collect();
+        let os: String = hello.os.chars().take(64).collect();
+        let answer = hello.negotiate(SIGNAL_MIN, SIGNAL_VERSION, features::signal::SUPPORTED);
+        write_frame(&mut send, &answer.encode()).await?;
+        let ServerHello::Welcome { version, .. } = answer else {
+            info!(%peer, min = hello.min_version, max = hello.version, "rejected client: no common signal version");
             let _ = send.finish();
             tokio::time::sleep(Duration::from_millis(500)).await;
             return Ok(());
-        }
-        write_msg(
-            &mut send,
-            &ServerMsg::Welcome {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await?;
-        info!(%peer, conn_id, ?role, %name, %os, "client connected");
+        };
+        info!(%peer, conn_id, ?role, %name, %os, version, "client connected");
 
         let (tx, rx) = mpsc::channel::<ServerMsg>(64);
         let tx = SignalTx {
@@ -905,7 +911,7 @@ impl Broker {
                     info!(%peer, code, "connect request failed: {denied:?}");
                 }
                 let result = result.map_err(Denied::error);
-                let _ = tx.send(ServerMsg::ConnectResult { req_id, result });
+                let _ = tx.send(ServerMsg::connect_result(req_id, result));
             }
             anyhow::Ok(())
         }
@@ -982,9 +988,11 @@ impl Broker {
                 host_link: host.conn.clone(),
                 ctrl_link: ctrl.tx.conn.clone(),
                 created: Instant::now(),
-                host_streams: std::array::from_fn(|_| None),
-                ctrl_streams: std::array::from_fn(|_| None),
-                slot,
+                half: HashMap::new(),
+                paired: 0,
+                ready: Vec::new(),
+                live: None,
+                slot: Some(slot),
                 label: label.clone(),
             },
         );
@@ -1099,11 +1107,12 @@ impl Broker {
             bail!("invalid session header");
         };
 
+        let session_id = h.session_id;
         let mut pending = self.pending.lock().unwrap();
-        let Some(p) = pending.get_mut(&h.session_id) else {
+        let Some(p) = pending.get_mut(&session_id) else {
             drop(pending);
             reject(send, recv);
-            bail!("no such session: {}", h.session_id);
+            bail!("no such session: {session_id}");
         };
         let expected = match role {
             Role::Host => p.host_conn,
@@ -1114,54 +1123,116 @@ impl Broker {
             reject(send, recv);
             bail!("the session doesn't belong to this connection");
         }
-        let slot = match role {
-            Role::Host => &mut p.host_streams[h.lane as usize],
-            Role::Controller => &mut p.ctrl_streams[h.lane as usize],
-        };
-        if slot.is_some() {
+        // 这一端往这条通道写数据时用它自己在会话头里给的优先级
+        send.set_priority(i32::from(h.priority))?;
+        let mine = (send, recv);
+        if p.paired & (1 << h.lane) != 0 {
             drop(pending);
+            let (send, recv) = mine;
             reject(send, recv);
-            bail!("duplicate session lane");
+            bail!("session lane {} is already paired", h.lane);
         }
-        send.set_priority(match h.lane {
-            airhand_proto::SessionLane::Control => 10,
-            airhand_proto::SessionLane::Audio => 5,
-            airhand_proto::SessionLane::Video => 0,
-        })?;
-        *slot = Some((send, recv));
-        if !p
-            .host_streams
-            .iter()
-            .chain(&p.ctrl_streams)
-            .all(Option::is_some)
-        {
+        let pair = match p.half.remove(&h.lane) {
+            None => {
+                p.half.insert(h.lane, (role, mine));
+                return Ok(());
+            }
+            Some((other, theirs)) if other != role => match role {
+                Role::Host => (h.lane, mine, theirs),
+                Role::Controller => (h.lane, theirs, mine),
+            },
+            // 同一端把同一条通道开了两次
+            Some(first) => {
+                p.half.insert(h.lane, first);
+                drop(pending);
+                let (send, recv) = mine;
+                reject(send, recv);
+                bail!("duplicate session lane {}", h.lane);
+            }
+        };
+        p.paired |= 1 << h.lane;
+        if let Some(live) = &p.live {
+            // 会话已经开始了：交给它转发（它已经结束的话，流随之关闭）
+            let _ = live.send(pair);
             return Ok(());
         }
-        let p = pending.remove(&h.session_id).unwrap();
+        if pair.0 != airhand_proto::SessionLane::Control as u8 {
+            p.ready.push(pair);
+            return Ok(());
+        }
+        // 控制通道两端都到了：会话开始
+        let (tx, rx) = mpsc::unbounded_channel();
+        p.live = Some(tx);
+        let mut lanes = std::mem::take(&mut p.ready);
+        lanes.push(pair);
+        let slot = p.slot.take();
+        let label = p.label.clone();
+        let route = Route {
+            host: (p.host_conn, p.host_link.clone()),
+            ctrl: (p.ctrl_conn, p.ctrl_link.clone()),
+        };
         drop(pending);
-        let session_id = h.session_id;
-        info!(session_id, "{}: session established (3 lanes)", p.label);
-        self.routes.lock().unwrap().insert(
-            session_id,
-            Route {
-                host: (p.host_conn, p.host_link),
-                ctrl: (p.ctrl_conn, p.ctrl_link),
-            },
-        );
-        let route = RouteGuard(self.clone(), session_id);
-        tokio::spawn(async move {
-            let mut relays = tokio::task::JoinSet::new();
-            for (a, b) in p.host_streams.into_iter().zip(p.ctrl_streams) {
-                relays.spawn(relay(a.unwrap(), b.unwrap()));
-            }
-            // Every lane is required; closing any one tears down the whole session.
-            let _ = relays.join_next().await;
-            drop(relays);
-            drop(route);
-            info!(session_id, "{}: session ended", p.label);
-            drop(p.slot);
-        });
+        info!(session_id, "{label}: session established");
+        tokio::spawn(self.run_session(session_id, label, route, lanes, rx, slot));
         Ok(())
+    }
+
+    /// 一个开始了的会话：转发它的每条通道（`lanes` 是已经配好的，之后配好的从 `more` 来）和数据报，
+    /// 直到控制通道结束。结束时停掉其它通道、不再转发数据报、归还会话槽位
+    async fn run_session(
+        self: Arc<Self>,
+        session_id: u64,
+        label: String,
+        route: Route,
+        lanes: Vec<LanePair>,
+        mut more: mpsc::UnboundedReceiver<LanePair>,
+        slot: Option<SlotGuard>,
+    ) {
+        self.routes.lock().unwrap().insert(session_id, route);
+        let route = RouteGuard(self.clone(), session_id);
+        let mut relays = tokio::task::JoinSet::new();
+        let mut control = None;
+        /// 开始转发一条通道，记下控制通道是哪个任务
+        fn spawn(
+            relays: &mut tokio::task::JoinSet<(u64, u64)>,
+            control: &mut Option<tokio::task::Id>,
+            (lane, host, ctrl): LanePair,
+        ) {
+            let id = relays.spawn(relay(host, ctrl)).id();
+            if lane == airhand_proto::SessionLane::Control as u8 {
+                *control = Some(id);
+            }
+        }
+        for pair in lanes {
+            spawn(&mut relays, &mut control, pair);
+        }
+        loop {
+            tokio::select! {
+                pair = more.recv() => match pair {
+                    Some(pair) => spawn(&mut relays, &mut control, pair),
+                    None => break,
+                },
+                done = relays.join_next_with_id() => match done {
+                    // 控制通道结束了：整个会话结束
+                    Some(Ok((id, _))) if Some(id) == control => break,
+                    Some(Err(e)) if Some(e.id()) == control => break,
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+        // 不再接受这个会话的通道；还在等另一端的通道随之关闭
+        let p = self.pending.lock().unwrap().remove(&session_id);
+        if let Some(p) = p {
+            for (_, (mut s, mut r)) in p.half.into_values() {
+                let _ = s.reset(VarInt::from_u32(0));
+                let _ = r.stop(VarInt::from_u32(0));
+            }
+        }
+        drop(relays);
+        drop(route);
+        info!(session_id, "{label}: session ended");
+        drop(slot);
     }
 }
 
@@ -1262,13 +1333,66 @@ fn limiter_key(ip: IpAddr) -> IpAddr {
 mod tests {
     use airhand_link::Problem;
     use airhand_link::controller::{
-        ControllerService, Frontend, SessionEvent, SessionUi, UiClosed,
+        ConnectOptions, ControllerService, Frontend, SessionEvent, SessionUi, UiClosed,
     };
+    use airhand_link::host::{Access, Gate, HostSession, Incoming};
     use airhand_link::net::{LinkConfig, Signal, connect_signal};
-    use airhand_proto::session::QualitySettings;
+    use airhand_link::secure::Identity;
+    use airhand_proto::handshake::PublicKey;
+    use airhand_proto::session::{ByeReason, QualitySettings};
+    use airhand_proto::signal::connect_outcome;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    use tokio::sync::watch;
 
     use super::*;
+
+    /// 谁都让进来的被控端（测试用）
+    struct OpenGate(Identity);
+
+    impl Gate for OpenGate {
+        fn identity(&self) -> Identity {
+            self.0.clone()
+        }
+        fn access(&self) -> Access {
+            Access::Open
+        }
+        fn pairing_code(&self) -> Option<String> {
+            None
+        }
+        fn pairing_failed(&self) {}
+        fn is_known(&self, _: &PublicKey) -> bool {
+            false
+        }
+        fn paired(&self, _: PublicKey, _: &str) {}
+    }
+
+    /// 回应这个被控端收到的会话请求：端到端握手、打开会话。会话一直开着，直到任务被中止
+    fn answer(sig: Signal, code: u32) -> tokio::task::JoinHandle<()> {
+        let gate = OpenGate(Identity::generate());
+        tokio::spawn(async move {
+            let mut sessions = Vec::new();
+            let (_kick_tx, kick) = watch::channel(ByeReason::Kicked);
+            let mut buf = Vec::new();
+            // 整个拿进来（只用到其中几个字段的话，别的字段在函数返回时就被丢掉了：信令流随之关闭）
+            let mut sig = sig;
+            while let Ok(Some(m)) =
+                read_msg::<_, ServerMsg>(&mut sig.recv, MAX_SIGNAL_MSG, &mut buf).await
+            {
+                if let ServerMsg::Incoming { session_id, peer } = m {
+                    let inc = Incoming {
+                        conn: sig.conn.clone(),
+                        session_id,
+                        code,
+                        peer,
+                        kick: kick.clone(),
+                    };
+                    if let Ok(s) = HostSession::open(&inc, 2, 16, &gate).await {
+                        sessions.push(s);
+                    }
+                }
+            }
+        })
+    }
 
     #[test]
     fn limiter_key_groups_addresses() {
@@ -1431,7 +1555,13 @@ mod tests {
         .await
         .unwrap();
         match next(ctrl).await {
-            ServerMsg::ConnectResult { req_id: r, result } if r == req_id => result,
+            ServerMsg::ConnectResult {
+                req_id: r,
+                grant,
+                error,
+            } if r == req_id => {
+                connect_outcome(grant, error).map_err(|e| e.expect("a known error"))
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1453,7 +1583,7 @@ mod tests {
         use airhand_link::transport::{FromHost, HostReceiver, open_session};
         use airhand_proto::framing::read_packet;
         use airhand_proto::media::{self, AudioHeader};
-        use airhand_proto::session::{ByeReason, HostMsg};
+        use airhand_proto::session::HostMsg;
         let (_broker, cfg) = start().await;
         let (mut host, id) = register(&cfg, None).await;
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
@@ -1517,6 +1647,10 @@ mod tests {
         let _ = stalled.await;
         // Also verify receiver cancellation does not damage framing, and clean
         // media EOF cannot hide a deliberate terminal control message.
+        // 这一次是真正的会话：经服务器转发的流上做端到端握手，之后都是密文
+        use airhand_link::secure::{self, InitiatorParams, ResponderParams};
+        use airhand_link::transport::Openers;
+        use airhand_proto::SessionLane;
         let grant = ask(&mut ctrl, 2, id.code, None).await.unwrap();
         let _ = next(&mut host).await;
         let h = open_session(&host.conn, grant.session_id, Role::Host)
@@ -1525,19 +1659,60 @@ mod tests {
         let c = open_session(&ctrl.conn, grant.session_id, Role::Controller)
             .await
             .unwrap();
-        let (_send, recv) = c.control;
-        let mut receiver = HostReceiver::new(recv, c.video, c.audio, None);
+        let gate = OpenGate(Identity::generate());
+        let me = Identity::generate();
+        let intro = secure::controller_intro("ctl", "test");
+        let (mut ctl, mut ctl_rx) = h.control;
+        let (mut csend, mut crecv) = c.control;
+        let (init, resp) = tokio::join!(
+            secure::initiate(
+                &mut crecv,
+                &mut csend,
+                InitiatorParams {
+                    session_id: grant.session_id,
+                    code: id.code,
+                    me: &me,
+                    host_key: None,
+                    pairing: None,
+                    intro: &intro,
+                },
+            ),
+            secure::respond(
+                &mut ctl_rx,
+                &mut ctl,
+                ResponderParams {
+                    session_id: grant.session_id,
+                    code: id.code,
+                    gate: &gate,
+                },
+            )
+        );
+        let (init, mut resp) = (init.unwrap(), resp.unwrap());
+        let mut receiver = HostReceiver::new(
+            crecv,
+            c.video,
+            c.audio,
+            None,
+            Openers {
+                control: init.opener,
+                video: init.secured.opener(SessionLane::Video),
+                audio: init.secured.opener(SessionLane::Audio),
+                datagrams: init.secured.datagram_opener(),
+            },
+        );
         assert!(
             timeout(Duration::from_millis(10), receiver.recv())
                 .await
                 .is_err()
         );
-        let (mut ctl, _r) = h.control;
         let (mut audio, _r2) = h.audio;
         let (mut video, _r3) = h.video;
-        write_msg(&mut ctl, &HostMsg::Bye(ByeReason::Kicked))
-            .await
-            .unwrap();
+        let mut bye = airhand_proto::framing::encode_with_spare(
+            &HostMsg::Bye(ByeReason::Kicked),
+            airhand_proto::handshake::TAG_LEN,
+        );
+        resp.sealer.seal_frame(&mut bye).unwrap();
+        ctl.write_all(&bye).await.unwrap();
         ctl.finish().unwrap();
         audio.finish().unwrap();
         video.finish().unwrap();
@@ -1638,6 +1813,8 @@ mod tests {
         let (broker, cfg) = start().await;
         let ip = limiter_key("127.0.0.1".parse().unwrap());
         let (host, id) = register(&cfg, None).await;
+        let host_conn = host.conn.clone();
+        let host = answer(host, id.code);
         let (online_tx, mut online_rx) = mpsc::unbounded_channel();
         let svc = ControllerService::start(
             Arc::new(cfg.clone()),
@@ -1646,12 +1823,16 @@ mod tests {
             Arc::new(move |code| {
                 let _ = online_tx.send(code);
             }),
+            Identity::generate(),
         );
         let code = id.code.to_string();
         let connect = |resume| {
             svc.connect(
                 &code,
-                resume,
+                ConnectOptions {
+                    resume,
+                    ..Default::default()
+                },
                 QualitySettings::default(),
                 Arc::new(NoUi),
                 Frontend::Browser,
@@ -1666,9 +1847,9 @@ mod tests {
         };
         let token = Some(first.unwrap().resume);
 
-        host.conn.close(VarInt::from_u32(0), b"");
+        host_conn.close(VarInt::from_u32(0), b"");
         wait_until("the host is gone", || broker.stats().0 == 0).await;
-        drop(host);
+        host.abort();
         for _ in 0..FAIL_LIMIT {
             broker.record_failure(ip);
         }
@@ -1676,7 +1857,8 @@ mod tests {
         // 不带凭证：普通的连接请求，照常限速
         assert_eq!(connect(None).await.unwrap_err(), Problem::RateLimited);
 
-        let (_host, _) = register(&cfg, Some(id)).await;
+        let (host, _) = register(&cfg, Some(id)).await;
+        let _host = answer(host, id.code);
         let code = tokio::time::timeout(Duration::from_secs(5), online_rx.recv())
             .await
             .expect("host_online wasn't called")
@@ -1827,7 +2009,7 @@ mod tests {
             true,
             None,
             Arc::new(Events(tx)),
-            |_conn, _id, _kick| async {},
+            |_inc| async {},
             cmd_rx,
         ));
         let next_saved = async |saved: &mut mpsc::UnboundedReceiver<(Reclaim, bool)>| {
@@ -1887,7 +2069,7 @@ mod tests {
             false,
             None,
             Arc::new(Events),
-            |_conn, _id, _kick| async {},
+            |_inc| async {},
             cmd_rx,
         ));
         let mut buf = Vec::new();
@@ -1899,16 +2081,20 @@ mod tests {
                 .unwrap();
             let conn = incoming.await.unwrap();
             let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-            let hello: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(hello, ClientMsg::Hello { .. }));
-            write_msg(
+            assert!(
+                read_frame(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+                    .await
+                    .unwrap()
+            );
+            let hello = ClientHello::decode(&buf).unwrap();
+            assert_eq!(hello.role, Role::Host);
+            write_frame(
                 &mut send,
-                &ServerMsg::Welcome {
-                    version: PROTOCOL_VERSION,
-                },
+                &ServerHello::Welcome {
+                    version: SIGNAL_VERSION,
+                    features: airhand_proto::Features::NONE,
+                }
+                .encode(),
             )
             .await
             .unwrap();
@@ -2068,6 +2254,64 @@ mod tests {
         assert_eq!(broker.failure_count(ip), 2);
     }
 
+    /// 服务器不管会话有几条通道、各是什么：以后新加的通道（这里是 5 号）照样配对转发；
+    /// 同一端把同一条通道开两次的拒绝；控制通道结束时整个会话结束，其它通道随之关闭
+    #[tokio::test]
+    async fn lanes_the_server_has_never_heard_of_are_relayed() {
+        use airhand_proto::{SessionHeader, SessionLane};
+        let (broker, cfg) = start().await;
+        let (mut host, id) = register(&cfg, None).await;
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+        assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+        let lane = async |conn: &quinn::Connection, role: Role, lane: u8| {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            let h = SessionHeader {
+                session_id: sid,
+                role,
+                lane,
+                priority: 3,
+            };
+            send.write_all(&h.encode()).await.unwrap();
+            (send, recv)
+        };
+        // 新的通道先到：控制通道还没配好，会话还没开始
+        let (mut h5, _h5r) = lane(&host.conn, Role::Host, 5).await;
+        let (_c5, mut c5r) = lane(&ctrl.conn, Role::Controller, 5).await;
+        h5.write_all(b"future lane").await.unwrap();
+        let (hc, mut hcr) = lane(&host.conn, Role::Host, SessionLane::Control as u8).await;
+        let (mut cc, _ccr) = lane(&ctrl.conn, Role::Controller, SessionLane::Control as u8).await;
+        let mut buf = [0u8; 11];
+        timeout(Duration::from_secs(2), c5r.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"future lane");
+        cc.write_all(b"ping").await.unwrap();
+        let mut b4 = [0u8; 4];
+        timeout(Duration::from_secs(2), hcr.read_exact(&mut b4))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&b4, b"ping");
+        assert!(broker.routes.lock().unwrap().contains_key(&sid));
+        // 同一端再开一次 5 号通道：拒绝
+        let (_dup, mut dup_r) = lane(&host.conn, Role::Host, 5).await;
+        assert!(
+            timeout(Duration::from_secs(2), dup_r.read(&mut buf))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        // 控制通道结束：整个会话结束
+        drop((hc, hcr, cc));
+        wait_until("the session is gone", || {
+            !broker.routes.lock().unwrap().contains_key(&sid)
+        })
+        .await;
+        assert!(!broker.pending.lock().unwrap().contains_key(&sid));
+    }
+
     /// 数据报按开头的会话 ID 在会话的两端之间转发；不是这个会话的连接发的、会话 ID 不对的、会话结束之后的都不转
     #[tokio::test]
     async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
@@ -2118,7 +2362,6 @@ mod tests {
     /// 被控端（airhand-link 的 HostSession）的声音包走数据报，经服务器转发，控制端服务交给界面
     #[tokio::test]
     async fn controller_service_gets_audio_over_datagrams() {
-        use airhand_link::host::HostSession;
         use airhand_proto::media::{self, AudioHeader, Kind};
         struct Ui(mpsc::UnboundedSender<Vec<u8>>);
         impl SessionUi for Ui {
@@ -2139,6 +2382,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(|_| {}),
             Arc::new(|_| {}),
+            Identity::generate(),
         );
         let (tx, mut audio) = mpsc::unbounded_channel();
         let ui = Arc::new(Ui(tx));
@@ -2148,7 +2392,7 @@ mod tests {
                 let r = svc
                     .connect(
                         &code,
-                        None,
+                        ConnectOptions::default(),
                         QualitySettings::default(),
                         ui.clone(),
                         Frontend::Browser,
@@ -2162,17 +2406,27 @@ mod tests {
                 }
             }
         };
+        let gate = OpenGate(Identity::generate());
         let accepting = async {
-            let ServerMsg::Incoming { session_id, .. } = next(&mut host).await else {
+            let ServerMsg::Incoming { session_id, peer } = next(&mut host).await else {
                 panic!("expected Incoming");
             };
-            let s = HostSession::open(&host.conn, session_id, 2, 16)
-                .await
-                .unwrap();
-            (session_id, s)
+            let (_kick_tx, kick) = watch::channel(ByeReason::Kicked);
+            let inc = Incoming {
+                conn: host.conn.clone(),
+                session_id,
+                code: id.code,
+                peer,
+                kick,
+            };
+            let (s, admitted) = HostSession::open(&inc, 2, 16, &gate).await.unwrap();
+            (session_id, s, admitted)
         };
-        let (info, (sid, session)) = tokio::join!(connecting, accepting);
-        info.unwrap();
+        let (info, (sid, session, admitted)) = tokio::join!(connecting, accepting);
+        let info = info.unwrap();
+        // 两端的安全码一样；控制端记下的是被控端真正的公钥
+        assert_eq!(info.safety, admitted.safety);
+        assert_eq!(info.host_key, airhand_link::secure::hex(gate.0.public()));
         wait_until("the session is established", || {
             broker.routes.lock().unwrap().contains_key(&sid)
         })

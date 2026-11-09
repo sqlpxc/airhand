@@ -95,6 +95,13 @@
     <string name="request_text">%1$s来自 %2$s，%3$d 秒内不处理会自动拒绝。</string>
     <string name="request_allow">允许</string>
     <string name="request_decline">拒绝</string>
+    <string name="request_safety">安全码 %1$s：中间没有人的话，对方显示的是同一个</string>
+    <string name="session_safety">安全码 %1$s</string>
+    <string name="pairing_title">输入配对码</string>
+    <string name="pairing_label">配对码</string>
+    <string name="pairing_hint">对方电脑 Airhand 托盘菜单里的 6 位配对码。配对之后对方记住这台手机，下次不用再输</string>
+    <string name="trust_new_title">信任新的身份？</string>
+    <string name="trust_new_confirm">信任并连接</string>
     <string name="require_approval">连接前先问我</string>
     <string name="require_approval_desc">有人输入本机控制码时，先由你允许或拒绝。允许过的设备在本次共享里断线重连不再询问</string>
     <string name="perm_battery">后台运行</string>
@@ -303,6 +310,12 @@
     <string name="problem_host_busy">对方当前连接的设备数已满</string>
     <string name="problem_server_timeout">服务器响应超时</string>
     <string name="problem_host_offline">对方已离线</string>
+    <string name="problem_host_key_changed">对方设备的身份和上次连接时不一样：可能是对方重装了 Airhand，也可能有人在冒充它。确认是对方重装之后再信任新的身份</string>
+    <string name="problem_pairing_required">第一次连接这台设备，需要配对码：在对方电脑的 Airhand 托盘菜单里可以看到</string>
+    <string name="problem_pairing_failed">配对码不对，请核对对方托盘菜单里的配对码</string>
+    <string name="problem_pairing_unavailable">对方暂停了配对（有人多次输错配对码）：请对方在托盘菜单里换一个配对码</string>
+    <string name="problem_peer_incompatible_update_app">与对方设备的版本不兼容：对方较新，请更新这台手机上的 Airhand</string>
+    <string name="problem_peer_incompatible_update_peer">与对方设备的版本不兼容：对方较旧，请对方更新 Airhand</string>
     <string name="problem_host_ended">对方结束了会话</string>
     <string name="problem_host_unresponsive">对方无响应</string>
     <string name="problem_kicked">对方断开了你的连接</string>

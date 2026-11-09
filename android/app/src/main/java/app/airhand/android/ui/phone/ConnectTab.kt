@@ -56,6 +56,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -65,6 +66,7 @@ import app.airhand.android.AirhandApp
 import app.airhand.android.R
 import app.airhand.android.controller.RemoteSession
 import app.airhand.android.core.Code
+import app.airhand.android.core.Problem
 import app.airhand.android.core.ServerState
 import app.airhand.android.data.SavedDevice
 import app.airhand.android.ui.CodeInput
@@ -101,6 +103,8 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
     var errorCode by remember { mutableStateOf<String?>(null) }
     var serverDetails by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<SavedDevice?>(null) }
+    // 端到端握手要用户决定的失败（要配对码 / 对方的身份变了）：哪个控制码、什么问题
+    var askUser by remember { mutableStateOf<Pair<String, Problem>?>(null) }
     var deleting by remember { mutableStateOf<SavedDevice?>(null) }
     val clipHasText = rememberClipHasText()
 
@@ -110,6 +114,7 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
         if (phase is RemoteSession.Phase.Failed) {
             error = Messages.problem(ctx, phase.reason)
             errorCode = s.code
+            if (phase.reason.needsPairing || phase.reason.kind == "hostKeyChanged") askUser = s.code to phase.reason
             app.endSession(s)
         }
         // 连上了：这台已经在“我的设备”里，输入框清空
@@ -281,6 +286,38 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
         }
     }
 
+    // 对方要配对码：输入对方托盘菜单里的配对码再连；对方的身份变了：用户确认是重装了才信任新的身份
+    askUser?.let { (c, p) ->
+        val retry = { pairing: String?, trustNew: Boolean ->
+            askUser = null
+            error = null
+            errorCode = null
+            app.startSession(c, viewOnly = false, pairing = pairing, trustNew = trustNew)
+        }
+        if (p.needsPairing) {
+            val hint = stringResource(R.string.pairing_hint)
+            EditTextDialog(
+                title = stringResource(R.string.pairing_title),
+                initial = "",
+                label = stringResource(R.string.pairing_label),
+                supporting = Messages.problem(ctx, p),
+                placeholder = "000000",
+                keyboardType = KeyboardType.Number,
+                validate = { if (it.count(Char::isDigit) == 6) null else hint },
+                onDismiss = { askUser = null },
+                onSave = { retry(it.filter(Char::isDigit), false) },
+            )
+        } else {
+            ConfirmDialog(
+                title = stringResource(R.string.trust_new_title),
+                text = Messages.problem(ctx, p),
+                confirm = stringResource(R.string.trust_new_confirm),
+                destructive = true,
+                onDismiss = { askUser = null },
+                onConfirm = { retry(null, true) },
+            )
+        }
+    }
     renaming?.let { d ->
         EditTextDialog(
             title = stringResource(R.string.device_rename),

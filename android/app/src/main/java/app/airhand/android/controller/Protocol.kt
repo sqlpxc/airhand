@@ -76,12 +76,18 @@ object Media {
 object Commands {
     private fun cmd(name: String, sid: Int): JSONObject = JSONObject().put("cmd", name).put("sid", sid)
 
-    /** `resume`：之前连上时得到的重连凭证（十六进制，见 [Resume]） */
-    fun connect(code: String, resume: String?, settings: Quality): JSONObject = JSONObject()
-        .put("cmd", "connect")
-        .put("code", code)
-        .put("resume", Resume.toJson(resume))
-        .put("settings", settings.toJson())
+    /**
+     * `resume`：之前连上时得到的重连凭证（十六进制，见 [Resume]）；`hostKey`：之前记下的对方公钥（只认它）；
+     * `pairing`：配对码（对方要求配对时用户输入的）。见 Rust 的 `airhand_link::controller::ConnectOptions`
+     */
+    fun connect(code: String, resume: String?, settings: Quality, hostKey: String? = null, pairing: String? = null): JSONObject =
+        JSONObject()
+            .put("cmd", "connect")
+            .put("code", code)
+            .put("resume", Resume.toJson(resume))
+            .put("hostKey", hostKey ?: JSONObject.NULL)
+            .put("pairing", pairing ?: JSONObject.NULL)
+            .put("settings", settings.toJson())
 
     fun input(sid: Int, events: JSONArray): JSONObject = cmd("input", sid).put("events", events)
     fun settings(sid: Int, q: Quality): JSONObject = cmd("settings", sid).put("settings", q.toJson())

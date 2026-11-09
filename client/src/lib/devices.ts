@@ -17,7 +17,14 @@ export const sortDevices = (list: SavedDevice[]) => [...list].sort((a, b) => b.l
 /** 连上了：记下（或更新）这台电脑。自己起的名字保留，对方的名字、系统、凭证、画质用这次的 */
 export function remember(
   list: SavedDevice[],
-  seen: { code: string; name: string; os: string; resume: ResumeToken | null; quality: QualitySettings | null },
+  seen: {
+    code: string;
+    name: string;
+    os: string;
+    resume: ResumeToken | null;
+    quality: QualitySettings | null;
+    hostKey?: string | null;
+  },
   now: number,
 ): SavedDevice[] {
   const old = list.find((d) => d.code === seen.code);
@@ -29,6 +36,8 @@ export function remember(
     resume: seen.resume ?? old?.resume ?? null,
     lastUsed: now,
     quality: seen.quality ?? old?.quality ?? null,
+    // 对方的公钥：连上时确认过的（第一次连上、或者用户信任了新的身份）代替旧的
+    hostKey: seen.hostKey ?? old?.hostKey ?? null,
   };
   return sortDevices([d, ...list.filter((x) => x.code !== seen.code)]).slice(0, MAX_DEVICES);
 }

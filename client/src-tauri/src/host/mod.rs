@@ -6,6 +6,7 @@ pub(crate) mod clock;
 #[cfg(windows)]
 pub(crate) mod desktop;
 pub mod encoder;
+pub mod gate;
 mod input;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
@@ -21,6 +22,8 @@ use std::sync::Arc;
 use airhand_link::ServerState;
 use airhand_link::host::HostEvents;
 use airhand_proto::signal::{Peer, Reclaim};
+
+use gate::DesktopGate;
 use tauri::async_runtime::JoinHandle;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -81,19 +84,26 @@ pub(crate) fn missing_permission(e: &anyhow::Error) -> bool {
 pub struct HostService {
     task: JoinHandle<()>,
     cmd: mpsc::UnboundedSender<HostCmd>,
+    gate: Arc<DesktopGate>,
 }
 
 impl HostService {
     /// 启动被控端，状态写进 `hub` 的 [`AppStatus::host`](crate::status::AppStatus::host)。
     pub fn start(hub: StatusHub) -> Self {
         clock::init();
+        let gate = DesktopGate::load(hub.clone());
         let (cmd, rx) = mpsc::unbounded_channel();
-        let task = tauri::async_runtime::spawn(run(hub, rx));
-        Self { task, cmd }
+        let task = tauri::async_runtime::spawn(run(hub, gate.clone(), rx));
+        Self { task, cmd, gate }
     }
 
     pub fn send(&self, c: HostCmd) {
         let _ = self.cmd.send(c);
+    }
+
+    /// 本机的身份、配对码、配对过的控制端（托盘菜单里换配对码、忘掉配对过的控制端）
+    pub fn gate(&self) -> &Arc<DesktopGate> {
+        &self.gate
     }
 
     /// 向被控端发命令的另一个入口（系统服务里的被控端经命名管道收到托盘的命令）
@@ -110,17 +120,20 @@ impl Drop for HostService {
     }
 }
 
-async fn run(hub: StatusHub, cmds: mpsc::UnboundedReceiver<HostCmd>) {
+async fn run(hub: StatusHub, gate: Arc<DesktopGate>, cmds: mpsc::UnboundedReceiver<HostCmd>) {
     // 保存过的控制码（config.toml）：第一次连接就取回它
     let reclaim = config::settings().code();
-    let events = Arc::new(TrayStatus(hub));
+    let events = Arc::new(TrayStatus(hub, gate.clone()));
     airhand_link::host::run(
         config::link(),
         config::persistent(),
         reclaim,
         events,
-        |conn, session_id, kick| async move {
-            let _ = session::run(conn, session_id, kick).await;
+        move |inc| {
+            let gate = gate.clone();
+            async move {
+                let _ = session::run(inc, gate).await;
+            }
         },
         cmds,
     )
@@ -128,7 +141,7 @@ async fn run(hub: StatusHub, cmds: mpsc::UnboundedReceiver<HostCmd>) {
 }
 
 /// 被控端的状态写进托盘的 [`StatusHub`]，控制码保存在 config.toml 里
-struct TrayStatus(StatusHub);
+struct TrayStatus(StatusHub, Arc<DesktopGate>);
 
 /// 保存控制码（找不到配置文件的位置时什么也不做）。写不进去只是下次启动时换一个控制码，不影响这次运行
 async fn save_code(code: Option<Reclaim>) {
@@ -160,8 +173,13 @@ impl HostEvents for TrayStatus {
 
     fn incoming(&self, session_id: u64, peer: &Peer) {
         let peer = peer.clone();
-        self.0
-            .send_modify(|s| s.host.controllers.push(Controller { session_id, peer }));
+        self.0.send_modify(|s| {
+            s.host.controllers.push(Controller {
+                session_id,
+                peer,
+                safety: None,
+            })
+        });
     }
 
     fn ended(&self, session_id: u64) {
@@ -174,5 +192,12 @@ impl HostEvents for TrayStatus {
             s.host.code = None;
             s.host.controllers.clear();
         });
+    }
+
+    fn kicked(&self, cmd: HostCmd) {
+        // 更换控制码：配对码也换一个，配对过的控制端全部忘掉（被断开的人不能拿着旧的配对连回来）
+        if cmd == HostCmd::NewCode {
+            self.1.reset();
+        }
     }
 }

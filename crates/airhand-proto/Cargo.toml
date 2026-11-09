@@ -7,10 +7,13 @@ license = "MIT"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_bytes = "0.11"
+# 只用于冻结的版本握手（见 signal 模块的"版本握手"）：它的编码永远不变
 postcard = { version = "1", features = ["use-std"] }
+# 其它消息：带编号、能前后兼容的 CBOR（见 framing 模块）
+minicbor = { version = "2", features = ["derive", "alloc", "std"] }
 tokio = { version = "1", features = ["io-util"] }
 thiserror = "2"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "rt", "macros"] }

@@ -55,11 +55,16 @@ class AirhandApp : Application() {
         })
     }
 
-    /** 连接一台设备（之前的会话会先关掉） */
-    fun startSession(code: String, viewOnly: Boolean): RemoteSession {
+    /**
+     * 连接一台设备（之前的会话会先关掉）。`pairing`：对方要求配对时用户输入的配对码；
+     * `trustNew`：对方的身份变了，用户确认是对方重装了：不带记着的公钥连，连上之后记下新的
+     */
+    fun startSession(code: String, viewOnly: Boolean, pairing: String? = null, trustNew: Boolean = false): RemoteSession {
         android.util.Log.i("airhand", "connecting to $code${if (viewOnly) " (view only)" else ""}")
         _session.value?.close()
-        val s = RemoteSession(this, code, devices.get(code)?.resume, viewOnly)
+        val saved = devices.get(code)
+        val hostKey = if (trustNew) null else saved?.hostKey
+        val s = RemoteSession(this, code, saved?.resume, viewOnly, hostKey, pairing)
         _session.value = s
         s.start()
         return s

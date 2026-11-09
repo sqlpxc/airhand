@@ -109,7 +109,19 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 ### Protocol versions
 
-Client and server compare `PROTOCOL_VERSION` (`crates/airhand-proto/src/lib.rs`) when they connect. On a mismatch the server replies `Incompatible` and the client tells the user whether to update Airhand or the server, then retries once a minute. Bump the version for any incompatible protocol change. The handshake itself (`ClientMsg::Hello`, `ServerMsg::Welcome` / `Incompatible`, the ALPN) must **never** change, otherwise different versions can't even tell each other that they differ. The `version_handshake_wire_is_stable` test guards this.
+There are two version numbers (`crates/airhand-proto/src/lib.rs`); the rules are in [How it works → Protocol evolution](architecture.md#protocol-evolution):
+
+- `SIGNAL_VERSION` / `SIGNAL_MIN`: client ⇄ server (signaling, the session header, the datagram's session ID). The server accepts clients within its range; without a common version it replies `Incompatible` (with its own range) and the client tells the user whether to update Airhand or the server, then retries once a minute
+- `SESSION_VERSION` / `SESSION_MIN`: host ⇄ controller, negotiated in the end-to-end handshake; the server never looks at it. Without a common version the controller shows `peerIncompatible`
+
+Before changing the protocol, look for a compatible way; if there is one, don't bump a version:
+
+- New message: add an enum variant with a **new number**; older versions skip it. If the peer may not know it, add a capability bit in `features` and only send it when the peer advertises the bit
+- New field: only `Option` fields (or `#[cbor(default)]`), with a new number; required fields must stay forever
+- New enum variants: use `crate::cbor::open_vec` in lists, `crate::cbor::or_default` for single values and `crate::cbor::opt` for optional ones (don't write `Option<index-only enum>` directly: minicbor's derive mishandles it, see the notes in `cbor.rs`)
+- Numbers can't be changed or reused once released; bump the version only when there's no other way (e.g. removing a required field)
+
+The start of the version handshake (the postcard part of `ClientHello` / `ServerHello`) and the ALPN must **never** change, otherwise different versions can't even tell each other that they differ. The `version_handshake_prefix_is_frozen` test guards this. The `airhand-proto` tests include examples of a newer peer sending new messages, fields and enum values; write one like them when adding a compatibility rule.
 
 ### One protocol, three implementations
 

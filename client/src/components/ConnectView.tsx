@@ -10,7 +10,10 @@ import { problemText, sessionStateText } from "../lib/messages";
 import { bestCodec } from "../lib/codec";
 import { CODEC_LABEL, PRESETS, matchPreset, presetDesc, presetName, presetSettings } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
-import { store, useSession, useStore } from "../lib/store";
+import { store, useSession, useStore, type Draft } from "../lib/store";
+
+/** 这些问题要用户输入配对码 */
+const PAIRING_PROBLEMS = new Set(["pairingRequired", "pairingFailed", "pairingUnavailable"]);
 import { IconBolt, IconClose, IconMonitor, IconPencil, IconSearch, IconWarn } from "./Icons";
 
 export function ConnectView() {
@@ -36,11 +39,12 @@ export function ConnectView() {
     inputs.current[i < 0 ? 5 : i]?.focus();
   }, []);
   useEffect(() => {
-    if (!busy && error) inputs.current[5]?.focus();
+    // 要配对码时光标留在配对码里
+    if (!busy && error && !PAIRING_PROBLEMS.has(error.kind)) inputs.current[5]?.focus();
   }, [busy, error]);
 
   if (!draft) return null;
-  const { digits, preset } = draft;
+  const { digits, preset, pairing } = draft;
   // 还不知道对方支持什么：先按本机能解码的选，连上后会按双方都支持的重新选（见 RemoteSession.fitCodec）
   const codec = bestCodec(decoders);
   const code = digits.join("");
@@ -49,22 +53,39 @@ export function ConnectView() {
   // 输入的是我的设备里的：告诉用户是哪台
   const known = ready ? devices.find((d) => d.code === code) : undefined;
 
+  // 对方要配对码（或者已经粘贴 / 输入了配对码）：显示配对码一栏
+  const pairingProblem = error && PAIRING_PROBLEMS.has(error.kind);
+  const showPairing = pairingProblem || pairing.length > 0;
+  const pairingReady = /^\d{6}$/.test(pairing);
+
   const setFrom = (start: number, text: string) => {
     const only = text.replace(/\D/g, "");
     if (!only) return;
     const next = [...digits];
     let i = start;
+    let used = 0;
     for (const ch of only) {
       if (i > 5) break;
       next[i++] = ch;
+      used++;
     }
-    store.patchDraft({ digits: next, error: null });
+    // 一次粘贴了控制码和配对码（12 位）：后面 6 位是配对码
+    const rest = only.slice(used);
+    const patch: Partial<Draft> = { digits: next, error: null };
+    if (start === 0 && rest.length === 6) patch.pairing = rest;
+    store.patchDraft(patch);
     inputs.current[Math.min(i, 5)]?.focus();
   };
 
   const connect = () => {
     if (!ready || busy || !online) return;
-    void openSession(code, presetSettings(preset, codec));
+    void openSession(code, presetSettings(preset, codec), { pairing: pairingReady ? pairing : null });
+  };
+
+  /** 对方的身份变了：用户确认是对方重装了之后，不带记着的公钥再连，连上之后记下新的 */
+  const trustNew = () => {
+    if (!ready || busy || !online) return;
+    void openSession(code, presetSettings(preset, codec), { trustNew: true });
   };
 
   /** 我的设备：用上次的画质连（没记下画质的用默认预设） */
@@ -143,6 +164,30 @@ export function ConnectView() {
             </div>
           </div>
 
+          {showPairing && (
+            <div className="nt-field">
+              <div className="nt-label">
+                <span>{t("connect.pairing")}</span>
+              </div>
+              <input
+                className={`pairing-input ${pairingProblem && !pairingReady ? "invalid" : ""}`}
+                value={pairing}
+                inputMode="numeric"
+                autoComplete="off"
+                maxLength={7}
+                placeholder="000 000"
+                disabled={busy}
+                aria-label={t("connect.pairing")}
+                autoFocus={!!pairingProblem}
+                onChange={(e) => store.patchDraft({ pairing: e.target.value.replace(/\D/g, "").slice(0, 6) })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") connect();
+                }}
+              />
+              <div className="preset-desc muted small">{t("connect.pairingHint")}</div>
+            </div>
+          )}
+
           <div className="nt-field">
             <div className="nt-label">
               <span>{t("connect.quality")}</span>
@@ -170,6 +215,11 @@ export function ConnectView() {
               <IconWarn size={15} />
               <span>{problemText(error)}</span>
             </div>
+          )}
+          {error?.kind === "hostKeyChanged" && (
+            <button className="text-btn" disabled={!ready || busy || !online} onClick={trustNew}>
+              {t("connect.trustNew")}
+            </button>
           )}
           {server.state === "disconnected" && (
             <div className="error-box soft">

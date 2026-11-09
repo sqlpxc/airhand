@@ -149,6 +149,13 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const title = useSessionTitle(s);
   const [menu, setMenu] = useState<Menu>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // 对方要求配对码时输入的配对码
+  const [pairing, setPairing] = useState("");
+  const needsPairing =
+    s.state === "closed" &&
+    (s.closedReason?.kind === "pairingRequired" ||
+      s.closedReason?.kind === "pairingFailed" ||
+      s.closedReason?.kind === "pairingUnavailable");
   const toolbarRef = useRef<HTMLElement>(null);
   const revealed = useToolbarReveal(immersive, toolbarRef);
   // 菜单关掉后键盘回到远程画面（例如按 Esc 关掉画质面板后接着打字）
@@ -213,7 +220,12 @@ export function SessionView({ s }: { s: RemoteSession }) {
               <span className="host">{title}</span>
             </div>
           )}
-          <span className="addr-code">{fmtCode(s.code)}</span>
+          <span
+            className="addr-code"
+            title={s.safety ? `${t("session.safety", { code: s.safety })} · ${t("session.safetyHint")}` : undefined}
+          >
+            {fmtCode(s.code)}
+          </span>
 
           <div className="addr-stats">
             {live ? (
@@ -458,11 +470,38 @@ export function SessionView({ s }: { s: RemoteSession }) {
                 <IconWarn size={28} />
                 <div className="overlay-title">{s.retries > 0 ? t("session.reconnectFailed") : t("session.lost")}</div>
                 <div className="muted">{s.closedReason ? problemText(s.closedReason) : t("session.ended")}</div>
+                {needsPairing && (
+                  <input
+                    className="pairing-input"
+                    value={pairing}
+                    inputMode="numeric"
+                    autoComplete="off"
+                    placeholder="000 000"
+                    aria-label={t("connect.pairing")}
+                    autoFocus
+                    onChange={(e) => setPairing(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && pairing.length === 6) s.pairWith(pairing);
+                    }}
+                  />
+                )}
                 <div className="overlay-actions">
-                  <button className="primary-btn small" onClick={() => s.reconnect()}>
-                    <IconRefresh size={16} />
-                    {t("session.reconnect")}
-                  </button>
+                  {s.closedReason?.kind === "hostKeyChanged" ? (
+                    <button className="primary-btn small" onClick={() => s.trustNewIdentity()}>
+                      <IconRefresh size={16} />
+                      {t("session.trustNew")}
+                    </button>
+                  ) : needsPairing ? (
+                    <button className="primary-btn small" disabled={pairing.length !== 6} onClick={() => s.pairWith(pairing)}>
+                      <IconRefresh size={16} />
+                      {t("session.pairAndReconnect")}
+                    </button>
+                  ) : (
+                    <button className="primary-btn small" onClick={() => s.reconnect()}>
+                      <IconRefresh size={16} />
+                      {t("session.reconnect")}
+                    </button>
+                  )}
                   <button className="ghost-btn" onClick={() => closeTab(s.id)}>
                     {t("session.close")}
                   </button>
@@ -473,6 +512,11 @@ export function SessionView({ s }: { s: RemoteSession }) {
                 <span className="spinner large" />
                 <div className="overlay-title">{t("session.approving", { name: title })}</div>
                 <div className="muted small">{t("session.approvingHint")}</div>
+                {s.safety && (
+                  <div className="muted small" title={t("session.safetyHint")}>
+                    {t("session.safety", { code: s.safety })}
+                  </div>
+                )}
                 <div className="overlay-actions">
                   <button className="ghost-btn" onClick={() => closeTab(s.id)}>
                     {t("session.close")}

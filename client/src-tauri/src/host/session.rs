@@ -1,20 +1,19 @@
 //! 被控端的单个远控会话。
 
 use airhand_link::flow::Flow;
-use airhand_link::host::{CursorCache, HostSession, PEER_TIMEOUT};
+use airhand_link::host::{Admission, CursorCache, HostSession, Incoming, PEER_TIMEOUT};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_proto::session::{
-    ByeReason, ControllerMsg, DisplayInfo, HostHello, HostMsg, Notice, Platform, QualitySettings,
+    ControllerMsg, DisplayInfo, HostHello, HostMsg, Notice, Platform, QualitySettings,
 };
 use anyhow::Result;
-use quinn::Connection;
-use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::audio::{self, AudioSubscription};
 use super::capture;
+use super::gate::DesktopGate;
 use super::input::Injector;
 use super::pipeline::Pipeline;
 use crate::clipboard::{self, ClipSync};
@@ -56,12 +55,20 @@ fn permission_notice((screen, input): (bool, bool)) -> Notice {
     Notice::MissingPermissions { screen, input }
 }
 
-pub async fn run(
-    conn: Connection,
-    session_id: u64,
-    mut kick: watch::Receiver<ByeReason>,
-) -> Result<()> {
-    let mut io = HostSession::open(&conn, session_id, VIDEO_QUEUE, audio::QUEUE).await?;
+pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
+    let session_id = inc.session_id;
+    // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）
+    let (mut io, admitted) = match HostSession::open(&inc, VIDEO_QUEUE, audio::QUEUE, &*gate).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(session_id, "controller not admitted: {e:#}");
+            return Err(e);
+        }
+    };
+    // 桌面被控端不请本机用户同意（无人值守），gate 不会要求它
+    debug_assert_ne!(admitted.admission, Admission::NeedsApproval);
+    gate.admitted(session_id, &admitted);
+    let mut kick = inc.kick;
     let ctl = io.ctl.clone();
 
     let (mut displays, codecs, notice) = tokio::task::spawn_blocking(|| {
@@ -173,8 +180,6 @@ pub async fn run(
                         }
                         ControllerMsg::Ping { t } => ctl.send(&HostMsg::Pong { t })?,
                         ControllerMsg::Clipboard { text } => clip.apply(text),
-                        // 桌面被控端不请本机用户同意，用不到控制端的标识
-                        ControllerMsg::Hello(_) => {}
                         ControllerMsg::Audio { enabled } => {
                             if !enabled {
                                 sound = None;

@@ -370,6 +370,11 @@ private fun RequestCard(r: Viewer) {
                 stringResource(R.string.request_text, what, r.ip, HostService.REQUEST_TIMEOUT_S),
                 style = MaterialTheme.typography.bodyMedium,
             )
+            // 安全码：对方屏幕上显示的是同一个，不一样就是中间有人
+            r.safety?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(stringResource(R.string.request_safety, it), style = MaterialTheme.typography.bodyMedium)
+            }
             Spacer(Modifier.height(16.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(onClick = { HostService.approve(r.id, false) }, modifier = Modifier.weight(1f)) {

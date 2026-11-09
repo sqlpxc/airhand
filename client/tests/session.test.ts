@@ -9,7 +9,7 @@ import * as media from "../src/lib/media.ts";
 
 // Load the actual session class with browser/backend dependencies replaced by
 // small fakes. This tests delivery ordering without a WebView or network.
-function sessionHarness(connect?: (code: string, resume: any) => Promise<any>) {
+function sessionHarness(connect?: (code: string, resume: any, opts: any) => Promise<any>) {
   const source = fs.readFileSync(new URL("../src/lib/session.ts", import.meta.url), "utf8")
     .replace(/^import[\s\S]*?from "[^"]+";\r?\n/gm, "");
   const js = stripTypeScriptTypes(source).replace(/\bexport\s+/g, "") + "\nglobalThis.RemoteSession = RemoteSession;";
@@ -21,9 +21,9 @@ function sessionHarness(connect?: (code: string, resume: any) => Promise<any>) {
     fitSize, stricter, viewMaxShort, media,
     toProblem: (e: any) => e,
     api: {
-      connect: (c: any, r: any, _s: any, output: any) => {
+      connect: (c: any, o: any, _s: any, output: any) => {
         sink = output;
-        return connect ? connect(c, r) : new Promise(res => { resolve = res; });
+        return connect ? connect(c, o.resume, o) : new Promise(res => { resolve = res; });
       },
       command: async (c: any) => { calls.push(c.cmd === "settings" ? [c.cmd, c.sid, c.settings] : [c.cmd, c.sid]); },
     },
@@ -36,7 +36,8 @@ function sessionHarness(connect?: (code: string, resume: any) => Promise<any>) {
     attempt: new ConnectionAttempt(), disposed: false, sid: null, state: "connecting", settings: {}, visible: true,
     viewLimit: 0, viewLimitAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
     video: { reset() {} }, audio: { reset() {} }, sync: { reset() {} }, input: { reset() {} },
-    cursorSlots: new Map(), resume: null, onlineAt: -1, attemptAt: 0, retries: 0,
+    cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
+    onlineAt: -1, attemptAt: 0, retries: 0,
     emit() {}, syncAudio() {}, onConnected() { calls.push("connected"); },
   });
   return { session, calls, timers, event: (ev: any) => sink.event(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
@@ -91,7 +92,43 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
   assert.equal(sent().at(-1), 0);
 });
 
-const granted = { sid: 7, resume: [9], hostName: "host", hostOs: "Windows" };
+const granted = { sid: 7, resume: [9], hostName: "host", hostOs: "Windows", hostKey: "ab".repeat(32), safety: "123-456" };
+
+test("端到端：记下对方的公钥、之后只认它；要配对码时不自动重连，输入之后带着它连一次", async () => {
+  const tried: any[] = [];
+  let answer: () => Promise<any> = async () => { throw { kind: "pairingRequired" }; };
+  const h = sessionHarness(async (_code, _resume, opts) => {
+    tried.push({ hostKey: opts.hostKey, pairing: opts.pairing });
+    return answer();
+  });
+  await h.session.connect().catch((e: any) => h.session.scheduleRetry(e));
+  assert.equal(h.session.state, "closed", "要用户输入配对码，不自动重连");
+  assert.equal(h.timers.length, 0);
+
+  answer = async () => granted;
+  h.session.pairWith("482 913");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(tried.at(-1), { hostKey: null, pairing: "482913" });
+  assert.equal(h.session.hostKey, granted.hostKey);
+  assert.equal(h.session.safety, "123-456");
+
+  // 之后重连：带着记下的公钥，不再带配对码
+  h.session.sid = null;
+  await h.session.connect();
+  assert.deepEqual(tried.at(-1), { hostKey: granted.hostKey, pairing: null });
+
+  // 对方的身份变了：不自动重连；用户信任新的身份之后不带公钥再连，记下新的
+  answer = async () => { throw { kind: "hostKeyChanged" }; };
+  h.session.sid = null;
+  await h.session.connect().catch((e: any) => h.session.scheduleRetry(e));
+  assert.equal(h.session.state, "closed");
+  const changed = { ...granted, hostKey: "cd".repeat(32) };
+  answer = async () => changed;
+  h.session.trustNewIdentity();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(tried.at(-1), { hostKey: null, pairing: null });
+  assert.equal(h.session.hostKey, changed.hostKey);
+});
 
 test("从我的设备打开不在线的设备：带着凭证等它上线，不再拿控制码试一次（那样会算一次猜错）", async () => {
   const tried: any[] = [];

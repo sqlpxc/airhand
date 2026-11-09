@@ -24,6 +24,7 @@ import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Problem
 import app.airhand.android.core.ServerState
+import app.airhand.android.core.optStringOrNull
 import app.airhand.android.data.HostCode
 import app.airhand.android.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
@@ -118,6 +119,8 @@ class HostService : Service() {
             .put("touch", Injector.touchSupported)
             .put("actions", JSONArray(Injector.supportedActions()))
             .put("approval", s.requireApproval)
+            // 本机的端到端加密身份：同意过的控制端在这次共享里重连时认得出来
+            .put("identity", app.settings.identity())
         val h = try {
             Native.hostStart(cfg.toString())
         } catch (e: IllegalArgumentException) {
@@ -178,7 +181,9 @@ class HostService : Service() {
             "controllers" -> {
                 val list = e.optJSONArray("list") ?: JSONArray()
                 val all = (0 until list.length()).map { list.getJSONObject(it) }
-                fun pick(key: String) = all.filter { it.optBoolean(key) }.map { Viewer(it.optString("id"), it.optString("name"), it.optString("ip")) }
+                fun pick(key: String) = all.filter { it.optBoolean(key) }.map {
+                    Viewer(it.optString("id"), it.optString("name"), it.optString("ip"), it.optStringOrNull("safety"))
+                }
                 val viewers = pick("active")
                 val requests = pick("pending")
                 HostState.update { it.copy(viewers = viewers, requests = requests) }
@@ -207,6 +212,7 @@ class HostService : Service() {
             "clipboard" -> app.clipboard.write(e.optString("text"))
             // 第一次连上服务器：记下它的证书指纹（不重新连接）
             "serverTrust" -> app.settings.learnTrust(e.optString("server"), e.optString("fp"))
+            "identity" -> app.settings.learnIdentity(e.optString("key"))
         }
     }
 
@@ -250,7 +256,9 @@ class HostService : Service() {
         )
         val name = r.name.ifBlank { getString(R.string.unknown_device) }
         val what = getString(if (InputService.isEnabled(this)) R.string.request_wants_control else R.string.request_wants_view)
-        val text = getString(R.string.request_text, what, r.ip, REQUEST_TIMEOUT_S)
+        // 安全码：控制端显示的是同一个，本机用户可以和对方对一下（见 airhand_proto::handshake）
+        val text = getString(R.string.request_text, what, r.ip, REQUEST_TIMEOUT_S) +
+            (r.safety?.let { "\n" + getString(R.string.request_safety, it) } ?: "")
         val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, REQUEST_CHANNEL)
         } else {

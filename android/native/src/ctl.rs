@@ -15,9 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_link::controller::{
-    Command, ControllerService, Frontend, HostOnline, SessionEvent, SessionUi, UiClosed,
+    Command, ConnectOptions, ControllerService, Frontend, HostOnline, SessionEvent, SessionUi,
+    UiClosed,
 };
 use airhand_link::net::{MemoryTrust, Report, TrustStore, format_fingerprint, parse_fingerprint};
+use airhand_link::secure::{Identity, hex, unhex32};
 use airhand_link::{LinkConfig, Problem, ServerState};
 use airhand_proto::session::QualitySettings;
 use airhand_proto::signal::ResumeToken;
@@ -43,7 +45,15 @@ pub struct LinkSettings {
     pub name: String,
     #[serde(default)]
     pub os: String,
+    /// 本机的端到端加密身份：64 位十六进制的私钥（Kotlin 保存在应用的私有目录里）。
+    /// 没有时生成一个，用 [`IDENTITY_EVENT`] 交给 Kotlin 保存。做被控端和做控制端用的是同一个
+    #[serde(default)]
+    pub identity: Option<String>,
 }
+
+/// 本机还没有身份、刚生成了一个：`{"type":"identity","key":"64 位十六进制的私钥"}`，
+/// Kotlin 保存下来，下次启动时放在 [`LinkSettings::identity`] 里传回来
+pub const IDENTITY_EVENT: &str = "identity";
 
 /// 第一次连上服务器时记下的指纹
 #[derive(Debug, Deserialize)]
@@ -77,6 +87,16 @@ impl TrustStore for EventTrust {
 }
 
 impl LinkSettings {
+    /// 本机的身份（见 [`LinkSettings::identity`]）。没有就生成一个，把它作为事件（[`IDENTITY_EVENT`]）放进 `events`
+    pub fn identity(&self, events: &Queue<String>) -> Identity {
+        if let Some(k) = self.identity.as_deref().and_then(unhex32) {
+            return Identity::from_private(k);
+        }
+        let id = Identity::generate();
+        events.push(json!({ "type": IDENTITY_EVENT, "key": hex(id.private()) }).to_string());
+        id
+    }
+
     /// `events`：第一次连上服务器时把记下的指纹作为事件（[`TRUST_EVENT`]）放进这里
     pub fn link(&self, events: Arc<Queue<String>>) -> Result<LinkConfig> {
         let learned = self.trust.as_ref().and_then(|t| {
@@ -101,11 +121,16 @@ impl LinkSettings {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Cmd {
-    /// 连接被控端（阻塞到有结果），回复 `SessionInfo`。`resume`：之前连上这台时得到的重连凭证
+    /// 连接被控端（阻塞到有结果），回复 `SessionInfo`。`resume`：之前连上这台时得到的重连凭证；
+    /// `hostKey`：之前记下的对方公钥；`pairing`：配对码（见 `ConnectOptions`）
     Connect {
         code: String,
         #[serde(default)]
         resume: Option<ResumeToken>,
+        #[serde(default)]
+        host_key: Option<String>,
+        #[serde(default)]
+        pairing: Option<String>,
         settings: QualitySettings,
     },
     /// 对会话的操作
@@ -156,7 +181,9 @@ impl Ctl {
         let host_online: HostOnline = Arc::new(move |code: u32| {
             ev.push(json!({ "type": "hostOnline", "code": code }).to_string());
         });
-        let svc = ControllerService::start(link, rt().handle().clone(), report, host_online);
+        let identity = cfg.identity(&events);
+        let svc =
+            ControllerService::start(link, rt().handle().clone(), report, host_online, identity);
         Ok(Arc::new(Ctl {
             svc,
             events,
@@ -187,8 +214,17 @@ impl Ctl {
             Cmd::Connect {
                 code,
                 resume,
+                host_key,
+                pairing,
                 settings,
-            } => return self.connect(&code, resume, settings),
+            } => {
+                let opts = ConnectOptions {
+                    resume,
+                    host_key,
+                    pairing,
+                };
+                return self.connect(&code, opts, settings);
+            }
             Cmd::Session(c) => {
                 if let Command::Disconnect { sid } = c
                     && let Some(q) = self.sessions.lock().unwrap().remove(&sid)
@@ -204,17 +240,12 @@ impl Ctl {
         }
     }
 
-    fn connect(
-        &self,
-        code: &str,
-        resume: Option<ResumeToken>,
-        settings: QualitySettings,
-    ) -> String {
+    fn connect(&self, code: &str, opts: ConnectOptions, settings: QualitySettings) -> String {
         let queue = Arc::new(Queue::new(SESSION_QUEUE));
         let ui = Arc::new(QueueUi(queue.clone()));
         let result = rt().block_on(
             self.svc
-                .connect(code, resume, settings, ui, Frontend::Browser),
+                .connect(code, opts, settings, ui, Frontend::Browser),
         );
         match result {
             Ok(info) => {
@@ -265,7 +296,22 @@ mod tests {
             r#"{"cmd":"connect","code":"123456","settings":{"fps":30,"bitrate_kbps":4000,"max_short":1080,"adaptive":true,"codec":"H264"}}"#,
         )
         .unwrap();
-        assert!(matches!(c, Cmd::Connect { resume: None, .. }));
+        assert!(matches!(
+            c,
+            Cmd::Connect {
+                resume: None,
+                host_key: None,
+                pairing: None,
+                ..
+            }
+        ));
+        let c: Cmd = serde_json::from_str(
+            r#"{"cmd":"connect","code":"123456","hostKey":"ab","pairing":"482913","settings":{"fps":30,"bitrate_kbps":4000,"max_short":1080,"adaptive":true,"codec":"H264"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(c, Cmd::Connect { host_key: Some(ref k), pairing: Some(ref p), .. } if k == "ab" && p == "482913")
+        );
     }
 
     #[test]
@@ -276,6 +322,7 @@ mod tests {
             trust: None,
             name: String::new(),
             os: String::new(),
+            identity: None,
         };
         assert!(cfg.link(Arc::new(Queue::new(4))).is_err());
     }
@@ -317,6 +364,7 @@ mod tests {
             trust: None,
             name: "test".into(),
             os: "test".into(),
+            identity: Some("11".repeat(32)),
         })
         .unwrap();
         let r: serde_json::Value = serde_json::from_str(&ctl.call(

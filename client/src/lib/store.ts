@@ -13,6 +13,8 @@ export type View = "new" | "grid" | string;
 export interface Draft {
   digits: string[];
   preset: PresetId;
+  /** 配对码（对方要求配对时才显示这一栏，见 ConnectView） */
+  pairing: string;
   busy: boolean;
   /** 保存类型而不是文字：切换语言后错误提示也跟着变 */
   error: Problem | null;
@@ -48,7 +50,13 @@ interface State {
 
 const MAX_RECENT = 8;
 
-export const emptyDraft = (): Draft => ({ digits: Array(6).fill(""), preset: DEFAULT_PRESET, busy: false, error: null });
+export const emptyDraft = (): Draft => ({
+  digits: Array(6).fill(""),
+  preset: DEFAULT_PRESET,
+  pairing: "",
+  busy: false,
+  error: null,
+});
 
 let state: State = {
   sessions: [],

@@ -3,8 +3,10 @@
 //!
 //! ```text
 //! cargo run --example probe -- <控制码> [秒数] [--tap x,y] [--touch] [--pinch] [--action Back]
-//!                                [--text 文字] [--audio] [--server host:port]
+//!                                [--text 文字] [--audio] [--server host:port] [--pairing 配对码]
 //! ```
+//!
+//! 每次运行是一个新的控制端身份（端到端加密）：被控端要配对码的话用 `--pairing`。
 //!
 //! `--tap 0.5,0.5` 在画面中间点一下（归一化坐标，默认用鼠标左键，加 `--touch` 改用触摸）；
 //! `--pinch` 在画面中间双指张开；`--action` 发系统操作；`--text` 打字；`--audio` 打开声音。
@@ -16,8 +18,9 @@ use std::time::Duration;
 
 use airhand_android::rt::rt;
 use airhand_link::controller::{
-    Command, ControllerService, Frontend, SessionEvent, SessionUi, UiClosed,
+    Command, ConnectOptions, ControllerService, Frontend, SessionEvent, SessionUi, UiClosed,
 };
+use airhand_link::secure::Identity;
 use airhand_link::{LinkConfig, ServerState};
 use airhand_proto::media::{Kind, VideoHeader};
 use airhand_proto::session::{
@@ -120,6 +123,7 @@ fn main() {
         rt().handle().clone(),
         report,
         Arc::new(|code| println!("host {code} is back online")),
+        Identity::generate(),
     ));
     loop {
         match rx
@@ -142,7 +146,10 @@ fn main() {
     let info = rt()
         .block_on(svc.connect(
             &code,
-            None,
+            ConnectOptions {
+                pairing: flag("--pairing"),
+                ..Default::default()
+            },
             settings,
             Arc::new(Ui(counters.clone(), slot.clone())),
             Frontend::Browser,

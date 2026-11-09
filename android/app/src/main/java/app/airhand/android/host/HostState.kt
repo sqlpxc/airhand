@@ -5,8 +5,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** 连到本机的设备（`id` 是会话 id） */
-data class Viewer(val id: String, val name: String, val ip: String)
+/** 连到本机的设备（`id` 是会话 id；`safety` 是端到端加密的安全码，对方显示的是同一个，握手之前为 null） */
+data class Viewer(val id: String, val name: String, val ip: String, val safety: String? = null)
 
 /** 本机作为被控端的状态（界面观察，[HostService] 更新） */
 data class HostStatus(

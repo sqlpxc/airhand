@@ -97,7 +97,7 @@ pub extern "system" fn Java_app_airhand_android_core_Native_init(
     rt::init_logging(&filter);
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        protocol = airhand_proto::PROTOCOL_VERSION,
+        protocol = airhand_proto::SIGNAL_VERSION,
         "airhand native library loaded"
     );
 }
@@ -107,7 +107,7 @@ pub extern "system" fn Java_app_airhand_android_core_Native_protocolVersion(
     _: JNIEnv,
     _: JClass,
 ) -> jint {
-    airhand_proto::PROTOCOL_VERSION as jint
+    airhand_proto::SIGNAL_VERSION as jint
 }
 
 /// 校验服务器证书指纹：合法返回 null，否则返回原因（英文）

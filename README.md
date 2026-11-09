@@ -13,7 +13,7 @@ Airhand is a **high-performance, low-latency** remote desktop: the screen is enc
 The same program is both the **host** (the device being controlled) and the **controller** (the device you control it from). The two sides meet through a **relay server** that you deploy yourself. It's small, and Docker Compose deploys it with one command. Enter the other side's 6-digit **control code** to connect.
 
 > [!NOTE]
-> **Work in progress (0.2.2).** The protocol still changes between versions, so the clients and the server need to be the same version; a mismatch is detected and reported (see [Protocol versions](docs/development.md#protocol-versions)).
+> **Work in progress (0.2.2).** Since protocol v9, client ⇄ server and host ⇄ controller each support a range of versions, new features are negotiated with capability bits and unknown messages are skipped, so later versions can be mixed; versions before v9 are incompatible, which is detected and reported (see [Protocol versions](docs/development.md#protocol-versions)).
 
 ## Performance
 
@@ -38,7 +38,7 @@ See [How it works → Video](docs/architecture.md#video) for details.
 - **Android**: control computers and phones from a phone as a trackpad or touchscreen, or share your own screen to get help (you approve each connection by default); watch on a TV with the remote
 - **Audio**: the host's system audio plays on the controller (Opus + adaptive jitter buffer), with optional A/V sync for watching videos
 - **Handy tools**: two-way clipboard sync, typing the clipboard as keystrokes, system shortcuts (Win, Alt+Tab, Ctrl+Shift+Esc…), multiple monitors, keyboard lock in fullscreen, quality presets
-- **Secure by default**: TLS 1.3 with certificate pinning, brute-force protection for control codes; the host always sees who is connected and can disconnect them with one click
+- **Secure by default**: sessions are end-to-end encrypted, so the relay server can't see the screen or keystrokes; the first connection needs the pairing code from the other computer's tray (it never goes through the server), and its identity is recognized afterwards; TLS 1.3 with certificate pinning, brute-force protection for control codes; the host always sees who is connected and can disconnect them with one click
 - **Leaves nothing behind**: the host is just a tray icon and doesn't start a WebView; everything worth keeping is in one `config.toml`, other runtime files are deleted on exit, and nothing is left after [uninstalling](docs/usage.md#uninstalling) (Windows has an uninstaller, macOS has "Uninstall Airhand…" in the menu, Linux takes two commands)
 - **English and Chinese**: follows the system language; notices from the other computer and the server also appear in **your** language
 
@@ -66,7 +66,7 @@ flowchart LR
     relay <-->|"QUIC · UDP 4433"| ctrl
 ```
 
-The host connects to the relay server and gets a 6-digit control code; the controller uses that code to find it. The server only registers codes, pairs sessions and forwards bytes; it never parses the video. Both the host and the controller connect out to the server, so neither needs an open port or a public IP. See [How it works](docs/architecture.md) for details.
+The host connects to the relay server and gets a 6-digit control code; the controller uses that code to find it. The server only registers codes, pairs sessions and forwards bytes; sessions are end-to-end encrypted, so it can't see their content. Both the host and the controller connect out to the server, so neither needs an open port or a public IP. See [How it works](docs/architecture.md) for details.
 
 ## Quick start
 
@@ -124,7 +124,7 @@ The server address and fingerprint can also be changed later in [`config.toml`](
 
 1. Install Airhand on both computers (on Windows run the installer, which needs administrator rights; on macOS grant the permissions it asks for the first time)
 2. On the computer **to be controlled**, right-click the tray icon (on macOS, click the menu bar icon) to see its 6-digit **control code**
-3. On **your** computer, choose **Open console** from the tray menu (**Switch to controller** on macOS / Linux) and enter the code
+3. On **your** computer, choose **Open console** from the tray menu (**Switch to controller** on macOS / Linux) and enter the code. The first time you connect to that computer, also enter the 6-digit **pairing code** from its tray menu; after that it isn't needed
 
 The full guide is in [Usage](docs/usage.md).
 
@@ -155,8 +155,8 @@ Open `http://localhost:8080` on that machine, or `https://<its address>:8080` fr
 ## Security notes
 
 - Everything runs over TLS 1.3 (QUIC), and clients verify the server by its certificate fingerprint. A client built without a fingerprint remembers the server's certificate on its first connection and refuses a different one later, so only that first connection is unprotected; pin the fingerprint for releases
-- **The relay server can see session contents** (TLS terminates at the server), so run it on a machine you trust; the same goes for the web console
-- **A control code is a key**: the Windows host runs as SYSTEM, so whoever has the code controls the computer with administrator rights. Give it only to people you trust; the host's tray always shows who is connected and lets you disconnect them or change the code
+- **End-to-end encryption**: the picture, sound, keyboard and mouse input and the clipboard are encrypted between the host and the controller, so the relay server can neither read nor alter them; it only knows who connected to whom, when, and how much traffic flowed. The web console is where end-to-end encryption ends, so the machine running it can see the picture
+- **Control code + pairing code**: the server knows every control code, so the first connection also needs the pairing code from the host's tray (it never goes through the server, and pairing pauses after 5 wrong codes); the host then remembers that controller. The Windows host runs as SYSTEM, so whoever can connect controls the computer with administrator rights; the host's tray always shows who is connected and lets you disconnect them or change the control code or pairing code
 
 See [Security](docs/security.md) for details.
 

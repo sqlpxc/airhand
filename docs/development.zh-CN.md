@@ -109,7 +109,19 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 ### 协议版本
 
-客户端和服务器连接时比较 `PROTOCOL_VERSION`（`crates/airhand-proto/src/lib.rs`）。不一致时服务器回复 `Incompatible`，客户端提示用户该更新 Airhand 还是服务器，之后每分钟重试一次。任何不兼容的协议改动都要把版本号加 1。握手本身（`ClientMsg::Hello`、`ServerMsg::Welcome` / `Incompatible`、ALPN）**永远不能改**，否则不同版本之间连“版本不一致”都无法告诉对方；`version_handshake_wire_is_stable` 测试守着这一点。
+有两个版本号（`crates/airhand-proto/src/lib.rs`），规则见[工作原理 → 协议的演进](architecture.zh-CN.md#协议的演进)：
+
+- `SIGNAL_VERSION` / `SIGNAL_MIN`：客户端 ⇄ 服务器（信令、会话头、数据报的会话 ID）。服务器接受这个区间里的客户端；没有交集时回复 `Incompatible`（带着服务器的区间），客户端提示用户该更新 Airhand 还是服务器，之后每分钟重试一次
+- `SESSION_VERSION` / `SESSION_MIN`：被控端 ⇄ 控制端，在端到端握手里协商，服务器不看。不兼容时控制端显示 `peerIncompatible`
+
+改协议时先想能不能兼容地改，能就不加版本号：
+
+- 加消息：给枚举加一个**新编号**的变体，旧版本会跳过它；对方可能不认识的话，先在 `features` 里分一个能力位，对方报了才发
+- 加字段：只能加 `Option`（或者带 `#[cbor(default)]`）的字段，用新的编号；必填字段要永远存在
+- 枚举加变体：列表里用 `crate::cbor::open_vec`，单个值用 `crate::cbor::or_default`，可选的用 `crate::cbor::opt`（不要直接写 `Option<只有编号的枚举>`：minicbor 派生对它的处理有问题，见 `cbor.rs` 的说明）
+- 编号一旦发布就不能改、不能复用；只有改不下去（例如要删掉必填字段）才加版本号
+
+版本握手的开头（`ClientHello` / `ServerHello` 的 postcard 部分）和 ALPN **永远不能改**，否则不同版本之间连“版本不一致”都无法告诉对方；`version_handshake_prefix_is_frozen` 测试守着这一点。`airhand-proto` 的测试里有“新版本的对方”发来新消息、新字段、新枚举值的例子，加兼容规则时照着写一个。
 
 ### 一份协议，三份实现
 

@@ -85,6 +85,8 @@ class ControllerClient(private val settings: SettingsStore) {
             .put("trust", s.trustJson())
             .put("name", settings.deviceName())
             .put("os", osName())
+            // 本机的端到端加密身份：配对过的电脑靠它认出本机
+            .put("identity", settings.identity())
         val h = try {
             Native.ctlStart(cfg.toString())
         } catch (e: IllegalArgumentException) {
@@ -114,6 +116,7 @@ class ControllerClient(private val settings: SettingsStore) {
                 "hostOnline" -> _hostOnline.tryEmit(e.optInt("code").toString())
                 // 第一次连上服务器：记下它的证书指纹（不重新连接）
                 "serverTrust" -> settings.learnTrust(e.optString("server"), e.optString("fp"))
+                "identity" -> settings.learnIdentity(e.optString("key"))
             }
         }
     }

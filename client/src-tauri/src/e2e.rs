@@ -8,28 +8,49 @@
 
 use std::time::{Duration, Instant};
 
-use airhand_link::transport::{FromHost, HostReceiver, open_session, session_datagrams};
+use airhand_link::secure::{self, FrameSealer, Identity, InitiatorParams};
+use airhand_link::transport::{FromHost, HostReceiver, Openers, open_session, session_datagrams};
 use airhand_proto::framing::{read_msg, write_msg};
+use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::media::{AudioHeader, HEADER_LEN, VideoHeader};
 use airhand_proto::session::{
-    ByeReason, Codec, ControllerHello, ControllerMsg, HostMsg, InputEvent, Notice, QualitySettings,
+    ByeReason, Codec, ControllerMsg, HostMsg, InputEvent, Notice, QualitySettings,
 };
-use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg};
-use airhand_proto::{MAX_SIGNAL_MSG, Role};
+use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg, connect_outcome};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, SessionLane};
 
 use airhand_link::ServerState;
 
 use crate::host::HostService;
 use crate::status;
 
+/// 控制流的发送端：加密之后写进去
+struct Ctl {
+    send: quinn::SendStream,
+    sealer: FrameSealer,
+}
+
+impl Ctl {
+    async fn send(&mut self, msg: &ControllerMsg) {
+        let mut f = airhand_proto::framing::encode_with_spare(msg, TAG_LEN);
+        self.sealer.seal_frame(&mut f).unwrap();
+        self.send.write_all(&f).await.unwrap();
+    }
+}
+
+/// 被控端的控制码和配对码（测试里没有配置文件：默认要配对码）
 async fn wait_code(hub: &status::StatusHub) -> u32 {
+    wait_host(hub).await.0
+}
+
+async fn wait_host(hub: &status::StatusHub) -> (u32, Option<String>) {
     let mut rx = hub.subscribe();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         {
             let st = rx.borrow_and_update();
             if let (ServerState::Connected, Some(code)) = (&st.host.server, st.host.code) {
-                return code;
+                return (code, st.host.pairing.clone());
             }
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -73,8 +94,8 @@ async fn e2e_roundtrip() {
         .try_init();
     let hub = status::new_hub();
     let _host = HostService::start(hub.clone());
-    let code = wait_code(&hub).await;
-    println!("被控端控制码: {code}");
+    let (code, pairing) = wait_host(&hub).await;
+    println!("被控端控制码: {code}，配对码: {pairing:?}");
 
     // 控制端：连接服务器
     let mut sig = airhand_link::net::connect_signal(&crate::config::link(), Role::Controller)
@@ -103,7 +124,8 @@ async fn e2e_roundtrip() {
             r,
             ServerMsg::ConnectResult {
                 req_id: 1,
-                result: Err(ConnectError::NotFound)
+                grant: None,
+                error: Some(ConnectError::NotFound)
             }
         ),
         "{r:?}"
@@ -126,48 +148,70 @@ async fn e2e_roundtrip() {
         .unwrap();
     let ServerMsg::ConnectResult {
         req_id: 2,
-        result: Ok(grant),
+        grant,
+        error,
     } = r
     else {
         panic!("{r:?}")
     };
+    let grant = connect_outcome(grant, error).expect("服务器批准了连接");
     println!("会话已授权: {} ({})", grant.host_name, grant.host_os);
 
     let streams = open_session(&sig.conn, grant.session_id, Role::Controller)
         .await
         .unwrap();
-    let (mut send, recv) = streams.control;
-    // 声音走数据报（放不进一个数据报的才走声音流）
-    let datagrams = session_datagrams(&sig.conn, grant.session_id);
-    let mut recv = HostReceiver::new(recv, streams.video, streams.audio, Some(datagrams));
-    // 和真正的控制端一样：先报上本次运行的标识，再发画质设置
-    write_msg(
+    let (send, mut recv) = streams.control;
+    let mut send = send;
+    // 端到端握手：第一次连，用配对码（测试里的被控端默认要配对码）
+    let me = Identity::generate();
+    let intro = secure::controller_intro("e2e", "test");
+    let init = secure::initiate(
+        &mut recv,
         &mut send,
-        &ControllerMsg::Hello(ControllerHello { device: [7; 16] }),
+        InitiatorParams {
+            session_id: grant.session_id,
+            code,
+            me: &me,
+            host_key: None,
+            pairing: pairing.as_deref(),
+            intro: &intro,
+        },
     )
     .await
-    .unwrap();
+    .expect("端到端握手");
+    println!("端到端握手完成，安全码 {}", init.secured.safety);
+    // 声音走数据报（放不进一个数据报的才走声音流）
+    let datagrams = session_datagrams(&sig.conn, grant.session_id);
+    let mut ctl = Ctl {
+        send,
+        sealer: init.secured.sealer(SessionLane::Control),
+    };
+    let mut recv = HostReceiver::new(
+        recv,
+        streams.video,
+        streams.audio,
+        Some(datagrams),
+        Openers {
+            video: init.secured.opener(SessionLane::Video),
+            audio: init.secured.opener(SessionLane::Audio),
+            datagrams: init.secured.datagram_opener(),
+            control: init.opener,
+        },
+    );
+    // 和真正的控制端一样：握手之后先发画质设置
     let settings = QualitySettings {
         codec: Codec::H264,
         fps: 30,
         ..Default::default()
     };
-    write_msg(&mut send, &ControllerMsg::Settings(settings))
-        .await
-        .unwrap();
-    write_msg(
-        &mut send,
-        &ControllerMsg::Input {
-            t: 1,
-            events: vec![InputEvent::ReleaseAll],
-        },
-    )
-    .await
-    .unwrap();
+    ctl.send(&ControllerMsg::Settings(settings)).await;
+    ctl.send(&ControllerMsg::Input {
+        t: 1,
+        events: vec![InputEvent::ReleaseAll],
+    })
+    .await;
     // 声音：在本机以 -60 dBFS（几乎听不见）播放测试音，被控端环回采集后应能收到并解码
-    write_msg(&mut send, &ControllerMsg::Audio { enabled: true })
-        .await
-        .unwrap();
+    ctl.send(&ControllerMsg::Audio { enabled: true }).await;
     let tone = match crate::host::audio::TonePlayer::start(440.0, 0.001) {
         Ok(t) => Some(t),
         Err(e) => {
@@ -209,14 +253,10 @@ async fn e2e_roundtrip() {
     let original_clip = crate::clipboard::get_text().ok();
     let to_host = format!("airhand-e2e-to-host-{}", rand::random::<u32>());
     let from_host = format!("airhand-e2e-from-host-{}", rand::random::<u32>());
-    write_msg(
-        &mut send,
-        &ControllerMsg::Clipboard {
-            text: to_host.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    ctl.send(&ControllerMsg::Clipboard {
+        text: to_host.clone(),
+    })
+    .await;
     let mut clip_written = false;
     let mut clip_echo = 0;
     let mut clip_back = false;
@@ -226,9 +266,7 @@ async fn e2e_roundtrip() {
     while started.elapsed() < Duration::from_secs(8) {
         if last_ping.elapsed() > Duration::from_millis(500) {
             last_ping = Instant::now();
-            write_msg(&mut send, &ControllerMsg::Ping { t: 1 })
-                .await
-                .unwrap();
+            ctl.send(&ControllerMsg::Ping { t: 1 }).await;
         }
         if !clip_written && started.elapsed() > Duration::from_secs(1) {
             let now = crate::clipboard::get_text().unwrap_or_default();
@@ -245,16 +283,12 @@ async fn e2e_roundtrip() {
                 bitrate_kbps: 8000,
                 ..settings
             };
-            write_msg(&mut send, &ControllerMsg::Settings(s))
-                .await
-                .unwrap();
+            ctl.send(&ControllerMsg::Settings(s)).await;
         }
         // 6 秒后关闭声音：之后不应再收到声音包
         if audio_off.is_none() && started.elapsed() > Duration::from_secs(6) {
             audio_off = Some(Instant::now());
-            write_msg(&mut send, &ControllerMsg::Audio { enabled: false })
-                .await
-                .unwrap();
+            ctl.send(&ControllerMsg::Audio { enabled: false }).await;
         }
         let msg = match tokio::time::timeout(Duration::from_secs(1), recv.recv()).await {
             Ok(m) => m.expect("读取会话消息"),
@@ -276,9 +310,7 @@ async fn e2e_roundtrip() {
                 if v.codec == Codec::H264 && matches!(decoder.decode(data), Ok(Some(_))) {
                     rep.decoded += 1;
                 }
-                write_msg(&mut send, &ControllerMsg::Ack { seq: v.seq })
-                    .await
-                    .unwrap();
+                ctl.send(&ControllerMsg::Ack { seq: v.seq }).await;
                 continue;
             }
             FromHost::Audio(p) => {
@@ -378,7 +410,7 @@ async fn e2e_roundtrip() {
         Some(ByeReason::Kicked),
         "没有收到\"断开所有控制端\"的 Bye"
     );
-    let _ = send.finish();
+    let _ = ctl.send.finish();
     println!(
         "帧 {} (关键帧 {}) · {:.1} KB · H.264 解码成功 {} · pong {} · 光标 {} · 声音包 {} (start {}, RMS {:.6}, 关闭后 {})",
         rep.frames,

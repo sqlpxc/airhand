@@ -20,6 +20,19 @@
 //! 凭证作废了（被控端的用户断开过所有控制端，或者换了控制码）时 `connect` 返回 [`Problem::Kicked`]：
 //! 自动重连就此停下；用户自己要连的（例如从"我的设备"打开）就不带凭证再连一次。
 //!
+//! # 端到端加密
+//!
+//! 服务器批准之后，`connect` 在控制流上和被控端握手（[`crate::secure::initiate`]，协议见
+//! `airhand_proto::handshake`），之后每条流的每一帧都是密文。本机的身份（[`Identity`]）由平台保存，
+//! 启动服务时给进来；被控端的公钥由界面保管（"我的设备"，和重连凭证一样，见 [`ConnectOptions::host_key`]）：
+//!
+//! * 第一次连（界面没有它的公钥）：记下对方的公钥（[`SessionInfo::host_key`]），界面保存下来；
+//! * 之后只认它：对不上返回 [`Problem::HostKeyChanged`]，不自动重连，由用户决定要不要相信新的身份
+//!   （不带公钥再连一次）；
+//! * 被控端要求配对时返回 [`Problem::PairingRequired`]：界面请用户输入对方托盘里的配对码，带着它再连一次
+//!   （[`ConnectOptions::pairing`]）。配对之后被控端记住本机，以后不用再输；
+//! * [`SessionInfo::safety`] 是安全码：被控端显示的是同一个，第一次连接时两边的人可以对一下。
+//!
 //! # 声音
 //!
 //! 被控端的声音包走 QUIC 数据报（见 `airhand_proto::datagram`）。一条连接上可能有好几个会话，
@@ -35,13 +48,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::transport::{HostReceiver, open_session};
+use crate::secure::{self, Identity, InitiatorParams};
+use crate::transport::{HostReceiver, Openers, open_session};
 use airhand_proto::framing::{read_msg, write_msg};
-use airhand_proto::session::{
-    ControllerHello, ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings,
-};
-use airhand_proto::signal::{ClientMsg, ConnectError, ResumeToken, ServerMsg, SessionGrant};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram};
+use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
+use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, SessionLane, datagram};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use quinn::Connection;
@@ -160,7 +172,22 @@ impl Command {
     }
 }
 
-type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<SessionGrant, ConnectError>>>>>;
+type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<SessionGrant, Problem>>>>>;
+
+/// 怎样连这台被控端（除了控制码）。界面保管这些，下次连时带上。JSON 是 camelCase
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectOptions {
+    /// 重连凭证：之前连上这个控制码时得到的（[`SessionInfo::resume`]），第一次连接时为 `None`
+    #[serde(default)]
+    pub resume: Option<ResumeToken>,
+    /// 之前记下的被控端公钥（[`SessionInfo::host_key`]，64 位十六进制）：只认它（见模块说明的"端到端加密"）
+    #[serde(default)]
+    pub host_key: Option<String>,
+    /// 配对码（被控端要求配对时用户输入的，6 位数字）
+    #[serde(default)]
+    pub pairing: Option<String>,
+}
 
 /// 会话 ID → 交给这个会话的声音数据报
 type Datagrams = Mutex<HashMap<u64, mpsc::Sender<Bytes>>>;
@@ -197,9 +224,8 @@ struct SessionHandle {
 
 struct Inner {
     cfg: Arc<LinkConfig>,
-    /// 本次运行的随机标识，每个会话开始时告诉被控端（见 [`ControllerHello::device`]）：
-    /// 断线重连时被控端认得出是同一台，不用再请它的用户同意
-    device: [u8; 16],
+    /// 本机的身份（端到端握手里的静态密钥）：被控端据此认出配对过、同意过的控制端
+    identity: Identity,
     rt: Handle,
     live: Mutex<Option<Live>>,
     sessions: Mutex<HashMap<u32, SessionHandle>>,
@@ -224,20 +250,26 @@ pub struct SessionInfo {
     pub host_os: String,
     /// 重连凭证：这个会话断了之后重连时交给 [`ControllerService::connect`]
     pub resume: ResumeToken,
+    /// 被控端的公钥（64 位十六进制）：界面保存下来，之后连它时带上（[`ConnectOptions::host_key`]）
+    pub host_key: String,
+    /// 安全码（见模块说明的"端到端加密"）
+    pub safety: String,
 }
 
 impl ControllerService {
     /// 在 `rt` 上启动服务：连接服务器并在掉线后自动重连，连接状态的变化通过 `report` 通知，
-    /// 在等的被控端上线了通过 `host_online` 通知。服务被 drop 时断开所有会话和连接。
+    /// 在等的被控端上线了通过 `host_online` 通知。`identity` 是本机的身份（平台保存，见模块说明的"端到端加密"）。
+    /// 服务被 drop 时断开所有会话和连接。
     pub fn start(
         cfg: Arc<LinkConfig>,
         rt: Handle,
         report: Report,
         host_online: HostOnline,
+        identity: Identity,
     ) -> Self {
         let inner = Arc::new(Inner {
             cfg,
-            device: rand::random(),
+            identity,
             rt: rt.clone(),
             live: Mutex::default(),
             sessions: Mutex::default(),
@@ -251,16 +283,27 @@ impl ControllerService {
     }
 
     /// 连接控制码为 `code` 的被控端（用户输入的样子，允许空格 / 短横线）。
-    /// `resume`：重连时带上之前连上这个控制码时得到的凭证（[`SessionInfo::resume`]），第一次连接时为 `None`
+    /// `opts`：重连凭证、记下的被控端公钥、配对码（见 [`ConnectOptions`]）
     pub async fn connect(
         &self,
         code: &str,
-        resume: Option<ResumeToken>,
+        opts: ConnectOptions,
         settings: QualitySettings,
         ui: Arc<dyn SessionUi>,
         frontend: Frontend,
     ) -> Result<SessionInfo, Problem> {
         let code = airhand_proto::parse_code(code).ok_or(Problem::InvalidCode)?;
+        let pairing = match opts.pairing.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(p) => Some(airhand_proto::parse_pairing(p).ok_or(Problem::PairingFailed)?),
+        };
+        let host_key = match opts.host_key.as_deref() {
+            None | Some("") => None,
+            Some(k) => {
+                Some(secure::unhex32(k).ok_or_else(|| Problem::failed("invalid saved host key"))?)
+            }
+        };
+        let resume = opts.resume;
         let live = self
             .inner
             .live
@@ -294,7 +337,7 @@ impl ControllerService {
             .map_err(|_| server_gone())?;
         let grant = match tokio::time::timeout(Duration::from_secs(10), orx).await {
             Ok(Ok(Ok(g))) => g,
-            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Ok(Err(e))) => return Err(e),
             Ok(Err(_)) => return Err(server_gone()),
             Err(_) => {
                 live.pending.lock().unwrap().remove(&req_id);
@@ -316,20 +359,41 @@ impl ControllerService {
         let streams = open_session(&live.conn, grant.session_id, Role::Controller)
             .await
             .map_err(Problem::failed)?;
-        let (mut send, recv) = streams.control;
-        let recv = HostReceiver::new(recv, streams.video, streams.audio, Some(dgram_rx));
-        let hello = ControllerMsg::Hello(ControllerHello {
-            device: self.inner.device,
-        });
-        write_msg(&mut send, &hello)
-            .await
-            .map_err(Problem::failed)?;
-        write_msg(&mut send, &ControllerMsg::Settings(settings.sanitized()))
-            .await
-            .map_err(Problem::failed)?;
+        let (mut send, mut recv) = streams.control;
+        // 端到端握手：确认对方的身份、让对方确认本机（见模块说明的"端到端加密"）
+        let intro = secure::controller_intro(&self.inner.cfg.name, &self.inner.cfg.os);
+        let init = secure::initiate(
+            &mut recv,
+            &mut send,
+            InitiatorParams {
+                session_id: grant.session_id,
+                code,
+                me: &self.inner.identity,
+                host_key,
+                pairing: pairing.as_deref(),
+                intro: &intro,
+            },
+        )
+        .await
+        .map_err(|e| Problem::from_error(e, Problem::failed))?;
+        let secured = init.secured;
+        let recv = HostReceiver::new(
+            recv,
+            streams.video,
+            streams.audio,
+            Some(dgram_rx),
+            Openers {
+                control: init.opener,
+                video: secured.opener(SessionLane::Video),
+                audio: secured.opener(SessionLane::Audio),
+                datagrams: secured.datagram_opener(),
+            },
+        );
 
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
+        // 先发画质设置（命令队列里排在最前面）
+        tx.send(ControllerMsg::Settings(settings.sanitized()))?;
         let (mode, clipboard) = match frontend {
             Frontend::Desktop { clipboard, sync } => {
                 let enabled = Arc::new(AtomicBool::new(sync));
@@ -343,6 +407,7 @@ impl ControllerService {
         };
         let io = session::SessionIo {
             send,
+            sealer: secured.sealer(SessionLane::Control),
             recv,
             ui,
             mode,
@@ -366,13 +431,15 @@ impl ControllerService {
                 clipboard,
             },
         );
-        info!(sid, code, host = %grant.host_name, "session established");
+        info!(sid, code, host = %grant.host_name, safety = %secured.safety, "session established");
         Ok(SessionInfo {
             sid,
             code: airhand_proto::format_code(code),
             host_name: grant.host_name,
             host_os: grant.host_os,
             resume: grant.resume,
+            host_key: secure::hex(&secured.peer),
+            safety: secured.safety.clone(),
         })
     }
 
@@ -516,9 +583,17 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
         let mut buf = Vec::new();
         while let Some(m) = read_msg::<_, ServerMsg>(&mut recv, MAX_SIGNAL_MSG, &mut buf).await? {
             match m {
-                ServerMsg::ConnectResult { req_id, result } => {
+                ServerMsg::ConnectResult {
+                    req_id,
+                    grant,
+                    error,
+                } => {
                     if let Some(tx) = pending.lock().unwrap().remove(&req_id) {
-                        let _ = tx.send(result);
+                        let _ = tx.send(connect_outcome(grant, error).map_err(|e| match e {
+                            Some(e) => e.into(),
+                            // 服务器的版本更新，拒绝的原因这边不认识
+                            None => Problem::failed("the server refused the connection"),
+                        }));
                     }
                 }
                 ServerMsg::HostOnline { code } => {

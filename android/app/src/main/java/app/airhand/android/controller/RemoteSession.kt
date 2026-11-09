@@ -57,6 +57,10 @@ class RemoteSession(
     resume: String?,
     /** 只看画面（电视）：不发送任何输入 */
     val viewOnly: Boolean,
+    /** 之前记下的对方公钥（我的设备）：只认它，对不上是 hostKeyChanged。null：第一次连，或者用户信任了对方的新身份 */
+    hostKey: String? = null,
+    /** 配对码（对方要求配对时用户输入的），只用于第一次连接 */
+    pairing: String? = null,
 ) {
     sealed interface Phase {
         data object Connecting : Phase
@@ -110,6 +114,17 @@ class RemoteSession(
 
     @Volatile
     private var resume: String? = resume
+
+    /** 对方的端到端加密公钥：连上时确认过的（之后重连只认它） */
+    @Volatile
+    private var hostKey: String? = hostKey
+
+    /** 配对码：连上之后就不要了 */
+    @Volatile
+    private var pairing: String? = pairing
+
+    /** 安全码（连上之后才有）：对方屏幕上显示的是同一个，不一样就是中间有人 */
+    val safety = MutableStateFlow<String?>(null)
 
     @Volatile
     private var handle = 0L
@@ -191,7 +206,7 @@ class RemoteSession(
                 val h = client.handle()
                 val settings = currentSettings()
                 sentSettings = settings
-                val cmd = Commands.connect(code, resume, settings)
+                val cmd = Commands.connect(code, resume, settings, hostKey, pairing)
                 val r = runCatching { JSONObject(Native.ctlCall(h, cmd.toString())) }
                     .getOrElse { JSONObject().put("err", JSONObject().put("kind", "failed").put("detail", it.toString())) }
                 if (closed) {
@@ -288,6 +303,10 @@ class RemoteSession(
         // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
         cursorSlots.clear()
         resume = Resume.fromJson(ok.optJSONArray("resume")) ?: resume
+        // 端到端握手确认过的对方公钥：之后重连只认它；配对码用过了
+        ok.optString("hostKey").takeIf { it.isNotBlank() }?.let { hostKey = it }
+        safety.value = ok.optString("safety").takeIf { it.isNotBlank() }
+        pairing = null
         grantName = ok.optString("hostName")
         grantOs = ok.optString("hostOs")
         if (grantName.isNotBlank() && saved?.alias.isNullOrBlank()) hostName.value = grantName
@@ -300,7 +319,7 @@ class RemoteSession(
 
     /** 会话开始（对方同意了，或者不需要同意） */
     private fun onHello() {
-        app.devices.connected(code, grantName, grantOs, resume ?: "")
+        app.devices.connected(code, grantName, grantOs, resume ?: "", hostKey)
         connectedOnce = true
         _phase.value = Phase.Live
     }

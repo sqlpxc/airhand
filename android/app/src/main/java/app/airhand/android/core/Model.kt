@@ -61,16 +61,28 @@ data class Problem(
     val detail: String? = null,
     val server: Int? = null,
     val client: Int? = null,
+    /** peerIncompatible：对方和本机的会话版本（对方的大就是本机该更新） */
+    val peer: Int? = null,
+    val ours: Int? = null,
 ) {
-    /** 对方有意结束，不应该自动重连 */
-    val isFinal get() = kind == "kicked" || kind == "codeChanged"
+    /** 对方有意结束，或者要用户来决定（对方的身份变了、要配对码、版本不兼容），不应该自动重连 */
+    val isFinal get() = kind in FINAL
+
+    /** 端到端握手的问题：要用户输入配对码 */
+    val needsPairing get() = kind == "pairingRequired" || kind == "pairingFailed" || kind == "pairingUnavailable"
 
     companion object {
+        private val FINAL = setOf(
+            "kicked", "codeChanged", "hostKeyChanged", "pairingRequired", "pairingFailed", "pairingUnavailable", "peerIncompatible",
+        )
+
         fun parse(o: JSONObject?): Problem = if (o == null) Problem("failed", "?") else Problem(
             kind = o.optString("kind", "failed"),
             detail = o.optStringOrNull("detail"),
             server = if (o.has("server")) o.optInt("server") else null,
             client = if (o.has("client")) o.optInt("client") else null,
+            peer = if (o.has("peer")) o.optInt("peer") else null,
+            ours = if (o.has("ours")) o.optInt("ours") else null,
         )
     }
 }

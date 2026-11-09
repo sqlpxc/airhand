@@ -37,6 +37,7 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::core::HSTRING;
 
 use crate::host::HostCmd;
+use crate::host::gate::DesktopGate;
 use crate::status::{HostStatus, ServiceStatus, StatusHub};
 
 /// 管道的访问权限：SYSTEM、管理员和创建者（OW，所有者）完全控制；交互登录的用户（IU）可以读写，
@@ -74,6 +75,12 @@ pub enum ToAgent {
     /// 控制台的"我的设备"：整个列表写进 config.toml（托盘没有写安装目录的权限）。
     /// 已经由托盘整理好、`code` 用那个用户的 DPAPI 加密过（见 [`crate::devices::for_file`]）
     SaveDevices { devices: Vec<crate::devices::Device> },
+    /// 换一个配对码（暂停了的配对随之恢复）
+    NewPairingCode,
+    /// 忘掉所有配对过的控制端
+    ForgetPaired,
+    /// 控制台的身份（那个用户的 DPAPI 加密过，见 [`crate::config::controller_identity`]）写进 config.toml
+    SaveControllerKey { key: String },
 }
 
 async fn send_line<W: AsyncWrite + Unpin>(w: &mut W, msg: &impl Serialize) -> Result<()> {
@@ -126,21 +133,20 @@ fn create(name: &str, first: bool) -> Result<NamedPipeServer> {
     Ok(server)
 }
 
-/// 在本会话的管道上接受托盘的连接
-pub async fn serve(
-    hub: StatusHub,
-    cmds: mpsc::UnboundedSender<HostCmd>,
-    autostart: Arc<watch::Sender<bool>>,
-) {
-    serve_on(pipe_name(my_session()), hub, cmds, autostart).await
+/// 被控端那一侧：发给被控端的命令、开机自动启动的设置、配对
+#[derive(Clone)]
+pub struct Agent {
+    pub cmds: mpsc::UnboundedSender<HostCmd>,
+    pub autostart: Arc<watch::Sender<bool>>,
+    pub gate: Arc<DesktopGate>,
 }
 
-async fn serve_on(
-    name: String,
-    hub: StatusHub,
-    cmds: mpsc::UnboundedSender<HostCmd>,
-    autostart: Arc<watch::Sender<bool>>,
-) {
+/// 在本会话的管道上接受托盘的连接
+pub async fn serve(hub: StatusHub, agent: Agent) {
+    serve_on(pipe_name(my_session()), hub, agent).await
+}
+
+async fn serve_on(name: String, hub: StatusHub, agent: Agent) {
     let session = my_session();
     let mut server = match create(&name, true) {
         Ok(s) => s,
@@ -177,25 +183,20 @@ async fn serve_on(
             warn!(client_session, "rejected a tray from another session");
             continue;
         }
-        let (hub, cmds, autostart) = (hub.clone(), cmds.clone(), autostart.clone());
+        let (hub, agent) = (hub.clone(), agent.clone());
         tokio::spawn(async move {
-            if let Err(e) = serve_tray(client, hub, cmds, autostart).await {
+            if let Err(e) = serve_tray(client, hub, agent).await {
                 debug!("tray disconnected: {e:#}");
             }
         });
     }
 }
 
-async fn serve_tray(
-    pipe: NamedPipeServer,
-    hub: StatusHub,
-    cmds: mpsc::UnboundedSender<HostCmd>,
-    autostart: Arc<watch::Sender<bool>>,
-) -> Result<()> {
+async fn serve_tray(pipe: NamedPipeServer, hub: StatusHub, agent: Agent) -> Result<()> {
     let (r, mut w) = tokio::io::split(pipe);
     let mut lines = BufReader::new(r).lines();
     let mut hub_rx = hub.subscribe();
-    let mut auto_rx = autostart.subscribe();
+    let mut auto_rx = agent.autostart.subscribe();
     let mut last: Option<AgentStatus> = None;
     loop {
         let status = AgentStatus {
@@ -212,7 +213,7 @@ async fn serve_tray(
             line = lines.next_line() => {
                 let Some(line) = line? else { return Ok(()) };
                 match serde_json::from_str::<ToAgent>(&line) {
-                    Ok(msg) => handle(msg, &cmds, &autostart).await,
+                    Ok(msg) => handle(msg, &agent).await,
                     Err(e) => warn!("invalid message from the tray: {e}"),
                 }
             }
@@ -220,17 +221,30 @@ async fn serve_tray(
     }
 }
 
-async fn handle(
-    msg: ToAgent,
-    cmds: &mpsc::UnboundedSender<HostCmd>,
-    autostart: &watch::Sender<bool>,
-) {
+async fn handle(msg: ToAgent, agent: &Agent) {
+    let (cmds, autostart) = (&agent.cmds, &agent.autostart);
     match msg {
         ToAgent::KickAll => {
             let _ = cmds.send(HostCmd::KickAll);
         }
         ToAgent::NewCode => {
             let _ = cmds.send(HostCmd::NewCode);
+        }
+        ToAgent::NewPairingCode => {
+            let gate = agent.gate.clone();
+            let _ = tokio::task::spawn_blocking(move || gate.new_pairing_code()).await;
+        }
+        ToAgent::ForgetPaired => {
+            let gate = agent.gate.clone();
+            let _ = tokio::task::spawn_blocking(move || gate.forget_paired()).await;
+        }
+        ToAgent::SaveControllerKey { key } => {
+            let r = tokio::task::spawn_blocking(move || crate::config::save_controller_key(&key)).await;
+            match r {
+                Ok(Ok(())) => debug!("saved a console identity"),
+                Ok(Err(e)) => warn!("can't save the console identity: {e:#}"),
+                Err(e) => warn!("can't save the console identity: {e}"),
+            }
         }
         ToAgent::SetAutostart { on } => {
             let r = tokio::task::spawn_blocking(move || {
@@ -439,7 +453,12 @@ mod tests {
         let hub = status::new_hub();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let autostart = Arc::new(watch::Sender::new(true));
-        tokio::spawn(serve_on(name.clone(), hub.clone(), cmd_tx, autostart));
+        let agent = Agent {
+            cmds: cmd_tx,
+            autostart,
+            gate: DesktopGate::load(hub.clone()),
+        };
+        tokio::spawn(serve_on(name.clone(), hub.clone(), agent));
 
         // 只用托盘的权限（读 + 写数据）就能收发消息
         let pipe = loop {
@@ -459,7 +478,7 @@ mod tests {
             serde_json::from_str(&line).unwrap()
         };
         let first = next().await;
-        assert_eq!(first.host, HostStatus::default());
+        assert_eq!((first.host.code, first.host.controllers.len()), (None, 0));
         assert!(first.autostart);
 
         hub.send_modify(|s| s.host.code = Some(123_456));

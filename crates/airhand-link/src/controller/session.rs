@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::transport::{FromHost, HostReceiver};
+use crate::secure::FrameSealer;
+use crate::transport::{self, FromHost, HostReceiver};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
     Codec, ControllerMsg, DisplayInfo, HostMsg, Notice, Platform, SystemAction,
@@ -154,6 +155,8 @@ impl Default for Stats {
 
 pub(super) struct SessionIo {
     pub send: SendStream,
+    /// 控制流上控制端 → 被控端的加密
+    pub sealer: FrameSealer,
     pub recv: HostReceiver,
     pub ui: Arc<dyn SessionUi>,
     pub mode: Mode,
@@ -178,6 +181,7 @@ pub(super) async fn run(
 ) {
     let SessionIo {
         mut send,
+        mut sealer,
         mut recv,
         ui,
         mode,
@@ -189,7 +193,7 @@ pub(super) async fn run(
     // Every frontend acknowledges after its last IPC/network hop, not here.
     let writer = async move {
         loop {
-            let bytes = rx.recv().await?;
+            let bytes = transport::seal(rx.recv().await?, &mut sealer)?;
             tokio::time::timeout(HOST_TIMEOUT, send.write_chunk(bytes)).await??;
         }
         #[allow(unreachable_code)]

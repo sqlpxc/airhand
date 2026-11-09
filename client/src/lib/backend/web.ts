@@ -11,8 +11,8 @@ import type {
   AppInfo,
   Backend,
   Command,
+  ConnectOptions,
   Problem,
-  ResumeToken,
   ServerState,
   SessionEvent,
   SessionInfo,
@@ -359,7 +359,7 @@ class WebConsole implements Backend {
 
   async connect(
     code: string,
-    resume: ResumeToken | null,
+    opts: ConnectOptions,
     settings: object,
     sink: SessionSink,
     clipboard: boolean,
@@ -375,7 +375,8 @@ class WebConsole implements Backend {
     };
     this.chans.set(ch, chan);
     try {
-      const info = await this.call<SessionInfo>("connect", { code, resume, settings, ch });
+      const { resume, hostKey, pairing } = opts;
+      const info = await this.call<SessionInfo>("connect", { code, resume, hostKey, pairing, settings, ch });
       chan.sid = info.sid;
       if (chan.unacked !== null) {
         this.ack(chan, chan.unacked);

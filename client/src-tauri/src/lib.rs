@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_link::controller::{
-    Command, ControllerService, Frontend, HostOnline, SessionEvent, SessionInfo, SessionUi,
-    UiClosed,
+    Command, ConnectOptions, ControllerService, Frontend, HostOnline, SessionEvent, SessionInfo,
+    SessionUi, UiClosed,
 };
 use airhand_link::{Problem, ServerState};
 use airhand_proto::session::QualitySettings;
@@ -81,6 +81,15 @@ enum Hosting {
     Service(winsvc::ipc::AgentLink),
 }
 
+/// 托盘菜单里对配对的操作
+#[derive(Debug, Clone, Copy)]
+enum PairingCmd {
+    /// 换一个配对码（暂停了的配对随之恢复）
+    NewCode,
+    /// 忘掉所有配对过的控制端
+    Forget,
+}
+
 impl Hosting {
     fn send(&self, cmd: HostCmd) {
         match self {
@@ -89,6 +98,24 @@ impl Hosting {
             Hosting::Service(link) => link.send(match cmd {
                 HostCmd::KickAll => winsvc::ipc::ToAgent::KickAll,
                 HostCmd::NewCode => winsvc::ipc::ToAgent::NewCode,
+            }),
+        }
+    }
+
+    fn pairing(&self, cmd: PairingCmd) {
+        match self {
+            Hosting::InProcess(h) => {
+                let gate = h.gate().clone();
+                // 要写配置文件，不在主线程上做
+                std::thread::spawn(move || match cmd {
+                    PairingCmd::NewCode => gate.new_pairing_code(),
+                    PairingCmd::Forget => gate.forget_paired(),
+                });
+            }
+            #[cfg(windows)]
+            Hosting::Service(link) => link.send(match cmd {
+                PairingCmd::NewCode => winsvc::ipc::ToAgent::NewPairingCode,
+                PairingCmd::Forget => winsvc::ipc::ToAgent::ForgetPaired,
             }),
         }
     }
@@ -140,15 +167,36 @@ fn switch_services(app: &AppHandle, mode: Mode) {
                 let host_online: HostOnline = Arc::new(move |code| {
                     let _ = handle.emit_to(CONSOLE, "host-online", code);
                 });
+                // 控制台的身份（端到端加密）：第一次用时生成，记进 config.toml
+                let (identity, new_key) = config::controller_identity();
+                if let Some(key) = new_key {
+                    save_controller_key(&sv, key);
+                }
                 sv.controller = Some(Arc::new(ControllerService::start(
                     config::link(),
                     tauri::async_runtime::handle().inner().clone(),
                     status::controller_reporter(&state.hub),
                     host_online,
+                    identity,
                 )))
             }
         }
     }
+}
+
+/// 记下控制台新生成的身份。Windows 安装版：配置文件由服务里的被控端维护，经命名管道交给它写
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn save_controller_key(sv: &Services, key: String) {
+    #[cfg(windows)]
+    if let Some(Hosting::Service(link)) = &sv.host {
+        link.send(winsvc::ipc::ToAgent::SaveControllerKey { key });
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Err(e) = config::save_controller_key(&key) {
+            warn!("can't save the console's identity: {e:#}");
+        }
+    });
 }
 
 fn set_mode(app: &AppHandle, mode: Mode) {
@@ -279,6 +327,16 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
                 h.send(cmd);
             }
         }
+        "new_pairing" | "forget_paired" => {
+            let cmd = if id == "new_pairing" {
+                PairingCmd::NewCode
+            } else {
+                PairingCmd::Forget
+            };
+            if let Some(h) = &app.state::<AppState>().services.lock().unwrap().host {
+                h.pairing(cmd);
+            }
+        }
         #[cfg(windows)]
         "autostart" => {
             let state = app.state::<AppState>();
@@ -335,6 +393,15 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
             if let Some(code) = app.state::<AppState>().hub.borrow().host.code {
                 match clipboard::set_text(&format!("{code:06}")) {
                     Ok(()) => info!("control code copied"),
+                    Err(e) => warn!("copying failed: {e}"),
+                }
+            }
+        }
+        "copy_pairing" => {
+            let pairing = app.state::<AppState>().hub.borrow().host.pairing.clone();
+            if let Some(p) = pairing {
+                match clipboard::set_text(&p) {
+                    Ok(()) => info!("pairing code copied"),
                     Err(e) => warn!("copying failed: {e}"),
                 }
             }
@@ -459,11 +526,15 @@ impl SessionUi for ConsoleUi {
     }
 }
 
+/// 连接被控端。`resume` / `host_key` / `pairing` 见 [`ConnectOptions`]
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn ctrl_connect(
     state: tauri::State<'_, AppState>,
     code: String,
     resume: Option<ResumeToken>,
+    host_key: Option<String>,
+    pairing: Option<String>,
     settings: QualitySettings,
     video: Channel<InvokeResponseBody>,
     events: Channel<SessionEvent>,
@@ -475,7 +546,12 @@ async fn ctrl_connect(
         clipboard: Box::new(clipboard::ClipSync::new()),
         sync: clipboard,
     };
-    svc.connect(&code, resume, settings, ui, frontend).await
+    let opts = ConnectOptions {
+        resume,
+        host_key,
+        pairing,
+    };
+    svc.connect(&code, opts, settings, ui, frontend).await
 }
 
 /// 对会话的操作（输入、画质、确认画面……），和网页版、Android 一样的 [`Command`]

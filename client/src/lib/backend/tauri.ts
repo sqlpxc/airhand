@@ -45,7 +45,7 @@ export function tauriBackend(): Backend {
     appInfo: () => invoke<AppInfo>("app_info"),
     serverStatus: () => invoke<ServerState>("server_status"),
     onServerStatus: (cb) => unlistenLater(listen<ServerState>("server-status", (e) => cb(e.payload))),
-    connect: async (code, resume, settings, sink, clipboard) => {
+    connect: async (code, opts, settings, sink, clipboard) => {
       let sid: number | null = null;
       let unacked: number | null = null;
       let closed = false;
@@ -72,7 +72,10 @@ export function tauriBackend(): Backend {
       };
       let info: SessionInfo;
       try {
-        info = await invoke<SessionInfo>("ctrl_connect", { code, resume, settings, video, events, clipboard });
+        const { resume, hostKey, pairing } = opts;
+        info = await invoke<SessionInfo>("ctrl_connect", {
+          code, resume, hostKey, pairing, settings, video, events, clipboard,
+        });
       } catch (e) {
         acks.dispose();
         throw e;

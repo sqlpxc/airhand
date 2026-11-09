@@ -118,8 +118,12 @@ pub(super) fn channel() -> (Sender, Receiver) {
     (Sender(shared.clone()), Receiver(shared))
 }
 
+/// 编码（明文，带长度前缀）；写任务加密时在后面追加认证标签，这里先留好位置
 fn encode(msg: &ControllerMsg) -> Result<Bytes, Problem> {
-    Ok(Bytes::from(framing::encode(msg).map_err(Problem::failed)?))
+    Ok(Bytes::from(framing::encode_with_spare(
+        msg,
+        airhand_proto::handshake::TAG_LEN,
+    )))
 }
 
 /// 一批输入，`t` 是现在（界面的输入都从这里进来）
@@ -276,7 +280,7 @@ mod tests {
     use std::time::Duration;
 
     fn decode(b: &Bytes) -> ControllerMsg {
-        framing::decode(&b[4..]).unwrap()
+        framing::decode_known(&b[4..]).unwrap()
     }
 
     fn queued(tx: &Sender) -> Vec<ControllerMsg> {

@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use airhand_link::controller::{
-    Command, ControllerService, Frontend, HostOnline, SessionEvent, SessionUi, UiClosed,
+    Command, ConnectOptions, ControllerService, Frontend, HostOnline, SessionEvent, SessionUi,
+    UiClosed,
 };
 use airhand_link::net::Report;
 use airhand_link::{Problem, ServerState};
@@ -86,6 +87,12 @@ enum Call {
         /// 重连凭证（上次连上时 connect 回复里的 resume），第一次连接时不带
         #[serde(default)]
         resume: Option<ResumeToken>,
+        /// 上次连上时记下的对方公钥（connect 回复里的 hostKey），见 `ConnectOptions`
+        #[serde(default)]
+        host_key: Option<String>,
+        /// 配对码（对方要求配对时）
+        #[serde(default)]
+        pairing: Option<String>,
         settings: QualitySettings,
         ch: u32,
     },
@@ -316,6 +323,7 @@ async fn run(socket: WebSocket, app: Arc<App>, peer: SocketAddr) {
         Handle::current(),
         report,
         host_online,
+        app.identity.clone(),
     ));
     let mut console = Console {
         app,
@@ -400,6 +408,8 @@ impl Console {
             Call::Connect {
                 code,
                 resume,
+                host_key,
+                pairing,
                 settings,
                 ch,
             } => {
@@ -415,8 +425,13 @@ impl Console {
                         ch,
                         out: out.clone(),
                     });
+                    let opts = ConnectOptions {
+                        resume,
+                        host_key,
+                        pairing,
+                    };
                     let r = svc
-                        .connect(&code, resume, settings, ui, Frontend::Browser)
+                        .connect(&code, opts, settings, ui, Frontend::Browser)
                         .await;
                     out.reply(req.id, r.and_then(to_value));
                 });
@@ -477,6 +492,8 @@ mod tests {
         let Call::Connect {
             code,
             resume,
+            host_key,
+            pairing,
             settings,
             ch,
         } = r.call
@@ -484,16 +501,22 @@ mod tests {
             panic!("{:?}", r.call)
         };
         assert_eq!((code.as_str(), ch, resume), ("123 456", 3, None));
+        assert_eq!((host_key, pairing), (None, None));
         assert_eq!((settings.fps, settings.codec), (60, Codec::AV1));
 
         // 重连：带上凭证
         let token = [7u8; 16];
         let r: Request = serde_json::from_value(json!({
             "id": 8, "cmd": "connect", "code": "123456", "ch": 4, "resume": token,
+            "hostKey": "ab".repeat(32), "pairing": "482913",
             "settings": { "fps": 30, "bitrate_kbps": 4000, "max_short": 0, "adaptive": false, "codec": "H264" }
         }))
         .unwrap();
         assert!(matches!(r.call, Call::Connect { resume: Some(t), .. } if t == token));
+        assert!(
+            matches!(r.call, Call::Connect { ref host_key, ref pairing, .. }
+                if host_key.as_deref() == Some(&"ab".repeat(32)[..]) && pairing.as_deref() == Some("482913"))
+        );
 
         // 不带 id：不回复
         let r: Request = serde_json::from_value(json!({

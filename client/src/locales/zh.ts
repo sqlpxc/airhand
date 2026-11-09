@@ -68,6 +68,9 @@ export default {
   "connect.code": "控制码",
   "connect.quality": "画质",
   "connect.clear": "清空",
+  "connect.pairing": "配对码",
+  "connect.pairingHint": "对方托盘菜单里的 6 位配对码。配对之后这台电脑记住本机，下次不用再输",
+  "connect.trustNew": "信任新的身份并连接",
   "connect.customQuality": "自定义画质",
 
   // 我的设备（新建连接页）
@@ -158,6 +161,10 @@ export default {
   "session.lost": "连接已断开",
   "session.ended": "会话已结束",
   "session.reconnect": "重新连接",
+  "session.trustNew": "信任新的身份并重新连接",
+  "session.pairAndReconnect": "配对并重新连接",
+  "session.safety": "安全码 {code}",
+  "session.safetyHint": "端到端加密。对方电脑的托盘里显示的安全码相同，就说明中间没有人",
   "session.close": "关闭",
   "session.reconnecting": "正在重新连接…",
   "session.connecting": "正在连接…",
@@ -255,6 +262,14 @@ export default {
   "problem.hostBusy": "对方当前会话数已满",
   "problem.serverTimeout": "服务器响应超时",
   "problem.hostOffline": "对方已离线",
+  // 端到端加密（见 Rust 的 airhand_proto::handshake）
+  "problem.hostKeyChanged":
+    "对方电脑的身份和上次连接时不一样：可能是对方重装了 Airhand，也可能有人在冒充它。确认是对方重装之后再选择信任新的身份",
+  "problem.pairingRequired": "第一次连接这台电脑，需要配对码：在对方电脑的 Airhand 托盘菜单里可以看到",
+  "problem.pairingFailed": "配对码不对，请核对对方托盘菜单里的配对码",
+  "problem.pairingUnavailable": "对方暂停了配对（有人多次输错配对码）：请对方在托盘菜单里换一个配对码",
+  "problem.peerIncompatible": (p) =>
+    Number(p.peer) > Number(p.ours) ? "与对方电脑的版本不兼容：对方较新，请更新本机的 Airhand" : "与对方电脑的版本不兼容：对方较旧，请对方更新 Airhand",
   // 会话
   "problem.hostEnded": "对方结束了会话",
   "problem.hostUnresponsive": "对方电脑无响应",

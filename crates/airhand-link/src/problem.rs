@@ -49,6 +49,19 @@ pub enum Problem {
     /// 对方暂时不在线（重连时才会遇到：服务器确认过是之前连上的那台），对方重新上线后自动重连
     HostOffline,
 
+    // ── 端到端握手（见 airhand_proto::handshake）──
+    /// 对方的身份（端到端加密的公钥）和之前记下的不一样：对方重装过、换了身份，或者有人在中间冒充它。
+    /// 不自动重连；用户确认之后忘掉记下的身份再连
+    HostKeyChanged,
+    /// 对方要求配对码：这台控制端还没和它配对过（配对码显示在对方的托盘菜单里）
+    PairingRequired,
+    /// 配对码不对
+    PairingFailed,
+    /// 对方现在不接受配对（有人多次输错了配对码，要对方的用户换一个配对码）
+    PairingUnavailable,
+    /// 和对方的会话版本不兼容。`peer` 比 `ours` 大：要更新本机的 Airhand；否则要对方更新
+    PeerIncompatible { peer: u16, ours: u16 },
+
     // ── 会话 ──
     /// 被控端结束了会话（会话流关闭）
     HostEnded,
@@ -98,11 +111,20 @@ impl Problem {
         matches!(self, Problem::Incompatible { .. })
     }
 
-    /// 对方有意结束（或者对方的用户没有同意）的会话，不应该自动重连
+    /// 对方有意结束（或者对方的用户没有同意）的会话，或者要用户来决定的问题（身份变了、要配对码……），
+    /// 不应该自动重连
     pub fn is_final(&self) -> bool {
         matches!(
             self,
-            Problem::Kicked | Problem::CodeChanged | Problem::Declined | Problem::Unanswered
+            Problem::Kicked
+                | Problem::CodeChanged
+                | Problem::Declined
+                | Problem::Unanswered
+                | Problem::HostKeyChanged
+                | Problem::PairingRequired
+                | Problem::PairingFailed
+                | Problem::PairingUnavailable
+                | Problem::PeerIncompatible { .. }
         )
     }
 }
@@ -130,6 +152,18 @@ impl fmt::Display for Problem {
             Problem::HostBusy => f.write_str("the host has reached its session limit"),
             Problem::ServerTimeout => f.write_str("the server didn't answer in time"),
             Problem::HostOffline => f.write_str("the host is offline, waiting for it to come back"),
+            Problem::HostKeyChanged => f.write_str(
+                "the host's identity changed (it was reinstalled, or someone is impersonating it)",
+            ),
+            Problem::PairingRequired => f.write_str("the host requires a pairing code"),
+            Problem::PairingFailed => f.write_str("wrong pairing code"),
+            Problem::PairingUnavailable => {
+                f.write_str("the host doesn't accept pairing right now (too many wrong codes)")
+            }
+            Problem::PeerIncompatible { peer, ours } => write!(
+                f,
+                "incompatible session protocol (host {peer}, this computer {ours})"
+            ),
             Problem::HostEnded => f.write_str("the host ended the session"),
             Problem::HostUnresponsive => f.write_str("the host stopped responding"),
             Problem::Kicked => f.write_str("the user at the host disconnected all controllers"),
@@ -168,6 +202,7 @@ impl From<ByeReason> for Problem {
             ByeReason::CodeChanged => Problem::CodeChanged,
             ByeReason::Declined => Problem::Declined,
             ByeReason::Unanswered => Problem::Unanswered,
+            ByeReason::Other => Problem::HostEnded,
         }
     }
 }
@@ -195,6 +230,14 @@ mod tests {
         assert_eq!(
             v(&Problem::NoClipboardText),
             json!({ "kind": "noClipboardText" })
+        );
+        assert_eq!(
+            v(&Problem::HostKeyChanged),
+            json!({ "kind": "hostKeyChanged" })
+        );
+        assert_eq!(
+            v(&Problem::PeerIncompatible { peer: 2, ours: 1 }),
+            json!({ "kind": "peerIncompatible", "peer": 2, "ours": 1 })
         );
         let st = ServerState::Disconnected {
             reason: Problem::ServerLost {

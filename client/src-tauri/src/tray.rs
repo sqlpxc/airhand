@@ -267,10 +267,11 @@ fn host_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Resul
                 app,
                 "new_code",
                 tr!(
-                    "更换控制码（旧码立即失效）",
-                    "Change control code (old code stops working)"
+                    "更换控制码（旧码立即失效，配对也全部作废）",
+                    "Change control code (old code stops working, all pairings are revoked)"
                 ),
             )?)?;
+            pairing_items(app, menu, st)?;
         }
         if !st.host.controllers.is_empty() {
             menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -284,7 +285,16 @@ fn host_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Resul
                 } else {
                     c.peer.name.clone()
                 };
-                menu.append(&label(app, format!("    {name} ({})", c.peer.ip))?)?;
+                // 安全码：控制端显示的是同一个，两边的人可以对一下（见 airhand_proto::handshake）
+                let line = match &c.safety {
+                    Some(s) => tr!(
+                        "    {name} ({ip}) · 安全码 {s}",
+                        "    {name} ({ip}) · safety code {s}",
+                        ip = c.peer.ip
+                    ),
+                    None => format!("    {name} ({})", c.peer.ip),
+                };
+                menu.append(&label(app, line)?)?;
             }
             menu.append(&item(
                 app,
@@ -292,6 +302,51 @@ fn host_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Resul
                 tr!("断开所有控制端", "Disconnect all controllers"),
             )?)?;
         }
+    }
+    Ok(())
+}
+
+/// 配对（见 [`crate::host::gate`]）：配对码，暂停了的话提示换一个；配对过的控制端可以全部忘掉。
+/// 不要配对码（config.toml 的 `access = "open"`）时什么也不显示
+fn pairing_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Result<()> {
+    let Some(pairing) = &st.host.pairing else {
+        return Ok(());
+    };
+    if st.host.pairing_locked {
+        menu.append(&item(
+            app,
+            "new_pairing",
+            tr!(
+                "⚠ 有人多次输错配对码，配对已暂停（点击换一个配对码）",
+                "⚠ Pairing paused after too many wrong codes (click for a new pairing code)"
+            ),
+        )?)?;
+    } else {
+        let p = format!("{} {}", &pairing[..3], &pairing[3..]);
+        menu.append(&label(
+            app,
+            tr!(
+                "配对码：{p}（第一次连接本机时要输入）",
+                "Pairing code: {p} (needed the first time a controller connects)"
+            ),
+        )?)?;
+        menu.append(&item(app, "copy_pairing", tr!("复制配对码", "Copy pairing code"))?)?;
+        menu.append(&item(
+            app,
+            "new_pairing",
+            tr!("更换配对码", "Change pairing code"),
+        )?)?;
+    }
+    if st.host.paired > 0 {
+        let n = st.host.paired;
+        menu.append(&item(
+            app,
+            "forget_paired",
+            tr!(
+                "忘掉已配对的 {n} 个控制端（下次要重新输入配对码）",
+                "Forget {n} paired controller(s) (they'll need the pairing code again)"
+            ),
+        )?)?;
     }
     Ok(())
 }

@@ -11,11 +11,12 @@ flowchart LR
     ctrl["<b>控制端</b><br>桌面控制台 / 网页控制台 / Android<br><br>硬件解码（WebCodecs；Android 用 MediaCodec）<br>低延迟渲染<br>输入采集 + 本地光标<br>多会话 / 多屏总览<br>声音抖动缓冲播放"]
     host <-->|"QUIC / TLS 1.3<br>UDP 4433"| relay
     relay <-->|"QUIC / TLS 1.3<br>UDP 4433"| ctrl
+    host -. "端到端：Noise（X25519 + ChaCha20-Poly1305）" .- ctrl
 ```
 
 被控端各平台的具体实现见[下面的表](#被控端在各平台上的实现)。
 
-每条 QUIC 连接上的第一条双向流是**信令流**。每建立一个远控会话，双方各再开三条双向流（会话控制、视频、音频），服务器按会话 ID 和流类别配对，之后**只转发字节、不解析会话内容**。声音包平时不走音频流，而是一包一个 **QUIC 数据报**（开头是 8 字节的会话 ID）：服务器只看会话 ID，发送方是这个会话的一端就原样转给另一端（见 `crates/airhand-proto/src/lib.rs` 的 `datagram`）。这是协议 v9 的格式，服务器与所有客户端必须一起升级。三条流各自有序，跨流没有顺序保证；音画用采集时间同步。每条消息都是 `u32` 长度前缀加内容：信令和会话控制流上是 postcard 编码的消息；视频、音频流上是**媒体包**（24 字节定长头 + 码流 / Opus 包，见 `crates/airhand-proto/src/media.rs`），控制端只看一眼头，**原样**交给界面（WebView、浏览器、Android），不重新编码、不拷贝。控制端重连时带上连上时得到的重连凭证；被控端不在线时服务器记下它，被控端重新上线时发 `HostOnline` 通知（见 `crates/airhand-proto/src/signal.rs` 的“重连凭证”）。
+每条 QUIC 连接上的第一条双向流是**信令流**。每建立一个远控会话，双方各再开几条双向流（“通道”：会话控制、视频、音频），服务器按会话 ID 和通道编号配对，之后**只转发字节**。服务器不知道会话有几条通道、各是什么（只限制数量），以后加通道不用升级服务器；控制通道（0 号）结束，整个会话就结束。控制通道上先做**端到端握手**（Noise，见 `crates/airhand-proto/src/handshake.rs` 和[安全](security.zh-CN.md#端到端加密)），之后每条通道的每一帧、每个声音数据报都是密文（ChaCha20-Poly1305，每条通道每个方向一把密钥），服务器看不到、也改不了会话的内容。声音包平时不走音频流，而是一包一个 **QUIC 数据报**（开头是明文的 8 字节会话 ID，后面是密文）：服务器只看会话 ID，发送方是这个会话的一端就原样转给另一端（见 `crates/airhand-proto/src/lib.rs` 的 `datagram`）。每条通道各自有序，跨通道没有顺序保证；音画用采集时间同步。每条消息都是 `u32` 长度前缀加内容：信令和会话控制流上是带编号的 CBOR 消息（不认识的消息、字段跳过，见下面的[协议的演进](#协议的演进)）；视频、音频流上是**媒体包**（24 字节定长头 + 码流 / Opus 包，见 `crates/airhand-proto/src/media.rs`），控制端原地解密、看一眼头，**原样**交给界面（WebView、浏览器、Android），不重新编码、不多拷贝。控制端重连时带上连上时得到的重连凭证；被控端不在线时服务器记下它，被控端重新上线时发 `HostOnline` 通知（见 `crates/airhand-proto/src/signal.rs` 的“重连凭证”）。
 
 界面和控制端服务之间（Tauri 命令、网页版的 WebSocket、Android 的 JNI）用同一套 JSON：对会话的操作都是 `airhand_link::controller::Command`，会话事件都是 `SessionEvent`。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的协议样例（媒体包、输入事件、命令），TypeScript 和 Kotlin 的测试读同一个文件，三边的实现对不上测试就会失败。
 
@@ -23,7 +24,15 @@ flowchart LR
 
 **鼠标**平时用绝对坐标（本机指针在画面的哪里，被控端光标就在哪里）。被控端的光标隐藏时（例如游戏里按住右键转视角、第一人称游戏）改发相对移动：游戏这时自己把光标拉回原位、只看移动了多少，绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动）。被控端用真实鼠标的方式注入相对移动（Windows `SendInput`、macOS 带移动量的 `CGEvent`、X11 XTEST 相对移动）。控制台这时锁定本机指针（Pointer Lock，原始移动量），按 Esc 解除；也可以手动锁定（Ctrl+Alt+Shift+M 或工具栏）。Android 控制端的触控板滑动、触屏拖动发相对移动，外接鼠标被抓住（pointer capture）；菜单里也有“锁定鼠标”。macOS 被控端检测不到光标隐藏，玩游戏时手动锁定。
 
-会话控制流上控制端先报上本次运行的随机标识，被控端回 `Hello`（平台、能不能接收多点触摸、支持哪些系统操作），之后开始发画面。被控端也可以先回“等待同意”，请坐在它面前的人允许之后再发 `Hello`（Android 默认这样，见 `crates/airhand-proto/src/session.rs` 的模块说明）。
+会话控制流上两端先做端到端握手：互相确认身份（控制端只认记下的被控端公钥；被控端决定让不让这个控制端进来：配对过的、输对了配对码的，或者被控端允许任何人连），协商会话版本和能力位。之后被控端回 `Hello`（平台、能不能接收多点触摸、支持哪些系统操作），开始发画面。被控端也可以先回“等待同意”，请坐在它面前的人允许之后再发 `Hello`（Android 默认这样，同意过的控制端按公钥认出来，见 `crates/airhand-proto/src/session.rs` 的模块说明）。
+
+### 协议的演进
+
+- **两个版本**：信令版本（客户端 ⇄ 服务器，包括会话头和数据报的会话 ID）和会话版本（被控端 ⇄ 控制端，服务器从来不看）。都不要求相等：各自支持一个区间，取双方都支持的最高版本。服务器只检查信令版本，所以会话层的改动从来不用升级服务器；会话版本在加密的握手里协商
+- **版本握手的开头永远不变**：`ClientHello` / `ServerHello` 开头是 v9 之前的 postcard 编码（`version | role | name | os`、`Welcome { version }` / `Incompatible { server_version }`），新加的东西（版本区间、能力位）是跟在后面的 CBOR。旧的服务器和客户端不管后面多出来的字节，所以任何两个版本之间都能告诉对方“不兼容”（`version_handshake_prefix_is_frozen` 测试守着这一点）
+- **不认识的消息跳过，不断开**：消息是 minicbor 的 CBOR，每个变体、每个字段都有显式的编号。新版本才有的消息（或者里面新加的枚举变体）跳过；认识但解不出来的照样是错误。字段只能以 `Option` 的形式加；枚举的列表跳过不认识的元素（`open_vec`），单个枚举值不认识时用默认值（`or_default`）
+- **能力位**：版本握手和端到端握手里各带一组 `Features`（信令和会话两套编号）。只用双方都支持的，不认识的位不管，位永远不复用。设备的能力（触摸、编码器、显示器）是 `HostHello` 里的数据，不是能力位
+- 只有没法兼容的改动才加版本号
 
 网页控制台把右边的控制端拆成两半：QUIC 连接和会话管理在 `airhand-web`（容器）里，解码、渲染、输入采集仍在浏览器里，两者之间是一条 WebSocket。媒体包原样转发给浏览器（前面加 4 字节的会话编号），浏览器收到画面后回确认。
 
@@ -41,8 +50,8 @@ flowchart LR
 
 | 目录 | 内容 |
 |---|---|
-| `crates/airhand-proto` | 协议：信令、会话控制消息、媒体包、帧格式 |
-| `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，会话的三条流，与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接，`Problem`。桌面客户端、网页控制台和 Android 共用；`tests/protocol.json` 是三边共用的协议样例 |
+| `crates/airhand-proto` | 协议：信令和版本握手、端到端握手的消息、会话控制消息、媒体包、帧格式和兼容规则 |
+| `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，端到端加密（`secure`：身份、Noise 握手、每条通道的加密），会话的几条流，与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接，`Problem`。桌面客户端、网页控制台和 Android 共用；`tests/protocol.json` 是三边共用的协议样例 |
 | `server/` | 中转服务器（quinn + rustls）及其 `Dockerfile` |
 | `web/` | 网页控制台服务（axum：静态网页 + WebSocket，HTTP / HTTPS 同一端口）及其 `Dockerfile`、`docker-compose.yml`。和 `client/src-tauri/` 一样是独立的 Cargo 工作区 |
 | `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`、托盘、控制台窗口和命令 |

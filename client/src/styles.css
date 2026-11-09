@@ -1033,6 +1033,29 @@ kbd {
 .code-inputs.invalid .code-box.filled:not(:focus) {
   border-color: rgba(255, 93, 108, 0.45);
 }
+/* 配对码：对方要求配对时才出现 */
+.pairing-input {
+  width: 100%;
+  height: 44px;
+  border-radius: 11px;
+  border: 1.5px solid var(--line-2);
+  background: var(--well);
+  color: var(--text);
+  font: inherit;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: 0.3em;
+  text-align: center;
+  outline: none;
+  font-variant-numeric: tabular-nums;
+}
+.pairing-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(91, 124, 255, 0.18);
+}
+.pairing-input.invalid:not(:focus) {
+  border-color: rgba(255, 93, 108, 0.45);
+}
 .segmented.presets button {
   padding: 7px 4px;
 }

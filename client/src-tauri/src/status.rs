@@ -60,6 +60,15 @@ pub struct HostStatus {
     pub code: Option<u32>,
     /// 正在控制本机的控制端
     pub controllers: Vec<Controller>,
+    /// 配对码（6 位数字，见 `airhand_proto::handshake` 的"配对"）。`None`：不要配对码（config.toml 的 `access = "open"`）
+    #[serde(default)]
+    pub pairing: Option<String>,
+    /// 有人多次输错配对码，配对暂停了：本机用户换一个配对码才恢复
+    #[serde(default)]
+    pub pairing_locked: bool,
+    /// 配对过的控制端有几个
+    #[serde(default)]
+    pub paired: usize,
 }
 
 impl Default for HostStatus {
@@ -68,6 +77,9 @@ impl Default for HostStatus {
             server: ServerState::Connecting,
             code: None,
             controllers: Vec::new(),
+            pairing: None,
+            pairing_locked: false,
+            paired: 0,
         }
     }
 }
@@ -89,6 +101,9 @@ pub struct ServiceStatus {
 pub struct Controller {
     pub session_id: u64,
     pub peer: Peer,
+    /// 端到端握手之后才有：安全码（控制端显示的是同一个，见 `airhand_proto::handshake`）
+    #[serde(default)]
+    pub safety: Option<String>,
 }
 
 pub type StatusHub = Arc<watch::Sender<AppStatus>>;

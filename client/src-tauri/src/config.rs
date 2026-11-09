@@ -20,6 +20,9 @@
 //!   控制码、开机自动启动、我的设备、记下的服务器指纹从删掉之前的内容接着用，不会丢。
 //! * 没有设置服务器证书指纹时，第一次连上服务器时记下它的指纹（`[server_trust]`，见 [`FileTrust`]），
 //!   之后证书变了就拒绝连接。
+//! * 端到端加密（见 `airhand_proto::handshake`）：本机作为被控端的身份密钥和配对码（`[host]`）、配对过的控制端
+//!   （`[[paired]]`）、控制台的身份密钥（`[controller]`，Windows 上每个账户一把），也都在这个文件里，
+//!   密钥和配对码加密保存（见 [`secret`]）。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -27,6 +30,7 @@ use std::time::Duration;
 
 use airhand_link::LinkConfig;
 use airhand_link::net::{MemoryTrust, Trust, TrustStore, format_fingerprint, parse_fingerprint};
+use airhand_link::secure::{Access, Identity};
 use airhand_proto::signal::Reclaim;
 use anyhow::Result;
 use toml_edit::{DocumentMut, Item};
@@ -97,6 +101,8 @@ pub struct Settings {
     pub server_fp: String,
     /// 开机自动启动（`autostart`，Windows 安装版）。macOS 上以系统设置为准，这一项只是记录（见 [`autostart_default_pending`]）
     pub autostart: bool,
+    /// 没配对过的控制端怎么办（`access`）：要配对码（默认），或者知道控制码就能连
+    pub access: Access,
     /// 服务器分配的控制码和加密过的密钥（`[code]`），用 [`Settings::code`] 解开
     saved_code: Option<(i64, String)>,
 }
@@ -107,6 +113,7 @@ impl Default for Settings {
             server: DEFAULT_SERVER.to_string(),
             server_fp: DEFAULT_SERVER_FP.to_string(),
             autostart: true,
+            access: Access::Pairing,
             saved_code: None,
         }
     }
@@ -210,6 +217,17 @@ fn parse(text: &str) -> Result<Settings> {
     }
     if let Some(v) = doc.get("autostart").and_then(|v| v.as_bool()) {
         s.autostart = v;
+    }
+    // 只有写明了 "open" 才不要配对码：写错了的按更安全的来
+    if let Some(v) = doc.get("access").and_then(|v| v.as_str()) {
+        s.access = match v.trim() {
+            "open" => Access::Open,
+            "pairing" => Access::Pairing,
+            other => {
+                warn!("config.toml: unknown access {other:?}, using \"pairing\"");
+                Access::Pairing
+            }
+        };
     }
     if let Some(t) = doc.get("code").and_then(|v| v.as_table_like()) {
         let code = t.get("code").and_then(|v| v.as_integer());
@@ -334,6 +352,7 @@ fn template() -> String {
 /// Windows 的模板：文件在安装目录里，由系统服务维护
 #[cfg(windows)]
 fn template_windows(server: &str, fp: &str) -> String {
+    let access = access_comment();
     tr!(
         r#"# Airhand 配置文件。修改后要重新启动 Airhand 才生效（托盘菜单"退出"，然后再打开 Airhand）。
 # 这个文件由 Airhand 维护（保存控制码、开机自动启动、控制台的"我的设备"），手动修改的内容和注释都会保留。
@@ -345,6 +364,8 @@ fn template_windows(server: &str, fp: &str) -> String {
 # 中转服务器证书的 SHA-256 指纹（服务器日志里打印的 64 位十六进制，可以用 : 或空格分隔）。
 # 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
+
+{access}
 
 # 开机自动启动：开机后被控端服务自动运行（登录之前也能被控制），登录后显示托盘图标。托盘菜单里也可以切换
 autostart = true
@@ -365,6 +386,8 @@ autostart = true
 # "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
 
+{access}
+
 # Start with Windows: the host service runs after boot (the computer can be controlled before anyone signs in),
 # and the tray icon shows up after signing in. Can also be changed in the tray menu
 autostart = true
@@ -380,6 +403,7 @@ autostart = true
 /// macOS / Linux 的模板：文件在用户自己的目录里，没有开机自动启动
 #[cfg(not(windows))]
 fn template_user(server: &str, fp: &str) -> String {
+    let access = access_comment();
     let quit = if cfg!(target_os = "macos") {
         tr!("菜单栏图标的菜单里选\"退出\"", "\"Quit\" in the menu bar icon's menu")
     } else {
@@ -398,6 +422,8 @@ fn template_user(server: &str, fp: &str) -> String {
 # 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
 
+{access}
+
 # 本机的控制码：第一次连上服务器时由服务器分配，之后一直使用同一个（重启、掉线、升级都不变）。
 # 菜单里"更换控制码"会换一个新的；删掉 code 和 secret 则下次启动时重新分配。
 # secret 是取回这个控制码的凭据
@@ -415,11 +441,21 @@ fn template_user(server: &str, fp: &str) -> String {
 # "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
 
+{access}
+
 # This computer's control code: assigned by the server the first time, then always the same (across restarts, disconnects and upgrades).
 # "Change control code" in the menu gets a new one; delete code and secret to get a new one at the next start.
 # secret proves to the server that this computer owns the code
 [code]
 "#
+    )
+}
+
+/// 模板里 `access` 的说明
+fn access_comment() -> String {
+    tr!(
+        "# 没配对过的控制端能不能连本机。会话是端到端加密的，中转服务器看不到画面和键盘输入，但它知道所有控制码：\n#   \"pairing\"：第一次连接时要输入托盘菜单里的配对码（配对码不经过服务器），配对之后记住它（默认）；\n#   \"open\"：知道控制码就能连。服务器也知道控制码，所以这等于信任中转服务器\n# access = \"pairing\"",
+        "# Whether controllers that haven't paired with this computer may connect. Sessions are end-to-end encrypted, so the relay server can't see the screen or keystrokes, but it does know every control code:\n#   \"pairing\": the first connection needs the pairing code shown in the tray menu (it never goes through the server); paired controllers are remembered (default);\n#   \"open\": the control code alone is enough. The server knows it too, so this means trusting the relay server\n# access = \"pairing\""
     )
 }
 
@@ -477,6 +513,15 @@ fn regenerate(before: Option<&str>) -> Result<DocumentMut> {
         Some((server, fp))
     }) {
         put_trust(&mut doc, &server, &fp);
+    }
+    // 端到端加密的身份、配对码、配对过的控制端：丢了的话控制端会认为本机"身份变了"，配对过的也要重新配对
+    for key in ["host", "controller"] {
+        if let Some(item) = old.get(key).filter(|i| i.is_table()) {
+            doc[key] = item.clone();
+        }
+    }
+    if let Some(item) = old.get("paired").filter(|i| i.is_array_of_tables()) {
+        doc["paired"] = item.clone();
     }
     // 设备写在最后，前面有自己的说明
     if let Some(item) = old.get("device").filter(|i| i.is_array_of_tables()) {
@@ -739,7 +784,240 @@ fn put_devices(doc: &mut DocumentMut, list: &[crate::devices::Device]) {
     }
 }
 
-/// 加密保存的东西：取回控制码用的密钥、"我的设备"里的控制码。
+// ───────────────────────────── 端到端加密的身份和配对 ─────────────────────────────
+
+/// 配对过的一个控制端（`[[paired]]`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paired {
+    /// 公钥（64 位十六进制）
+    pub key: String,
+    /// 它配对时报的名称
+    pub name: String,
+    /// 配对的时间（Unix 毫秒）
+    pub since: i64,
+}
+
+/// 本机作为被控端的端到端状态（`[host]` 和 `[[paired]]`）
+#[derive(Debug, Default)]
+pub struct HostSecurity {
+    /// 身份密钥（私钥）；没有、解不开时为 `None`
+    pub key: Option<[u8; 32]>,
+    /// 配对码
+    pub pairing: Option<String>,
+    /// 有人连续输错配对码，暂停了配对（本机用户换一个配对码才恢复）
+    pub pairing_locked: bool,
+    pub paired: Vec<Paired>,
+}
+
+/// 写在 `[host]` 前面的说明
+fn host_comment() -> String {
+    tr!(
+        "# 本机作为被控端的端到端加密身份（key）和配对码（pairing），由 Airhand 维护，都是加密保存的。\n# 删掉 key 会生成新的身份：连过本机的控制端会提示本机的身份变了\n",
+        "# This computer's end-to-end encryption identity as a host (key) and its pairing code (pairing). Maintained by Airhand, stored encrypted.\n# Deleting key creates a new identity: controllers that connected before will warn that this computer's identity changed\n"
+    )
+}
+
+/// 写在第一个 `[[paired]]` 前面的说明
+fn paired_comment() -> String {
+    tr!(
+        "# 配对过的控制端（它们的公钥）：不用配对码就能连本机。删掉一项就是忘掉那个控制端\n",
+        "# Paired controllers (their public keys): they can connect without the pairing code. Delete an entry to forget that controller\n"
+    )
+}
+
+/// 本机作为被控端的端到端状态（每次重新读文件）。密钥解不开（例如配置文件是从别的电脑拷来的）当作没有
+pub fn host_security() -> HostSecurity {
+    let Some(doc) = read_text().and_then(|t| t.parse::<DocumentMut>().ok()) else {
+        return HostSecurity::default();
+    };
+    host_security_in(&doc)
+}
+
+fn host_security_in(doc: &DocumentMut) -> HostSecurity {
+    let mut s = HostSecurity::default();
+    if let Some(t) = doc.get("host").and_then(Item::as_table_like) {
+        let open = |k: &str, kind| {
+            let text = t.get(k)?.as_str()?;
+            match secret::open_bytes(text, kind) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    warn!("config.toml: can't read [host] {k} ({e:#})");
+                    None
+                }
+            }
+        };
+        s.key = open("key", secret::Kind::HostKey).and_then(|b| <[u8; 32]>::try_from(b).ok());
+        s.pairing = open("pairing", secret::Kind::Pairing)
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|p| airhand_proto::parse_pairing(&p));
+        s.pairing_locked = t
+            .get("pairing_locked")
+            .and_then(Item::as_bool)
+            .unwrap_or(false);
+    }
+    if let Some(arr) = doc.get("paired").and_then(Item::as_array_of_tables) {
+        s.paired = arr
+            .iter()
+            .filter_map(|t| {
+                let key = t.get("key")?.as_str()?.trim().to_ascii_lowercase();
+                airhand_link::secure::unhex32(&key)?;
+                Some(Paired {
+                    key,
+                    name: t
+                        .get("name")
+                        .and_then(Item::as_str)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(64)
+                        .collect(),
+                    since: match t.get("since") {
+                        Some(Item::Value(toml_edit::Value::Datetime(d))) => {
+                            crate::devices::to_millis(d.value()).unwrap_or(0)
+                        }
+                        _ => 0,
+                    },
+                })
+            })
+            .collect();
+    }
+    s
+}
+
+/// 保存本机作为被控端的身份密钥
+pub fn save_host_key(key: &[u8; 32]) -> Result<()> {
+    let sealed = secret::seal_bytes(key, secret::Kind::HostKey)?;
+    edit(|doc| {
+        host_table(doc)?["key"] = toml_edit::value(sealed);
+        Ok(())
+    })
+}
+
+/// 保存配对码和它有没有暂停
+pub fn save_pairing(code: &str, locked: bool) -> Result<()> {
+    let sealed = secret::seal_bytes(code.as_bytes(), secret::Kind::Pairing)?;
+    edit(|doc| {
+        let t = host_table(doc)?;
+        t["pairing"] = toml_edit::value(sealed);
+        t["pairing_locked"] = toml_edit::value(locked);
+        Ok(())
+    })
+}
+
+/// 保存配对过的控制端（整个换掉）
+pub fn save_paired(list: &[Paired]) -> Result<()> {
+    edit(|doc| {
+        put_paired(doc, list);
+        Ok(())
+    })
+}
+
+fn put_paired(doc: &mut DocumentMut, list: &[Paired]) {
+    let mut arr = toml_edit::ArrayOfTables::new();
+    for p in list.iter().take(MAX_PAIRED) {
+        let mut t = toml_edit::Table::new();
+        t["key"] = toml_edit::value(&p.key);
+        t["name"] = toml_edit::value(&p.name);
+        if let Some(dt) = crate::devices::from_millis(p.since) {
+            t["since"] = toml_edit::value(dt);
+        }
+        arr.push(t);
+    }
+    if let Some(first) = arr.get_mut(0) {
+        first.decor_mut().set_prefix(format!("\n{}", paired_comment()));
+    }
+    doc.remove("paired");
+    if !arr.is_empty() {
+        doc.insert("paired", Item::ArrayOfTables(arr));
+    }
+}
+
+/// 最多记住这么多个配对过的控制端（再多就忘掉最早的）
+pub const MAX_PAIRED: usize = 64;
+
+fn host_table(doc: &mut DocumentMut) -> Result<&mut toml_edit::Table> {
+    let item = doc.entry("host").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.decor_mut().set_prefix(format!("\n{}", host_comment()));
+        Item::Table(t)
+    });
+    item.as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("`host` in config.toml must be a table"))
+}
+
+/// 控制台的身份（端到端握手里的静态密钥）：`[controller]` 里这个账户解得开的那一把。
+///
+/// Windows 上配置文件是所有账户共用的，每个账户一把，用各自的 DPAPI 加密（和我的设备里的控制码一样）。
+/// 没有就生成一把，返回要保存的那一项（加密过的）：调用方自己写进去（[`save_controller_key`]），
+/// Windows 安装版经命名管道交给服务里的被控端写
+pub fn controller_identity() -> (Identity, Option<String>) {
+    let doc = read_text().and_then(|t| t.parse::<DocumentMut>().ok());
+    let found = doc.as_ref().and_then(|doc| {
+        doc.get("controller")?
+            .get("keys")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .find_map(|s| secret::open_bytes(s, secret::Kind::ControllerKey).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    });
+    if let Some(k) = found {
+        return (Identity::from_private(k), None);
+    }
+    let id = Identity::generate();
+    let sealed = match secret::seal_bytes(id.private(), secret::Kind::ControllerKey) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("can't encrypt the console's identity ({e:#}), it's only kept until restart");
+            None
+        }
+    };
+    (id, sealed)
+}
+
+/// `[controller]` 里最多这么多把（Windows 上每个账户一把）
+const MAX_CONTROLLER_KEYS: usize = 32;
+
+/// 记下控制台的身份（[`controller_identity`] 返回的那一项）。别的账户的原样保留
+pub fn save_controller_key(sealed: &str) -> Result<()> {
+    let sealed = sealed.trim();
+    anyhow::ensure!(
+        !sealed.is_empty() && sealed.len() <= 1024 && !sealed.contains(['\n', '\r']),
+        "invalid controller key"
+    );
+    edit(|doc| {
+        let item = doc.entry("controller").or_insert_with(|| {
+            let mut t = toml_edit::Table::new();
+            t.decor_mut().set_prefix(format!("\n{}", controller_comment()));
+            Item::Table(t)
+        });
+        let t = item
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("`controller` in config.toml must be a table"))?;
+        let mut keys = t
+            .get("keys")
+            .and_then(Item::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !keys.iter().any(|v| v.as_str() == Some(sealed)) {
+            keys.push(sealed);
+        }
+        while keys.len() > MAX_CONTROLLER_KEYS {
+            keys.remove(0);
+        }
+        t["keys"] = toml_edit::value(keys);
+        Ok(())
+    })
+}
+
+/// 写在 `[controller]` 前面的说明
+fn controller_comment() -> String {
+    tr!(
+        "# 控制台的端到端加密身份（加密保存，Windows 上每个账户一把）。配对过的电脑靠它认出这个控制台；删掉了就要重新配对\n",
+        "# The console's end-to-end encryption identity (stored encrypted, one per account on Windows). Paired computers recognize this console by it; delete it and you'll have to pair again\n"
+    )
+}
+
+/// 加密保存的东西：取回控制码用的密钥、"我的设备"里的控制码、端到端加密的身份密钥和配对码。
 ///
 /// Windows：config.toml 在安装目录里，本机所有账户都能读，所以用 DPAPI 加密（只有同一个账户能解开：
 /// 被控端的密钥是 SYSTEM，设备的控制码是保存它的用户），配置文件被别人读到、拷走也没用。
@@ -753,6 +1031,48 @@ pub(crate) mod secret {
     const ENTROPY: &[u8] = b"airhand control code secret v1";
     #[cfg(windows)]
     const DEVICE_ENTROPY: &[u8] = b"airhand saved device code v1";
+
+    /// 端到端加密用到的密文：各用各的 DPAPI 熵，不能互相冒充
+    #[derive(Debug, Clone, Copy)]
+    pub enum Kind {
+        /// 本机作为被控端的身份密钥（Windows：SYSTEM 的 DPAPI）
+        HostKey,
+        /// 配对码（同上）
+        Pairing,
+        /// 控制台的身份密钥（Windows：用户的 DPAPI）
+        ControllerKey,
+    }
+
+    #[cfg(windows)]
+    fn entropy(kind: Kind) -> &'static [u8] {
+        match kind {
+            Kind::HostKey => b"airhand host identity v1",
+            Kind::Pairing => b"airhand pairing code v1",
+            Kind::ControllerKey => b"airhand console identity v1",
+        }
+    }
+
+    /// 加密保存一段字节（Windows：DPAPI；macOS / Linux：文件只有本账户能读，只是 base64）
+    pub fn seal_bytes(data: &[u8], kind: Kind) -> Result<String> {
+        #[cfg(windows)]
+        {
+            Ok(STANDARD.encode(dpapi(data, entropy(kind), true)?))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = kind;
+            Ok(STANDARD.encode(data))
+        }
+    }
+
+    pub fn open_bytes(text: &str, kind: Kind) -> Result<Vec<u8>> {
+        let raw = STANDARD.decode(text.trim())?;
+        #[cfg(windows)]
+        let raw = dpapi(&raw, entropy(kind), false)?;
+        #[cfg(not(windows))]
+        let _ = kind;
+        Ok(raw)
+    }
 
     pub fn seal(secret: &[u8; 16]) -> Result<String> {
         #[cfg(windows)]
@@ -952,7 +1272,46 @@ mod tests {
             resume: None,
             last_used: 1_762_597_230_000,
             quality: None,
+            host_key: None,
         }
+    }
+
+    /// 被控端的身份、配对码、配对过的控制端、控制台的身份：保存之后读得回来，文件被删掉重新生成时接着用
+    #[test]
+    fn security_state_roundtrip_and_survives_regeneration() {
+        let mut doc: DocumentMut = template().parse().unwrap();
+        let key = [9u8; 32];
+        host_table(&mut doc).unwrap()["key"] =
+            toml_edit::value(secret::seal_bytes(&key, secret::Kind::HostKey).unwrap());
+        let t = host_table(&mut doc).unwrap();
+        t["pairing"] = toml_edit::value(secret::seal_bytes(b"482913", secret::Kind::Pairing).unwrap());
+        t["pairing_locked"] = toml_edit::value(true);
+        let paired = vec![Paired {
+            key: "cd".repeat(32),
+            name: "DESIGN-PC".into(),
+            since: 1_762_597_230_000,
+        }];
+        put_paired(&mut doc, &paired);
+        let text = doc.to_string();
+        assert!(text.contains(&host_comment()));
+        assert!(text.contains(&paired_comment()));
+        let s = host_security_in(&text.parse().unwrap());
+        assert_eq!(s.key, Some(key));
+        assert_eq!(s.pairing.as_deref(), Some("482913"));
+        assert!(s.pairing_locked);
+        assert_eq!(s.paired, paired);
+        // 设置不受影响
+        assert_eq!(parse(&text).unwrap(), Settings::default());
+        // 文件被删掉之后重新生成：身份和配对都还在
+        let again = regenerate(Some(&text)).unwrap();
+        let s = host_security_in(&again);
+        assert_eq!(s.key, Some(key));
+        assert_eq!(s.paired, paired);
+
+        // access：只有写明了 open 才不要配对码
+        assert_eq!(parse("access = \"open\"").unwrap().access, Access::Open);
+        assert_eq!(parse("access = \"opne\"").unwrap().access, Access::Pairing);
+        assert_eq!(parse("").unwrap().access, Access::Pairing);
     }
 
     /// 我的设备写在 [code] 后面，带一段说明；再次保存时整个换掉，说明只有一份；删光了就没有 [[device]]

@@ -45,6 +45,7 @@ Environment variables (see `web/docker-compose.yml` and `web/.env.example`):
 | `AIRHAND_SERVER` | (required) | Relay server address `host:port` |
 | `AIRHAND_SERVER_FP` | empty | Relay certificate fingerprint. Empty means the relay's certificate is remembered on the first connection (`data/server-trust.txt`) and a different one is refused later; delete that file if the relay really gets a new certificate |
 | `AIRHAND_NAME` | `Airhand Web` | The name shown in the host's tray under who is controlling it |
+| `AIRHAND_WEB_IDENTITY` | `controller-key.txt` next to `AIRHAND_WEB_CERT` (`/data/controller-key.txt` in the image) | The web console's end-to-end identity (one private key shared by all tabs, file mode 600). Computers paired with the web console recognize it by this key; without a place to keep it the key lives in memory and every restart needs pairing again. End-to-end encryption ends at the web console, so the machine running it can see the picture (see [Security](security.md#end-to-end-encryption)) |
 | `AIRHAND_WEB_PASSWORD` | empty | Access password: the browser shows a login prompt, any user name works. Empty means anyone who can reach the port can use the console (connecting to a computer still needs its control code) |
 | `AIRHAND_WEB_PORT` | `8080` | Port published on the Docker host |
 | `AIRHAND_WEB_CERT_NAMES` | `localhost` | Names / IPs written into the generated HTTPS certificate (comma-separated). List the address you actually use if you want the OS to trust the certificate |

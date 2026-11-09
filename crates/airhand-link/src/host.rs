@@ -5,9 +5,10 @@
 //!
 //! * [`run`]：一直连着服务器（掉线自动重连，取回原来的控制码），每来一个控制端就调用 `session` 开始一个会话；
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
-//! * [`HostSession`]：会话的三条流。控制消息、画面包、声音包分别排进三个有界队列，各自的写任务把它们写进流
-//!   （声音包优先发成数据报）；控制端的消息由读任务交给 [`HostSession::incoming`]，过时的输入在这里换成
-//!   "释放所有按键"（见 [`InputClock`]）；
+//! * [`HostSession`]：会话的三条流。先在控制流上做端到端握手（[`crate::secure::respond`]）：让不让这个控制端进来
+//!   由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……）。之后控制消息、画面包、声音包分别排进
+//!   三个有界队列，各自的写任务把它们加密后写进流（声音包优先发成数据报）；控制端的消息由读任务解密后交给
+//!   [`HostSession::incoming`]，过时的输入在这里换成"释放所有按键"（见 [`InputClock`]）；
 //! * [`CursorCache`]：控制端缓存了哪些光标形状。
 
 use std::collections::hash_map::DefaultHasher;
@@ -16,24 +17,28 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use airhand_proto::framing::{self, read_msg, write_msg};
+use airhand_proto::framing::{self, Decoded, read_frame, read_msg, write_msg};
+use airhand_proto::handshake::{PublicKey, TAG_LEN};
 use airhand_proto::session::{
     ByeReason, CURSOR_SLOTS, ControllerMsg, CursorShape, CursorSlot, HostMsg, INPUT_MAX_AGE,
     InputEvent,
 };
 use airhand_proto::signal::{ClientMsg, Peer, Reclaim, ServerMsg};
-use airhand_proto::{MAX_CONTROL_MSG, MAX_SIGNAL_MSG, Role};
+use airhand_proto::{Features, MAX_CONTROL_MSG, MAX_SIGNAL_MSG, Role, SessionLane};
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use quinn::Connection;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::ServerState;
 use crate::net::{self, LinkConfig, Reconnect, Report};
+use crate::secure::{self, ResponderParams};
 use crate::tasks::OwnedTask;
 use crate::transport::{SessionStreams, open_session, write_audio, write_lane};
+
+pub use crate::secure::{Access, Admission, Gate};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -78,11 +83,23 @@ pub trait HostEvents: Send + Sync + 'static {
     fn kicked(&self, _cmd: HostCmd) {}
 }
 
+/// 有控制端要连进来（交给 `run` 的 `session`）
+pub struct Incoming {
+    pub conn: Connection,
+    pub session_id: u64,
+    /// 本机现在的控制码（配对时要用）
+    pub code: u32,
+    /// 服务器看到的控制端（名称是控制端自己报的，IP 是服务器看到的）
+    pub peer: Peer,
+    /// 本机用户断开所有控制端时收到原因：会话应发 Bye 然后结束
+    pub kick: watch::Receiver<ByeReason>,
+}
+
 /// 被控端服务：一直连着服务器，直到 future 被丢掉（丢掉时依次释放会话、QUIC 连接）。
 ///
 /// * `keep`：让服务器一直为本机保留控制码（被控端会保存控制码，见 `airhand_proto::signal` 的"固定控制码"）；
 /// * `reclaim`：上次保存的控制码，第一次连接就取回它；
-/// * `session`：开始一个会话。本机用户断开所有控制端时 `kick` 会收到原因，会话应发 Bye 然后结束。
+/// * `session`：开始一个会话（[`HostSession::open`]）。
 pub async fn run<E, S, F>(
     link: Arc<LinkConfig>,
     keep: bool,
@@ -92,7 +109,7 @@ pub async fn run<E, S, F>(
     mut cmds: mpsc::UnboundedReceiver<HostCmd>,
 ) where
     E: HostEvents,
-    S: Fn(Connection, u64, watch::Receiver<ByeReason>) -> F + Send + Sync + 'static,
+    S: Fn(Incoming) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let report: Report = {
@@ -132,7 +149,7 @@ async fn connect_once<E, S, F>(
 ) -> Result<()>
 where
     E: HostEvents,
-    S: Fn(Connection, u64, watch::Receiver<ByeReason>) -> F,
+    S: Fn(Incoming) -> F,
     F: Future<Output = ()> + Send + 'static,
 {
     let mut sig = net::connect_signal(link, Role::Host).await?;
@@ -204,7 +221,13 @@ where
                 Some(ServerMsg::Incoming { session_id, peer }) => {
                     info!(session_id, name = %peer.name, ip = %peer.ip, "controller wants to connect");
                     events.incoming(session_id, &peer);
-                    let run = session(sig.conn.clone(), session_id, kick_tx.subscribe());
+                    let run = session(Incoming {
+                        conn: sig.conn.clone(),
+                        session_id,
+                        code,
+                        peer,
+                        kick: kick_tx.subscribe(),
+                    });
                     sessions.spawn(async move {
                         run.await;
                         session_id
@@ -278,9 +301,9 @@ impl Control {
         Self(queue)
     }
 
-    /// 编码一条控制消息（带长度前缀）。同一条消息发给多个会话时只编码一次
+    /// 编码一条控制消息（带长度前缀，明文：写任务加密）。同一条消息发给多个会话时只编码一次
     pub fn encode(msg: &HostMsg) -> Bytes {
-        Bytes::from(framing::encode(msg).expect("control messages always encode"))
+        Bytes::from(framing::encode_with_spare(msg, TAG_LEN))
     }
 
     pub fn send(&self, msg: &HostMsg) -> Result<()> {
@@ -455,40 +478,115 @@ impl Writer {
     }
 }
 
+/// 端到端握手之后，被控端知道的这个控制端（见 [`crate::secure::respond`]）
+#[derive(Debug, Clone)]
+pub struct Admitted {
+    /// 控制端的公钥（它的身份）
+    pub key: PublicKey,
+    /// 控制端自己报的名称（空字符串表示不知道）和系统：在加密的握手里，服务器改不了
+    pub name: String,
+    pub os: String,
+    /// 安全码：控制端显示的是同一个，两边的人可以对一下（见 `airhand_proto::handshake`）
+    pub safety: String,
+    /// 为什么让它进来；[`Admission::NeedsApproval`] 时会话要先请本机用户同意
+    pub admission: Admission,
+    /// 选定的会话版本、双方都支持的会话能力位
+    pub version: u16,
+    pub features: Features,
+}
+
+/// 读一条控制端的消息（解密、解码）；对方版本新增的消息跳过。流在消息边界处结束时为 `None`
+async fn next_controller_msg(
+    recv: &mut quinn::RecvStream,
+    opener: &mut secure::FrameOpener,
+    buf: &mut Vec<u8>,
+) -> Result<Option<ControllerMsg>> {
+    loop {
+        if !read_frame(recv, MAX_CONTROL_MSG, buf).await? {
+            return Ok(None);
+        }
+        opener.open(buf)?;
+        match framing::decode(buf)? {
+            Decoded::Msg(m) => return Ok(Some(m)),
+            Decoded::Unknown => debug!("skipping a message from a newer controller"),
+        }
+    }
+}
+
 impl HostSession {
-    /// 打开会话的三条流。`video_queue` / `audio_queue`：画面、声音的发送队列有多长（满了由发送方决定丢弃还是等待）
+    /// 打开会话的三条流，在控制流上做端到端握手（让不让这个控制端进来由 `gate` 决定，拒绝时返回错误）。
+    /// `video_queue` / `audio_queue`：画面、声音的发送队列有多长（满了由发送方决定丢弃还是等待）
     pub async fn open(
-        conn: &Connection,
-        session_id: u64,
+        inc: &Incoming,
         video_queue: usize,
         audio_queue: usize,
-    ) -> Result<Self> {
+        gate: &dyn Gate,
+    ) -> Result<(Self, Admitted)> {
+        let session_id = inc.session_id;
         let SessionStreams {
-            control: (send, mut recv),
+            control: (mut send, mut recv),
             video: (video_send, _),
             audio: (audio_send, _),
-        } = open_session(conn, session_id, Role::Host).await?;
+        } = open_session(&inc.conn, session_id, Role::Host).await?;
+        let r = secure::respond(
+            &mut recv,
+            &mut send,
+            ResponderParams {
+                session_id,
+                code: inc.code,
+                gate,
+            },
+        )
+        .await?;
+        let admitted = Admitted {
+            key: r.secured.peer,
+            name: r.intro.name.chars().take(64).collect(),
+            os: r.intro.os.chars().take(64).collect(),
+            safety: r.secured.safety.clone(),
+            admission: r.admission,
+            version: r.version,
+            features: r.features,
+        };
+        info!(
+            session_id,
+            admission = ?admitted.admission,
+            controller = %secure::hex(&admitted.key),
+            safety = %admitted.safety,
+            "end-to-end session established"
+        );
+        let (video_sealer, audio_sealer, datagrams) = (
+            r.secured.sealer(SessionLane::Video),
+            r.secured.sealer(SessionLane::Audio),
+            r.secured.datagram_sealer(),
+        );
+        let mut opener = r.secured.opener(SessionLane::Control);
+        let control_sealer = r.sealer;
         let (ctl_tx, ctl_rx) = mpsc::channel(CONTROL_QUEUE);
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
-        let conn = conn.clone();
+        let conn = inc.conn.clone();
         let writer = OwnedTask(tokio::spawn(async move {
             tokio::try_join!(
-                write_lane(send, ctl_rx),
-                write_lane(video_send, video_rx),
-                write_audio(conn, session_id, audio_send, audio_rx)
+                write_lane(send, ctl_rx, control_sealer),
+                write_lane(video_send, video_rx, video_sealer),
+                write_audio(
+                    conn,
+                    session_id,
+                    audio_send,
+                    audio_rx,
+                    audio_sealer,
+                    datagrams
+                )
             )
         }));
-        // 读任务：read_msg 不是取消安全的，单独放在一个任务里，通过通道交给会话
+        // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话
         let (in_tx, incoming) = mpsc::channel(64);
         let reader = OwnedTask(tokio::spawn(async move {
             let mut buf = Vec::with_capacity(1024);
             let mut clock = InputClock::default();
             // 这一串过时的输入已经换成了一个"释放所有按键"
             let mut released = false;
-            while let Some(m) =
-                read_msg::<_, ControllerMsg>(&mut recv, MAX_CONTROL_MSG, &mut buf).await?
-            {
+            while let Some(m) = next_controller_msg(&mut recv, &mut opener, &mut buf).await? {
                 let m = match m {
                     ControllerMsg::Ping { t } => {
                         clock.stale(t, Instant::now());
@@ -518,14 +616,17 @@ impl HostSession {
             }
             Ok(())
         }));
-        Ok(Self {
-            ctl: Control(ctl_tx),
-            video: video_tx,
-            audio: audio_tx,
-            incoming,
-            writer: Writer(writer),
-            reader,
-        })
+        Ok((
+            Self {
+                ctl: Control(ctl_tx),
+                video: video_tx,
+                audio: audio_tx,
+                incoming,
+                writer: Writer(writer),
+                reader,
+            },
+            admitted,
+        ))
     }
 
     /// 结束会话：等写任务把排好队的数据（例如 Bye）发完（最多 1 秒），返回会话的结果

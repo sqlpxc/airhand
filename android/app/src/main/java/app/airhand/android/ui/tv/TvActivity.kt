@@ -119,6 +119,9 @@ private fun TvHome(onSettings: () -> Unit) {
     val firstKey = remember { FocusRequester() }
     var opened by remember { mutableStateOf<RemoteSession?>(null) }
     var deleting by remember { mutableStateOf<SavedDevice?>(null) }
+    // 对方要配对码：数字键盘输入的是这个控制码的配对码；对方的身份变了：问用户要不要信任新的身份
+    var pairingFor by remember { mutableStateOf<String?>(null) }
+    var trustFor by remember { mutableStateOf<String?>(null) }
     // 每台设备卡片的焦点：删掉一台之后把焦点放到旁边那一台上（不然焦点丢了，遥控器按不动）
     val cardFocus = remember { HashMap<String, FocusRequester>() }
     var refocus by remember { mutableStateOf<String?>(null) }
@@ -133,6 +136,11 @@ private fun TvHome(onSettings: () -> Unit) {
             }
             is RemoteSession.Phase.Failed -> {
                 error = Messages.problem(ctx, phase.reason)
+                if (phase.reason.needsPairing) {
+                    pairingFor = s.code
+                    code = ""
+                }
+                if (phase.reason.kind == "hostKeyChanged") trustFor = s.code
                 app.endSession(s)
             }
             else -> {}
@@ -144,6 +152,15 @@ private fun TvHome(onSettings: () -> Unit) {
     val waitingCode = session?.code.takeIf { phase is RemoteSession.Phase.WaitingHost }
 
     fun connect(c: String) {
+        // 输入的是配对码：带着它连刚才那台
+        pairingFor?.let { target ->
+            if (c.length != 6) return
+            pairingFor = null
+            error = null
+            code = ""
+            app.startSession(target, viewOnly = true, pairing = c)
+            return
+        }
         val parsed = Code.parse(c) ?: run {
             error = ctx.getString(R.string.problem_invalid_code)
             return
@@ -160,6 +177,12 @@ private fun TvHome(onSettings: () -> Unit) {
     }
 
     BackHandler(enabled = session != null && (busy || waitingCode != null)) { app.endSession() }
+    // 在输配对码：返回键放弃，变回输控制码
+    BackHandler(enabled = pairingFor != null && session == null) {
+        pairingFor = null
+        code = ""
+        error = null
+    }
 
     fun delete(d: SavedDevice) {
         val i = devices.indexOfFirst { it.code == d.code }
@@ -211,9 +234,16 @@ private fun TvHome(onSettings: () -> Unit) {
                 ServerPill(server)
             }
             Spacer(Modifier.height(20.dp))
-            Text(stringResource(R.string.tv_enter_code), style = MaterialTheme.typography.titleLarge)
+            Text(
+                stringResource(if (pairingFor != null) R.string.pairing_title else R.string.tv_enter_code),
+                style = MaterialTheme.typography.titleLarge,
+            )
             Spacer(Modifier.height(2.dp))
-            Text(stringResource(R.string.tv_enter_code_hint), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+            Text(
+                stringResource(if (pairingFor != null) R.string.pairing_hint else R.string.tv_enter_code_hint),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
             Spacer(Modifier.height(14.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 for (i in 0 until 6) {
@@ -316,6 +346,34 @@ private fun TvHome(onSettings: () -> Unit) {
                 ) { Text(stringResource(R.string.delete), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text(stringResource(R.string.cancel)) } },
+        )
+        LaunchedEffect(Unit) {
+            delay(100)
+            runCatching { focus.requestFocus() }
+        }
+    }
+
+    // 对方的身份变了：用户确认是对方重装了才信任新的身份（也可能是有人在冒充它）
+    trustFor?.let { target ->
+        val focus = remember { FocusRequester() }
+        AlertDialog(
+            onDismissRequest = { trustFor = null },
+            title = { Text(stringResource(R.string.trust_new_title)) },
+            text = { Text(stringResource(R.string.problem_host_key_changed)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        trustFor = null
+                        error = null
+                        app.startSession(target, viewOnly = true, trustNew = true)
+                    },
+                ) { Text(stringResource(R.string.trust_new_confirm), color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { trustFor = null }, modifier = Modifier.focusRequester(focus)) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
         )
         LaunchedEffect(Unit) {
             delay(100)

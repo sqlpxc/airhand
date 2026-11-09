@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_link::ServerState;
-use airhand_link::host::{Control, HostCmd, HostEvents};
+use airhand_link::host::{Access, Control, Gate, HostCmd, HostEvents};
+use airhand_link::secure::Identity;
+use airhand_proto::handshake::PublicKey;
 use airhand_proto::session::{Codec, DisplayInfo, EncoderInfo, HostMsg, Notice, SystemAction};
 use airhand_proto::signal::{Peer, Reclaim};
 use anyhow::Result;
@@ -123,8 +125,11 @@ pub(crate) struct Shared {
     approval: AtomicBool,
     /// 正在问本机用户的会话：回答从这里交给会话
     pending: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
-    /// 这次共享里本机用户同意过的控制端（`ControllerHello::device`）：断线重连时不再问
-    trusted: Mutex<HashSet<[u8; 16]>>,
+    /// 这次共享里本机用户同意过的控制端（它们在端到端握手里的公钥）：断线重连时不再问。
+    /// 公钥是加密握手认证过的，服务器冒充不了（以前用的是明文的设备标识，服务器看得见、能照抄）
+    trusted: Mutex<HashSet<PublicKey>>,
+    /// 本机的端到端加密身份
+    identity: Identity,
 }
 
 fn as_string<S: serde::Serializer>(v: &u64, s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -137,8 +142,11 @@ pub(crate) struct ControllerView {
     /// 会话 id。是随机的 u64，转成字符串（Kotlin 的 JSON 解析会把超过 Long 的数字变成浮点数）
     #[serde(serialize_with = "as_string")]
     id: u64,
-    name: String,
+    /// 端到端握手之后是控制端在加密握手里报的名称（之前是服务器转来的）
+    pub name: String,
     ip: String,
+    /// 安全码：控制端显示的是同一个，请本机用户同意时一起显示（见 `airhand_proto::handshake`）。握手之前为 null
+    pub safety: Option<String>,
     /// 在等本机用户同意
     pub pending: bool,
     /// 已经开始（看得到画面）
@@ -181,13 +189,37 @@ impl Shared {
         self.pending.lock().unwrap().remove(&id)
     }
 
-    pub fn is_trusted(&self, device: &[u8; 16]) -> bool {
-        self.trusted.lock().unwrap().contains(device)
+    /// 本机用户同意了这个控制端：这次共享里它断线重连不再问
+    pub fn trust(&self, key: PublicKey) {
+        self.trusted.lock().unwrap().insert(key);
+    }
+}
+
+/// 手机不用配对码：没见过的控制端请本机用户同意（同意之后这次共享里记住它），或者知道控制码就能连（关掉了"先请我同意"）
+impl Gate for Shared {
+    fn identity(&self) -> Identity {
+        self.identity.clone()
     }
 
-    pub fn trust(&self, device: [u8; 16]) {
-        self.trusted.lock().unwrap().insert(device);
+    fn access(&self) -> Access {
+        if self.approval_required() {
+            Access::Approval
+        } else {
+            Access::Open
+        }
     }
+
+    fn pairing_code(&self) -> Option<String> {
+        None
+    }
+
+    fn pairing_failed(&self) {}
+
+    fn is_known(&self, key: &PublicKey) -> bool {
+        self.trusted.lock().unwrap().contains(key)
+    }
+
+    fn paired(&self, _: PublicKey, _: &str) {}
 }
 
 pub struct Host {
@@ -200,6 +232,7 @@ impl Host {
     pub fn start(cfg: HostConfig) -> Result<Arc<Host>> {
         let events = Arc::new(Queue::new(1024));
         let link = Arc::new(cfg.link.link(events.clone())?);
+        let identity = cfg.link.identity(&events);
         let (broadcast, _) = broadcast::channel(32);
         let shared = Arc::new(Shared {
             info: Mutex::new(Info {
@@ -222,6 +255,7 @@ impl Host {
             approval: AtomicBool::new(cfg.approval),
             pending: Mutex::default(),
             trusted: Mutex::default(),
+            identity,
         });
         let reclaim = cfg.reclaim.and_then(|s| {
             Some(Reclaim {
@@ -236,10 +270,10 @@ impl Host {
             true,
             reclaim,
             shared.clone(),
-            move |conn, session_id, kick| {
+            move |inc| {
                 let sh = sh.clone();
                 async move {
-                    let _ = session::run(conn, session_id, kick, sh).await;
+                    let _ = session::run(inc, sh).await;
                 }
             },
             rx,
@@ -354,6 +388,7 @@ impl HostEvents for Shared {
             id: session_id,
             name: peer.name.clone(),
             ip: peer.ip.to_string(),
+            safety: None,
             pending: false,
             active: false,
         });
@@ -389,12 +424,13 @@ mod tests {
             id: u64::MAX,
             name: "PC".into(),
             ip: "1.2.3.4".into(),
+            safety: Some("482-913".into()),
             pending: true,
             active: false,
         };
         assert_eq!(
             serde_json::to_value(&v).unwrap(),
-            json!({ "id": "18446744073709551615", "name": "PC", "ip": "1.2.3.4", "pending": true, "active": false })
+            json!({ "id": "18446744073709551615", "name": "PC", "ip": "1.2.3.4", "safety": "482-913", "pending": true, "active": false })
         );
     }
 

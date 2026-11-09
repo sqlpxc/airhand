@@ -153,6 +153,7 @@ fun SessionStatus(session: RemoteSession, big: Boolean, onExit: () -> Unit): Boo
     val phase by session.phase.collectAsState()
     val video by session.videoSize.collectAsState()
     val name by session.hostName.collectAsState()
+    val safety by session.safety.collectAsState()
     val who = name.ifBlank { Code.format(session.code) }
     LaunchedEffect(phase) { if (phase is RemoteSession.Phase.Closed) onExit() }
 
@@ -160,7 +161,15 @@ fun SessionStatus(session: RemoteSession, big: Boolean, onExit: () -> Unit): Boo
 
     val st: St? = when (val p = phase) {
         RemoteSession.Phase.Connecting -> St(true, ctx.getString(R.string.session_connecting, who), null, false, false, true)
-        RemoteSession.Phase.Approving -> St(true, ctx.getString(R.string.approving_title, who), ctx.getString(R.string.approving_text), false, false, true)
+        // 安全码：对方在请它的用户同意时显示的是同一个，两边可以对一下
+        RemoteSession.Phase.Approving -> St(
+            true,
+            ctx.getString(R.string.approving_title, who),
+            ctx.getString(R.string.approving_text) + (safety?.let { "\n" + ctx.getString(R.string.session_safety, it) } ?: ""),
+            false,
+            false,
+            true,
+        )
         RemoteSession.Phase.Live -> if (video == null) St(true, ctx.getString(R.string.session_waiting_video), null, false, false, false) else null
         is RemoteSession.Phase.Reconnecting -> St(true, ctx.getString(R.string.session_reconnecting), Messages.problem(ctx, p.reason), false, false, true)
         is RemoteSession.Phase.WaitingHost -> St(true, ctx.getString(R.string.session_waiting_host, who), ctx.getString(R.string.session_waiting_host_detail), true, false, true)

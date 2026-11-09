@@ -36,6 +36,12 @@ object Messages {
         "hostBusy" -> R.string.problem_host_busy
         "serverTimeout" -> R.string.problem_server_timeout
         "hostOffline" -> R.string.problem_host_offline
+        "hostKeyChanged" -> R.string.problem_host_key_changed
+        "pairingRequired" -> R.string.problem_pairing_required
+        "pairingFailed" -> R.string.problem_pairing_failed
+        "pairingUnavailable" -> R.string.problem_pairing_unavailable
+        "peerIncompatible" -> if ((p.peer ?: 0) > (p.ours ?: 0)) R.string.problem_peer_incompatible_update_app
+        else R.string.problem_peer_incompatible_update_peer
         "hostEnded" -> R.string.problem_host_ended
         "hostUnresponsive" -> R.string.problem_host_unresponsive
         "kicked" -> R.string.problem_kicked

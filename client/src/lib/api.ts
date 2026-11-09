@@ -60,6 +60,16 @@ export type Problem =
   | { kind: "serverTimeout" }
   /** 重连时对方不在线（服务器确认过是之前连上的那台）：对方重新上线时会收到 onHostOnline */
   | { kind: "hostOffline" }
+  // 端到端加密（见 Rust 的 airhand_proto::handshake）
+  /** 对方的身份（公钥）和记下的不一样：不自动重连，用户确认后不带公钥再连（trustNew） */
+  | { kind: "hostKeyChanged" }
+  /** 对方要求配对码（第一次连这台电脑） */
+  | { kind: "pairingRequired" }
+  | { kind: "pairingFailed" }
+  /** 对方暂停了配对（有人多次输错配对码） */
+  | { kind: "pairingUnavailable" }
+  /** 与对方的会话版本不兼容：peer 比 ours 大要更新本机，否则对方更新 */
+  | { kind: "peerIncompatible"; peer: number; ours: number }
   // 会话
   | { kind: "hostEnded" }
   | { kind: "hostUnresponsive" }
@@ -122,6 +132,8 @@ export interface SavedDevice {
   lastUsed: number;
   /** 上次用的画质 */
   quality: QualitySettings | null;
+  /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
+  hostKey: string | null;
 }
 
 /**
@@ -136,6 +148,20 @@ export interface SessionInfo {
   hostName: string;
   hostOs: string;
   resume: ResumeToken;
+  /** 对方的端到端加密公钥：记进我的设备，下次连时带上（ConnectOptions.hostKey） */
+  hostKey: string;
+  /** 安全码：对方托盘里显示的是同一个 */
+  safety: string;
+}
+
+/** 怎样连这台电脑（除了控制码），与 Rust 的 airhand_link::controller::ConnectOptions 对应 */
+export interface ConnectOptions {
+  /** 重连凭证：之前连上时得到的，第一次连接时为 null */
+  resume: ResumeToken | null;
+  /** 之前记下的对方公钥：只认它（对不上是 hostKeyChanged） */
+  hostKey: string | null;
+  /** 配对码（对方要求配对时） */
+  pairing: string | null;
 }
 
 /** 被控端的平台，与 airhand_proto::session::Platform 对应 */
@@ -235,10 +261,10 @@ export interface Backend {
   serverStatus(): Promise<ServerState>;
   /** 返回取消订阅的函数 */
   onServerStatus(cb: (s: ServerState) => void): () => void;
-  /** `resume`：重连时带上之前连上时得到的凭证，第一次连接时为 null */
+  /** `opts`：重连凭证、记下的对方公钥、配对码（见 ConnectOptions） */
   connect(
     code: string,
-    resume: ResumeToken | null,
+    opts: ConnectOptions,
     settings: QualitySettings,
     sink: SessionSink,
     clipboard: boolean,
