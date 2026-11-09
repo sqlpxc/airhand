@@ -186,7 +186,8 @@ pub async fn run(
                         ControllerMsg::Audio { enabled } if !is_open => want_audio = enabled,
                         // 同意之前不执行任何操作、不发画面
                         _ if !is_open => {}
-                        ControllerMsg::Input(events) => {
+                        // 晚到太久的输入已经在 HostSession 里换成了"释放所有按键"
+                        ControllerMsg::Input { events, .. } => {
                             shared.event(json!({ "type": "input", "events": events }));
                         }
                         ControllerMsg::Ack { seq } => shared.video.ack(session_id, seq),

@@ -4,15 +4,19 @@
 //! 网络满了声音也会慢）。
 //!
 //! * 双方：[`open_session`] 打开三条流；
-//! * 被控端：[`write_lane`] 把排好队的数据写进一条流（见 [`crate::host::HostSession`]）；
-//! * 控制端：[`HostReceiver`] 从三条流读被控端发来的东西。
+//! * 被控端：[`write_lane`] 把排好队的数据写进一条流，[`write_audio`] 把声音包发成数据报（见 [`crate::host::HostSession`]）；
+//! * 控制端：[`HostReceiver`] 从三条流和数据报读被控端发来的东西。
+//!
+//! 声音走 QUIC 数据报（`airhand_proto::datagram`）：不重传，也不排在丢了的包后面等重传，
+//! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流。
 use airhand_proto::framing::{read_msg, read_packet};
-use airhand_proto::media::{self, Kind};
+use airhand_proto::media::{self, AudioHeader, Kind};
 use airhand_proto::session::HostMsg;
-use airhand_proto::{MAX_CONTROL_MSG, Role, SessionHeader, SessionLane};
+use airhand_proto::{MAX_CONTROL_MSG, Role, SessionHeader, SessionLane, datagram};
 use anyhow::{Context, Result, anyhow};
-use quinn::{Connection, RecvStream, SendStream};
-use std::time::Duration;
+use bytes::Bytes;
+use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -27,6 +31,53 @@ pub async fn write_lane(mut send: SendStream, mut rx: mpsc::Receiver<bytes::Byte
     }
     send.finish()?;
     Ok(())
+}
+
+/// 被控端的声音：`rx` 里排好队的声音包（[`media::frame`] 编好的，带长度前缀）发成数据报，
+/// 放不进一个数据报的、或者连接不支持数据报的写进声音流 `send`。`rx` 关闭后正常结束声音流
+pub async fn write_audio(
+    conn: Connection,
+    session_id: u64,
+    mut send: SendStream,
+    mut rx: mpsc::Receiver<Bytes>,
+) -> Result<()> {
+    while let Some(framed) = rx.recv().await {
+        let packet = framed.get(4..).unwrap_or_default();
+        let fits = conn
+            .max_datagram_size()
+            .is_some_and(|max| datagram::HEADER + packet.len() <= max.min(datagram::MAX));
+        if fits {
+            match conn.send_datagram(Bytes::from(datagram::encode(session_id, packet))) {
+                Ok(()) => continue,
+                Err(SendDatagramError::ConnectionLost(e)) => return Err(e.into()),
+                // 对方不收数据报、太大了：走声音流
+                Err(_) => {}
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), send.write_chunk(framed))
+            .await
+            .context("session writer stalled")??;
+    }
+    send.finish()?;
+    Ok(())
+}
+
+/// 连接上发给会话 `session_id` 的数据报（去掉会话 ID，就是媒体包）。连接上只有一个会话的控制端用
+///（测试、调试工具）；[`crate::controller::ControllerService`] 自己按会话分发
+pub fn session_datagrams(conn: &Connection, session_id: u64) -> mpsc::Receiver<Bytes> {
+    let (tx, rx) = mpsc::channel(16);
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(d) = conn.read_datagram().await {
+            if datagram::session(&d) == Some(session_id)
+                && let Err(mpsc::error::TrySendError::Closed(_)) =
+                    tx.try_send(d.slice(datagram::HEADER..))
+            {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 pub struct SessionStreams {
@@ -88,7 +139,7 @@ pub enum FromHost {
     Audio(Vec<u8>),
 }
 
-/// 控制端读被控端的三条流。
+/// 控制端读被控端的三条流和声音数据报。
 ///
 /// 每条流一个读任务，读任务活到流结束：`select!` / 超时只会取消通道上的接收，不会切断半帧。
 /// 三个有界的信箱互相独立，画面再多也挡不住 Pong 和 Bye。
@@ -98,20 +149,35 @@ pub struct HostReceiver {
     audio: mpsc::Receiver<Result<FromHost>>,
     video_open: bool,
     audio_open: bool,
+    audio_order: AudioOrder,
     _tasks: JoinSet<()>,
     // 画面流和声音流反方向的一半用不到，但要留到会话结束
     _reverse: (SendStream, SendStream),
 }
 
 impl HostReceiver {
-    pub fn new(control: RecvStream, video: Stream, audio: Stream) -> Self {
+    /// `datagrams`：发给这个会话的数据报（去掉了会话 ID），里面是声音包
+    pub fn new(
+        control: RecvStream,
+        video: Stream,
+        audio: Stream,
+        datagrams: Option<mpsc::Receiver<Bytes>>,
+    ) -> Self {
         let mut tasks = JoinSet::new();
+        let (audio_tx, audio_rx) = mpsc::channel(16);
+        if let Some(d) = datagrams {
+            datagram_reader(&mut tasks, d, audio_tx.clone());
+        }
+        media_reader(&mut tasks, audio.1, Kind::Audio, audio_tx);
+        let (video_tx, video_rx) = mpsc::channel(2);
+        media_reader(&mut tasks, video.1, Kind::Video, video_tx);
         Self {
             control: control_reader(&mut tasks, control),
-            video: media_reader(&mut tasks, video.1, Kind::Video, 2),
-            audio: media_reader(&mut tasks, audio.1, Kind::Audio, 16),
+            video: video_rx,
+            audio: audio_rx,
             video_open: true,
             audio_open: true,
+            audio_order: AudioOrder::default(),
             _tasks: tasks,
             _reverse: (video.0, audio.0),
         }
@@ -124,6 +190,11 @@ impl HostReceiver {
                 biased;
                 m = self.control.recv() => return m.context("control stream ended")?,
                 m = self.audio.recv(), if self.audio_open => match m {
+                    Some(Ok(FromHost::Audio(p))) => {
+                        if self.audio_order.accept(&p, Instant::now()) {
+                            return Ok(FromHost::Audio(p));
+                        }
+                    }
                     Some(m) => return m,
                     None => self.audio_open = false,
                 },
@@ -133,6 +204,33 @@ impl HostReceiver {
                 },
             }
         }
+    }
+}
+
+/// 数据报可能乱序：比已经交出去的包还早的声音包（迟到的）丢掉，不倒着播放。
+/// 停顿后的第一包（`start`）、隔了一阵子才来的包照收：被控端重新开始发声音时序号会从头算
+#[derive(Default)]
+struct AudioOrder {
+    last: Option<(u32, Instant)>,
+}
+
+impl AudioOrder {
+    /// 这么久以内才算乱序
+    const WINDOW: Duration = Duration::from_millis(500);
+
+    fn accept(&mut self, packet: &[u8], now: Instant) -> bool {
+        let Some(h) = AudioHeader::decode(packet) else {
+            return true;
+        };
+        if let Some((last, at)) = self.last
+            && !h.start
+            && now.duration_since(at) < Self::WINDOW
+            && h.seq.wrapping_sub(last) as i32 <= 0
+        {
+            return false;
+        }
+        self.last = Some((h.seq, now));
+        true
     }
 }
 
@@ -167,13 +265,32 @@ fn control_reader(
     rx
 }
 
+/// 声音数据报放进声音的信箱。数据报本来就可能丢：信箱满了（界面跟不上）就丢掉这一包，不等
+fn datagram_reader(
+    tasks: &mut JoinSet<()>,
+    mut rx: mpsc::Receiver<Bytes>,
+    tx: mpsc::Sender<Result<FromHost>>,
+) {
+    tasks.spawn(async move {
+        while let Some(p) = rx.recv().await {
+            if Kind::of(&p) != Some(Kind::Audio) || p.len() > media::MAX_AUDIO_PACKET {
+                continue;
+            }
+            if let Err(mpsc::error::TrySendError::Closed(_)) =
+                tx.try_send(Ok(FromHost::Audio(p.to_vec())))
+            {
+                break;
+            }
+        }
+    });
+}
+
 fn media_reader(
     tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
     kind: Kind,
-    capacity: usize,
-) -> mpsc::Receiver<Result<FromHost>> {
-    let (tx, rx) = mpsc::channel(capacity);
+    tx: mpsc::Sender<Result<FromHost>>,
+) {
     let max = match kind {
         Kind::Audio => media::MAX_AUDIO_PACKET,
         _ => media::MAX_VIDEO_PACKET,
@@ -194,5 +311,42 @@ fn media_reader(
             }
         }
     });
-    rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audio(seq: u32, start: bool) -> Vec<u8> {
+        let h = AudioHeader {
+            seq,
+            start,
+            capture_us: 0,
+        };
+        h.encode().to_vec()
+    }
+
+    #[test]
+    fn late_audio_datagrams_are_dropped() {
+        let mut o = AudioOrder::default();
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        assert!(o.accept(&audio(1, true), ms(0)));
+        assert!(o.accept(&audio(3, false), ms(20)));
+        // 迟到的 2、重复的 3
+        assert!(!o.accept(&audio(2, false), ms(25)));
+        assert!(!o.accept(&audio(3, false), ms(26)));
+        assert!(o.accept(&audio(4, false), ms(40)));
+        // 序号从头算：停顿后的第一包
+        assert!(o.accept(&audio(1, true), ms(60)));
+        assert!(o.accept(&audio(2, false), ms(80)));
+        // 停顿后的第一包丢了：隔了一阵子之后照收
+        assert!(o.accept(&audio(7, false), ms(1000)));
+        assert!(o.accept(&audio(2, false), ms(2000)));
+        // 序号绕回
+        let mut o = AudioOrder::default();
+        assert!(o.accept(&audio(u32::MAX, false), ms(0)));
+        assert!(o.accept(&audio(0, false), ms(20)));
+        assert!(!o.accept(&audio(u32::MAX, false), ms(30)));
+    }
 }

@@ -18,6 +18,16 @@
 //! 被控端的光标隐藏了（[`CursorState::visible`] 为 false，例如游戏里按住右键转视角、第一人称游戏）时，
 //! 控制端改发相对移动（[`InputEvent::MouseDelta`]）：游戏这时自己把光标拉回原位、只看移动了多少，
 //! 绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动了）。
+//!
+//! # 过时的输入
+//!
+//! 网络卡住的时候，输入会积在路上：控制端的命令队列里、QUIC 的发送缓冲里（断网时往里写不会阻塞）、服务器上。
+//! 网络恢复后把它们补发出去，就是在对方电脑上重放一串几秒、几分钟之前的操作。所以每批输入都带着控制端
+//! 收到它的时刻（[`ControllerMsg::Input::t`]，和 [`ControllerMsg::Ping`] 是同一个时钟），比平时晚到超过
+//! [`INPUT_MAX_AGE`] 的输入被控端不执行，改成释放所有按键（丢掉的里面可能有松开按键）。
+//! 两边的时钟不需要同步，见 `airhand_link::host` 的 `InputClock`。
+
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -95,11 +105,25 @@ pub enum ByeReason {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct CursorState {
     pub visible: bool,
-    /// `None` 表示形状未变化
-    pub shape: Option<CursorShape>,
+    /// 换成了哪个形状；`None` 表示形状未变化
+    pub shape: Option<CursorSlot>,
 }
 
+/// 控制端按槽位缓存光标形状，最多这么多个。动画光标（例如忙碌时的转圈）反复用到同几个形状，
+/// 被控端只在控制端还没有它时发图像，之后只发槽位：不然优先级最高的控制流上一秒要发几十次几十 KB 的图像。
+/// 哪个槽位放什么由被控端决定（控制端照做），两边不会对不上。槽位只在一个会话里有效
+pub const CURSOR_SLOTS: u8 = 32;
+
+/// 光标换成了控制端槽位 `slot` 里的形状（见 [`CURSOR_SLOTS`]）
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CursorSlot {
+    /// `< CURSOR_SLOTS`
+    pub slot: u8,
+    /// 新的形状：存进这个槽位（替换掉原来的）。`None` 表示槽位里已经是它了
+    pub image: Option<CursorShape>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Hash)]
 pub struct CursorShape {
     pub width: u16,
     pub height: u16,
@@ -210,8 +234,14 @@ impl Codec {
 pub enum ControllerMsg {
     /// 会话流上的第一条消息（见模块说明）
     Hello(ControllerHello),
-    /// 批量输入事件（鼠标移动会被合并）
-    Input(Vec<InputEvent>),
+    /// 批量输入事件（鼠标移动会被合并）。
+    ///
+    /// `t`：控制端收到这批输入的时刻（微秒，和 [`ControllerMsg::Ping::t`] 同一个时钟）。
+    /// 被控端据此丢掉晚到太久的输入（见模块说明的"过时的输入"）
+    Input {
+        t: u64,
+        events: Vec<InputEvent>,
+    },
     /// 确认收到某一帧，用于被控端的在途帧控制（防止延迟堆积）。
     Ack {
         seq: u32,
@@ -221,6 +251,7 @@ pub enum ControllerMsg {
     SelectDisplay {
         index: u8,
     },
+    /// 每秒一次，被控端回 [`HostMsg::Pong`]。`t` 是控制端的时钟（微秒），被控端也用它估算输入晚到了多久
     Ping {
         t: u64,
     },
@@ -243,6 +274,10 @@ pub struct ControllerHello {
 
 /// 剪贴板同步的文本上限
 pub const MAX_CLIPBOARD_TEXT: usize = 1 << 20;
+
+/// 输入在路上（控制端的队列、网络）耗了这么久就过时了：控制端不再发，被控端收到了也不执行
+/// （见模块说明的"过时的输入"）
+pub const INPUT_MAX_AGE: Duration = Duration::from_secs(2);
 
 /// 画质设置（由控制端 UI 选择，被控端会做范围校验）。
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]

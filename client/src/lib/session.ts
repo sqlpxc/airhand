@@ -67,8 +67,11 @@ const MAX_RETRIES = 30;
 const WAIT_CHECK_MS = 60_000;
 /** 没连上服务器（网页版还有控制端服务）时多久试一次；连上时马上会试（serverConnected） */
 const NO_SERVER_RETRY_MS = 5_000;
-/** 服务器的明确回答：自动重试只会被当成在猜控制码 */
-const GIVE_UP = new Set<Problem["kind"]>(["codeNotFound", "rateLimited", "invalidCode", "notController"]);
+/**
+ * 服务器的明确回答：自动重试只会被当成在猜控制码。
+ * kicked：重连凭证作废了（对方断开过所有控制端，或者换了控制码），连上过的会话不再自动重连（见 connect）
+ */
+const GIVE_UP = new Set<Problem["kind"]>(["codeNotFound", "rateLimited", "invalidCode", "notController", "kicked"]);
 /** 与服务器（网页版还有控制端服务）的连接断了：等重新连上再试，不计入重试次数 */
 const NO_SERVER = new Set<Problem["kind"]>(["notConnected", "serverLost", "serverUnreachable", "consoleLost"]);
 
@@ -110,6 +113,8 @@ export class RemoteSession {
   /** 音画同步统计（约每秒更新） */
   syncStats: AvSyncStats = { skewMs: null, videoDelayMs: 0, extraMs: 0 };
   retries = 0;
+  /** 这个标签里连上过：之后重连凭证作废了（对方断开过所有控制端）就不再自动重连，见 connect */
+  private connectedOnce = false;
 
   /** 连上了（第一次和每次重连）：记进我的设备 */
   onConnected: ((s: RemoteSession) => void) | null = null;
@@ -160,10 +165,11 @@ export class RemoteSession {
   private readonly input: RemoteInput;
 
   // 光标
-  private cursorRaw: { w: number; h: number; hx: number; hy: number; rgba: Uint8ClampedArray } | null = null;
+  private cursorRaw: CursorImage | null = null;
+  /** 被控端按槽位缓存的光标形状（动画光标反复用到的那几帧，见 media.ts），只在一个会话里有效 */
+  private cursorSlots = new Map<number, CursorImage>();
   private cursorVisible = true;
   private cursorCss = "default";
-  private cursorScale = 0;
 
   /**
    * `saved`：我的设备里记着的这台电脑。带着上次的重连凭证连，对方不在线时等它上线（见 [`open`]），
@@ -243,6 +249,8 @@ export class RemoteSession {
     this.video.reset();
     this.audio.reset();
     this.sync.reset();
+    // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
+    this.cursorSlots.clear();
     // 在连接之前清掉旧提示：被控端紧跟在 Hello 后面发的提示可能比 connect 的返回值先到
     this.notice = null;
     this.audioError = null;
@@ -264,6 +272,7 @@ export class RemoteSession {
       return;
     }
     this.resume = info.resume;
+    this.connectedOnce = true;
     this.sid = info.sid;
     this.hostName = info.hostName;
     this.hostOs = info.hostOs;
@@ -281,31 +290,33 @@ export class RemoteSession {
   }
 
   /**
-   * 第一次连接。带着重连凭证（我的设备里保存的）时，对方不在线不算失败：
-   * 进入"等待对方上线"，对方一上线就连上（和断线后等对方一样）。其它失败照样抛出
+   * 连一次。重连凭证作废了（服务器回答 kicked：对方断开过所有控制端，或者换了控制码）就丢掉它：
+   * 还没连上过（从我的设备打开、等对方上线时）就用控制码直接连；连上过就不再自动重连（抛出 kicked，见 GIVE_UP）。
    */
-  async open(): Promise<void> {
+  private async connect(): Promise<void> {
     try {
       await this.start();
     } catch (e) {
-      let p = toProblem(e);
+      if (toProblem(e).kind !== "kicked" || this.resume === null || this.disposed) throw e;
+      this.resume = null;
+      if (this.connectedOnce) throw e;
+      await this.start();
+    }
+  }
+
+  /**
+   * 第一次连接。带着重连凭证（我的设备里保存的）时，对方不在线不算失败：
+   * 进入"等待对方上线"，对方一上线就连上（和断线后等对方一样）。其它失败照样抛出。
+   *
+   * 凭证作废了服务器回答的是 kicked（connect 已经改用控制码连过了），不是 hostOffline：
+   * 所以对方不在线时不用再拿控制码试一次——那样会算一次猜错，占掉这个 IP 的额度
+   */
+  async open(): Promise<void> {
+    try {
+      await this.connect();
+    } catch (e) {
+      const p = toProblem(e);
       if (p.kind !== "hostOffline" || this.disposed) throw e;
-      // 保存的凭证可能已经作废（对方断开过所有控制端，服务器换了它的密钥），带着作废的凭证服务器也只回答
-      // "不在线"：用控制码直接连一次。对方确实不在线的话，再带着凭证等它上线
-      const saved = this.resume;
-      if (saved !== null) {
-        this.resume = null;
-        try {
-          await this.start();
-          return;
-        } catch (e2) {
-          if (this.disposed) return;
-          const p2 = toProblem(e2);
-          if (p2.kind !== "codeNotFound" && p2.kind !== "rateLimited") throw e2;
-          this.resume = saved;
-          p = { kind: "hostOffline" };
-        }
-      }
       this.scheduleRetry(p);
     }
   }
@@ -359,7 +370,7 @@ export class RemoteSession {
     clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
     if (this.disposed || this.attempt.attempting) return;
-    this.start().catch((e) => this.scheduleRetry(toProblem(e)));
+    this.connect().catch((e) => this.scheduleRetry(toProblem(e)));
   }
 
   /** 服务器通知：控制码为 `code` 的被控端重新上线了 */
@@ -422,7 +433,6 @@ export class RemoteSession {
       case "displays":
         this.displays = ev.displays;
         this.currentDisplay = ev.current;
-        this.cursorScale = 0;
         this.updateViewLimit();
         break;
       case "stats":
@@ -554,14 +564,19 @@ export class RemoteSession {
     this.cursorVisible = c.visible;
     const s = c.shape;
     if (s && s.width > 0 && s.height > 0 && rgba.byteLength >= s.width * s.height * 4) {
-      this.cursorRaw = {
+      // 新的形状：存进被控端指定的槽位。复制一份，不一直占着整个包的缓冲区
+      const img: CursorImage = {
         w: s.width,
         h: s.height,
         hx: s.hotX,
         hy: s.hotY,
-        rgba: new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, s.width * s.height * 4),
+        rgba: new Uint8ClampedArray(rgba.subarray(0, s.width * s.height * 4)),
       };
-      this.cursorScale = 0;
+      this.cursorSlots.set(c.slot, img);
+      this.cursorRaw = img;
+    } else if (c.cached) {
+      // 槽位里已有的形状（例如动画光标的下一帧）；万一没有（不应该发生）就保持原样
+      this.cursorRaw = this.cursorSlots.get(c.slot) ?? this.cursorRaw;
     }
     // 被控端的光标隐藏了：鼠标改发相对移动（会回调 onModeChange 刷新指针）
     this.input.setRemoteCursorHidden(!c.visible);
@@ -586,8 +601,11 @@ export class RemoteSession {
     // 远端物理像素 → 本地 CSS 像素；限制在 Chromium 支持的 128px 以内
     let scale = cssWidth / srcWidth;
     scale = Math.min(Math.max(scale, 0.35), 2, 128 / Math.max(c.w, c.h));
-    if (Math.abs(scale - this.cursorScale) < 0.02 && this.cursorCss !== "none") return;
-    this.cursorScale = scale;
+    // 这个形状按差不多的比例生成过（动画光标循环回来）：直接用，不再生成一次 PNG
+    if (c.css !== undefined && c.scale !== undefined && Math.abs(scale - c.scale) < 0.02) {
+      if (this.cursorCss !== c.css) this.setCursor(c.css);
+      return;
+    }
     const src = new OffscreenCanvas(c.w, c.h);
     src.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(c.rgba), c.w, c.h), 0, 0);
     const w = Math.max(1, Math.round(c.w * scale));
@@ -600,7 +618,9 @@ export class RemoteSession {
     octx.drawImage(src, 0, 0, w, h);
     const hx = Math.min(w - 1, Math.round(c.hx * scale));
     const hy = Math.min(h - 1, Math.round(c.hy * scale));
-    this.setCursor(`url(${out.toDataURL("image/png")}) ${hx} ${hy}, default`);
+    c.css = `url(${out.toDataURL("image/png")}) ${hx} ${hy}, default`;
+    c.scale = scale;
+    this.setCursor(c.css);
   }
 
   private setCursor(css: string) {
@@ -836,6 +856,18 @@ export class RemoteSession {
   focus() { this.input.focus(); }
   private releaseAll() { this.input.releaseAll(); }
   private enqueue(events: InputEvent[], urgent: boolean) { this.input.enqueue(events, urgent); }
+}
+
+/** 光标的一个形状（RGBA，非预乘） */
+interface CursorImage {
+  w: number;
+  h: number;
+  hx: number;
+  hy: number;
+  rgba: Uint8ClampedArray;
+  /** 按 scale 缩放、生成好的 CSS cursor */
+  css?: string;
+  scale?: number;
 }
 
 function sameQuality(a: QualitySettings, b: QualitySettings): boolean {

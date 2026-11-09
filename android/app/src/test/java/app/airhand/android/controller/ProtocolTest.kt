@@ -35,7 +35,7 @@ class ProtocolTest {
     @Test
     fun mediaPacketsParse() {
         val media = fixture.getJSONArray("media")
-        assertTrue(media.length() >= 5)
+        assertTrue(media.length() >= 6)
         for (i in 0 until media.length()) {
             val m = media.getJSONObject(i)
             val name = m.getString("name")
@@ -55,7 +55,11 @@ class ProtocolTest {
                 else -> {
                     val s = m.optJSONObject("shape")
                     val shape = s?.let { Media.Shape(it.getInt("width"), it.getInt("height"), it.getInt("hotX"), it.getInt("hotY")) }
-                    assertEquals(name, Media.Cursor(m.getBoolean("visible"), shape), Media.cursor(b))
+                    assertEquals(
+                        name,
+                        Media.Cursor(m.getBoolean("visible"), shape, m.getInt("slot"), m.getBoolean("cached")),
+                        Media.cursor(b),
+                    )
                 }
             }
         }

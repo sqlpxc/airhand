@@ -9,7 +9,7 @@ import * as media from "../src/lib/media.ts";
 
 // Load the actual session class with browser/backend dependencies replaced by
 // small fakes. This tests delivery ordering without a WebView or network.
-function sessionHarness() {
+function sessionHarness(connect?: (code: string, resume: any) => Promise<any>) {
   const source = fs.readFileSync(new URL("../src/lib/session.ts", import.meta.url), "utf8")
     .replace(/^import[\s\S]*?from "[^"]+";\r?\n/gm, "");
   const js = stripTypeScriptTypes(source).replace(/\bexport\s+/g, "") + "\nglobalThis.RemoteSession = RemoteSession;";
@@ -19,8 +19,12 @@ function sessionHarness() {
   const timers: (() => void)[] = [];
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
     fitSize, stricter, viewMaxShort, media,
+    toProblem: (e: any) => e,
     api: {
-      connect: (_c: any, _r: any, _s: any, output: any) => { sink = output; return new Promise(r => { resolve = r; }); },
+      connect: (c: any, r: any, _s: any, output: any) => {
+        sink = output;
+        return connect ? connect(c, r) : new Promise(res => { resolve = res; });
+      },
       command: async (c: any) => { calls.push(c.cmd === "settings" ? [c.cmd, c.sid, c.settings] : [c.cmd, c.sid]); },
     },
     // 延时发送用的定时器：由测试手动触发
@@ -32,6 +36,7 @@ function sessionHarness() {
     attempt: new ConnectionAttempt(), disposed: false, sid: null, state: "connecting", settings: {}, visible: true,
     viewLimit: 0, viewLimitAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
     video: { reset() {} }, audio: { reset() {} }, sync: { reset() {} }, input: { reset() {} },
+    cursorSlots: new Map(), resume: null, onlineAt: -1, attemptAt: 0, retries: 0,
     emit() {}, syncAudio() {}, onConnected() { calls.push("connected"); },
   });
   return { session, calls, timers, event: (ev: any) => sink.event(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
@@ -84,6 +89,79 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
   s.viewLimitAt = -Infinity;
   s.updateViewLimit();
   assert.equal(sent().at(-1), 0);
+});
+
+const granted = { sid: 7, resume: [9], hostName: "host", hostOs: "Windows" };
+
+test("从我的设备打开不在线的设备：带着凭证等它上线，不再拿控制码试一次（那样会算一次猜错）", async () => {
+  const tried: any[] = [];
+  const h = sessionHarness(async (_code, resume) => {
+    tried.push(resume);
+    throw { kind: "hostOffline" };
+  });
+  h.session.resume = [1, 2, 3];
+  await h.session.open();
+  assert.deepEqual(tried, [[1, 2, 3]]);
+  assert.equal(h.session.state, "waiting");
+});
+
+test("凭证作废了（kicked）：还没连上过就用控制码直接连，连上过就不再自动重连", async () => {
+  const tried: any[] = [];
+  const h = sessionHarness(async (_code, resume) => {
+    tried.push(resume);
+    if (resume !== null) throw { kind: "kicked" };
+    return granted;
+  });
+  h.session.resume = [1];
+  await h.session.open();
+  assert.deepEqual(tried, [[1], null]);
+  assert.equal(h.session.sid, 7);
+  assert.deepEqual(h.session.resume, [9]);
+
+  // 连上过之后断了，重连时凭证已经作废（断线期间对方断开了所有控制端）：不自动用控制码连回去
+  tried.length = 0;
+  h.session.sid = null;
+  await h.session.connect().catch((e: any) => h.session.scheduleRetry(e));
+  assert.deepEqual(tried, [[9]]);
+  assert.equal(h.session.state, "closed");
+  assert.equal(h.session.closedReason.kind, "kicked");
+  assert.equal(h.session.resume, null, "之后手动重连是普通的连接请求");
+});
+
+test("光标形状按槽位缓存：只带槽位的包换成缓存里的形状，新的会话清空", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  Object.assign(s, { input: { reset() {}, setRemoteCursorHidden() {} }, applyCursor() {} });
+  const header = (flags: number, slot: number, w = 0) => {
+    const b = new Uint8Array(media.HEADER_LEN + w * w * 4);
+    b[0] = media.CURSOR;
+    b[1] = flags;
+    b[2] = slot;
+    const dv = new DataView(b.buffer);
+    dv.setUint16(8, w, true);
+    dv.setUint16(10, w, true);
+    b.fill(slot, media.HEADER_LEN);
+    return b;
+  };
+  const push = (b: Uint8Array) => s.onBinary(b);
+  push(header(1 | 2, 3, 2));
+  const three = s.cursorRaw;
+  assert.equal(three.w, 2);
+  push(header(1 | 2, 5, 1));
+  assert.equal(s.cursorRaw.w, 1);
+  push(header(1 | 4, 3));
+  assert.equal(s.cursorRaw, three, "槽位 3 里的形状");
+  assert.equal(three.rgba[0], 3);
+  // 缓存里没有的槽位（不应该发生）：保持原样
+  push(header(1 | 4, 9));
+  assert.equal(s.cursorRaw, three);
+  // 只改可见性
+  push(header(0, 0));
+  assert.equal(s.cursorRaw, three);
+  assert.equal(s.cursorVisible, false);
+  // 新的会话：槽位从头开始
+  void s.start();
+  assert.equal(s.cursorSlots.size, 0);
 });
 
 test("stale completion cannot finish a newer attempt", () => {

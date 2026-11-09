@@ -14,7 +14,7 @@ const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => pa
 const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
 test("媒体包：头和数据按 media.ts 解析", () => {
-  assert.ok(fixture.media.length >= 5);
+  assert.ok(fixture.media.length >= 6);
   for (const m of fixture.media) {
     const pkt = bytes(m.hex);
     const dv = new DataView(pkt.buffer);
@@ -28,7 +28,7 @@ test("媒体包：头和数据按 media.ts 解析", () => {
       assert.deepEqual(media.audioHeader(dv), { seq: m.seq, start: m.start, captureUs: m.captureUs }, m.name);
       assert.equal(media.videoSeq(dv), null);
     } else {
-      assert.deepEqual(media.cursorHeader(dv), { visible: m.visible, shape: m.shape }, m.name);
+      assert.deepEqual(media.cursorHeader(dv), { visible: m.visible, slot: m.slot, shape: m.shape, cached: m.cached }, m.name);
     }
   }
   assert.equal(media.kind(new DataView(new ArrayBuffer(10))), 0, "不到一个头长");

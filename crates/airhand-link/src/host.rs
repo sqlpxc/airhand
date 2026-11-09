@@ -5,15 +5,22 @@
 //!
 //! * [`run`]：一直连着服务器（掉线自动重连，取回原来的控制码），每来一个控制端就调用 `session` 开始一个会话；
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
-//! * [`HostSession`]：会话的三条流。控制消息、画面包、声音包分别排进三个有界队列，各自的写任务把它们写进流；
-//!   控制端的消息由读任务交给 [`HostSession::incoming`]。
+//! * [`HostSession`]：会话的三条流。控制消息、画面包、声音包分别排进三个有界队列，各自的写任务把它们写进流
+//!   （声音包优先发成数据报）；控制端的消息由读任务交给 [`HostSession::incoming`]，过时的输入在这里换成
+//!   "释放所有按键"（见 [`InputClock`]）；
+//! * [`CursorCache`]：控制端缓存了哪些光标形状。
 
+use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use airhand_proto::framing::{self, read_msg, write_msg};
-use airhand_proto::session::{ByeReason, ControllerMsg, HostMsg};
+use airhand_proto::session::{
+    ByeReason, CURSOR_SLOTS, ControllerMsg, CursorShape, CursorSlot, HostMsg, INPUT_MAX_AGE,
+    InputEvent,
+};
 use airhand_proto::signal::{ClientMsg, Peer, Reclaim, ServerMsg};
 use airhand_proto::{MAX_CONTROL_MSG, MAX_SIGNAL_MSG, Role};
 use anyhow::{Result, anyhow, bail};
@@ -26,7 +33,7 @@ use tracing::{info, warn};
 use crate::ServerState;
 use crate::net::{self, LinkConfig, Reconnect, Report};
 use crate::tasks::OwnedTask;
-use crate::transport::{SessionStreams, open_session, write_lane};
+use crate::transport::{SessionStreams, open_session, write_audio, write_lane};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,7 +86,7 @@ pub trait HostEvents: Send + Sync + 'static {
 pub async fn run<E, S, F>(
     link: Arc<LinkConfig>,
     keep: bool,
-    mut reclaim: Option<Reclaim>,
+    reclaim: Option<Reclaim>,
     events: Arc<E>,
     session: S,
     mut cmds: mpsc::UnboundedReceiver<HostCmd>,
@@ -93,19 +100,32 @@ pub async fn run<E, S, F>(
         Arc::new(move |s| e.server(s))
     };
     let mut reconnect = Reconnect::new(report);
+    let mut id = Identity {
+        reclaim,
+        rekey: false,
+    };
     loop {
         reconnect.begin();
-        let result = connect_once(&link, keep, &mut reclaim, &*events, &session, &mut cmds).await;
+        let result = connect_once(&link, keep, &mut id, &*events, &session, &mut cmds).await;
         events.offline();
         reconnect.end("host", result).await;
     }
+}
+
+/// 被控端在服务器上是谁：取回控制码用的控制码和密钥，以及有没有还没换成的密钥
+struct Identity {
+    reclaim: Option<Reclaim>,
+    /// 发了 [`ClientMsg::Rekey`] 还没收到 [`ServerMsg::Rekeyed`]（例如这时断线了）。下次注册时请服务器顺便换密钥
+    /// （[`ClientMsg::Register::rekey`]）：服务器可能根本没收到 `Rekey`，或者收到之后还没记下来就重启了，
+    /// 手里的旧密钥又成了有效的，被断开的控制端拿着旧凭证就能连回来
+    rekey: bool,
 }
 
 /// 返回 `Ok(())` 表示需要立即重连（更换控制码），`Err` 表示掉线。
 async fn connect_once<E, S, F>(
     link: &LinkConfig,
     keep: bool,
-    reclaim: &mut Option<Reclaim>,
+    id: &mut Identity,
     events: &E,
     session: &S,
     cmds: &mut mpsc::UnboundedReceiver<HostCmd>,
@@ -116,11 +136,13 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let mut sig = net::connect_signal(link, Role::Host).await?;
+    let reclaim = &mut id.reclaim;
     write_msg(
         &mut sig.send,
         &ClientMsg::Register {
             reclaim: *reclaim,
             keep,
+            rekey: id.rekey && reclaim.is_some(),
         },
     )
     .await?;
@@ -160,6 +182,14 @@ where
     }
     let got = Reclaim { code, secret };
     let changed = *reclaim != Some(got);
+    if id.rekey {
+        info!(
+            code,
+            "the server changed this host's secret while registering"
+        );
+    }
+    // 带着 rekey 注册成功：要么换了密钥，要么拿到的是新的控制码，旧凭证都作废了
+    id.rekey = false;
     *reclaim = Some(got);
     events.registered(got, changed).await;
     info!(code, "host connected to the server");
@@ -183,6 +213,7 @@ where
                 // 服务器换了取回控制码的密钥（断开所有控制端之后，见 HostCmd::KickAll）：保存下来，下次取回用它
                 Some(ServerMsg::Rekeyed { secret }) => {
                     let got = Reclaim { code, secret };
+                    id.rekey = false;
                     *reclaim = Some(got);
                     events.registered(got, true).await;
                     info!(code, "the server changed this host's secret, old reconnect tokens are void");
@@ -202,7 +233,9 @@ where
                 info!(?cmd, "command from the local user");
                 if cmd == HostCmd::KickAll {
                     // 先让服务器换密钥（之前发出的重连凭证随之作废），再让会话发 Bye：
-                    // 被断开的控制端不能带着凭证马上连回来。更换控制码时旧码直接作废，不用换
+                    // 被断开的控制端不能带着凭证马上连回来。更换控制码时旧码直接作废，不用换。
+                    // 收到 Rekeyed 之前一直记着：断线了就在下次注册时换（见 Identity::rekey）
+                    id.rekey = true;
                     write_msg(&mut sig.send, &ClientMsg::Rekey).await?;
                 }
                 events.kicked(cmd);
@@ -284,6 +317,131 @@ pub struct HostSession {
     reader: OwnedTask<Result<()>>,
 }
 
+/// 判断控制端的输入晚到了多久（见 `airhand_proto::session` 的"过时的输入"）。
+///
+/// 两边的时钟不同步，只能比"比平时晚了多少"：`收到的时刻 − t` 是两边时钟之差加上这一路的耽搁，
+/// 记下它的最小值当作基准（时钟之差 + 最快的那一次），超出基准的部分就是这条消息额外耽搁了多久——
+/// 在控制端的队列里、在 QUIC 的发送缓冲里（断网时往里写不会阻塞）、在服务器上。Ping 和输入都带着 `t`，都算样本。
+///
+/// * 基准每秒最多上调 1 ms（[`InputClock::DRIFT`]），跟得上两边时钟的漂移（通常不到 0.01%），
+///   断网再久，恢复后涌来的旧消息也远远超出基准；
+/// * 连续 [`InputClock::RESYNC`] 收到的全是晚到的消息，说明这一路本身变慢了（例如换了网络），而不是积压：
+///   以现在为准重新取基准，不能一直丢下去。
+pub struct InputClock {
+    epoch: Instant,
+    /// 基准（微秒）和取它的时刻
+    base: Option<(i64, Instant)>,
+    /// 从什么时候起收到的全是晚到的消息
+    late_since: Option<Instant>,
+}
+
+impl Default for InputClock {
+    fn default() -> Self {
+        Self {
+            epoch: Instant::now(),
+            base: None,
+            late_since: None,
+        }
+    }
+}
+
+impl InputClock {
+    /// 基准每过这么多微秒最多上调 1 微秒
+    const DRIFT: i64 = 1000;
+    const RESYNC: Duration = Duration::from_secs(5);
+
+    /// 记下一条带着控制端时刻 `t` 的消息（Ping、输入），`now` 是收到它的时刻。返回它是不是过时了（只对输入有意义）
+    pub fn stale(&mut self, t: u64, now: Instant) -> bool {
+        let offset = now.saturating_duration_since(self.epoch).as_micros() as i64 - t as i64;
+        let base = match self.base {
+            Some((b, at)) => {
+                (b + now.saturating_duration_since(at).as_micros() as i64 / Self::DRIFT).min(offset)
+            }
+            None => offset,
+        };
+        let late = Duration::from_micros((offset - base) as u64) > INPUT_MAX_AGE;
+        let since = match (late, self.late_since) {
+            (false, _) => None,
+            (true, since) => Some(since.unwrap_or(now)),
+        };
+        if since.is_some_and(|s| now.saturating_duration_since(s) > Self::RESYNC) {
+            warn!(
+                "input has been arriving late for {:?}, the network path got slower: resynchronizing",
+                Self::RESYNC
+            );
+            self.base = Some((offset, now));
+            self.late_since = None;
+            return false;
+        }
+        self.base = Some((base, now));
+        self.late_since = since;
+        late
+    }
+}
+
+/// 发给一个控制端的光标形状缓存：控制端按槽位存形状（[`CURSOR_SLOTS`] 个），这里记着每个槽位里是什么
+/// （见 [`CursorSlot`]）。只在一个会话里有效，会话里换显示器、重建编码管线时接着用。
+///
+/// 槽位满了换掉最久没用到的那个。用形状内容的 64 位哈希认形状，几十个形状里撞上的概率可以忽略
+pub struct CursorCache {
+    /// 每个槽位里的形状（哈希）和最近一次用到的时刻
+    slots: Vec<Option<(u64, u64)>>,
+    clock: u64,
+}
+
+impl Default for CursorCache {
+    fn default() -> Self {
+        Self {
+            slots: vec![None; CURSOR_SLOTS as usize],
+            clock: 0,
+        }
+    }
+}
+
+impl CursorCache {
+    /// 光标换成了 `shape`：控制端已经有它的话只给槽位，否则挑一个槽位、带上图像
+    pub fn place(&mut self, shape: &CursorShape) -> CursorSlot {
+        let mut h = DefaultHasher::new();
+        shape.hash(&mut h);
+        let hash = h.finish();
+        self.clock += 1;
+        if let Some(i) = self
+            .slots
+            .iter()
+            .position(|s| s.is_some_and(|(h, _)| h == hash))
+        {
+            self.slots[i] = Some((hash, self.clock));
+            return CursorSlot {
+                slot: i as u8,
+                image: None,
+            };
+        }
+        let i = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                (0..self.slots.len())
+                    .min_by_key(|&i| self.slots[i].map_or(0, |(_, used)| used))
+                    .unwrap_or(0)
+            });
+        self.slots[i] = Some((hash, self.clock));
+        CursorSlot {
+            slot: i as u8,
+            image: Some(shape.clone()),
+        }
+    }
+
+    /// 带着图像的 `slot` 没能发出去（例如编码管线正在停下）：控制端没有它，下次还得带图像
+    pub fn forget(&mut self, slot: &CursorSlot) {
+        if slot.image.is_some()
+            && let Some(s) = self.slots.get_mut(slot.slot as usize)
+        {
+            *s = None;
+        }
+    }
+}
+
 /// 三条流的写任务
 pub struct Writer(OwnedTask<Result<((), (), ())>>);
 
@@ -313,20 +471,47 @@ impl HostSession {
         let (ctl_tx, ctl_rx) = mpsc::channel(CONTROL_QUEUE);
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
+        let conn = conn.clone();
         let writer = OwnedTask(tokio::spawn(async move {
             tokio::try_join!(
                 write_lane(send, ctl_rx),
                 write_lane(video_send, video_rx),
-                write_lane(audio_send, audio_rx)
+                write_audio(conn, session_id, audio_send, audio_rx)
             )
         }));
         // 读任务：read_msg 不是取消安全的，单独放在一个任务里，通过通道交给会话
         let (in_tx, incoming) = mpsc::channel(64);
         let reader = OwnedTask(tokio::spawn(async move {
             let mut buf = Vec::with_capacity(1024);
+            let mut clock = InputClock::default();
+            // 这一串过时的输入已经换成了一个"释放所有按键"
+            let mut released = false;
             while let Some(m) =
                 read_msg::<_, ControllerMsg>(&mut recv, MAX_CONTROL_MSG, &mut buf).await?
             {
+                let m = match m {
+                    ControllerMsg::Ping { t } => {
+                        clock.stale(t, Instant::now());
+                        m
+                    }
+                    ControllerMsg::Input { t, events } => {
+                        if !clock.stale(t, Instant::now()) {
+                            released = false;
+                            ControllerMsg::Input { t, events }
+                        } else if released {
+                            continue;
+                        } else {
+                            // 不在网络恢复后重放过时的操作；丢掉的里面可能有松开按键，所以松开所有按键
+                            warn!(session_id, "dropping input that arrived too late");
+                            released = true;
+                            ControllerMsg::Input {
+                                t,
+                                events: vec![InputEvent::ReleaseAll],
+                            }
+                        }
+                    }
+                    m => m,
+                };
                 if in_tx.send(m).await.is_err() {
                     break;
                 }
@@ -371,5 +556,110 @@ impl HostSession {
             Err(e) => warn!(session_id, "session failed: {e:#}"),
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 控制端的时钟比被控端晚 1000 秒、正常时这一路 30 ms
+    fn clock_at(start: Instant) -> InputClock {
+        InputClock {
+            epoch: start,
+            ..InputClock::default()
+        }
+    }
+
+    const SKEW: u64 = 1_000_000_000;
+
+    #[test]
+    fn input_that_waited_out_a_network_outage_is_stale() {
+        let start = Instant::now();
+        let mut c = clock_at(start);
+        // 控制端在 sent 时刻（被控端时钟，毫秒）发出、被控端在 at 时刻收到
+        let mut msg =
+            |sent: u64, at: u64| c.stale(SKEW + sent * 1000, start + Duration::from_millis(at));
+        // 时快时慢的正常网络
+        for i in 0..100 {
+            assert!(!msg(i * 100, i * 100 + 30 + (i % 7) * 20));
+        }
+        // 断网 30 秒：这期间的 Ping 和输入都积在 QUIC 的发送缓冲里，恢复后一起到
+        let back = 10_000 + 30_000;
+        assert!(msg(10_000, back));
+        assert!(msg(25_000, back + 1));
+        assert!(msg(37_000, back + 2));
+        // 恢复前 1 秒才发的：不到 INPUT_MAX_AGE，照样执行
+        assert!(!msg(39_000, back + 3));
+        // 恢复之后新发的
+        assert!(!msg(39_990, back + 40));
+        assert!(!msg(40_100, 40_100 + 35));
+    }
+
+    #[test]
+    fn follows_clock_drift_and_a_slower_path() {
+        let start = Instant::now();
+        let mut c = clock_at(start);
+        // 控制端的时钟每秒慢 0.05 ms（50 ppm），跑一个小时
+        for s in 0..3600u64 {
+            let sent = SKEW + s * 1_000_000 - s * 50;
+            assert!(!c.stale(sent, start + Duration::from_millis(s * 1000 + 30)));
+        }
+        // 换了一条慢 3 秒的网络：丢一阵子（不超过 RESYNC），然后重新取基准
+        let mut dropped = 0;
+        for i in 0..100u64 {
+            let at = 3_700_000 + i * 100;
+            if c.stale(
+                SKEW + (at - 3_030) * 1000 - 3600 * 50,
+                start + Duration::from_millis(at),
+            ) {
+                dropped += 1;
+            }
+        }
+        assert!(dropped > 0 && dropped <= 51, "{dropped}");
+        assert!(!c.stale(
+            SKEW + (3_720_000 - 3_030) * 1000 - 3600 * 50,
+            start + Duration::from_millis(3_720_000)
+        ));
+    }
+
+    #[test]
+    fn cursor_cache_sends_each_shape_once() {
+        let shape = |n: u8| CursorShape {
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: vec![n; 4],
+        };
+        let mut c = CursorCache::default();
+        // 动画光标：同几个形状循环
+        let first: Vec<CursorSlot> = (0..8).map(|n| c.place(&shape(n))).collect();
+        assert!(first.iter().all(|s| s.image.is_some()));
+        for round in 0..3 {
+            for n in 0..8 {
+                let s = c.place(&shape(n));
+                assert_eq!(
+                    (s.slot, s.image.is_none()),
+                    (first[n as usize].slot, true),
+                    "round {round}"
+                );
+            }
+        }
+        // 槽位满了：换掉最久没用的（现在是 0 号形状）
+        for n in 8..CURSOR_SLOTS {
+            assert!(c.place(&shape(n)).image.is_some());
+        }
+        for n in 1..8 {
+            c.place(&shape(n));
+        }
+        let s = c.place(&shape(200));
+        assert_eq!(s.slot, first[0].slot);
+        assert!(s.image.is_some());
+        assert!(c.place(&shape(0)).image.is_some());
+        // 没发出去的要忘掉，下次还带图像
+        let s = c.place(&shape(201));
+        c.forget(&s);
+        assert!(c.place(&shape(201)).image.is_some());
     }
 }

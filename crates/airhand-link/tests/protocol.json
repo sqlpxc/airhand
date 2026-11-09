@@ -145,7 +145,8 @@
       "start": true
     },
     {
-      "hex": "020300000000000002000100010000000000000000000000ff0000ff0000ff80",
+      "cached": false,
+      "hex": "020307000000000002000100010000000000000000000000ff0000ff0000ff80",
       "kind": 2,
       "name": "cursor",
       "payload": "ff0000ff0000ff80",
@@ -155,14 +156,27 @@
         "hotY": 0,
         "width": 2
       },
+      "slot": 7,
       "visible": true
     },
     {
+      "cached": true,
+      "hex": "020507000000000000000000000000000000000000000000",
+      "kind": 2,
+      "name": "cached cursor",
+      "payload": "",
+      "shape": null,
+      "slot": 7,
+      "visible": true
+    },
+    {
+      "cached": false,
       "hex": "020000000000000000000000000000000000000000000000",
       "kind": 2,
       "name": "hidden cursor",
       "payload": "",
       "shape": null,
+      "slot": 0,
       "visible": false
     }
   ]

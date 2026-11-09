@@ -18,9 +18,12 @@
 //! |------|---------------------|---------------------------------------------------|------|
 //! | 控制 | 双向                | [`session::HostMsg`] / [`session::ControllerMsg`] | postcard（[`framing`]） |
 //! | 画面 | 被控端 → 控制端     | 画面包                                            | 媒体包（[`media`]） |
-//! | 声音 | 被控端 → 控制端     | 声音包                                            | 媒体包（[`media`]） |
+//! | 声音 | 被控端 → 控制端     | 放不进数据报的声音包（很少见）                    | 媒体包（[`media`]） |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`。媒体包是定长头 + 原始数据，控制端原样交给界面，不重新编码。
+//!
+//! 声音包平时走 QUIC 数据报（[`datagram`]）：丢了就丢了，不重传，也不用排在丢了的包后面等重传。
+//! 服务器按数据报开头的会话 ID 在这个会话的两端之间原样转发。
 
 pub mod framing;
 pub mod media;
@@ -115,6 +118,30 @@ impl SessionHeader {
     }
 }
 
+/// QUIC 数据报：`会话 ID（u64 LE）| 媒体包`（没有长度前缀，一个数据报就是一个包）。
+///
+/// 服务器只看开头的会话 ID：发送方是这个会话的一端，就原样转给另一端，否则丢掉。
+/// 目前只有被控端的声音包走数据报（见 [`media`]）。
+pub mod datagram {
+    /// 开头的会话 ID
+    pub const HEADER: usize = 8;
+    /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
+    /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
+    pub const MAX: usize = 1000;
+
+    pub fn encode(session_id: u64, packet: &[u8]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(HEADER + packet.len());
+        d.extend_from_slice(&session_id.to_le_bytes());
+        d.extend_from_slice(packet);
+        d
+    }
+
+    /// 数据报属于哪个会话；不到一个会话 ID 长时为 `None`
+    pub fn session(d: &[u8]) -> Option<u64> {
+        Some(u64::from_le_bytes(d.get(..HEADER)?.try_into().ok()?))
+    }
+}
+
 /// 把控制码格式化为 `123 456` 形式，便于阅读。
 pub fn format_code(code: u32) -> String {
     let s = format!("{code:06}");
@@ -152,6 +179,14 @@ mod tests {
         let mut bad = h.encode();
         bad[13] = 3;
         assert_eq!(SessionHeader::decode(&bad), None);
+    }
+
+    #[test]
+    fn datagram_layout() {
+        let d = datagram::encode(0x0102_0304_0506_0708, &[9, 9]);
+        assert_eq!(d, [8, 7, 6, 5, 4, 3, 2, 1, 9, 9]);
+        assert_eq!(datagram::session(&d), Some(0x0102_0304_0506_0708));
+        assert_eq!(datagram::session(&d[..7]), None);
     }
 
     #[test]

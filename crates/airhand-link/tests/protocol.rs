@@ -9,8 +9,8 @@
 use airhand_link::controller::Command;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
-    Codec, CursorShape, CursorState, InputEvent, MouseButton, QualitySettings, SystemAction,
-    TouchPhase,
+    Codec, CursorShape, CursorSlot, CursorState, InputEvent, MouseButton, QualitySettings,
+    SystemAction, TouchPhase,
 };
 use serde_json::{Value, json};
 
@@ -147,7 +147,17 @@ fn fixture() -> Value {
     };
     let cursor = media::cursor_packet(&CursorState {
         visible: true,
-        shape: Some(shape.clone()),
+        shape: Some(CursorSlot {
+            slot: 7,
+            image: Some(shape.clone()),
+        }),
+    });
+    let cached = media::cursor_packet(&CursorState {
+        visible: true,
+        shape: Some(CursorSlot {
+            slot: 7,
+            image: None,
+        }),
     });
     let hidden = media::cursor_packet(&CursorState {
         visible: false,
@@ -171,11 +181,15 @@ fn fixture() -> Value {
                 "kind": 3, "seq": 3, "start": true, "captureUs": capture_us + 20_000, "payload": "fcfffe"
             },
             {
-                "name": "cursor", "hex": hex(&cursor), "kind": 2, "visible": true,
+                "name": "cursor", "hex": hex(&cursor), "kind": 2, "visible": true, "slot": 7, "cached": false,
                 "shape": { "width": 2, "height": 1, "hotX": 1, "hotY": 0 }, "payload": hex(&shape.rgba)
             },
             {
-                "name": "hidden cursor", "hex": hex(&hidden), "kind": 2, "visible": false,
+                "name": "cached cursor", "hex": hex(&cached), "kind": 2, "visible": true, "slot": 7, "cached": true,
+                "shape": null, "payload": ""
+            },
+            {
+                "name": "hidden cursor", "hex": hex(&hidden), "kind": 2, "visible": false, "slot": 0, "cached": false,
                 "shape": null, "payload": ""
             }
         ],

@@ -3,13 +3,15 @@
 //! 服务器只做三件事：
 //! 1. 为被控端分配 6 位控制码（断线重连可取回原控制码；保存了控制码的被控端一直为它保留，见 [`crate::codes`]）；
 //! 2. 控制端按控制码发起会话时通知被控端；
-//! 3. 把双方的会话流配对后，以 `Bytes` 块为单位零拷贝透传。
+//! 3. 把双方的会话流配对后，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音，见 `airhand_proto::datagram`）
+//!    按开头的会话 ID 在两端之间原样转发（[`Route`]）。
 //!
 //! 服务器从不解析画面/输入数据。
 //!
-//! 防暴力猜码：控制码不存在算一次猜错（[`FAIL_LIMIT`]）。被控端掉线后，之前连上过它的控制端带着重连凭证
-//! 重连（见 `airhand_proto::signal` 模块说明的"重连凭证"）：这些请求不算猜错、不受限速影响，
-//! 被控端不在线时服务器记下它们（[`Waiter`]），被控端重新上线时通知它们重连。
+//! 防暴力猜码：控制码不存在算一次猜错（[`FAIL_LIMIT`]），并且晚 400 ms 回答。控制码存在、但被控端还没准备好
+//! （正在注册、正在断开）时回答得一模一样（也算猜错、也晚回答），不能靠回答的快慢看出控制码存在。
+//! 之前连上过的控制端带着重连凭证重连（见 `airhand_proto::signal` 模块说明的"重连凭证"）：凭证证明它本来就知道这个
+//! 控制码，这些请求不算猜错、不受限速影响，被控端不在线时服务器记下它们（[`Waiter`]），被控端重新上线时通知它们重连。
 //!
 //! 注册不能用来探测控制码：取回控制码要出示密钥，密钥由服务器签名（[`Broker::issue_secret`]），
 //! 控制码空闲时也只认服务器为**这个控制码**签发过的密钥，对不上就分配一个新的——回答和控制码有没有人用无关。
@@ -29,7 +31,9 @@ use airhand_proto::framing::{read_msg, write_msg};
 use airhand_proto::signal::{
     ClientMsg, ConnectError, Peer, Reclaim, ResumeToken, ServerMsg, SessionGrant,
 };
-use airhand_proto::{CODE_MAX, CODE_MIN, MAX_SIGNAL_MSG, PROTOCOL_VERSION, Role, SessionHeader};
+use airhand_proto::{
+    CODE_MAX, CODE_MIN, MAX_SIGNAL_MSG, PROTOCOL_VERSION, Role, SessionHeader, datagram,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::{RecvStream, SendStream, VarInt};
 use rand::Rng;
@@ -136,17 +140,19 @@ struct Reserved {
     until: Instant,
 }
 
-/// 控制码 `code`、密钥 `secret` 对应的重连凭证。密钥只有服务器和被控端知道，
-/// 所以凭证只能从服务器那里得到（连上过这个被控端），也不能从凭证反推出密钥（取回控制码要用）。
-/// 被控端取回控制码时密钥不变，凭证也就仍然有效（包括服务器重启之后）；换了密钥（[`ClientMsg::Rekey`]）就作废了。
-fn resume_token(code: u32, secret: &[u8; 16]) -> ResumeToken {
+/// 重连凭证的前一半：服务器为控制码 `code` 签的名（见 [`Broker::resume_token`]）
+fn token_proof(key: &[u8; 32], code: u32) -> [u8; 8] {
+    let mac = hmac_sha256(key, &[b"airhand resume proof v1\0", &code.to_le_bytes()]);
+    mac[..8].try_into().unwrap()
+}
+
+/// 重连凭证的后一半：只对密钥 `secret` 有效（见 [`Broker::resume_token`]）
+fn token_auth(code: u32, secret: &[u8; 16]) -> [u8; 8] {
     let mut h = Sha256::new();
-    h.update(b"airhand resume token v1\0");
+    h.update(b"airhand resume token v2\0");
     h.update(code.to_le_bytes());
     h.update(secret);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&h.finalize()[..16]);
-    out
+    h.finalize()[..8].try_into().unwrap()
 }
 
 /// 比较凭证、密钥，用时与内容无关（不能靠测量回答的快慢逐字节猜出来）
@@ -182,12 +188,31 @@ fn secret_mac(key: &[u8; 32], code: u32, nonce: &[u8]) -> [u8; 8] {
     mac[..8].try_into().unwrap()
 }
 
-/// 等被控端上线的控制端（回答过它 [`ConnectError::Offline`]）。
-/// 被控端用这个控制码上线、并且凭证对得上时发 [`ServerMsg::HostOnline`]，然后忘掉。
+/// 等被控端上线的控制端（带着本服务器为这个控制码发的凭证，回答过它 [`ConnectError::Offline`]）。
+/// 被控端用这个控制码上线时发 [`ServerMsg::HostOnline`]，然后忘掉。凭证的后一半对不上（被控端换过密钥）的也通知：
+/// 它重连时会收到 [`ConnectError::Revoked`]，而不是一直等下去
 struct Waiter {
     conn_id: u64,
-    resume: ResumeToken,
     tx: SignalTx,
+}
+
+/// 一个会话的两端（转发数据报用，见 [`Broker::relay_datagrams`]）
+struct Route {
+    host: (u64, quinn::Connection),
+    ctrl: (u64, quinn::Connection),
+}
+
+impl Route {
+    /// 连接 `conn_id` 发来的数据报转给谁；不是这个会话的两端时为 `None`
+    fn peer_of(&self, conn_id: u64) -> Option<&quinn::Connection> {
+        if conn_id == self.host.0 {
+            Some(&self.ctrl.1)
+        } else if conn_id == self.ctrl.0 {
+            Some(&self.host.1)
+        } else {
+            None
+        }
+    }
 }
 
 /// 发起连接请求的控制端（一条连接）
@@ -203,12 +228,13 @@ struct Ctrl<'a> {
 /// 连接请求被拒绝的原因（发给控制端的是 [`Denied::error`]）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Denied {
-    /// 控制码不存在：算一次猜错
+    /// 控制码不存在，或者被控端还没准备好（正在注册、正在断开）：算一次猜错，晚一点回答。
+    /// 这两种情况必须答得一模一样，否则能靠回答的快慢看出控制码存在
     Unknown,
-    /// 控制码没错，但被控端正在断开：不算猜错
-    Vanished,
-    /// 回答带凭证的请求：被控端不在线、凭证不对、控制码不存在都是这个回答（不透露控制码是否存在）
+    /// 回答带凭证的请求：被控端不在线（凭证的前一半是本服务器为这个控制码签的，回答实情不泄露什么）
     Offline,
+    /// 回答带凭证的请求：凭证作废了，或者不是本服务器为这个控制码发的
+    Revoked,
     /// 猜错次数过多
     Limited,
     /// 对方会话数已满
@@ -218,8 +244,9 @@ enum Denied {
 impl Denied {
     fn error(self) -> ConnectError {
         match self {
-            Denied::Unknown | Denied::Vanished => ConnectError::NotFound,
+            Denied::Unknown => ConnectError::NotFound,
             Denied::Offline => ConnectError::Offline,
+            Denied::Revoked => ConnectError::Revoked,
             Denied::Limited => ConnectError::RateLimited,
             Denied::Busy => ConnectError::Busy,
         }
@@ -320,6 +347,9 @@ impl Limiter {
 struct Pending {
     host_conn: u64,
     ctrl_conn: u64,
+    /// 两端的连接：会话建立后按它们转发数据报
+    host_link: quinn::Connection,
+    ctrl_link: quinn::Connection,
     created: Instant,
     host_streams: [Option<(SendStream, RecvStream)>; 3],
     ctrl_streams: [Option<(SendStream, RecvStream)>; 3],
@@ -344,6 +374,8 @@ pub struct Broker {
     bindings: Mutex<Bindings>,
     /// 控制码 → 等它上线的控制端
     waiters: Mutex<HashMap<u32, Vec<Waiter>>>,
+    /// 建立了的会话（会话 ID → 两端），转发数据报用
+    routes: Mutex<HashMap<u64, Route>>,
     next_conn: AtomicU64,
 }
 
@@ -361,8 +393,28 @@ impl Broker {
             conns: Mutex::default(),
             bindings: Mutex::new(bindings),
             waiters: Mutex::default(),
+            routes: Mutex::default(),
             next_conn: AtomicU64::new(1),
         })
+    }
+
+    /// 控制码 `code`、密钥 `secret` 对应的重连凭证：
+    ///
+    /// * 前一半是服务器用自己的密钥给控制码签的名（[`token_proof`]）：证明拿着它的控制端连上过这个控制码，
+    ///   服务器重启之后也认得，被控端不在线也能验证（[`Broker::vouches`]）；
+    /// * 后一半由控制码和被控端的密钥算出（[`token_auth`]）：密钥只有服务器和被控端知道，所以只能从服务器那里得到，
+    ///   也不能从它反推出密钥（取回控制码要用）。被控端取回控制码时密钥不变，凭证仍然有效（包括服务器重启之后）；
+    ///   换了密钥（[`ClientMsg::Rekey`]）就作废了。
+    fn resume_token(&self, code: u32, secret: &[u8; 16]) -> ResumeToken {
+        let mut t = [0u8; 16];
+        t[..8].copy_from_slice(&token_proof(&self.key, code));
+        t[8..].copy_from_slice(&token_auth(code, secret));
+        t
+    }
+
+    /// `token` 是不是本服务器给控制码 `code` 的控制端发的（不管现在还有没有效）
+    fn vouches(&self, code: u32, token: &ResumeToken) -> bool {
+        ct_eq(&token[..8], &token_proof(&self.key, code))
     }
 
     /// 为控制码 `code` 签发一个新的密钥（见 [`secret_mac`]）
@@ -541,6 +593,7 @@ impl Broker {
             writer_conn.close(VarInt::from_u32(close::SIGNAL), b"signal writer ended");
         });
         let acceptor = tokio::spawn(self.clone().accept_sessions(conn.clone(), conn_id, role));
+        let datagrams = tokio::spawn(self.clone().relay_datagrams(conn.clone(), conn_id));
 
         // 被控端注册到的控制码：断开时按它直接找到自己的登记，不用遍历所有被控端
         let mut host_code = None;
@@ -563,6 +616,7 @@ impl Broker {
         };
 
         acceptor.abort();
+        datagrams.abort();
         writer.abort();
         if let Some(code) = host_code {
             self.unregister(conn_id, code);
@@ -582,8 +636,15 @@ impl Broker {
         let conn_id = host.conn_id;
         while let Some(msg) = read_msg::<_, ClientMsg>(&mut recv, MAX_SIGNAL_MSG, buf).await? {
             match (msg, *code) {
-                (ClientMsg::Register { reclaim, keep }, None) => {
-                    let (got, barrier) = match self.register(host, reclaim, keep) {
+                (
+                    ClientMsg::Register {
+                        reclaim,
+                        keep,
+                        rekey,
+                    },
+                    None,
+                ) => {
+                    let (got, barrier) = match self.register(host, reclaim, keep, rekey) {
                         Ok(r) => r,
                         Err(refused) => {
                             info!(%peer, conn_id, ?refused, "registration refused");
@@ -598,7 +659,7 @@ impl Broker {
                         self.persisted(barrier).await;
                     }
                     self.announce(conn_id, got);
-                    info!(%peer, conn_id, code = got, keep, reclaimed = reclaim.is_some_and(|r| r.code == got), "host registered");
+                    info!(%peer, conn_id, code = got, keep, rekey, reclaimed = reclaim.is_some_and(|r| r.code == got), "host registered");
                 }
                 (ClientMsg::Release, Some(c)) => {
                     if self.release(conn_id, c) {
@@ -622,12 +683,14 @@ impl Broker {
     }
 
     /// 分配（或者还回原来的）控制码并登记被控端（还不发布，见 [`Broker::announce`]）。
+    /// `rekey`：还回原来的控制码时换一个密钥（被控端之前的 [`ClientMsg::Rekey`] 没等到回答，见 `ClientMsg::Register`）。
     /// 返回控制码，以及绑定有实质变化时要等它落盘的屏障
     fn register(
         &self,
         host: &HostConn<'_>,
         reclaim: Option<Reclaim>,
         keep: bool,
+        rekey: bool,
     ) -> Result<(u32, Option<Barrier>), Refused> {
         let mut hosts = self.hosts.lock().unwrap();
         let mut reserved = self.reserved.lock().unwrap();
@@ -649,9 +712,10 @@ impl Broker {
                 }
             };
             let secrets = match owner {
-                Owner::Current => Some(Secrets::new(r.secret)),
-                // 被控端没来得及保存上次换的密钥：再签发一个新的给它，它手里的旧密钥继续认到它保存了新的为止
-                Owner::Previous => Some(Secrets {
+                Owner::Current if !rekey => Some(Secrets::new(r.secret)),
+                // 被控端没来得及保存上次换的密钥，或者请求换的密钥没等到回答（服务器可能没收到、或者没记下来就重启了）：
+                // 签发一个新的给它，用它手里的密钥算出的重连凭证随之作废；它手里的密钥继续认到它保存了新的为止
+                Owner::Current | Owner::Previous => Some(Secrets {
                     cur: self.issue_secret(r.code),
                     prev: Some(r.secret),
                 }),
@@ -735,10 +799,10 @@ impl Broker {
         // 控制端收到通知后马上发起的会话（Incoming）只能排在它后面
         let _ = tx.send(ServerMsg::Registered { code, secret });
 
-        // 叫醒在等这个被控端的控制端。凭证对不上的直接忘掉：它们等的是以前用过这个控制码的另一台被控端
+        // 叫醒在等这个控制码的控制端（它们的凭证是本服务器为这个控制码发的）。凭证作废了的（被控端换过密钥、
+        // 控制码换了主人）重连时会收到 Revoked，而不是一直等下去
         if let Some(list) = self.waiters.lock().unwrap().remove(&code) {
-            let token = resume_token(code, &secret);
-            for w in list.iter().filter(|w| ct_eq(&w.resume, &token)) {
+            for w in &list {
                 debug!(
                     code,
                     ctrl = w.conn_id,
@@ -853,7 +917,7 @@ impl Broker {
         result
     }
 
-    /// `resume` 是控制端带来的重连凭证（见 [`resume_token`]）。
+    /// `resume` 是控制端带来的重连凭证（见 [`Broker::resume_token`]）。
     fn connect(
         &self,
         ctrl: &Ctrl,
@@ -863,32 +927,40 @@ impl Broker {
     ) -> Result<SessionGrant, Denied> {
         let hosts = self.hosts.lock().unwrap();
         let host = match resume {
-            // 带凭证：凭证对得上才回答实情，否则（被控端不在线、凭证不对、控制码不存在）一律"不在线"。
-            // 回答不透露控制码是否存在，所以不算猜错，也不必限速
-            Some(resume) => match hosts.get(&code) {
-                Some(h) if ct_eq(&resume_token(code, &h.secrets.cur), &resume) => h,
-                _ => {
-                    self.wait(ctrl, code, resume, waiting);
-                    return Err(Denied::Offline);
+            Some(token) => {
+                // 不是本服务器为这个控制码发的（伪造的、旧版本的、别的服务器的）：回答只取决于凭证本身，
+                // 和控制码在不在、有没有人用都无关，所以凭证不能用来猜码
+                if !self.vouches(code, &token) {
+                    return Err(Denied::Revoked);
                 }
-            },
+                // 是本服务器为这个控制码发的：控制端本来就知道这个控制码，回答实情，不算猜错，也不必限速
+                match hosts.get(&code) {
+                    Some(h) if h.ready => {
+                        if !ct_eq(&self.resume_token(code, &h.secrets.cur), &token) {
+                            // 被控端换过密钥（断开过所有控制端）、控制码换了主人
+                            return Err(Denied::Revoked);
+                        }
+                        h
+                    }
+                    // 不在线，或者正在上线：等它
+                    _ => {
+                        self.wait(ctrl, code, waiting);
+                        return Err(Denied::Offline);
+                    }
+                }
+            }
             None => {
                 // 先检查限速再查控制码：被限速时不透露控制码是否存在
                 if self.failure_count(ctrl.ip) >= FAIL_LIMIT {
                     return Err(Denied::Limited);
                 }
-                hosts.get(&code).ok_or(Denied::Unknown)?
+                // 还没准备好的被控端（正在注册、正在断开）和不存在的控制码答得一样
+                match hosts.get(&code) {
+                    Some(h) if h.ready => h,
+                    _ => return Err(Denied::Unknown),
+                }
             }
         };
-        if !host.ready {
-            return Err(match resume {
-                Some(token) => {
-                    self.wait(ctrl, code, token, waiting);
-                    Denied::Offline
-                }
-                None => Denied::Vanished,
-            });
-        }
         // 预占一个会话槽位
         let prev = host.sessions.fetch_add(1, Ordering::AcqRel);
         let slot = SlotGuard(host.sessions.clone());
@@ -907,6 +979,8 @@ impl Broker {
             Pending {
                 host_conn: host.conn_id,
                 ctrl_conn: ctrl.conn_id,
+                host_link: host.conn.clone(),
+                ctrl_link: ctrl.tx.conn.clone(),
                 created: Instant::now(),
                 host_streams: std::array::from_fn(|_| None),
                 ctrl_streams: std::array::from_fn(|_| None),
@@ -925,11 +999,11 @@ impl Broker {
             // 被控端正在断开
             self.pending.lock().unwrap().remove(&session_id);
             return Err(match resume {
-                Some(resume) => {
-                    self.wait(ctrl, code, resume, waiting);
+                Some(_) => {
+                    self.wait(ctrl, code, waiting);
                     Denied::Offline
                 }
-                None => Denied::Vanished,
+                None => Denied::Unknown,
             });
         }
         info!(session_id, "{label}: session created");
@@ -937,19 +1011,18 @@ impl Broker {
             session_id,
             host_name: host.name.clone(),
             host_os: host.os.clone(),
-            resume: resume_token(code, &host.secrets.cur),
+            resume: self.resume_token(code, &host.secrets.cur),
         })
     }
 
     /// 记下 `ctrl` 在等 `code` 上线（调用方持有 hosts 锁，所以不会错过同时发生的上线）。
     /// `waiting` 是这条连接在等的控制码，最多 [`MAX_WAITING`] 个
-    fn wait(&self, ctrl: &Ctrl, code: u32, resume: ResumeToken, waiting: &mut Vec<u32>) {
+    fn wait(&self, ctrl: &Ctrl, code: u32, waiting: &mut Vec<u32>) {
         let mut all = self.waiters.lock().unwrap();
         let list = all.entry(code).or_default();
         list.retain(|w| w.conn_id != ctrl.conn_id);
         list.push(Waiter {
             conn_id: ctrl.conn_id,
-            resume,
             tx: ctrl.tx.clone(),
         });
         waiting.retain(|c| *c != code);
@@ -967,6 +1040,27 @@ impl Broker {
     fn record_failure(&self, ip: IpAddr) {
         self.failures.hit(ip);
     }
+
+    /// 转发连接 `conn_id` 发来的数据报：开头的会话 ID 是这条连接所在的会话，就原样转给会话的另一端，否则丢掉。
+    /// 数据报本来就可能丢：另一端的发送缓冲满了、太大了，都直接丢掉
+    async fn relay_datagrams(self: Arc<Self>, conn: quinn::Connection, conn_id: u64) {
+        while let Ok(d) = conn.read_datagram().await {
+            let Some(session_id) = datagram::session(&d) else {
+                continue;
+            };
+            let to = self
+                .routes
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .and_then(|r| r.peer_of(conn_id))
+                .cloned();
+            if let Some(to) = to {
+                let _ = to.send_datagram(d);
+            }
+        }
+    }
+
     async fn accept_sessions(self: Arc<Self>, conn: quinn::Connection, conn_id: u64, role: Role) {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -1047,6 +1141,14 @@ impl Broker {
         drop(pending);
         let session_id = h.session_id;
         info!(session_id, "{}: session established (3 lanes)", p.label);
+        self.routes.lock().unwrap().insert(
+            session_id,
+            Route {
+                host: (p.host_conn, p.host_link),
+                ctrl: (p.ctrl_conn, p.ctrl_link),
+            },
+        );
+        let route = RouteGuard(self.clone(), session_id);
         tokio::spawn(async move {
             let mut relays = tokio::task::JoinSet::new();
             for (a, b) in p.host_streams.into_iter().zip(p.ctrl_streams) {
@@ -1055,10 +1157,19 @@ impl Broker {
             // Every lane is required; closing any one tears down the whole session.
             let _ = relays.join_next().await;
             drop(relays);
+            drop(route);
             info!(session_id, "{}: session ended", p.label);
             drop(p.slot);
         });
         Ok(())
+    }
+}
+
+/// 会话结束时不再转发它的数据报
+struct RouteGuard(Arc<Broker>, u64);
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        self.0.routes.lock().unwrap().remove(&self.1);
     }
 }
 
@@ -1177,10 +1288,16 @@ mod tests {
 
     #[test]
     fn resume_token_binds_code_and_secret() {
-        let t = resume_token(123_456, &[1; 16]);
-        assert!(ct_eq(&t, &resume_token(123_456, &[1; 16])));
-        assert!(!ct_eq(&t, &resume_token(123_457, &[1; 16])));
-        assert!(!ct_eq(&t, &resume_token(123_456, &[2; 16])));
+        let broker = Broker::new(test_config(None));
+        let t = broker.resume_token(123_456, &[1; 16]);
+        assert!(ct_eq(&t, &broker.resume_token(123_456, &[1; 16])));
+        assert!(!ct_eq(&t, &broker.resume_token(123_457, &[1; 16])));
+        assert!(!ct_eq(&t, &broker.resume_token(123_456, &[2; 16])));
+        // 前一半只和控制码、服务器有关：换了密钥也认得是自己发的，别的控制码、别的服务器不认
+        assert!(broker.vouches(123_456, &broker.resume_token(123_456, &[2; 16])));
+        assert!(!broker.vouches(123_457, &t));
+        assert!(!Broker::new(test_config(None)).vouches(123_456, &t));
+        assert!(!broker.vouches(123_456, &[0; 16]));
         assert!(!ct_eq(&t, &t[..15]));
     }
 
@@ -1270,10 +1387,26 @@ mod tests {
         reclaim: Option<Reclaim>,
         keep: bool,
     ) -> (Signal, Reclaim) {
+        register_full(cfg, reclaim, keep, false).await
+    }
+
+    async fn register_full(
+        cfg: &LinkConfig,
+        reclaim: Option<Reclaim>,
+        keep: bool,
+        rekey: bool,
+    ) -> (Signal, Reclaim) {
         let mut sig = connect_signal(cfg, Role::Host).await.unwrap();
-        write_msg(&mut sig.send, &ClientMsg::Register { reclaim, keep })
-            .await
-            .unwrap();
+        write_msg(
+            &mut sig.send,
+            &ClientMsg::Register {
+                reclaim,
+                keep,
+                rekey,
+            },
+        )
+        .await
+        .unwrap();
         match next(&mut sig).await {
             ServerMsg::Registered { code, secret } => (sig, Reclaim { code, secret }),
             other => panic!("{other:?}"),
@@ -1393,7 +1526,7 @@ mod tests {
             .await
             .unwrap();
         let (_send, recv) = c.control;
-        let mut receiver = HostReceiver::new(recv, c.video, c.audio);
+        let mut receiver = HostReceiver::new(recv, c.video, c.audio, None);
         assert!(
             timeout(Duration::from_millis(10), receiver.recv())
                 .await
@@ -1417,8 +1550,8 @@ mod tests {
         ));
     }
 
-    /// 带凭证的请求：凭证不对时什么也不透露；被控端掉线期间一直重连不算猜码、不受限速影响，
-    /// 被控端回来时马上收到通知
+    /// 带凭证的请求：不是本服务器为这个控制码发的凭证什么也不透露；被控端掉线期间一直重连不算猜码、
+    /// 不受限速影响，被控端回来时马上收到通知
     #[tokio::test]
     async fn resume_and_wait_for_the_host() {
         let (broker, cfg) = start().await;
@@ -1429,15 +1562,16 @@ mod tests {
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
         let token = ask(&mut ctrl, 1, code, None).await.unwrap().resume;
 
-        // 凭证不对：被控端在线也不给连，回答和控制码不存在时一样
+        // 不是为这个控制码发的凭证：不管控制码在不在线、存不存在都是同一个回答，不算猜错，也不等
         let mut stranger = connect_signal(&cfg, Role::Controller).await.unwrap();
         for (req, c, t) in [(1, code, [0; 16]), (2, other, [0; 16]), (3, other, token)] {
             assert_eq!(
                 ask(&mut stranger, req, c, Some(t)).await.unwrap_err(),
-                ConnectError::Offline
+                ConnectError::Revoked
             );
         }
         assert_eq!(broker.failure_count(ip), 0);
+        assert_eq!(waiter_count(&broker), 0);
 
         // 被控端掉线
         host.conn.close(VarInt::from_u32(0), b"");
@@ -1460,7 +1594,7 @@ mod tests {
         }
         assert_eq!(broker.failure_count(ip), FAIL_LIMIT);
 
-        // 被控端取回控制码：在等的控制端收到通知（只一次），凭证对不上的收不到
+        // 被控端取回控制码：在等的控制端收到通知（只一次），没在等的收不到
         let (_host, again) = register(&cfg, Some(id)).await;
         assert_eq!(again.code, code);
         assert!(matches!(next(&mut ctrl).await, ServerMsg::HostOnline { code: c } if c == code));
@@ -1468,14 +1602,18 @@ mod tests {
         // 下一条消息就是回答，说明 stranger 没有收到通知
         assert_eq!(
             ask(&mut stranger, 4, other, Some(token)).await.unwrap_err(),
-            ConnectError::Offline
+            ConnectError::Revoked
         );
 
         // 每条连接最多等 MAX_WAITING 个被控端；连接断开后全部忘掉
         for i in 0..MAX_WAITING as u32 + 8 {
             let c = CODE_MIN + i;
             if c != code {
-                let _ = ask(&mut stranger, 100 + i, c, Some([0; 16])).await;
+                let t = broker.resume_token(c, &[0; 16]);
+                assert_eq!(
+                    ask(&mut stranger, 100 + i, c, Some(t)).await.unwrap_err(),
+                    ConnectError::Offline
+                );
             }
         }
         assert_eq!(waiter_count(&broker), MAX_WAITING);
@@ -1631,12 +1769,12 @@ mod tests {
             panic!("expected Rekeyed");
         };
         assert_ne!(secret, id.secret);
-        // 旧凭证：和被控端不在线时的回答一样
+        // 旧凭证作废了
         assert_eq!(
             ask(&mut ctrl, 2, id.code, Some(old_token))
                 .await
                 .unwrap_err(),
-            ConnectError::Offline
+            ConnectError::Revoked
         );
         // 控制码本身照样能连，拿到的是新凭证
         let fresh = ask(&mut ctrl, 3, id.code, None).await.unwrap().resume;
@@ -1712,9 +1850,354 @@ mod tests {
             ask(&mut ctrl, 2, first.code, Some(token))
                 .await
                 .unwrap_err(),
-            ConnectError::Offline
+            ConnectError::Revoked
         );
         task.abort();
+    }
+
+    /// 被控端发了 Rekey 却没等到回答就断线了（服务器可能没收到、或者收到了还没记下就重启了）：
+    /// 重新注册时带上 rekey，直到换成了为止（airhand-link 的被控端服务）
+    #[tokio::test]
+    async fn host_service_retries_an_unanswered_rekey() {
+        use airhand_link::host::{HostCmd, HostEvents};
+        struct Events;
+        impl HostEvents for Events {
+            fn server(&self, _: airhand_link::ServerState) {}
+            async fn registered(&self, _: Reclaim, _: bool) {}
+            async fn released(&self) {}
+            fn incoming(&self, _: u64, _: &Peer) {}
+            fn ended(&self, _: u64) {}
+            fn offline(&self) {}
+        }
+        // 只会说信令的假服务器
+        let ck = rcgen::generate_simple_self_signed(vec!["airhand".into()]).unwrap();
+        let chain = vec![CertificateDer::from(ck.cert.der().to_vec())];
+        let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into();
+        let endpoint = quinn::Endpoint::server(
+            crate::server_config(chain, key).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let cfg =
+            LinkConfig::new(endpoint.local_addr().unwrap().to_string(), "", "t", "t").unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        // 不保存控制码的被控端
+        let task = tokio::spawn(airhand_link::host::run(
+            Arc::new(cfg),
+            false,
+            None,
+            Arc::new(Events),
+            |_conn, _id, _kick| async {},
+            cmd_rx,
+        ));
+        let mut buf = Vec::new();
+        // 接受被控端的一条连接，握手，返回它的注册请求
+        let mut accept = async || {
+            let incoming = timeout(Duration::from_secs(10), endpoint.accept())
+                .await
+                .expect("the host didn't (re)connect")
+                .unwrap();
+            let conn = incoming.await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let hello: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(hello, ClientMsg::Hello { .. }));
+            write_msg(
+                &mut send,
+                &ServerMsg::Welcome {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await
+            .unwrap();
+            let reg: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+                .await
+                .unwrap()
+                .unwrap();
+            (conn, send, recv, reg)
+        };
+        let (conn, mut send, mut recv, reg) = accept().await;
+        assert!(
+            matches!(
+                reg,
+                ClientMsg::Register {
+                    reclaim: None,
+                    rekey: false,
+                    ..
+                }
+            ),
+            "{reg:?}"
+        );
+        let id = Reclaim {
+            code: 123_456,
+            secret: [7; 16],
+        };
+        write_msg(
+            &mut send,
+            &ServerMsg::Registered {
+                code: id.code,
+                secret: id.secret,
+            },
+        )
+        .await
+        .unwrap();
+        cmd_tx.send(HostCmd::KickAll).unwrap();
+        let mut b = Vec::new();
+        let rekey: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut b)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(rekey, ClientMsg::Rekey));
+        // 还没回答就断了
+        conn.close(VarInt::from_u32(0), b"gone");
+        let (_conn, _send, _recv, reg) = accept().await;
+        assert!(
+            matches!(reg, ClientMsg::Register { reclaim: Some(r), keep: false, rekey: true } if r == id),
+            "{reg:?}"
+        );
+        task.abort();
+    }
+
+    /// 不保存控制码的被控端发了 Rekey 却没等到回答（断线了），服务器又恰好重启（什么都没记下）：
+    /// 被控端注册时带上 rekey，服务器还回控制码的同时换密钥，旧密钥不会"重新生效"、旧凭证也就恢复不了
+    #[tokio::test]
+    async fn rekey_on_register_survives_a_lost_answer_and_a_restart() {
+        let (dir, file) = temp_db();
+        let (old, cfg) = start_with(Some(file.clone())).await;
+        let (host, id) = register(&cfg, None).await;
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
+        old.flush_bindings().await;
+        drop((host, ctrl, old));
+
+        let (broker, cfg) = start_with(Some(file)).await;
+        let (h1, again) = register_full(&cfg, Some(id), false, true).await;
+        assert_eq!(again.code, id.code);
+        assert_ne!(again.secret, id.secret);
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        assert_eq!(
+            ask(&mut ctrl, 1, id.code, Some(token)).await.unwrap_err(),
+            ConnectError::Revoked
+        );
+        // 新密钥又没收到、拿着旧的回来：控制码还给它，但再换一个，旧凭证一直作废
+        h1.conn.close(VarInt::from_u32(0), b"");
+        wait_until("the host is gone", || broker.stats().0 == 0).await;
+        let (_h2, third) = register(&cfg, Some(id)).await;
+        assert_eq!(third.code, id.code);
+        assert!(third.secret != id.secret && third.secret != again.secret);
+        assert_eq!(
+            ask(&mut ctrl, 2, id.code, Some(token)).await.unwrap_err(),
+            ConnectError::Revoked
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 我的设备里保存的凭证可能作废了（对方断开过所有控制端）：对方在线时回答 Revoked（控制端改用控制码直接连），
+    /// 不在线时照样等它、对方上线时也通知，都不算猜错——从我的设备打开一台不在线的设备，不用再拿控制码试一次
+    #[tokio::test]
+    async fn stale_tokens_are_revoked_and_never_count_as_guesses() {
+        let (broker, cfg) = start().await;
+        let ip = limiter_key("127.0.0.1".parse().unwrap());
+        let (mut host, id) = register(&cfg, None).await;
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let stale = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
+        assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+        write_msg(&mut host.send, &ClientMsg::Rekey).await.unwrap();
+        let ServerMsg::Rekeyed { secret } = next(&mut host).await else {
+            panic!("expected Rekeyed");
+        };
+        assert_eq!(
+            ask(&mut ctrl, 2, id.code, Some(stale)).await.unwrap_err(),
+            ConnectError::Revoked
+        );
+        // 对方不在线：等它
+        host.conn.close(VarInt::from_u32(0), b"");
+        wait_until("the host is gone", || broker.stats().0 == 0).await;
+        drop(host);
+        assert_eq!(
+            ask(&mut ctrl, 3, id.code, Some(stale)).await.unwrap_err(),
+            ConnectError::Offline
+        );
+        assert_eq!(broker.failure_count(ip), 0);
+        // 对方回来了：照样通知；重连时才知道凭证作废了，改用控制码直接连
+        let (_host, _) = register(
+            &cfg,
+            Some(Reclaim {
+                code: id.code,
+                secret,
+            }),
+        )
+        .await;
+        assert!(matches!(next(&mut ctrl).await, ServerMsg::HostOnline { code } if code == id.code));
+        assert_eq!(
+            ask(&mut ctrl, 4, id.code, Some(stale)).await.unwrap_err(),
+            ConnectError::Revoked
+        );
+        assert!(ask(&mut ctrl, 5, id.code, None).await.is_ok());
+        assert_eq!(broker.failure_count(ip), 0);
+    }
+
+    /// 控制码存在、但被控端还没准备好（正在注册、正在断开）：回答和控制码不存在时一模一样——
+    /// 一样算猜错、一样晚回答，不能靠回答的快慢看出控制码存在
+    #[tokio::test]
+    async fn a_host_that_isnt_ready_is_answered_like_an_unknown_code() {
+        let (broker, cfg) = start().await;
+        let ip = limiter_key("127.0.0.1".parse().unwrap());
+        let (_host, id) = register(&cfg, None).await;
+        broker
+            .hosts
+            .lock()
+            .unwrap()
+            .get_mut(&id.code)
+            .unwrap()
+            .ready = false;
+        let unknown = (CODE_MIN..=CODE_MAX)
+            .find(|c| !broker.hosts.lock().unwrap().contains_key(c))
+            .unwrap();
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        for (req, code) in [(1, id.code), (2, unknown)] {
+            let t = Instant::now();
+            assert_eq!(
+                ask(&mut ctrl, req, code, None).await.unwrap_err(),
+                ConnectError::NotFound
+            );
+            assert!(t.elapsed() >= Duration::from_millis(400), "{code}");
+        }
+        assert_eq!(broker.failure_count(ip), 2);
+    }
+
+    /// 数据报按开头的会话 ID 在会话的两端之间转发；不是这个会话的连接发的、会话 ID 不对的、会话结束之后的都不转
+    #[tokio::test]
+    async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
+        use airhand_link::transport::open_session;
+        let (broker, cfg) = start().await;
+        let (mut host, id) = register(&cfg, None).await;
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+        assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+        let h = open_session(&host.conn, sid, Role::Host).await.unwrap();
+        let c = open_session(&ctrl.conn, sid, Role::Controller)
+            .await
+            .unwrap();
+        wait_until("the session is established", || {
+            broker.routes.lock().unwrap().contains_key(&sid)
+        })
+        .await;
+        let dgram = |sid: u64, body: &[u8]| datagram::encode(sid, body).into();
+        let recv = async |conn: &quinn::Connection| {
+            let d = timeout(Duration::from_secs(2), conn.read_datagram())
+                .await
+                .expect("no datagram")
+                .unwrap();
+            assert_eq!(datagram::session(&d), Some(sid));
+            d[datagram::HEADER..].to_vec()
+        };
+        host.conn.send_datagram(dgram(sid, b"hello")).unwrap();
+        assert_eq!(recv(&ctrl.conn).await, b"hello");
+        ctrl.conn.send_datagram(dgram(sid, b"back")).unwrap();
+        assert_eq!(recv(&host.conn).await, b"back");
+        // 别的连接冒用这个会话、会话 ID 不对：都不转（接着收到的是后面那个）
+        let other = connect_signal(&cfg, Role::Controller).await.unwrap();
+        other.conn.send_datagram(dgram(sid, b"intruder")).unwrap();
+        host.conn.send_datagram(dgram(sid ^ 1, b"lost")).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ctrl.conn.send_datagram(dgram(sid, b"back again")).unwrap();
+        host.conn.send_datagram(dgram(sid, b"again")).unwrap();
+        assert_eq!(recv(&host.conn).await, b"back again");
+        assert_eq!(recv(&ctrl.conn).await, b"again");
+        // 会话结束：不再转
+        drop((h, c));
+        wait_until("the session is gone", || {
+            !broker.routes.lock().unwrap().contains_key(&sid)
+        })
+        .await;
+    }
+
+    /// 被控端（airhand-link 的 HostSession）的声音包走数据报，经服务器转发，控制端服务交给界面
+    #[tokio::test]
+    async fn controller_service_gets_audio_over_datagrams() {
+        use airhand_link::host::HostSession;
+        use airhand_proto::media::{self, AudioHeader, Kind};
+        struct Ui(mpsc::UnboundedSender<Vec<u8>>);
+        impl SessionUi for Ui {
+            fn packet(&self, p: Vec<u8>) -> Result<(), UiClosed> {
+                if Kind::of(&p) == Some(Kind::Audio) {
+                    let _ = self.0.send(p);
+                }
+                Ok(())
+            }
+            fn event(&self, _: SessionEvent) -> Result<(), UiClosed> {
+                Ok(())
+            }
+        }
+        let (broker, cfg) = start().await;
+        let (mut host, id) = register(&cfg, None).await;
+        let svc = ControllerService::start(
+            Arc::new(cfg.clone()),
+            tokio::runtime::Handle::current(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let (tx, mut audio) = mpsc::unbounded_channel();
+        let ui = Arc::new(Ui(tx));
+        let code = id.code.to_string();
+        let connecting = async {
+            loop {
+                let r = svc
+                    .connect(
+                        &code,
+                        None,
+                        QualitySettings::default(),
+                        ui.clone(),
+                        Frontend::Browser,
+                    )
+                    .await;
+                match r {
+                    Err(Problem::NotConnected) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    r => break r,
+                }
+            }
+        };
+        let accepting = async {
+            let ServerMsg::Incoming { session_id, .. } = next(&mut host).await else {
+                panic!("expected Incoming");
+            };
+            let s = HostSession::open(&host.conn, session_id, 2, 16)
+                .await
+                .unwrap();
+            (session_id, s)
+        };
+        let (info, (sid, session)) = tokio::join!(connecting, accepting);
+        info.unwrap();
+        wait_until("the session is established", || {
+            broker.routes.lock().unwrap().contains_key(&sid)
+        })
+        .await;
+        for seq in 1..=5u32 {
+            let h = AudioHeader {
+                seq,
+                start: seq == 1,
+                capture_us: seq as u64,
+            };
+            let packet = media::frame(&h.encode(), &[&[seq as u8; 200]]);
+            session.audio.send(packet.into()).await.unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            let p = timeout(Duration::from_secs(5), audio.recv())
+                .await
+                .expect("no audio")
+                .unwrap();
+            assert_eq!(p.len(), media::HEADER_LEN + 200);
+            got.push(AudioHeader::decode(&p).unwrap().seq);
+        }
+        assert_eq!(got, [1, 2, 3, 4, 5]);
+        assert!(host.conn.stats().frame_tx.datagram >= 5);
+        drop(session);
     }
 
     /// 新分配的控制码按来源限量；取回自己原来的控制码不算
@@ -1733,6 +2216,7 @@ mod tests {
             &ClientMsg::Register {
                 reclaim: None,
                 keep: false,
+                rekey: false,
             },
         )
         .await

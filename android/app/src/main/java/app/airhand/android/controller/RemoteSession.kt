@@ -123,6 +123,9 @@ class RemoteSession(
     @Volatile
     private var background = false
     private var connectedOnce = false
+
+    /** 被控端按槽位缓存的光标形状（动画光标反复用到的那几帧只传一次，见 [Media]）。只在一个会话里有效，只在会话线程上用 */
+    private val cursorSlots = HashMap<Int, CursorState>()
     private val wake = Object()
     private var woken = false
 
@@ -178,9 +181,6 @@ class RemoteSession(
         client.acquire()
         try {
             var attempts = 0
-            // 带着凭证被告知"不在线"时用控制码直接试过一次没有；试的时候先把凭证放在这里
-            var plainTried = false
-            var staleResume: String? = null
             while (!closed) {
                 val serverProblem = waitServer(if (connectedOnce) Long.MAX_VALUE else FIRST_SERVER_WAIT_MS)
                 if (closed) break
@@ -219,18 +219,21 @@ class RemoteSession(
                 val p = Problem.parse(r.optJSONObject("err"))
                 attempts++
                 when (p.kind) {
+                    // 带着凭证（我的设备里保存的、或者断线重连）而对方不在线：等它。凭证作废了的话服务器回答的是
+                    // kicked（见下面），所以不用再拿控制码试一次——那样会算一次猜错，占掉这个 IP 的额度
                     "hostOffline" -> {
-                        if (resume != null && !plainTried) {
-                            // 凭证可能已经作废（对方断开过所有控制端，服务器换了它的密钥），而带着作废的凭证
-                            // 服务器也只回答"不在线"：用控制码直接连一次。对方确实不在线的话再带着凭证等它
-                            plainTried = true
-                            staleResume = resume
-                            resume = null
-                            continue
-                        }
                         _phase.value = Phase.WaitingHost(p)
                         // 对方上线时服务器通知（signal）；保险起见隔一会儿也再问一次
                         sleep(OFFLINE_RECHECK_MS)
+                    }
+                    // 重连凭证作废了（对方断开过所有控制端，或者换了控制码）：还没连上过（从我的设备打开）就丢掉凭证、
+                    // 用控制码直接连；连上过就不再自动重连
+                    "kicked" -> {
+                        val retryPlain = resume != null && !connectedOnce
+                        resume = null
+                        if (retryPlain) continue
+                        _phase.value = if (connectedOnce) Phase.Ended(p) else Phase.Failed(p)
+                        break
                     }
                     "notConnected", "serverTimeout", "serverLost" -> {
                         if (!connectedOnce && attempts >= 3) {
@@ -241,15 +244,6 @@ class RemoteSession(
                         sleep(RETRY_MS * 2)
                     }
                     else -> {
-                        val waiting = staleResume
-                        if (waiting != null && p.kind in listOf("codeNotFound", "rateLimited")) {
-                            // 用控制码直接连也不行：对方确实不在线，带着原来的凭证等它上线
-                            resume = waiting
-                            staleResume = null
-                            _phase.value = Phase.WaitingHost(Problem("hostOffline"))
-                            sleep(OFFLINE_RECHECK_MS)
-                            continue
-                        }
                         _phase.value = if (connectedOnce) Phase.Ended(p) else Phase.Failed(p)
                         break
                     }
@@ -291,6 +285,8 @@ class RemoteSession(
     private fun onConnected(h: Long, ok: JSONObject) {
         handle = h
         sid = ok.getInt("sid")
+        // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
+        cursorSlots.clear()
         resume = Resume.fromJson(ok.optJSONArray("resume")) ?: resume
         grantName = ok.optString("hostName")
         grantOs = ok.optString("hostOs")
@@ -365,11 +361,15 @@ class RemoteSession(
             Media.CURSOR -> {
                 val c = Media.cursor(b)
                 val s = c.shape
-                cursor.value = if (s == null) {
-                    cursor.value.copy(visible = c.visible)
-                } else {
-                    CursorState(c.visible, cursorBitmap(b, s.width, s.height), s.hotX, s.hotY)
+                // 新的形状存进槽位；只带槽位的（例如动画光标的下一帧）用槽位里已有的，万一没有就保持原样
+                val shape = when {
+                    s != null -> cursorBitmap(b, s.width, s.height)
+                        ?.let { CursorState(c.visible, it, s.hotX, s.hotY) }
+                        ?.also { cursorSlots[c.slot] = it }
+                    c.cached -> cursorSlots[c.slot]
+                    else -> null
                 }
+                cursor.value = (shape ?: cursor.value).copy(visible = c.visible)
             }
             Media.AUDIO -> {
                 val a = Media.audio(b)

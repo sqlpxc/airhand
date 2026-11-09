@@ -1,7 +1,7 @@
 //! 控制端的单个会话：把画面、声音原样转交给界面（界面自己解码），转发输入与设置。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::transport::{FromHost, HostReceiver};
@@ -14,18 +14,12 @@ use quinn::SendStream;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use super::{CLIPBOARD_POLL, ClipboardSync};
+use super::{CLIPBOARD_POLL, ClipboardSync, now_us};
 use crate::Problem;
-
-static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
 /// 网络卡一下不断开：卡住期间排着的输入由命令队列丢掉（见 [`super::queue`]）
 const HOST_TIMEOUT: Duration = Duration::from_secs(20);
-
-fn now_us() -> u64 {
-    EPOCH.elapsed().as_micros() as u64
-}
 
 /// 会话的画面和事件交给谁：桌面版是 Tauri 的 Channel，网页版是浏览器的 WebSocket，Android 是 Kotlin 取的队列。
 ///

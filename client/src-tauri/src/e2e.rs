@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use airhand_link::transport::{FromHost, HostReceiver, open_session};
+use airhand_link::transport::{FromHost, HostReceiver, open_session, session_datagrams};
 use airhand_proto::framing::{read_msg, write_msg};
 use airhand_proto::media::{AudioHeader, HEADER_LEN, VideoHeader};
 use airhand_proto::session::{
@@ -137,7 +137,9 @@ async fn e2e_roundtrip() {
         .await
         .unwrap();
     let (mut send, recv) = streams.control;
-    let mut recv = HostReceiver::new(recv, streams.video, streams.audio);
+    // 声音走数据报（放不进一个数据报的才走声音流）
+    let datagrams = session_datagrams(&sig.conn, grant.session_id);
+    let mut recv = HostReceiver::new(recv, streams.video, streams.audio, Some(datagrams));
     // 和真正的控制端一样：先报上本次运行的标识，再发画质设置
     write_msg(
         &mut send,
@@ -155,7 +157,10 @@ async fn e2e_roundtrip() {
         .unwrap();
     write_msg(
         &mut send,
-        &ControllerMsg::Input(vec![InputEvent::ReleaseAll]),
+        &ControllerMsg::Input {
+            t: 1,
+            events: vec![InputEvent::ReleaseAll],
+        },
     )
     .await
     .unwrap();

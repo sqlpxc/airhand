@@ -54,7 +54,8 @@ pub enum Problem {
     HostEnded,
     /// 被控端长时间没有任何消息
     HostUnresponsive,
-    /// 被控端的用户断开了所有控制端
+    /// 被控端的用户断开了所有控制端。重连凭证作废了（[`ConnectError::Revoked`]）也是这个：
+    /// 通常就是因为对方断开过所有控制端（也可能是对方换了控制码、这个控制码给了别人）
     Kicked,
     /// 被控端的用户更换了控制码
     CodeChanged,
@@ -155,6 +156,7 @@ impl From<ConnectError> for Problem {
             ConnectError::RateLimited => Problem::RateLimited,
             ConnectError::Busy => Problem::HostBusy,
             ConnectError::Offline => Problem::HostOffline,
+            ConnectError::Revoked => Problem::Kicked,
         }
     }
 }

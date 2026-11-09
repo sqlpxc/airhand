@@ -1,8 +1,8 @@
 //! 被控端的单个远控会话。
 
 use airhand_link::flow::Flow;
-use airhand_link::host::{HostSession, PEER_TIMEOUT};
-use std::sync::Arc;
+use airhand_link::host::{CursorCache, HostSession, PEER_TIMEOUT};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_proto::session::{
@@ -103,6 +103,8 @@ pub async fn run(
 
     let mut settings = QualitySettings::default();
     let flow = Arc::new(Flow::default());
+    // 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
+    let cursors = Arc::new(Mutex::new(CursorCache::default()));
     let start = |display: u8, settings: QualitySettings| {
         Pipeline::start(
             display,
@@ -110,6 +112,7 @@ pub async fn run(
             io.video.clone(),
             ctl.clone(),
             flow.clone(),
+            cursors.clone(),
         )
     };
     let mut pipeline = (!displays.is_empty()).then(|| start(current, settings));
@@ -141,7 +144,8 @@ pub async fn run(
                     let Some(msg) = msg else { break };
                     last_msg = Instant::now();
                     match msg {
-                        ControllerMsg::Input(events) => {
+                        // 晚到太久的输入已经在 HostSession 里换成了"释放所有按键"
+                        ControllerMsg::Input { events, .. } => {
                             let d = displays.get(current as usize).unwrap_or(&fallback);
                             injector.handle(&events, d);
                         }

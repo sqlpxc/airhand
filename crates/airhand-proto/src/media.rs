@@ -13,13 +13,16 @@
 //! 三边都用 `crates/airhand-link/tests/protocol.json` 里的样例检查）。
 //! 光标形状走控制流（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor)），控制端把它转成同样格式的光标包。
 //!
+//! 声音包平时不走声音流，而是一包一个 QUIC 数据报（[`crate::datagram`]，不带长度前缀）：丢了的不重传，
+//! 后面的包也不用等它。放不进一个数据报的（很少见）才走声音流。数据报可能乱序，控制端按包序号丢掉迟到的包。
+//!
 //! 头（小端）：
 //!
-//! | 偏移 | 类型    | 画面（1）            | 光标（2）              | 声音（3）            |
-//! |-----:|---------|----------------------|------------------------|----------------------|
-//! | 0    | u8      | 类型                 | 类型                   | 类型                 |
-//! | 1    | u8      | 标志：bit0 关键帧    | bit0 可见，bit1 带形状 | bit0 停顿后的第一包  |
-//! | 2    | u8      | [`Codec::id`]        | 0                      | 0                    |
+//! | 偏移 | 类型    | 画面（1）            | 光标（2）                         | 声音（3）            |
+//! |-----:|---------|----------------------|-----------------------------------|----------------------|
+//! | 0    | u8      | 类型                 | 类型                              | 类型                 |
+//! | 1    | u8      | 标志：bit0 关键帧    | bit0 可见，bit1 新形状，bit2 旧形状 | bit0 停顿后的第一包  |
+//! | 2    | u8      | [`Codec::id`]        | 形状的槽位                        | 0                    |
 //! | 3    | u8      | 0                    | 0                      | 0                    |
 //! | 4    | u32     | 帧序号               | 0                      | 包序号               |
 //! | 8    | u16 × 2 | 画面宽、高           | 形状宽、高             | 0                    |
@@ -28,6 +31,10 @@
 //! | 24   |         | 码流（Annex-B / OBU）| RGBA（非预乘）         | 一个 Opus 包         |
 //!
 //! 采集时间是被控端的时钟，画面和声音是同一个时钟，控制端据此做音画同步。
+//!
+//! 光标的形状按槽位缓存（[`CURSOR_SLOTS`](crate::session::CURSOR_SLOTS)）：带新形状（bit1）的包后面是 RGBA，
+//! 界面把它存进字节 2 给出的槽位并换成它；带旧形状（bit2）的包没有数据，换成这个槽位里已有的形状；
+//! 都没有就是形状没变。槽位只在一个会话里有效，重连之后界面要清空。
 //!
 //! 编码格式不认识的画面包（[`VideoHeader::decode`] 返回 `None`）三边都丢掉，不猜成某种格式送进解码器。
 
@@ -73,6 +80,7 @@ const FLAG_KEY: u8 = 1;
 const FLAG_START: u8 = 1;
 const FLAG_VISIBLE: u8 = 1;
 const FLAG_SHAPE: u8 = 2;
+const FLAG_CACHED: u8 = 4;
 
 fn u16_at(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([b[i], b[i + 1]])
@@ -162,20 +170,27 @@ impl AudioHeader {
 
 /// 光标包（控制端交给界面，不在线上传）
 pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
-    let shape_len = c.shape.as_ref().map_or(0, |s| s.rgba.len());
+    let image = c.shape.as_ref().and_then(|s| s.image.as_ref());
     let mut h = [0u8; HEADER_LEN];
     h[0] = Kind::Cursor as u8;
     h[1] = if c.visible { FLAG_VISIBLE } else { 0 };
     if let Some(s) = &c.shape {
-        h[1] |= FLAG_SHAPE;
+        h[2] = s.slot;
+        h[1] |= if image.is_some() {
+            FLAG_SHAPE
+        } else {
+            FLAG_CACHED
+        };
+    }
+    if let Some(s) = image {
         h[8..10].copy_from_slice(&s.width.to_le_bytes());
         h[10..12].copy_from_slice(&s.height.to_le_bytes());
         h[12..14].copy_from_slice(&s.hot_x.to_le_bytes());
         h[14..16].copy_from_slice(&s.hot_y.to_le_bytes());
     }
-    let mut buf = Vec::with_capacity(HEADER_LEN + shape_len);
+    let mut buf = Vec::with_capacity(HEADER_LEN + image.map_or(0, |s| s.rgba.len()));
     buf.extend_from_slice(&h);
-    if let Some(s) = &c.shape {
+    if let Some(s) = image {
         buf.extend_from_slice(&s.rgba);
     }
     buf
@@ -196,7 +211,7 @@ pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::CursorShape;
+    use crate::session::{CursorShape, CursorSlot};
 
     #[test]
     fn video_header_roundtrip() {
@@ -238,19 +253,33 @@ mod tests {
     fn cursor_layout() {
         let p = cursor_packet(&CursorState {
             visible: true,
-            shape: Some(CursorShape {
-                width: 2,
-                height: 1,
-                hot_x: 1,
-                hot_y: 0,
-                rgba: vec![9; 8],
+            shape: Some(CursorSlot {
+                slot: 5,
+                image: Some(CursorShape {
+                    width: 2,
+                    height: 1,
+                    hot_x: 1,
+                    hot_y: 0,
+                    rgba: vec![9; 8],
+                }),
             }),
         });
         assert_eq!(Kind::of(&p), Some(Kind::Cursor));
         assert_eq!(p[1], FLAG_VISIBLE | FLAG_SHAPE);
+        assert_eq!(p[2], 5);
         assert_eq!((u16_at(&p, 8), u16_at(&p, 10)), (2, 1));
         assert_eq!((u16_at(&p, 12), u16_at(&p, 14)), (1, 0));
         assert_eq!(&p[HEADER_LEN..], &[9; 8]);
+        // 槽位里已有的形状：只有头
+        let cached = cursor_packet(&CursorState {
+            visible: true,
+            shape: Some(CursorSlot {
+                slot: 31,
+                image: None,
+            }),
+        });
+        assert_eq!(cached.len(), HEADER_LEN);
+        assert_eq!((cached[1], cached[2]), (FLAG_VISIBLE | FLAG_CACHED, 31));
         let hidden = cursor_packet(&CursorState {
             visible: false,
             shape: None,

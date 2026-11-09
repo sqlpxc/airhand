@@ -140,6 +140,13 @@ mod tests {
                 visible: false,
                 shape: None,
             }),
+            HostMsg::Cursor(CursorState {
+                visible: true,
+                shape: Some(CursorSlot {
+                    slot: 3,
+                    image: None,
+                }),
+            }),
         ];
         let mut wire = Vec::new();
         for m in &msgs {
@@ -175,6 +182,17 @@ mod tests {
             HostMsg::Cursor(CursorState {
                 visible: false,
                 shape: None
+            })
+        ));
+        let c: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        assert!(matches!(
+            c,
+            HostMsg::Cursor(CursorState {
+                visible: true,
+                shape: Some(CursorSlot {
+                    slot: 3,
+                    image: None
+                })
             })
         ));
         let c: Option<HostMsg> = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap();
@@ -297,6 +315,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(back, ClientMsg::Rekey));
+        let reclaim = Reclaim {
+            code: 123_456,
+            secret: [5; 16],
+        };
+        let wire = encode(&ClientMsg::Register {
+            reclaim: Some(reclaim),
+            keep: false,
+            rekey: true,
+        })
+        .unwrap();
+        let back: ClientMsg = read_msg(&mut &wire[..], 1024, &mut buf)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::Register { reclaim: Some(r), keep: false, rekey: true } if r == reclaim
+        ));
         for m in [
             ServerMsg::ConnectResult {
                 req_id: 5,
@@ -310,6 +346,10 @@ mod tests {
             ServerMsg::ConnectResult {
                 req_id: 6,
                 result: Err(ConnectError::Offline),
+            },
+            ServerMsg::ConnectResult {
+                req_id: 7,
+                result: Err(ConnectError::Revoked),
             },
             ServerMsg::HostOnline { code: 123_456 },
             ServerMsg::Rekeyed { secret: [3; 16] },
@@ -396,18 +436,21 @@ mod tests {
 
         let msgs = vec![
             ControllerMsg::Hello(ControllerHello { device: [9; 16] }),
-            ControllerMsg::Input(vec![
-                InputEvent::Touch {
-                    id: 1,
-                    phase: TouchPhase::Down,
-                    x: 0.25,
-                    y: 0.5,
-                },
-                InputEvent::System {
-                    action: SystemAction::Recents,
-                },
-                InputEvent::MouseDelta { dx: -3, dy: 70_000 },
-            ]),
+            ControllerMsg::Input {
+                t: 1 << 40,
+                events: vec![
+                    InputEvent::Touch {
+                        id: 1,
+                        phase: TouchPhase::Down,
+                        x: 0.25,
+                        y: 0.5,
+                    },
+                    InputEvent::System {
+                        action: SystemAction::Recents,
+                    },
+                    InputEvent::MouseDelta { dx: -3, dy: 70_000 },
+                ],
+            },
         ];
         let mut wire = Vec::new();
         for m in &msgs {
@@ -419,9 +462,10 @@ mod tests {
             matches!(hello, ControllerMsg::Hello(ControllerHello { device }) if device == [9; 16])
         );
         let input: ControllerMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
-        let ControllerMsg::Input(events) = input else {
+        let ControllerMsg::Input { t, events } = input else {
             panic!()
         };
+        assert_eq!(t, 1 << 40);
         assert_eq!(
             events,
             [
@@ -441,9 +485,12 @@ mod tests {
 
     #[tokio::test]
     async fn too_large() {
-        let wire = encode(&ControllerMsg::Input(vec![InputEvent::Text {
-            text: "x".repeat(100),
-        }]))
+        let wire = encode(&ControllerMsg::Input {
+            t: 0,
+            events: vec![InputEvent::Text {
+                text: "x".repeat(100),
+            }],
+        })
         .unwrap();
         let mut r = &wire[..];
         let mut buf = Vec::new();

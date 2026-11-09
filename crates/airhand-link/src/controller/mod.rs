@@ -16,6 +16,14 @@
 //! 这样的重连不会被服务器当成猜码而限速。被控端不在线时 `connect` 返回 [`Problem::HostOffline`]，
 //! 被控端重新上线时服务器通知，本服务调用 [`HostOnline`]，控制台这时再连一次即可，等待期间不需要反复尝试。
 //! 与服务器的连接断过之后服务器不再记得谁在等谁，控制台在重新连上服务器时再连一次（还不在线的话会重新登记）。
+//!
+//! 凭证作废了（被控端的用户断开过所有控制端，或者换了控制码）时 `connect` 返回 [`Problem::Kicked`]：
+//! 自动重连就此停下；用户自己要连的（例如从"我的设备"打开）就不带凭证再连一次。
+//!
+//! # 声音
+//!
+//! 被控端的声音包走 QUIC 数据报（见 `airhand_proto::datagram`）。一条连接上可能有好几个会话，
+//! 连接的读任务按数据报开头的会话 ID 交给对应会话的 [`HostReceiver`]。
 
 mod queue;
 mod session;
@@ -24,8 +32,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::transport::{HostReceiver, open_session};
 use airhand_proto::framing::{read_msg, write_msg};
@@ -33,8 +41,9 @@ use airhand_proto::session::{
     ControllerHello, ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings,
 };
 use airhand_proto::signal::{ClientMsg, ConnectError, ResumeToken, ServerMsg, SessionGrant};
-use airhand_proto::{MAX_SIGNAL_MSG, Role};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram};
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use quinn::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -48,6 +57,15 @@ pub use session::{NoticeView, SessionEvent, SessionUi, UiClosed};
 
 /// 桌面版检查本机剪贴板变化的间隔
 pub const CLIPBOARD_POLL: Duration = Duration::from_millis(300);
+
+/// 每个会话最多排着这么多个还没交出去的声音数据报（再多就丢：本来就可能丢）
+const DATAGRAM_QUEUE: usize = 16;
+
+/// 控制端的时钟（微秒）：Ping 和输入里的 `t` 都是它
+fn now_us() -> u64 {
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+    EPOCH.elapsed().as_micros() as u64
+}
 
 /// 本机剪贴板的双向同步（桌面版；实现见客户端的 `clipboard.rs`）。
 pub trait ClipboardSync: Send + 'static {
@@ -144,6 +162,25 @@ impl Command {
 
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<SessionGrant, ConnectError>>>>>;
 
+/// 会话 ID → 交给这个会话的声音数据报
+type Datagrams = Mutex<HashMap<u64, mpsc::Sender<Bytes>>>;
+
+/// 会话收数据报的登记，丢掉时注销（会话结束、被中止，或者还没开始就失败了）
+struct DatagramRoute {
+    inner: Arc<Inner>,
+    session_id: u64,
+}
+
+impl Drop for DatagramRoute {
+    fn drop(&mut self) {
+        self.inner
+            .datagrams
+            .lock()
+            .unwrap()
+            .remove(&self.session_id);
+    }
+}
+
 #[derive(Clone)]
 struct Live {
     conn: Connection,
@@ -166,6 +203,8 @@ struct Inner {
     rt: Handle,
     live: Mutex<Option<Live>>,
     sessions: Mutex<HashMap<u32, SessionHandle>>,
+    /// 声音数据报交给哪个会话（见模块说明的"声音"）
+    datagrams: Datagrams,
     next_req: AtomicU32,
     next_sid: AtomicU32,
     host_online: HostOnline,
@@ -202,6 +241,7 @@ impl ControllerService {
             rt: rt.clone(),
             live: Mutex::default(),
             sessions: Mutex::default(),
+            datagrams: Mutex::default(),
             next_req: AtomicU32::new(0),
             next_sid: AtomicU32::new(0),
             host_online,
@@ -262,11 +302,22 @@ impl ControllerService {
             }
         };
 
+        // 先登记再开流：被控端一开始发声音，数据报就有地方去
+        let (dgram_tx, dgram_rx) = mpsc::channel(DATAGRAM_QUEUE);
+        self.inner
+            .datagrams
+            .lock()
+            .unwrap()
+            .insert(grant.session_id, dgram_tx);
+        let route = DatagramRoute {
+            inner: self.inner.clone(),
+            session_id: grant.session_id,
+        };
         let streams = open_session(&live.conn, grant.session_id, Role::Controller)
             .await
             .map_err(Problem::failed)?;
         let (mut send, recv) = streams.control;
-        let recv = HostReceiver::new(recv, streams.video, streams.audio);
+        let recv = HostReceiver::new(recv, streams.video, streams.audio, Some(dgram_rx));
         let hello = ControllerMsg::Hello(ControllerHello {
             device: self.inner.device,
         });
@@ -302,6 +353,8 @@ impl ControllerService {
         // not-yet-inserted entry and leave a dead handle behind.
         let mut sessions = self.inner.sessions.lock().unwrap();
         let handle = self.inner.rt.spawn(async move {
+            // 会话结束或者被中止时随之注销
+            let _route = route;
             session::run(sid, io, tx2, rx).await;
             inner.sessions.lock().unwrap().remove(&sid);
         });
@@ -326,7 +379,7 @@ impl ControllerService {
     /// 执行界面的命令
     pub fn command(&self, cmd: Command) -> Result<(), Problem> {
         let msg = match cmd {
-            Command::Input { sid, events } => (sid, ControllerMsg::Input(events)),
+            Command::Input { sid, events } => (sid, queue::input(events)),
             Command::Settings { sid, settings } => {
                 (sid, ControllerMsg::Settings(settings.sanitized()))
             }
@@ -371,8 +424,7 @@ impl ControllerService {
     /// 断开会话（[`Command::Disconnect`]）
     pub fn disconnect(&self, sid: u32) {
         if let Some(s) = self.inner.sessions.lock().unwrap().remove(&sid) {
-            let _ =
-                s.tx.send(ControllerMsg::Input(vec![InputEvent::ReleaseAll]));
+            let _ = s.tx.send(queue::input(vec![InputEvent::ReleaseAll]));
             // 给写任务一点时间把"释放按键"发出去
             let task = s.task;
             self.inner.rt.spawn(async move {
@@ -431,6 +483,29 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     let mut send = sig.send;
     let mut recv = sig.recv;
     let inner = inner.clone();
+    // 声音数据报：按会话 ID 交给会话（见模块说明的"声音"）
+    let dgram_conn = sig.conn.clone();
+    let dgram_inner = inner.clone();
+    let datagrams = async move {
+        loop {
+            let d = dgram_conn.read_datagram().await?;
+            let Some(session_id) = datagram::session(&d) else {
+                continue;
+            };
+            let to = dgram_inner
+                .datagrams
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .cloned();
+            // 会话跟不上（或者已经结束了）就丢掉这一包
+            if let Some(to) = to {
+                let _ = to.try_send(d.slice(datagram::HEADER..));
+            }
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    };
     let writer = async move {
         while let Some(m) = rx.recv().await {
             write_msg(&mut send, &m).await?;
@@ -458,6 +533,7 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     tokio::select! {
         r = reader => r,
         r = writer => r,
+        r = datagrams => r,
         e = sig.conn.closed() => Err(anyhow!(e)),
     }
 }

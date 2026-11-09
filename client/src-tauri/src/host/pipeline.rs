@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_link::flow::{Abr, Flow};
-use airhand_link::host::Control;
+use airhand_link::host::{Control, CursorCache};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{CursorState, HostMsg, Notice, QualitySettings};
 use bytes::Bytes;
@@ -43,16 +43,20 @@ struct Ctrl {
     force_key: AtomicBool,
     stop: AtomicBool,
     flow: Arc<Flow>,
+    /// 控制端缓存了哪些光标形状（整个会话一份）
+    cursors: Arc<Mutex<CursorCache>>,
 }
 
 impl Pipeline {
-    /// `video`：画面流的发送队列；`control`：控制流（光标、编码器、采集失败的提示）
+    /// `video`：画面流的发送队列；`control`：控制流（光标、编码器、采集失败的提示）；
+    /// `cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
     pub fn start(
         display: u8,
         settings: QualitySettings,
         video: mpsc::Sender<Bytes>,
         control: Control,
         flow: Arc<Flow>,
+        cursors: Arc<Mutex<CursorCache>>,
     ) -> Self {
         let ctrl = Arc::new(Ctrl {
             settings: Mutex::new(settings),
@@ -60,6 +64,7 @@ impl Pipeline {
             force_key: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             flow,
+            cursors,
         });
         let c = ctrl.clone();
         let thread = std::thread::Builder::new()
@@ -168,20 +173,24 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
         };
         let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
 
-        // 光标变化：只发送可见性 +（如有变化）形状
+        // 光标变化：只发送可见性 +（如有变化）形状。控制端已经有的形状（动画光标循环到的帧）只发槽位
         if cs > cursor_seq {
             cursor_seq = cs;
             let c = slot.cursor();
-            let shape = if c.shape_seq > shape_seq {
-                c.shape.as_deref().cloned()
-            } else {
-                None
+            let shape = match &c.shape {
+                Some(s) if c.shape_seq > shape_seq => Some(ctrl.cursors.lock().unwrap().place(s)),
+                _ => None,
             };
             shape_seq = c.shape_seq;
-            if !send(&HostMsg::Cursor(CursorState {
+            let msg = HostMsg::Cursor(CursorState {
                 visible: c.visible,
                 shape,
-            })) {
+            });
+            if !send(&msg) {
+                // 没发出去：控制端没有这个形状，下次还得带图像
+                if let HostMsg::Cursor(CursorState { shape: Some(s), .. }) = &msg {
+                    ctrl.cursors.lock().unwrap().forget(s);
+                }
                 break;
             }
         }
