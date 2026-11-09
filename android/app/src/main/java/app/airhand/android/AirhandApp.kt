@@ -70,12 +70,13 @@ class AirhandApp : Application() {
         if (s != null && _session.value === s) _session.value = null
     }
 
-    /** 改设置。服务器、本机名称变了要重新连接 */
+    /** 改设置。服务器、证书指纹、本机名称变了要重新连接（清掉第一次连接时记下的指纹也算） */
     fun updateSettings(f: (Settings) -> Settings) {
         val old = settings.value
         settings.update(f)
         val now = settings.value
-        if (old.server != now.server || old.fingerprint != now.fingerprint || old.deviceName != now.deviceName) {
+        val trustReset = old.trustedFp.isNotEmpty() && now.trustedFp.isEmpty()
+        if (old.server != now.server || old.fingerprint != now.fingerprint || old.deviceName != now.deviceName || trustReset) {
             endSession()
             controller.restart()
             HostService.restartIfRunning(this)

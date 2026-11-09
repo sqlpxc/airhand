@@ -124,8 +124,9 @@
     <string name="server_address_hint">The relay server\'s host:port, e.g. relay.example.com:4433</string>
     <string name="server_address_invalid">Use host:port</string>
     <string name="server_fingerprint">Certificate fingerprint</string>
-    <string name="fingerprint_none">Not set: the server certificate isn\'t verified (testing only)</string>
-    <string name="fingerprint_hint">The SHA-256 fingerprint printed in the server log (64 hex digits, colons allowed). Empty = don\'t verify</string>
+    <string name="fingerprint_none">Not set: the server\'s certificate is remembered on the first connection</string>
+    <string name="fingerprint_learned">Not set, remembered on the first connection (%1$s…)</string>
+    <string name="fingerprint_hint">The SHA-256 fingerprint printed in the server log (64 hex digits, colons allowed). Empty = remember the server\'s certificate on the first connection and refuse a different one later (saving again forgets the remembered one)</string>
     <string name="fingerprint_invalid">The fingerprint must be 64 hex digits</string>
     <string name="settings_this_device">This device</string>
     <string name="device_name">Device name</string>
@@ -294,7 +295,7 @@
 
     <!-- Problems (types, see problem.rs in Rust) -->
     <string name="problem_server_unreachable">Can\'t connect to the server: %1$s</string>
-    <string name="problem_cert_mismatch">The server certificate doesn\'t match the fingerprint in Settings; the connection may be intercepted</string>
+    <string name="problem_cert_mismatch">The server certificate doesn\'t match the fingerprint in Settings (or the one remembered on the first connection); the connection may be intercepted. If the server really got a new certificate, save the fingerprint in Settings again</string>
     <string name="problem_incompatible_update_app">Incompatible with the server: the server is newer, please update Airhand</string>
     <string name="problem_incompatible_update_server">Incompatible with the server: the server is older, please update the server</string>
     <string name="problem_server_lost">Lost the connection to the server: %1$s</string>

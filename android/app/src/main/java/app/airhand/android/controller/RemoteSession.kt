@@ -178,6 +178,9 @@ class RemoteSession(
         client.acquire()
         try {
             var attempts = 0
+            // 带着凭证被告知"不在线"时用控制码直接试过一次没有；试的时候先把凭证放在这里
+            var plainTried = false
+            var staleResume: String? = null
             while (!closed) {
                 val serverProblem = waitServer(if (connectedOnce) Long.MAX_VALUE else FIRST_SERVER_WAIT_MS)
                 if (closed) break
@@ -217,6 +220,14 @@ class RemoteSession(
                 attempts++
                 when (p.kind) {
                     "hostOffline" -> {
+                        if (resume != null && !plainTried) {
+                            // 凭证可能已经作废（对方断开过所有控制端，服务器换了它的密钥），而带着作废的凭证
+                            // 服务器也只回答"不在线"：用控制码直接连一次。对方确实不在线的话再带着凭证等它
+                            plainTried = true
+                            staleResume = resume
+                            resume = null
+                            continue
+                        }
                         _phase.value = Phase.WaitingHost(p)
                         // 对方上线时服务器通知（signal）；保险起见隔一会儿也再问一次
                         sleep(OFFLINE_RECHECK_MS)
@@ -230,6 +241,15 @@ class RemoteSession(
                         sleep(RETRY_MS * 2)
                     }
                     else -> {
+                        val waiting = staleResume
+                        if (waiting != null && p.kind in listOf("codeNotFound", "rateLimited")) {
+                            // 用控制码直接连也不行：对方确实不在线，带着原来的凭证等它上线
+                            resume = waiting
+                            staleResume = null
+                            _phase.value = Phase.WaitingHost(Problem("hostOffline"))
+                            sleep(OFFLINE_RECHECK_MS)
+                            continue
+                        }
                         _phase.value = if (connectedOnce) Phase.Ended(p) else Phase.Failed(p)
                         break
                     }
@@ -321,7 +341,11 @@ class RemoteSession(
     private fun handlePacket(h: Long, sid: Int, b: ByteArray) {
         when (Media.kind(b)) {
             Media.VIDEO -> {
-                val v = Media.video(b)
+                val v = Media.video(b) ?: run {
+                    // 不认识的编码格式：丢掉，但照样确认（否则对方的在途帧满了就不再发画面）
+                    Native.ctlAck(h, sid, Media.seq(b))
+                    return
+                }
                 if (videoSize.value != v.width to v.height) videoSize.value = v.width to v.height
                 decoder.submit(
                     VideoPacket(

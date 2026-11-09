@@ -5,7 +5,8 @@
 //!
 //! 浏览器 → 服务：文本（JSON），`{"id": 1, "cmd": "connect", ...参数}`，命令见 [`Call`]：网页版自己的几个，
 //! 加上对会话的操作 [`Command`]（和桌面版、Android 一样）。
-//! 带 `id` 的会收到回复；不带的（画面确认、输入事件这类高频消息）不回复。
+//! 带 `id` 的会收到回复；不带的（输入事件这类高频消息）不回复。
+//! 画面确认每帧都有，不走 JSON：二进制 `1u8 | sid u32 LE | seq u32 LE`（[`parse_ack`]），不回复。
 //!
 //! 服务 → 浏览器：
 //! * 文本（JSON），见 [`Out`]：
@@ -18,7 +19,7 @@
 //! `ch` 是浏览器在 `connect` 时自己选的编号（相当于桌面版的 Tauri Channel）：会话的第一批数据
 //! 可能比 `connect` 的回复先到，浏览器靠它认出是哪个会话的。
 //!
-//! 浏览器收到每一帧画面后发 `ack`，被控端的在途帧控制因此把浏览器这段网络也算进去
+//! 浏览器收到画面后发确认（累积确认，连着到的几帧只确认最后一帧），被控端的在途帧控制因此把浏览器这段网络也算进去
 //!（见 `airhand_link::controller::Frontend::Browser`）。
 
 use std::net::SocketAddr;
@@ -59,6 +60,20 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// 浏览器发来的单条消息上限（剪贴板文本最多 1 MiB，JSON 转义后可能变大）
 const MAX_MESSAGE: usize = 4 << 20;
+
+/// 二进制消息的类型：画面确认
+const BINARY_ACK: u8 = 1;
+
+/// 浏览器发来的二进制画面确认 `1u8 | sid u32 LE | seq u32 LE` → `(sid, seq)`
+fn parse_ack(b: &[u8]) -> Option<(u32, u32)> {
+    let [BINARY_ACK, s0, s1, s2, s3, q0, q1, q2, q3] = *b else {
+        return None;
+    };
+    Some((
+        u32::from_le_bytes([s0, s1, s2, s3]),
+        u32::from_le_bytes([q0, q1, q2, q3]),
+    ))
+}
 
 /// 浏览器 → 服务的命令
 #[derive(Debug, Deserialize)]
@@ -324,6 +339,11 @@ async fn run(socket: WebSocket, app: Arc<App>, peer: SocketAddr) {
             };
             match msg {
                 Message::Text(text) => console.handle(&text),
+                Message::Binary(b) => {
+                    if let Some((sid, seq)) = parse_ack(&b) {
+                        let _ = console.svc.ack(sid, seq);
+                    }
+                }
                 Message::Close(_) => return Ok(()),
                 // 心跳回应等：只用来证明浏览器还在
                 _ => {}
@@ -417,6 +437,15 @@ mod tests {
     use airhand_proto::session::{Codec, InputEvent};
     use axum::http::HeaderValue;
     use serde_json::json;
+
+    /// 前端（client/src/lib/backend/web.ts 的 ackMessage）发的二进制确认
+    #[test]
+    fn binary_acks() {
+        assert_eq!(parse_ack(&[1, 3, 0, 0, 0, 0x2a, 1, 0, 0]), Some((3, 298)));
+        assert_eq!(parse_ack(&[2, 3, 0, 0, 0, 0x2a, 1, 0, 0]), None);
+        assert_eq!(parse_ack(&[1, 3, 0, 0, 0]), None);
+        assert_eq!(parse_ack(&[]), None);
+    }
 
     #[tokio::test]
     async fn outbox_limits_bytes_and_releases_budget_on_drop() {

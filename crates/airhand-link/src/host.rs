@@ -56,8 +56,8 @@ impl HostCmd {
 pub trait HostEvents: Send + Sync + 'static {
     /// 与服务器的连接状态（注册成功之后才算 `Connected`）
     fn server(&self, state: ServerState);
-    /// 注册成功（每次连上服务器都会）。`changed`：和带去的控制码不一样（第一次注册、或者原来的取不回来了），
-    /// 要保存下来，下次启动时带上
+    /// 注册成功（每次连上服务器都会），或者服务器换了密钥（本机用户断开所有控制端之后）。
+    /// `changed`：和带去的不一样（第一次注册、原来的控制码取不回来了、换了密钥），要保存下来，下次启动时带上
     fn registered(&self, code: Reclaim, changed: bool) -> impl Future<Output = ()> + Send;
     /// 放弃了控制码（更换控制码）：保存的控制码也要忘掉，之后重新注册
     fn released(&self) -> impl Future<Output = ()> + Send;
@@ -140,8 +140,18 @@ where
 
     let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
-        .map_err(|_| anyhow!("registration timed out"))?
-        .ok_or_else(|| anyhow!("the server closed the connection before registering"))?;
+        .map_err(|_| anyhow!("registration timed out"))?;
+    let Some(first) = first else {
+        // 例如这个网络短时间内申请了太多新的控制码：服务器关闭连接时写明了原因
+        match tokio::time::timeout(Duration::from_secs(2), sig.conn.closed()).await {
+            Ok(quinn::ConnectionError::ApplicationClosed(c)) => bail!(
+                "the server refused to register: {}",
+                String::from_utf8_lossy(&c.reason)
+            ),
+            Ok(e) => bail!("the server closed the connection before registering: {e}"),
+            Err(_) => bail!("the server closed the control stream before registering"),
+        }
+    };
     let ServerMsg::Registered { code, secret } = first else {
         bail!("registration failed: {first:?}");
     };
@@ -170,6 +180,13 @@ where
                         session_id
                     });
                 }
+                // 服务器换了取回控制码的密钥（断开所有控制端之后，见 HostCmd::KickAll）：保存下来，下次取回用它
+                Some(ServerMsg::Rekeyed { secret }) => {
+                    let got = Reclaim { code, secret };
+                    *reclaim = Some(got);
+                    events.registered(got, true).await;
+                    info!(code, "the server changed this host's secret, old reconnect tokens are void");
+                }
                 Some(other) => warn!("ignoring server message: {other:?}"),
                 None => match sig.conn.close_reason() {
                     Some(reason) => bail!(reason),
@@ -183,6 +200,11 @@ where
             }
             Some(cmd) = cmds.recv() => {
                 info!(?cmd, "command from the local user");
+                if cmd == HostCmd::KickAll {
+                    // 先让服务器换密钥（之前发出的重连凭证随之作废），再让会话发 Bye：
+                    // 被断开的控制端不能带着凭证马上连回来。更换控制码时旧码直接作废，不用换
+                    write_msg(&mut sig.send, &ClientMsg::Rekey).await?;
+                }
                 events.kicked(cmd);
                 kick_tx.send_replace(cmd.reason());
                 if cmd == HostCmd::NewCode {

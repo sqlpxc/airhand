@@ -31,8 +31,8 @@ sudo apt install build-essential cmake pkg-config libssl-dev libwebkit2gtk-4.1-d
 - 指纹的格式不对（不是 64 位十六进制，允许用 `:` 或空格分隔）时构建会直接报错
 - 它们只是默认值，装好之后 `config.toml` 里的 `server`、`server_fp` 优先（见[配置文件](usage.zh-CN.md#配置文件)）。那里的 `server_fp` 写错了会拒绝所有连接，而不是不校验
 
-> [!WARNING]
-> `AIRHAND_SERVER_FP` 留空时**不校验服务器证书**，无法防止中间人攻击，只适合开发环境；这时控制台左上角会显示“未固定证书”。
+> [!NOTE]
+> `AIRHAND_SERVER_FP` 留空时，客户端第一次连上服务器时记住它的证书（`config.toml` 里的 `[server_trust]`），之后证书变了就拒绝连接（首次连接时信任，控制台左上角显示“首次连接时信任”）。只有第一次连接防不了中间人，正式发布时请固定指纹。服务器有意换了证书时，删掉 `config.toml` 里的 `[server_trust]`。
 
 ### 构建
 

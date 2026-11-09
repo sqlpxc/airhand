@@ -121,8 +121,9 @@
     <string name="server_address_hint">中转服务器的 地址:端口，例如 relay.example.com:4433</string>
     <string name="server_address_invalid">格式应为 地址:端口</string>
     <string name="server_fingerprint">证书指纹</string>
-    <string name="fingerprint_none">未设置：不校验服务器证书（仅适合测试）</string>
-    <string name="fingerprint_hint">服务器日志里打印的 SHA-256 指纹（64 位十六进制，可以带冒号）。留空则不校验</string>
+    <string name="fingerprint_none">未设置：第一次连接时记住服务器的证书</string>
+    <string name="fingerprint_learned">未设置，已记住第一次连接时的证书（%1$s…）</string>
+    <string name="fingerprint_hint">服务器日志里打印的 SHA-256 指纹（64 位十六进制，可以带冒号）。留空则第一次连接时记住服务器的证书，之后证书变了就拒绝连接（重新保存一次会忘掉记住的证书）</string>
     <string name="fingerprint_invalid">指纹应为 64 位十六进制数字</string>
     <string name="settings_this_device">本机</string>
     <string name="device_name">设备名称</string>
@@ -291,7 +292,7 @@
 
     <!-- 问题（类型，见 Rust 的 problem.rs） -->
     <string name="problem_server_unreachable">无法连接服务器：%1$s</string>
-    <string name="problem_cert_mismatch">服务器证书与设置里的指纹不一致，连接可能被人拦截</string>
+    <string name="problem_cert_mismatch">服务器证书与设置里的指纹（或第一次连接时记住的证书）不一致，连接可能被人拦截。服务器确实换了证书的话，在设置里重新保存一次证书指纹</string>
     <string name="problem_incompatible_update_app">与服务器版本不兼容：服务器较新，请更新 Airhand</string>
     <string name="problem_incompatible_update_server">与服务器版本不兼容：服务器较旧，请更新服务器</string>
     <string name="problem_server_lost">与服务器的连接已断开：%1$s</string>

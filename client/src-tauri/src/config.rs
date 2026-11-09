@@ -17,13 +17,16 @@
 //!   * macOS：`~/Library/Application Support/app.airhand.client/`；Linux：`~/.config/airhand/`。只有本账户能读写（600）。
 //! * 文件由 Airhand 维护，手动修改的内容和注释都会保留；改了设置要重新启动 Airhand 才生效。
 //! * 文件不存在时（第一次运行、被删掉了）按默认配置重新生成：启动时检查一次，运行中每隔几秒检查一次（[`keep_file`]），
-//!   控制码、开机自动启动、我的设备从删掉之前的内容接着用，不会丢。
+//!   控制码、开机自动启动、我的设备、记下的服务器指纹从删掉之前的内容接着用，不会丢。
+//! * 没有设置服务器证书指纹时，第一次连上服务器时记下它的指纹（`[server_trust]`，见 [`FileTrust`]），
+//!   之后证书变了就拒绝连接。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use airhand_link::LinkConfig;
+use airhand_link::net::{MemoryTrust, Trust, TrustStore, format_fingerprint, parse_fingerprint};
 use airhand_proto::signal::Reclaim;
 use anyhow::Result;
 use toml_edit::{DocumentMut, Item};
@@ -38,7 +41,7 @@ pub const DEFAULT_SERVER: &str = match option_env!("AIRHAND_SERVER") {
 /// 编译进程序的服务器证书 SHA-256 指纹（64 位十六进制，允许用 `:` 或空白分隔），`config.toml` 里没有设置时使用。
 ///
 /// * 非空：严格校验，指纹不符直接拒绝连接（防中间人）。
-/// * 为空：不校验证书，**仅建议在开发环境使用**。
+/// * 为空：第一次连上服务器时记下它的指纹（`[server_trust]`），之后只认它。
 pub const DEFAULT_SERVER_FP: &str = match option_env!("AIRHAND_SERVER_FP") {
     Some(v) => v,
     None => "",
@@ -90,7 +93,7 @@ const KEEP_CHECK: Duration = if cfg!(test) {
 pub struct Settings {
     /// 中转服务器地址（`server`）
     pub server: String,
-    /// 中转服务器证书指纹（`server_fp`），空字符串表示不校验
+    /// 中转服务器证书指纹（`server_fp`），空字符串表示第一次连接时记下（见 [`FileTrust`]）
     pub server_fp: String,
     /// 开机自动启动（`autostart`，Windows 安装版）。macOS 上以系统设置为准，这一项只是记录（见 [`autostart_default_pending`]）
     pub autostart: bool,
@@ -225,12 +228,13 @@ pub fn link() -> Arc<LinkConfig> {
         let (name, os) = crate::sysinfo::host_identity();
         Arc::new(
             LinkConfig::new(s.server.clone(), &s.server_fp, name.clone(), os.clone())
+                .map(|l| l.with_store(Arc::new(FileTrust::default())))
                 .unwrap_or_else(|e| {
                     // 指纹写错了：不能因此就不校验证书。用一个不可能对得上的指纹，连接时报"证书指纹不匹配"
                     error!("config.toml: invalid server_fp ({e:#}), refusing to connect");
                     LinkConfig {
                         server: s.server.clone(),
-                        pin: Some([0; 32]),
+                        trust: Trust::Pinned([0; 32]),
                         name,
                         os,
                     }
@@ -240,9 +244,68 @@ pub fn link() -> Arc<LinkConfig> {
     LINK.clone()
 }
 
-/// 是否校验服务器证书（控制台据此提示"未固定证书"）
+/// 是否配置了固定的服务器证书指纹（否则第一次连接时记下，控制台据此说明）
 pub fn pinned() -> bool {
     link().pinned()
+}
+
+/// 第一次连上服务器时记下的证书指纹：存在 config.toml 的 `[server_trust]` 里（服务器地址 + 指纹，
+/// 换了服务器就重新记）。每次连接前重新读文件：Windows 上配置文件由系统服务里的被控端维护，
+/// 控制台（用户进程）写不进去，它自己记下的只在内存里，之后用被控端记下的那一个
+#[derive(Default)]
+struct FileTrust(MemoryTrust);
+
+impl TrustStore for FileTrust {
+    fn load(&self, server: &str) -> Option<[u8; 32]> {
+        let fp = read_text()
+            .as_deref()
+            .and_then(|t| saved_trust(t, server))
+            .or_else(|| self.0.load(server))?;
+        self.0.save(server, fp);
+        Some(fp)
+    }
+
+    fn save(&self, server: &str, fp: [u8; 32]) {
+        self.0.save(server, fp);
+        if let Err(e) = edit(|doc| {
+            put_trust(doc, server, &fp);
+            Ok(())
+        }) {
+            // Windows 的控制台进程：配置文件在安装目录里，由服务里的被控端记下
+            info!("can't save the server certificate fingerprint ({e:#}), keeping it in memory");
+        }
+    }
+}
+
+/// `[server_trust]` 里为 `server` 记下的指纹
+fn saved_trust(text: &str, server: &str) -> Option<[u8; 32]> {
+    let doc: DocumentMut = text.parse().ok()?;
+    let t = doc.get("server_trust")?.as_table_like()?;
+    if t.get("server")?.as_str()?.trim() != server {
+        return None;
+    }
+    parse_fingerprint(t.get("fp")?.as_str()?).ok()?
+}
+
+fn put_trust(doc: &mut DocumentMut, server: &str, fp: &[u8; 32]) {
+    let item = doc.entry("server_trust").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.decor_mut().set_prefix(format!("\n{}", trust_comment()));
+        Item::Table(t)
+    });
+    if !item.is_table() {
+        *item = Item::Table(toml_edit::Table::new());
+    }
+    item["server"] = toml_edit::value(server);
+    item["fp"] = toml_edit::value(format_fingerprint(fp));
+}
+
+/// 写在 `[server_trust]` 前面的说明
+fn trust_comment() -> String {
+    tr!(
+        "# 第一次连上中转服务器时记下的证书指纹（没有设置 server_fp 时使用）：之后服务器的证书变了就拒绝连接，防止有人冒充服务器。\n# 服务器确实换了证书时，删掉这一段（或者写上新的 server_fp），然后重新启动 Airhand\n",
+        "# Certificate fingerprint remembered on the first connection to the relay server (used when server_fp isn't set): if the server's certificate changes later, Airhand refuses to connect, so nobody can impersonate the server.\n# If the server really got a new certificate, delete this section (or set the new server_fp) and restart Airhand\n"
+    )
 }
 
 // ───────────────────────────── 写配置 ─────────────────────────────
@@ -251,8 +314,8 @@ pub fn pinned() -> bool {
 fn template() -> String {
     let fp = if DEFAULT_SERVER_FP.is_empty() {
         tr!(
-            "（未设置，不校验证书）",
-            "(none, the certificate isn't checked)"
+            "（未设置，第一次连接时记住服务器的证书）",
+            "(none, the server's certificate is remembered on the first connection)"
         )
     } else {
         DEFAULT_SERVER_FP.to_string()
@@ -280,7 +343,7 @@ fn template_windows(server: &str, fp: &str) -> String {
 # server = "relay.example.com:4433"
 
 # 中转服务器证书的 SHA-256 指纹（服务器日志里打印的 64 位十六进制，可以用 : 或空格分隔）。
-# 设为 "" 表示不校验证书，只适合开发环境。不设置时使用编译进程序的指纹：{fp}
+# 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
 
 # 开机自动启动：开机后被控端服务自动运行（登录之前也能被控制），登录后显示托盘图标。托盘菜单里也可以切换
@@ -299,7 +362,7 @@ autostart = true
 # server = "relay.example.com:4433"
 
 # SHA-256 fingerprint of the relay server certificate (the 64 hex digits printed in the server log, `:` and spaces are allowed).
-# "" means the certificate isn't checked: for development only. Without it the built-in fingerprint is used: {fp}
+# "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
 
 # Start with Windows: the host service runs after boot (the computer can be controlled before anyone signs in),
@@ -332,7 +395,7 @@ fn template_user(server: &str, fp: &str) -> String {
 # server = "relay.example.com:4433"
 
 # 中转服务器证书的 SHA-256 指纹（服务器日志里打印的 64 位十六进制，可以用 : 或空格分隔）。
-# 设为 "" 表示不校验证书，只适合开发环境。不设置时使用编译进程序的指纹：{fp}
+# 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
 
 # 本机的控制码：第一次连上服务器时由服务器分配，之后一直使用同一个（重启、掉线、升级都不变）。
@@ -349,7 +412,7 @@ fn template_user(server: &str, fp: &str) -> String {
 # server = "relay.example.com:4433"
 
 # SHA-256 fingerprint of the relay server certificate (the 64 hex digits printed in the server log, `:` and spaces are allowed).
-# "" means the certificate isn't checked: for development only. Without it the built-in fingerprint is used: {fp}
+# "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
 
 # This computer's control code: assigned by the server the first time, then always the same (across restarts, disconnects and upgrades).
@@ -406,6 +469,14 @@ fn regenerate(before: Option<&str>) -> Result<DocumentMut> {
         for (k, v) in from.iter() {
             to.insert(k, v.clone());
         }
+    }
+    // 记下的服务器指纹：不重新记（重新记的话，那一次连接就防不了中间人）
+    if let Some((server, fp)) = old.get("server_trust").and_then(|t| {
+        let server = t.get("server")?.as_str()?.to_string();
+        let fp = parse_fingerprint(t.get("fp")?.as_str()?).ok()??;
+        Some((server, fp))
+    }) {
+        put_trust(&mut doc, &server, &fp);
     }
     // 设备写在最后，前面有自己的说明
     if let Some(item) = old.get("device").filter(|i| i.is_array_of_tables()) {
@@ -780,6 +851,28 @@ pub(crate) mod secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 第一次连上服务器时记下的指纹：跟着服务器地址走，再记只改值，文件被删掉重新生成时接着用
+    #[test]
+    fn server_trust_roundtrip_and_survives_regeneration() {
+        let mut doc: DocumentMut = template().parse().unwrap();
+        put_trust(&mut doc, "relay.example.com:4433", &[0xab; 32]);
+        let text = doc.to_string();
+        assert!(text.contains(&trust_comment()));
+        assert_eq!(
+            saved_trust(&text, "relay.example.com:4433"),
+            Some([0xab; 32])
+        );
+        assert_eq!(saved_trust(&text, "other:4433"), None);
+        put_trust(&mut doc, "other:4433", &[1; 32]);
+        let text = doc.to_string();
+        assert_eq!(text.lines().filter(|l| *l == "[server_trust]").count(), 1);
+        assert_eq!(text.matches(trust_comment().as_str()).count(), 1);
+        assert_eq!(saved_trust(&text, "other:4433"), Some([1; 32]));
+        let again = regenerate(Some(&text)).unwrap().to_string();
+        assert_eq!(saved_trust(&again, "other:4433"), Some([1; 32]));
+        assert!(parse(&again).is_ok());
+    }
 
     #[test]
     fn fingerprint_check_matches_the_parser() {

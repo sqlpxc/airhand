@@ -15,6 +15,8 @@ Environment variables (see `docker-compose.yml`):
 | `AIRHAND_CERT_NAMES` | `airhand,localhost` | SANs written into an auto-generated certificate |
 | `AIRHAND_DB` | `airhand.db` next to the certificate | SQLite database with the fixed control codes (code, hash of the host's secret, last seen). Without it, codes of hosts that are offline could go to other hosts (a host still gets its code back if nobody took it). If it can't be opened the server keeps the codes in memory and logs an error |
 | `AIRHAND_MAX_SESSIONS` | `4` | Max simultaneous controllers per host |
+| `AIRHAND_MAX_CONNS_PER_IP` | `128` | Max simultaneous connections per IPv4 address / IPv6 /64 (a web console uses one per browser tab; raise it if many hosts share one public IP) |
+| `AIRHAND_NEW_CODES_PER_IP` | `30` | Max fresh control codes per IPv4 address / IPv6 /48 per 10 minutes (getting an existing code back doesn't count) |
 | `RUST_LOG` | `info` | Log level |
 
 The image is based on distroless, runs as a non-root user, and is about 28 MB.
@@ -41,7 +43,7 @@ Environment variables (see `web/docker-compose.yml` and `web/.env.example`):
 | Variable | Default | Description |
 |---|---|---|
 | `AIRHAND_SERVER` | (required) | Relay server address `host:port` |
-| `AIRHAND_SERVER_FP` | empty | Relay certificate fingerprint. Empty means the certificate is **not verified**; for development only (the console shows "Not pinned") |
+| `AIRHAND_SERVER_FP` | empty | Relay certificate fingerprint. Empty means the relay's certificate is remembered on the first connection (`data/server-trust.txt`) and a different one is refused later; delete that file if the relay really gets a new certificate |
 | `AIRHAND_NAME` | `Airhand Web` | The name shown in the host's tray under who is controlling it |
 | `AIRHAND_WEB_PASSWORD` | empty | Access password: the browser shows a login prompt, any user name works. Empty means anyone who can reach the port can use the console (connecting to a computer still needs its control code) |
 | `AIRHAND_WEB_PORT` | `8080` | Port published on the Docker host |

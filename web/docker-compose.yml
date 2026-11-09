@@ -15,11 +15,12 @@ services:
     ports:
       - "${AIRHAND_WEB_PORT:-8080}:8080" # HTTP 和 HTTPS 共用这一个端口（TCP）
     volumes:
-      - ./data:/data # 网页的自签名 HTTPS 证书（保持不变，浏览器就不会每次都提示）
+      - ./data:/data # 网页的自签名 HTTPS 证书（保持不变，浏览器就不会每次都提示），第一次连上中转服务器时记下的证书指纹
     environment:
       # 中转服务器地址（host:port，UDP）
       AIRHAND_SERVER: ${AIRHAND_SERVER:?set AIRHAND_SERVER to the relay server address, e.g. relay.example.com:4433}
-      # 中转服务器的证书指纹（docker compose logs airhand | grep fingerprint）。留空则不校验证书，仅用于开发
+      # 中转服务器的证书指纹（docker compose logs airhand | grep fingerprint）。留空则第一次连上时记下服务器的证书
+      # （data/server-trust.txt），之后证书变了就拒绝连接；服务器确实换了证书时删掉那个文件
       AIRHAND_SERVER_FP: ${AIRHAND_SERVER_FP:-}
       # 被控端托盘里"谁在控制"显示的名称
       AIRHAND_NAME: ${AIRHAND_NAME:-Airhand Web}

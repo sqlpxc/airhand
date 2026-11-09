@@ -19,6 +19,10 @@ use crate::Problem;
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
+/// 网络卡一下不断开：卡住期间排着的输入由命令队列丢掉（见 [`super::queue`]）
+const HOST_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn now_us() -> u64 {
     EPOCH.elapsed().as_micros() as u64
 }
@@ -192,7 +196,7 @@ pub(super) async fn run(
     let writer = async move {
         loop {
             let bytes = rx.recv().await?;
-            tokio::time::timeout(Duration::from_secs(2), send.write_chunk(bytes)).await??;
+            tokio::time::timeout(HOST_TIMEOUT, send.write_chunk(bytes)).await??;
         }
         #[allow(unreachable_code)]
         anyhow::Ok(())
@@ -308,7 +312,7 @@ pub(super) async fn run(
             last = Instant::now();
             let event = {
                 let mut s = stats.lock().unwrap();
-                if s.last_msg.elapsed() > Duration::from_secs(20) {
+                if s.last_msg.elapsed() > HOST_TIMEOUT {
                     return Err(Problem::HostUnresponsive.into());
                 }
                 let e = SessionEvent::Stats {

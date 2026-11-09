@@ -13,13 +13,17 @@ services:
     ports:
       - "4433:4433/udp" # QUIC 只需要 UDP
     volumes:
-      - ./data:/data # 自动生成的 TLS 证书（保持不变，客户端靠指纹校验）和 SQLite 数据库 airhand.db（固定的控制码）
+      - ./data:/data # 自动生成的 TLS 证书（保持不变，客户端靠指纹校验）和 SQLite 数据库 airhand.db（固定的控制码、给控制码密钥签名的服务器密钥）
     environment:
       RUST_LOG: info
       # 自动生成证书时写入的域名/IP（逗号分隔）
       AIRHAND_CERT_NAMES: airhand,localhost
       # 每台被控端最多允许几个控制端同时连接
       AIRHAND_MAX_SESSIONS: "4"
+      # 同一个来源（IPv4 地址 / IPv6 的 /64）最多同时几条连接；很多被控端共用一个出口 IP 时调大
+      # AIRHAND_MAX_CONNS_PER_IP: "128"
+      # 同一个来源（IPv4 地址 / IPv6 的 /48）10 分钟内最多分配几个新控制码（取回原来的不算）
+      # AIRHAND_NEW_CODES_PER_IP: "30"
       # 如需使用自己的证书，挂载到 /data 并修改以下路径
       # AIRHAND_CERT: /data/cert.pem
       # AIRHAND_KEY: /data/key.pem

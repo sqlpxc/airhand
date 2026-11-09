@@ -26,8 +26,8 @@ const en: Record<MsgKey, Msg> = {
   "server.connected": "Server connected",
   "server.connecting": "Connecting to server…",
   "server.disconnected": "Server disconnected",
-  "server.unpinned": "Not pinned",
-  "server.unpinnedHint": "No certificate fingerprint configured. For development only.",
+  "server.unpinned": "Trust on first use",
+  "server.unpinnedHint": "No certificate fingerprint configured: the server's certificate was remembered on the first connection, and a different one is refused.",
 
   "menu.title": "Menu",
   "menu.version": "v{version} · Controller mode",
@@ -233,7 +233,7 @@ const en: Record<MsgKey, Msg> = {
     "The console needs WebCodecs video decoding. Please use a recent version of Chrome, Edge, Safari or Firefox.",
 
   "problem.serverUnreachable": "Can't connect to the server: {detail}",
-  "problem.certMismatch": "The server certificate doesn't match the pinned fingerprint. Someone may be intercepting the connection",
+  "problem.certMismatch": "The server certificate doesn't match the pinned fingerprint (or the one remembered on the first connection). Someone may be intercepting the connection. If the server really got a new certificate, update the fingerprint or forget the remembered one (server_fp / [server_trust] in config.toml; AIRHAND_SERVER_FP / server-trust.txt for the web console)",
   "problem.incompatible": (p) =>
     Number(p.server) > Number(p.client)
       ? "Incompatible with the server: the server is newer, please update Airhand"

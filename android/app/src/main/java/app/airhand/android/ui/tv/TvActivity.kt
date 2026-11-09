@@ -495,7 +495,17 @@ private fun TvSettings(onBack: () -> Unit) {
         Spacer(Modifier.height(16.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             TvKey(stringResource(R.string.save), accent = true, enabled = serverOk && fpError == null, wide = true) {
-                app.updateSettings { it.copy(server = server.trim(), fingerprint = fp.trim(), deviceName = name.trim()) }
+                app.updateSettings {
+                    // 改了指纹：第一次连接时记下的那个也不要了（清空指纹 = 下次连接时重新记）
+                    val reset = fp.trim() != it.fingerprint
+                    it.copy(
+                        server = server.trim(),
+                        fingerprint = fp.trim(),
+                        deviceName = name.trim(),
+                        trustedServer = if (reset) "" else it.trustedServer,
+                        trustedFp = if (reset) "" else it.trustedFp,
+                    )
+                }
                 onBack()
             }
             TvKey(stringResource(R.string.cancel), wide = true) { onBack() }

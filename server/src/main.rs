@@ -7,6 +7,10 @@
 //! * `AIRHAND_DB`            SQLite 数据库（固定控制码的绑定表，见 [`codes`]），默认和证书放在同一个目录（`/data/airhand.db`）
 //! * `AIRHAND_CERT_NAMES`    自动生成证书时的 SAN，逗号分隔，默认 `airhand,localhost`
 //! * `AIRHAND_MAX_SESSIONS`  每台被控端最多同时被几个控制端连接，默认 4
+//! * `AIRHAND_MAX_CONNS_PER_IP` 同一个来源（IPv4 地址 / IPv6 的 /64）最多同时有几条连接，默认 128
+//!   （网页控制台每个标签页一条；公司出口 IP 后面可能有很多台被控端）
+//! * `AIRHAND_NEW_CODES_PER_IP` 同一个来源（IPv4 地址 / IPv6 的 /48）10 分钟内最多分配几个新控制码，默认 30
+//!   （取回原来的控制码不算）
 //! * `RUST_LOG`              日志级别，默认 `info`
 
 mod broker;
@@ -42,10 +46,12 @@ pub fn transport_config() -> TransportConfig {
     t.max_concurrent_uni_streams(VarInt::from_u32(0));
     t.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(4)));
-    // 足够大的窗口以跑满高码率，在途帧数量由应用层 ACK 控制，不会造成延迟堆积
-    t.stream_receive_window(VarInt::from_u32(16 * 1024 * 1024));
-    t.receive_window(VarInt::from_u32(64 * 1024 * 1024));
-    t.send_window(64 * 1024 * 1024);
+    // 服务器只转发：收到就转出去，窗口只要盖住一段链路的带宽时延积（100 Mbps × 300 ms ≈ 3.75 MB）。
+    // 窗口就是服务器肯替一条连接缓存多少：不读数据的一方（或者故意这样做的攻击者）最多让服务器缓存
+    // 接收 16 MiB + 发送 16 MiB，而不是几百 MiB。在途帧数量由应用层 ACK 控制，不靠这里的窗口
+    t.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
+    t.receive_window(VarInt::from_u32(16 * 1024 * 1024));
+    t.send_window(16 * 1024 * 1024);
     // BBR：在有随机丢包的网络（Wi-Fi/跨境）上比 Cubic 更能维持吞吐，且排队延迟更低
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t
@@ -98,6 +104,20 @@ async fn main() -> Result<()> {
         .parse()
         .unwrap_or(4)
         .max(1);
+    let number = |key: &str, default: usize| -> usize {
+        env_or(key, &default.to_string())
+            .parse()
+            .unwrap_or(default)
+            .max(1)
+    };
+    let max_conns_per_ip = number(
+        "AIRHAND_MAX_CONNS_PER_IP",
+        broker::Config::DEFAULT_MAX_CONNS_PER_IP,
+    );
+    let new_codes_per_ip = number(
+        "AIRHAND_NEW_CODES_PER_IP",
+        broker::Config::DEFAULT_NEW_CODES_PER_IP,
+    );
 
     let cert = tls::load_or_generate(&cert_path, &key_path, &names)?;
     info!("Certificate SHA-256 fingerprint: {}", cert.fingerprint);
@@ -112,6 +132,8 @@ async fn main() -> Result<()> {
     let broker = broker::Broker::new(broker::Config {
         max_sessions_per_host: max_sessions,
         db: Some(db_path),
+        max_conns_per_ip,
+        new_codes_per_ip,
     });
     tokio::spawn(broker.clone().janitor());
     {

@@ -17,7 +17,7 @@ use std::time::Duration;
 use airhand_link::controller::{
     Command, ControllerService, Frontend, HostOnline, SessionEvent, SessionUi, UiClosed,
 };
-use airhand_link::net::Report;
+use airhand_link::net::{MemoryTrust, Report, TrustStore, format_fingerprint, parse_fingerprint};
 use airhand_link::{LinkConfig, Problem, ServerState};
 use airhand_proto::session::QualitySettings;
 use airhand_proto::signal::ResumeToken;
@@ -33,22 +33,67 @@ use crate::rt::rt;
 #[serde(rename_all = "camelCase")]
 pub struct LinkSettings {
     pub server: String,
+    /// 设置里填的证书指纹；空字符串表示第一次连上时记下（见 `airhand_link::net`）
     #[serde(default)]
     pub fingerprint: String,
+    /// 之前第一次连上服务器时记下的指纹（Kotlin 保存在设置里，见 [`TRUST_EVENT`]）
+    #[serde(default)]
+    pub trust: Option<Learned>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub os: String,
 }
 
+/// 第一次连上服务器时记下的指纹
+#[derive(Debug, Deserialize)]
+pub struct Learned {
+    pub server: String,
+    pub fp: String,
+}
+
+/// 第一次连上服务器时发给 Kotlin 的事件：`{"type":"serverTrust","server":"...","fp":"64 位十六进制"}`，
+/// Kotlin 保存下来，下次启动时放在 [`LinkSettings::trust`] 里传回来
+pub const TRUST_EVENT: &str = "serverTrust";
+
+/// 记下的指纹先放在内存里，同时交给 Kotlin 保存
+struct EventTrust {
+    mem: MemoryTrust,
+    events: Arc<Queue<String>>,
+}
+
+impl TrustStore for EventTrust {
+    fn load(&self, server: &str) -> Option<[u8; 32]> {
+        self.mem.load(server)
+    }
+
+    fn save(&self, server: &str, fp: [u8; 32]) {
+        self.mem.save(server, fp);
+        self.events.push(
+            json!({ "type": TRUST_EVENT, "server": server, "fp": format_fingerprint(&fp) })
+                .to_string(),
+        );
+    }
+}
+
 impl LinkSettings {
-    pub fn link(&self) -> Result<LinkConfig> {
-        LinkConfig::new(
+    /// `events`：第一次连上服务器时把记下的指纹作为事件（[`TRUST_EVENT`]）放进这里
+    pub fn link(&self, events: Arc<Queue<String>>) -> Result<LinkConfig> {
+        let learned = self.trust.as_ref().and_then(|t| {
+            let fp = parse_fingerprint(&t.fp).ok()??;
+            Some((t.server.trim(), fp))
+        });
+        let mem = match learned {
+            Some((server, fp)) => MemoryTrust::with(server, Some(fp)),
+            None => MemoryTrust::default(),
+        };
+        Ok(LinkConfig::new(
             self.server.trim(),
             &self.fingerprint,
             self.name.clone(),
             self.os.clone(),
-        )
+        )?
+        .with_store(Arc::new(EventTrust { mem, events })))
     }
 }
 
@@ -101,8 +146,8 @@ impl SessionUi for QueueUi {
 
 impl Ctl {
     pub fn start(cfg: &LinkSettings) -> Result<Arc<Ctl>> {
-        let link = Arc::new(cfg.link()?);
         let events = Arc::new(Queue::new(256));
+        let link = Arc::new(cfg.link(events.clone())?);
         let ev = events.clone();
         let report: Report = Arc::new(move |s: ServerState| {
             ev.push(json!({ "type": "server", "state": s }).to_string());
@@ -228,10 +273,40 @@ mod tests {
         let cfg = LinkSettings {
             server: "127.0.0.1:4433".into(),
             fingerprint: "zz".into(),
+            trust: None,
             name: String::new(),
             os: String::new(),
         };
-        assert!(cfg.link().is_err());
+        assert!(cfg.link(Arc::new(Queue::new(4))).is_err());
+    }
+
+    /// 第一次连上时记下的指纹：Kotlin 传回来的按服务器地址认，新记下的作为事件交给 Kotlin
+    #[test]
+    fn learned_fingerprint_roundtrip() {
+        let cfg: LinkSettings = serde_json::from_str(&format!(
+            r#"{{"server":" relay:4433 ","fingerprint":"","trust":{{"server":"relay:4433","fp":"{}"}}}}"#,
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        let events = Arc::new(Queue::new(4));
+        let link = cfg.link(events.clone()).unwrap();
+        assert!(!link.pinned());
+        let airhand_link::net::Trust::FirstUse(store) = &link.trust else {
+            panic!("expected trust on first use");
+        };
+        assert_eq!(store.load("relay:4433"), Some([0xab; 32]));
+        assert_eq!(store.load("other:4433"), None);
+        store.save("other:4433", [1; 32]);
+        let e: serde_json::Value =
+            serde_json::from_str(&events.pop(Duration::ZERO).unwrap()).unwrap();
+        assert_eq!(
+            e,
+            json!({ "type": "serverTrust", "server": "other:4433", "fp": "01".repeat(32) })
+        );
+        // 没有 trust 字段（之前的版本存的设置）也能用
+        let old: LinkSettings =
+            serde_json::from_str(r#"{"server":"relay:4433","fingerprint":""}"#).unwrap();
+        assert!(old.trust.is_none());
     }
 
     #[test]
@@ -239,6 +314,7 @@ mod tests {
         let ctl = Ctl::start(&LinkSettings {
             server: "127.0.0.1:1".into(),
             fingerprint: String::new(),
+            trust: None,
             name: "test".into(),
             os: "test".into(),
         })

@@ -46,7 +46,7 @@ export function AppMenu({ onClose }: { onClose: () => void }) {
               <div className="am-addr">
                 <span>{app.server}</span>
                 {!app.pinned && (
-                  <span className="badge warn" title={t("server.unpinnedHint")}>
+                  <span className="badge" title={t("server.unpinnedHint")}>
                     {t("server.unpinned")}
                   </span>
                 )}

@@ -154,7 +154,7 @@ Open `http://localhost:8080` on that machine, or `https://<its address>:8080` fr
 
 ## Security notes
 
-- Everything runs over TLS 1.3 (QUIC), and clients verify the server by its certificate fingerprint. A client built without a fingerprint **doesn't verify** the server; use that for development only
+- Everything runs over TLS 1.3 (QUIC), and clients verify the server by its certificate fingerprint. A client built without a fingerprint remembers the server's certificate on its first connection and refuses a different one later, so only that first connection is unprotected; pin the fingerprint for releases
 - **The relay server can see session contents** (TLS terminates at the server), so run it on a machine you trust; the same goes for the web console
 - **A control code is a key**: the Windows host runs as SYSTEM, so whoever has the code controls the computer with administrator rights. Give it only to people you trust; the host's tray always shows who is connected and lets you disconnect them or change the code
 

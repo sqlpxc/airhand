@@ -28,8 +28,8 @@ export default {
   "server.connected": "服务器已连接",
   "server.connecting": "正在连接服务器…",
   "server.disconnected": "服务器未连接",
-  "server.unpinned": "未固定证书",
-  "server.unpinnedHint": "未配置证书指纹，仅适合开发环境",
+  "server.unpinned": "首次连接时信任",
+  "server.unpinnedHint": "未配置证书指纹：第一次连接时记住了服务器的证书，之后证书变了就拒绝连接",
 
   // 菜单（标签栏最左边的图标）
   "menu.title": "菜单",
@@ -243,7 +243,7 @@ export default {
 
   // 问题（类型，见 Rust 的 problem.rs）：与中转服务器的连接
   "problem.serverUnreachable": "无法连接服务器：{detail}",
-  "problem.certMismatch": "服务器证书与程序里固定的指纹不一致，连接可能被人拦截",
+  "problem.certMismatch": "服务器证书与固定的指纹（或第一次连接时记住的证书）不一致，连接可能被人拦截。服务器确实换了证书的话，更新指纹或删掉记住的证书（config.toml 里的 server_fp / [server_trust]；网页控制台是 AIRHAND_SERVER_FP / server-trust.txt）",
   "problem.incompatible": (p) =>
     Number(p.server) > Number(p.client) ? "与服务器版本不兼容：服务器较新，请更新 Airhand" : "与服务器版本不兼容：服务器较旧，请更新服务器",
   "problem.serverLost": "与服务器的连接已断开：{detail}",

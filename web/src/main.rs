@@ -6,7 +6,10 @@
 //!
 //! 环境变量：
 //! * `AIRHAND_SERVER`          中转服务器地址 `host:port`，默认 `127.0.0.1:4433`
-//! * `AIRHAND_SERVER_FP`       中转服务器的证书指纹（服务器日志里打印的那个）；不设置则**不校验证书**，仅用于开发
+//! * `AIRHAND_SERVER_FP`       中转服务器的证书指纹（服务器日志里打印的那个）；不设置则第一次连上时记下服务器的指纹，
+//!   之后只认它（见 [`trust`]）
+//! * `AIRHAND_SERVER_TRUST`    没有设置 `AIRHAND_SERVER_FP` 时，记下的指纹存在这个文件里。默认放在 `AIRHAND_WEB_CERT`
+//!   所在的目录（`server-trust.txt`）；都没有设置时只记在内存里，重启后重新记
 //! * `AIRHAND_NAME`            被控端托盘里显示的控制端名称，默认 `Airhand Web`
 //! * `AIRHAND_WEB_LISTEN`      监听地址（TCP），默认 `0.0.0.0:8080`。同一个端口同时支持 HTTP 和 HTTPS
 //! * `AIRHAND_WEB_PASSWORD`    访问密码（浏览器弹出登录框，用户名随意）；不设置则不需要密码
@@ -21,6 +24,7 @@ mod auth;
 mod console;
 mod http;
 mod tls;
+mod trust;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -51,12 +55,25 @@ async fn main() -> Result<()> {
     let fingerprint = env("AIRHAND_SERVER_FP").unwrap_or_default();
     let name = env_or("AIRHAND_NAME", "Airhand Web");
     let os = format!("{} (web console)", std::env::consts::OS);
-    let link = LinkConfig::new(server.trim(), &fingerprint, name, os)
+    let mut link = LinkConfig::new(server.trim(), &fingerprint, name, os)
         .context("invalid AIRHAND_SERVER_FP")?;
     if !link.pinned() {
-        warn!(
-            "AIRHAND_SERVER_FP is not set: the relay server's certificate is NOT verified, which leaves the sessions open to man-in-the-middle attacks. Set it to the fingerprint printed in the server log"
-        );
+        let trust_file = env("AIRHAND_SERVER_TRUST").map(PathBuf::from).or_else(|| {
+            env("AIRHAND_WEB_CERT")
+                .and_then(|c| Some(Path::new(&c).parent()?.join("server-trust.txt")))
+        });
+        match trust_file {
+            Some(path) => {
+                info!(
+                    "AIRHAND_SERVER_FP is not set: the relay server's certificate is remembered on the first connection ({}) and a different one is refused later",
+                    path.display()
+                );
+                link = link.with_store(Arc::new(trust::FileTrust::new(path)));
+            }
+            None => warn!(
+                "AIRHAND_SERVER_FP is not set: the relay server's certificate is remembered on the first connection, but only until restart (set AIRHAND_SERVER_TRUST to keep it, or AIRHAND_SERVER_FP to pin it)"
+            ),
+        }
     }
 
     let listen: SocketAddr = env_or("AIRHAND_WEB_LISTEN", "0.0.0.0:8080")

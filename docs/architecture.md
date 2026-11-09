@@ -27,9 +27,13 @@ On the session control stream the controller first sends a random ID for this ru
 
 The web console splits the controller on the right in two: the QUIC connection and session handling run in `airhand-web` (the container), while decoding, rendering and input capture stay in the browser, with one WebSocket in between. Media packets are forwarded to the browser unchanged (with a 4-byte session number in front), and the browser acknowledges the frames.
 
-The desktop WebView also acknowledges frames after the IPC hop. Controller commands are bounded to 128 messages / 2 MiB, with adjacent mouse movement and superseded state coalesced. Overflow or commands older than two seconds end the session instead of replaying stale operations. WebSocket output has both a message limit and a 32 MiB byte budget.
+The desktop WebView also acknowledges frames after the IPC hop. Acknowledgements are cumulative, so frames arriving within 8 ms of each other are acknowledged once (the browser sends them as 9-byte binary WebSocket messages, not JSON). Controller commands are bounded to 128 messages / 2 MiB. Acknowledgements, pings and quality settings keep only their latest value and are sent ahead of queued input; adjacent mouse movements are coalesced. Input queued for more than two seconds (or a full queue) is dropped and replaced by a "release all keys", and the session carries on instead of replaying stale operations; a genuinely lost host is detected by the 20-second timeout. WebSocket output has both a message limit and a 32 MiB byte budget.
 
-Fixed codes are queried from an in-memory index. A dedicated SQLite worker coalesces updates per code; registration waits for persistence outside broker locks before publishing, and shutdown also flushes. Disk failures retain in-memory ownership and retry, never treating a failed lookup as an unowned code. A persistence-barrier timeout is logged and service continues in memory; a forced exit can then lose uncommitted updates.
+The video in-flight window is the base RTT (sliding 10-second minimum) × frame rate + 2, up to 32 frames, so long links still reach full frame rate.
+
+Fixed codes are queried from an in-memory index. A dedicated SQLite worker coalesces updates per code. When a binding really changes (a new binding, a new secret) the registration waits outside broker locks until that write is committed, then publishes; the wait is by write sequence number, so later writes from other hosts don't delay it. Shutdown also flushes. Disk failures retain in-memory ownership and retry, never treating a failed lookup as an unowned code. A persistence-barrier timeout is logged and service continues in memory; a forced exit can then lose uncommitted updates.
+
+Host secrets are issued by the server (a nonce plus an HMAC with the server's own key, stored in `airhand.db`): getting a free code back requires a secret issued for that code, so registration can't be used to probe which codes are in use. When the user at the host disconnects all controllers, the host asks the server for a new secret (`Rekey`), which voids every resume token handed out so far.
 
 ### Source layout
 

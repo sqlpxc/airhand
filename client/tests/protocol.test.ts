@@ -32,6 +32,11 @@ test("媒体包：头和数据按 media.ts 解析", () => {
     }
   }
   assert.equal(media.kind(new DataView(new ArrayBuffer(10))), 0, "不到一个头长");
+  // 不认识的编码格式：不猜成 H.264（序号照样读得出来，收到就确认）
+  const first = bytes(fixture.media[0].hex);
+  first[2] = 9;
+  assert.equal(media.videoHeader(new DataView(first.buffer)), null);
+  assert.equal(media.videoSeq(new DataView(first.buffer)), fixture.media[0].seq);
 });
 
 test("输入事件和命令的 JSON 形状与 Rust 一致", () => {

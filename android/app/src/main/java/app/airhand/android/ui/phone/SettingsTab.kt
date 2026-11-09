@@ -84,11 +84,15 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
 
         SectionTitle(stringResource(R.string.settings_server))
         Item(Icons.Outlined.Dns, stringResource(R.string.server_address), s.server) { dialog = "server" }
+        val learned = s.learnedFp
         Item(
             Icons.Outlined.VerifiedUser,
             stringResource(R.string.server_fingerprint),
-            s.fingerprint.ifBlank { stringResource(R.string.fingerprint_none) },
-            warn = s.fingerprint.isBlank(),
+            when {
+                s.fingerprint.isNotBlank() -> s.fingerprint
+                learned != null -> stringResource(R.string.fingerprint_learned, learned.take(16))
+                else -> stringResource(R.string.fingerprint_none)
+            },
         ) { dialog = "fingerprint" }
         Text(
             Messages.server(ctx, server),
@@ -170,7 +174,8 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
             onDismiss = { dialog = null },
             onSave = { v ->
                 dialog = null
-                app.updateSettings { it.copy(fingerprint = v.trim()) }
+                // 第一次连接时记下的指纹也不要了：填了指纹就用填的，清空了就下次连接时重新记
+                app.updateSettings { it.copy(fingerprint = v.trim(), trustedServer = "", trustedFp = "") }
             },
         )
         "name" -> EditTextDialog(

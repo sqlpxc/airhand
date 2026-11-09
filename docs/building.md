@@ -31,8 +31,8 @@ Set them at build time with the `AIRHAND_SERVER` and `AIRHAND_SERVER_FP` environ
 - A malformed fingerprint (it must be 64 hex digits; `:` and spaces are allowed) fails the build
 - These are only defaults: once installed, `server` and `server_fp` in `config.toml` override them (see [Configuration file](usage.md#configuration-file)). An invalid `server_fp` there refuses every connection rather than turning verification off
 
-> [!WARNING]
-> When `AIRHAND_SERVER_FP` is empty the **server certificate is not verified**, which leaves you open to man-in-the-middle attacks. Use that for development only; the console then shows "Not pinned" at the top left.
+> [!NOTE]
+> When `AIRHAND_SERVER_FP` is empty the client remembers the server's certificate on its first connection (`[server_trust]` in `config.toml`) and refuses a different one later (trust on first use; the console shows "Trust on first use" at the top left). Only that first connection is unprotected against a man in the middle, so pin the fingerprint for releases. If the server's certificate changes on purpose, delete `[server_trust]` from `config.toml`.
 
 ### Build
 

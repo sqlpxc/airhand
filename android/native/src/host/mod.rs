@@ -198,8 +198,8 @@ pub struct Host {
 
 impl Host {
     pub fn start(cfg: HostConfig) -> Result<Arc<Host>> {
-        let link = Arc::new(cfg.link.link()?);
         let events = Arc::new(Queue::new(1024));
+        let link = Arc::new(cfg.link.link(events.clone())?);
         let (broadcast, _) = broadcast::channel(32);
         let shared = Arc::new(Shared {
             info: Mutex::new(Info {

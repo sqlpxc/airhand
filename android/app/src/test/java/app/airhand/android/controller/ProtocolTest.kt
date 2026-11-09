@@ -60,6 +60,11 @@ class ProtocolTest {
             }
         }
         assertEquals(0, Media.kind(ByteArray(10)))
+        // 不认识的编码格式：不猜成 H.264
+        val first = bytes(media.getJSONObject(0).getString("hex"))
+        first[2] = 9
+        assertEquals(null, Media.video(first))
+        assertEquals(media.getJSONObject(0).getInt("seq"), Media.seq(first))
     }
 
     @Test

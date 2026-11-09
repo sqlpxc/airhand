@@ -1,10 +1,14 @@
 //! 控制端发给被控端的命令队列（有界）。
 //!
-//! * 被后来的取代的状态不排队：连续的绝对移动只留最后一个，连续的相对移动加起来，
-//!   画质设置只留最新的，确认和 Ping 各只留一个（可以越过排着队的输入）；
-//! * 移动只和相邻的移动合并，不会越过点击、按键（松开按键永远不会丢）；
-//! * 排满了、或者排着的输入太旧了（网络断了一阵子），会话直接失败，
-//!   不在网络恢复时把一大串过时的远程操作补发出去。
+//! * 只关心最新值的状态不排队：画面确认（累积确认）、Ping、画质设置各占一个槽位，只留最新的一个，
+//!   写任务**先发它们**，再按顺序发排着队的输入和其它命令。确认因此不会被排在一串输入后面、
+//!   把被控端测到的往返时延拉长；也不会夹在两个鼠标移动中间，让移动合并不起来；
+//! * 连续的绝对移动只留最后一个，连续的相对移动加起来；移动只和紧挨着的移动合并，
+//!   不会越过点击、按键（松开按键不会被合并掉）；
+//! * 排着的输入太旧了（网络卡了一阵子，[`MAX_AGE`]），或者队列满了：丢掉排着的输入、
+//!   补发一个"释放所有按键"（丢掉的里面可能有松开按键），会话照常继续——不在网络恢复时把一串过时的远程操作补发出去，
+//!   也不因为网络卡了一下就断开重连。真正失联由会话的超时处理。
+//!   丢掉输入之后还是放不下（例如几个 1 MiB 的剪贴板文本）才算会话失败。
 use crate::Problem;
 use airhand_proto::{
     framing,
@@ -15,21 +19,30 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tracing::warn;
 
 const MAX_MESSAGES: usize = 128;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
+/// 输入排队超过这么久就过时了，丢掉
 const MAX_AGE: Duration = Duration::from_secs(2);
 
+/// 排队的东西是什么
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
-    Ordered,
+    /// 其它输入（点击、按键、文字……）
+    Input,
     /// 只有绝对移动：只留最后一个
     Move,
     /// 只有相对移动：加起来
     Delta,
-    Settings,
-    Ack,
-    Ping,
+    /// 不是输入的命令（切换显示器、请求关键帧、剪贴板……）：不会过时，不丢
+    Command,
+}
+
+impl Kind {
+    fn is_input(self) -> bool {
+        self != Kind::Command
+    }
 }
 
 struct Item {
@@ -40,17 +53,51 @@ struct Item {
     at: Instant,
 }
 
+/// 只留最新值的槽位，按发送的先后排列
+#[derive(Clone, Copy)]
+enum Slot {
+    Ack = 0,
+    Ping = 1,
+    Settings = 2,
+}
+
 #[derive(Default)]
 struct State {
+    slots: [Option<Bytes>; 3],
     items: VecDeque<Item>,
     bytes: usize,
     failed: bool,
 }
 
-#[derive(Default)]
+impl State {
+    /// 丢掉排着的输入，补一个"释放所有按键"排在最前面。返回丢掉了几条（没有可丢的就什么也不做）
+    fn drop_input(&mut self, release: &Bytes) -> usize {
+        let before = self.items.len();
+        self.items.retain(|i| !i.kind.is_input());
+        let dropped = before - self.items.len();
+        if dropped == 0 {
+            return 0;
+        }
+        self.items.push_front(Item {
+            kind: Kind::Input,
+            delta: (0, 0),
+            bytes: release.clone(),
+            at: Instant::now(),
+        });
+        self.bytes = self.items.iter().map(|i| i.bytes.len()).sum();
+        dropped
+    }
+
+    fn full(&self, extra: usize) -> bool {
+        self.items.len() >= MAX_MESSAGES || self.bytes + extra > MAX_BYTES
+    }
+}
+
 struct Shared {
     state: Mutex<State>,
     ready: Notify,
+    /// 编码好的"释放所有按键"
+    release: Bytes,
 }
 
 #[derive(Clone)]
@@ -58,7 +105,13 @@ pub(super) struct Sender(Arc<Shared>);
 pub(super) struct Receiver(Arc<Shared>);
 
 pub(super) fn channel() -> (Sender, Receiver) {
-    let shared = Arc::new(Shared::default());
+    let release = encode(&ControllerMsg::Input(vec![InputEvent::ReleaseAll]))
+        .expect("ReleaseAll always encodes");
+    let shared = Arc::new(Shared {
+        state: Mutex::default(),
+        ready: Notify::new(),
+        release,
+    });
     (Sender(shared.clone()), Receiver(shared))
 }
 
@@ -79,29 +132,30 @@ impl Sender {
                 return Ok(());
             }
         }
-        let kind = match &msg {
-            ControllerMsg::Settings(_) => Kind::Settings,
-            ControllerMsg::Ack { .. } => Kind::Ack,
-            ControllerMsg::Ping { .. } => Kind::Ping,
-            ControllerMsg::Input(e) if matches!(e[..], [InputEvent::MouseMove { .. }]) => {
-                Kind::Move
-            }
-            ControllerMsg::Input(e) if matches!(e[..], [InputEvent::MouseDelta { .. }]) => {
-                Kind::Delta
-            }
-            _ => Kind::Ordered,
+        let slot = match &msg {
+            ControllerMsg::Ack { .. } => Some(Slot::Ack),
+            ControllerMsg::Ping { .. } => Some(Slot::Ping),
+            ControllerMsg::Settings(_) => Some(Slot::Settings),
+            _ => None,
         };
-        let delta = match &msg {
+        let (kind, delta) = match &msg {
             ControllerMsg::Input(e) => match e[..] {
-                [InputEvent::MouseDelta { dx, dy }] => (dx, dy),
-                _ => (0, 0),
+                [InputEvent::MouseMove { .. }] => (Kind::Move, (0, 0)),
+                [InputEvent::MouseDelta { dx, dy }] => (Kind::Delta, (dx, dy)),
+                _ => (Kind::Input, (0, 0)),
             },
-            _ => (0, 0),
+            _ => (Kind::Command, (0, 0)),
         };
         let mut bytes = encode(&msg)?;
         let mut s = self.0.state.lock().unwrap();
         if s.failed {
             return Err(Problem::SessionEnded);
+        }
+        if let Some(slot) = slot {
+            s.slots[slot as usize] = Some(bytes);
+            drop(s);
+            self.0.ready.notify_one();
+            return Ok(());
         }
         let mut item = Item {
             kind,
@@ -109,34 +163,38 @@ impl Sender {
             bytes: Bytes::new(),
             at: Instant::now(),
         };
-        // 确认和 Ping 可以越过排着队的输入；其它状态只和紧挨着的合并，移动不会越过点击或切换显示器
-        let replace = if matches!(kind, Kind::Ack | Kind::Ping) {
-            s.items.iter().position(|i| i.kind == kind)
-        } else if kind != Kind::Ordered && s.items.back().is_some_and(|i| i.kind == kind) {
-            Some(s.items.len() - 1)
-        } else {
-            None
-        };
-        if let Some(i) = replace {
-            let old = s.items.remove(i).unwrap();
+        // 移动只和紧挨着的移动合并（队尾只会是输入或命令，确认这类状态不在队列里）
+        if matches!(kind, Kind::Move | Kind::Delta)
+            && s.items.back().is_some_and(|i| i.kind == kind)
+        {
+            let old = s.items.pop_back().unwrap();
             s.bytes -= old.bytes.len();
             if kind == Kind::Delta {
                 item.delta = (
                     old.delta.0.saturating_add(delta.0),
                     old.delta.1.saturating_add(delta.1),
                 );
+                // 合并之后的移动从最早的那一部分算起，过时了一起丢
                 item.at = old.at;
                 bytes = encode(&delta_msg(item.delta))?;
             }
         }
         item.bytes = bytes;
-        if s.items.len() >= MAX_MESSAGES || s.bytes + item.bytes.len() > MAX_BYTES {
-            s.failed = true;
-            s.items.clear();
-            s.bytes = 0;
-            drop(s);
-            self.0.ready.notify_one();
-            return Err(Problem::failed("controller command queue overflow"));
+        if s.full(item.bytes.len()) {
+            // 网络卡住了：排着的输入已经没有意义，丢掉它们再放这一条
+            let dropped = s.drop_input(&self.0.release);
+            warn!(
+                dropped,
+                "controller command queue full, dropped the queued input"
+            );
+            if s.full(item.bytes.len()) {
+                s.failed = true;
+                s.items.clear();
+                s.bytes = 0;
+                drop(s);
+                self.0.ready.notify_one();
+                return Err(Problem::failed("controller command queue overflow"));
+            }
         }
         s.bytes += item.bytes.len();
         s.items.push_back(item);
@@ -153,9 +211,23 @@ impl Receiver {
             {
                 let mut s = self.0.state.lock().unwrap();
                 anyhow::ensure!(!s.failed, "controller command queue overflow");
+                if let Some(b) = s.slots.iter_mut().find_map(Option::take) {
+                    return Ok(b);
+                }
+                // 最早的输入已经过时：排着的输入全都丢掉（后面的也是在网络卡住时攒下的）
+                if s.items
+                    .iter()
+                    .find(|i| i.kind.is_input())
+                    .is_some_and(|i| i.at.elapsed() > MAX_AGE)
+                {
+                    let dropped = s.drop_input(&self.0.release);
+                    warn!(
+                        dropped,
+                        "dropped stale input queued for more than {MAX_AGE:?}"
+                    );
+                }
                 if let Some(i) = s.items.pop_front() {
                     s.bytes -= i.bytes.len();
-                    anyhow::ensure!(i.at.elapsed() <= MAX_AGE, "controller commands expired");
                     return Ok(i.bytes);
                 }
             }
@@ -169,6 +241,7 @@ impl Drop for Receiver {
         let mut s = self.0.state.lock().unwrap();
         s.failed = true;
         s.items.clear();
+        s.slots = Default::default();
         s.bytes = 0;
     }
 }
@@ -176,7 +249,11 @@ impl Drop for Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use airhand_proto::session::MouseButton;
+    use airhand_proto::session::{MouseButton, QualitySettings};
+
+    fn decode(b: &Bytes) -> ControllerMsg {
+        framing::decode(&b[4..]).unwrap()
+    }
 
     fn queued(tx: &Sender) -> Vec<ControllerMsg> {
         tx.0.state
@@ -184,12 +261,16 @@ mod tests {
             .unwrap()
             .items
             .iter()
-            .map(|i| framing::decode(&i.bytes[4..]).unwrap())
+            .map(|i| decode(&i.bytes))
             .collect()
     }
 
     fn input(events: Vec<InputEvent>) -> ControllerMsg {
         ControllerMsg::Input(events)
+    }
+
+    fn is_release(m: &ControllerMsg) -> bool {
+        matches!(m, ControllerMsg::Input(e) if e[..] == [InputEvent::ReleaseAll])
     }
 
     #[test]
@@ -203,6 +284,60 @@ mod tests {
         tx.send(input(vec![InputEvent::MouseMove { x: 1.0, y: 1.0 }]))
             .unwrap();
         assert_eq!(tx.0.state.lock().unwrap().items.len(), 3);
+    }
+
+    /// 确认、Ping 夹在鼠标移动中间：移动照样合并，确认只留最新的一个
+    #[test]
+    fn acks_do_not_break_movement_coalescing() {
+        let (tx, _rx) = channel();
+        for seq in 0..50 {
+            tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
+                .unwrap();
+            tx.send(ControllerMsg::Ack { seq }).unwrap();
+            tx.send(ControllerMsg::Ping { t: seq as u64 }).unwrap();
+            tx.send(input(vec![InputEvent::MouseDelta { dx: 1, dy: 0 }]))
+                .unwrap();
+        }
+        // 绝对移动和相对移动交替，各不合并；但确认和 Ping 不在队列里
+        assert_eq!(queued(&tx).len(), 100);
+        let (tx, _rx) = channel();
+        for seq in 0..50 {
+            tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
+                .unwrap();
+            tx.send(ControllerMsg::Ack { seq }).unwrap();
+        }
+        assert_eq!(queued(&tx).len(), 1);
+    }
+
+    /// 写任务先发确认、Ping、画质设置（各只留最新的），再按顺序发排着的输入
+    #[tokio::test]
+    async fn states_go_first_and_keep_only_the_latest() {
+        let (tx, mut rx) = channel();
+        let click = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+        };
+        tx.send(input(vec![click.clone()])).unwrap();
+        tx.send(ControllerMsg::RequestKeyframe).unwrap();
+        tx.send(ControllerMsg::Ack { seq: 1 }).unwrap();
+        tx.send(ControllerMsg::Settings(QualitySettings::default()))
+            .unwrap();
+        tx.send(ControllerMsg::Ping { t: 7 }).unwrap();
+        tx.send(ControllerMsg::Ack { seq: 9 }).unwrap();
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            out.push(decode(&rx.recv().await.unwrap()));
+        }
+        assert!(matches!(out[0], ControllerMsg::Ack { seq: 9 }));
+        assert!(matches!(out[1], ControllerMsg::Ping { t: 7 }));
+        assert!(matches!(out[2], ControllerMsg::Settings(_)));
+        assert!(matches!(&out[3], ControllerMsg::Input(e) if e[..] == [click]));
+        assert!(matches!(out[4], ControllerMsg::RequestKeyframe));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -239,18 +374,58 @@ mod tests {
         assert_eq!(queued(&tx).len(), 5);
     }
 
+    /// 输入过时了：丢掉排着的输入、补一个"释放所有按键"，其它命令照发，会话继续
     #[tokio::test]
-    async fn overflow_and_expiry_fail_the_reader() {
+    async fn stale_input_is_dropped_and_keys_released() {
+        let (tx, mut rx) = channel();
+        let key = |down| {
+            input(vec![InputEvent::Key {
+                code: "KeyA".into(),
+                down,
+            }])
+        };
+        tx.send(key(true)).unwrap();
+        tx.send(ControllerMsg::SelectDisplay { index: 1 }).unwrap();
+        tx.send(key(false)).unwrap();
+        for i in tx.0.state.lock().unwrap().items.iter_mut() {
+            i.at = Instant::now() - MAX_AGE - Duration::from_millis(1);
+        }
+        assert!(is_release(&decode(&rx.recv().await.unwrap())));
+        assert!(matches!(
+            decode(&rx.recv().await.unwrap()),
+            ControllerMsg::SelectDisplay { index: 1 }
+        ));
+        // 之后的输入照常发
+        tx.send(key(true)).unwrap();
+        assert!(matches!(
+            decode(&rx.recv().await.unwrap()),
+            ControllerMsg::Input(_)
+        ));
+        assert!(tx.0.state.lock().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overflow_drops_input_and_only_fails_without_input_to_drop() {
+        let (tx, mut rx) = channel();
+        for i in 0..MAX_MESSAGES * 2 {
+            tx.send(input(vec![InputEvent::Key {
+                code: "KeyA".into(),
+                down: i % 2 == 0,
+            }]))
+            .unwrap();
+        }
+        let q = queued(&tx);
+        assert!(q.len() <= MAX_MESSAGES);
+        assert!(q.iter().any(is_release));
+        assert!(is_release(&decode(&rx.recv().await.unwrap())));
+
+        // 排满了不能丢的命令：会话失败
         let (tx, mut rx) = channel();
         for _ in 0..MAX_MESSAGES {
             tx.send(ControllerMsg::RequestKeyframe).unwrap();
         }
         assert!(tx.send(ControllerMsg::RequestKeyframe).is_err());
         assert!(rx.recv().await.is_err());
-        let (tx, mut rx) = channel();
-        tx.send(ControllerMsg::RequestKeyframe).unwrap();
-        tx.0.state.lock().unwrap().items.front_mut().unwrap().at =
-            Instant::now() - MAX_AGE - Duration::from_millis(1);
-        assert!(rx.recv().await.is_err());
+        assert!(tx.send(ControllerMsg::Ack { seq: 1 }).is_err());
     }
 }

@@ -9,7 +9,7 @@
 //! ```
 //!
 //! 控制端读到一个包后只看一眼头（统计、校验），不解码、不拷贝，原样交给界面；
-//! 界面按同一个格式解析（`client/src/lib/media.ts`、`android/.../controller/Media.kt`，
+//! 界面按同一个格式解析（`client/src/lib/media.ts`、`android/.../controller/Protocol.kt` 里的 `Media`，
 //! 三边都用 `crates/airhand-link/tests/protocol.json` 里的样例检查）。
 //! 光标形状走控制流（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor)），控制端把它转成同样格式的光标包。
 //!
@@ -28,6 +28,8 @@
 //! | 24   |         | 码流（Annex-B / OBU）| RGBA（非预乘）         | 一个 Opus 包         |
 //!
 //! 采集时间是被控端的时钟，画面和声音是同一个时钟，控制端据此做音画同步。
+//!
+//! 编码格式不认识的画面包（[`VideoHeader::decode`] 返回 `None`）三边都丢掉，不猜成某种格式送进解码器。
 
 use crate::session::{Codec, CursorState};
 

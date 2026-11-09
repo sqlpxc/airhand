@@ -10,8 +10,15 @@
 //! 防暴力猜码：控制码不存在算一次猜错（[`FAIL_LIMIT`]）。被控端掉线后，之前连上过它的控制端带着重连凭证
 //! 重连（见 `airhand_proto::signal` 模块说明的"重连凭证"）：这些请求不算猜错、不受限速影响，
 //! 被控端不在线时服务器记下它们（[`Waiter`]），被控端重新上线时通知它们重连。
+//!
+//! 注册不能用来探测控制码：取回控制码要出示密钥，密钥由服务器签名（[`Broker::issue_secret`]），
+//! 控制码空闲时也只认服务器为**这个控制码**签发过的密钥，对不上就分配一个新的——回答和控制码有没有人用无关。
+//! 新分配的控制码按来源限量（[`Config::new_codes_per_ip`]），防止批量占用控制码。
+//!
+//! 资源：每个来源同时最多 [`Config::max_conns_per_ip`] 条连接；QUIC 的流控窗口按"转发"来定（见 `main.rs`），
+//! 不读数据的一方最多让服务器替它缓存几 MiB，而不是几百 MiB。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -31,7 +38,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::codes::Bindings;
+use crate::codes::{Barrier, Bindings, Owner};
 
 /// 被控端掉线后，控制码保留的时长（期间只有原设备能取回）。固定的控制码（`keep`）一直保留，见 [`crate::codes`]。
 const RESERVE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -40,14 +47,36 @@ const PENDING_TTL: Duration = Duration::from_secs(20);
 /// 失败尝试统计窗口与上限（防暴力猜码）。
 const FAIL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const FAIL_LIMIT: usize = 20;
+/// 新分配控制码的统计窗口（上限见 [`Config::new_codes_per_ip`]）
+const NEW_CODE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 每条控制端连接最多同时等这么多个被控端上线，再多就忘掉最早的
 const MAX_WAITING: usize = 32;
+/// 绑定变化等待落盘的最长时间（超过了记日志，按内存里的状态继续）
+const PERSIST_WAIT: Duration = Duration::from_secs(6);
+
+/// 关闭连接的原因（QUIC 的应用错误码）
+mod close {
+    pub const REPLACED: u32 = 2;
+    pub const SIGNAL: u32 = 3;
+    pub const REGISTER_REFUSED: u32 = 4;
+    pub const TOO_MANY_CONNECTIONS: u32 = 5;
+}
 
 pub struct Config {
     pub max_sessions_per_host: usize,
     /// 固定控制码的绑定表文件，`None` 表示只在内存里
     pub db: Option<std::path::PathBuf>,
+    /// 同一个来源（[`limiter_key`]）最多同时有这么多条连接。网页控制台每个标签页一条，
+    /// 一个公司的出口 IP 后面可能有很多台被控端，所以默认值比较宽
+    pub max_conns_per_ip: usize,
+    /// 同一个来源（[`registration_key`]）10 分钟内最多分配这么多个**新**控制码（取回自己原来的控制码不算）
+    pub new_codes_per_ip: usize,
+}
+
+impl Config {
+    pub const DEFAULT_MAX_CONNS_PER_IP: usize = 128;
+    pub const DEFAULT_NEW_CODES_PER_IP: usize = 30;
 }
 
 /// Bounded signaling output. A non-reading peer is disconnected on overflow,
@@ -61,15 +90,38 @@ impl SignalTx {
     fn send(&self, msg: ServerMsg) -> Result<(), ()> {
         self.tx.try_send(msg).map_err(|_| {
             self.conn
-                .close(VarInt::from_u32(3), b"signal queue overflow");
+                .close(VarInt::from_u32(close::SIGNAL), b"signal queue overflow");
         })
+    }
+}
+
+/// 被控端取回控制码用的密钥：现在的，以及换密钥之后被控端可能还没保存、所以暂时也认的旧密钥
+#[derive(Clone, Copy)]
+struct Secrets {
+    cur: [u8; 16],
+    prev: Option<[u8; 16]>,
+}
+
+impl Secrets {
+    fn new(cur: [u8; 16]) -> Self {
+        Self { cur, prev: None }
+    }
+
+    fn owner(&self, secret: &[u8; 16]) -> Owner {
+        if ct_eq(&self.cur, secret) {
+            Owner::Current
+        } else if self.prev.is_some_and(|p| ct_eq(&p, secret)) {
+            Owner::Previous
+        } else {
+            Owner::Other
+        }
     }
 }
 
 struct HostEntry {
     conn_id: u64,
     ready: bool,
-    secret: [u8; 16],
+    secrets: Secrets,
     /// 被控端发过 [`ClientMsg::Release`]：断开后不再保留这个控制码
     released: bool,
     name: String,
@@ -80,13 +132,13 @@ struct HostEntry {
 }
 
 struct Reserved {
-    secret: [u8; 16],
+    secrets: Secrets,
     until: Instant,
 }
 
 /// 控制码 `code`、密钥 `secret` 对应的重连凭证。密钥只有服务器和被控端知道，
 /// 所以凭证只能从服务器那里得到（连上过这个被控端），也不能从凭证反推出密钥（取回控制码要用）。
-/// 被控端取回控制码时密钥不变，凭证也就仍然有效（包括服务器重启之后）。
+/// 被控端取回控制码时密钥不变，凭证也就仍然有效（包括服务器重启之后）；换了密钥（[`ClientMsg::Rekey`]）就作废了。
 fn resume_token(code: u32, secret: &[u8; 16]) -> ResumeToken {
     let mut h = Sha256::new();
     h.update(b"airhand resume token v1\0");
@@ -97,9 +149,37 @@ fn resume_token(code: u32, secret: &[u8; 16]) -> ResumeToken {
     out
 }
 
-/// 比较凭证，用时与内容无关（不能靠测量回答的快慢逐字节猜出凭证）
-fn same_token(a: &ResumeToken, b: &ResumeToken) -> bool {
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// 比较凭证、密钥，用时与内容无关（不能靠测量回答的快慢逐字节猜出来）
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// HMAC-SHA256（RFC 2104）。密钥 32 字节，短于 SHA-256 的块长，直接补零
+fn hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for (i, k) in key.iter().enumerate() {
+        ipad[i] ^= k;
+        opad[i] ^= k;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    for p in parts {
+        inner.update(p);
+    }
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+/// 控制码密钥的签名：`密钥 = 随机数（8 字节）| HMAC(服务器密钥, 控制码 | 随机数) 的前 8 字节`
+fn secret_mac(key: &[u8; 32], code: u32, nonce: &[u8]) -> [u8; 8] {
+    let mac = hmac_sha256(
+        key,
+        &[b"airhand code secret v1\0", &code.to_le_bytes(), nonce],
+    );
+    mac[..8].try_into().unwrap()
 }
 
 /// 等被控端上线的控制端（回答过它 [`ConnectError::Offline`]）。
@@ -146,11 +226,94 @@ impl Denied {
     }
 }
 
+/// 注册被拒绝的原因（关闭连接时告诉被控端）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// 这个来源短时间内申请了太多新控制码
+    Limited,
+    /// 控制码用完了
+    Exhausted,
+}
+
+impl Refused {
+    fn reason(self) -> &'static [u8] {
+        match self {
+            Refused::Limited => {
+                b"too many new control codes from this network, try again in a few minutes"
+            }
+            Refused::Exhausted => b"the server has no free control codes left",
+        }
+    }
+}
+
 /// 会话槽位，Drop 时自动归还。
 struct SlotGuard(Arc<AtomicUsize>);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 一个来源的连接，Drop 时归还（见 [`Config::max_conns_per_ip`]）
+struct ConnSlot<'a> {
+    conns: &'a Mutex<HashMap<IpAddr, usize>>,
+    key: IpAddr,
+}
+impl Drop for ConnSlot<'_> {
+    fn drop(&mut self) {
+        let mut conns = self.conns.lock().unwrap();
+        if let Some(n) = conns.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                conns.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// 按来源统计一段时间内发生了几次（猜错的次数、新分配的控制码）
+struct Limiter {
+    window: Duration,
+    hits: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+}
+
+impl Limiter {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            hits: Mutex::default(),
+        }
+    }
+
+    fn count(&self, key: IpAddr) -> usize {
+        let now = Instant::now();
+        let mut hits = self.hits.lock().unwrap();
+        let Some(v) = hits.get_mut(&key) else {
+            return 0;
+        };
+        while v.front().is_some_and(|t| now - *t >= self.window) {
+            v.pop_front();
+        }
+        v.len()
+    }
+
+    fn hit(&self, key: IpAddr) {
+        self.hits
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .push_back(Instant::now());
+    }
+
+    fn cleanup(&self) {
+        let now = Instant::now();
+        self.hits.lock().unwrap().retain(|_, v| {
+            while v.front().is_some_and(|t| now - *t >= self.window) {
+                v.pop_front();
+            }
+            !v.is_empty()
+        });
     }
 }
 
@@ -166,10 +329,17 @@ struct Pending {
 
 pub struct Broker {
     cfg: Config,
+    /// 给控制码密钥签名的服务器密钥（随数据库保存，见 [`Bindings::server_key`]）
+    key: [u8; 32],
     hosts: Mutex<HashMap<u32, HostEntry>>,
     reserved: Mutex<HashMap<u32, Reserved>>,
     pending: Mutex<HashMap<u64, Pending>>,
-    failures: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    /// 猜错控制码（按 [`limiter_key`]）
+    failures: Limiter,
+    /// 新分配的控制码（按 [`registration_key`]）
+    new_codes: Limiter,
+    /// 每个来源（[`limiter_key`]）现在有几条连接
+    conns: Mutex<HashMap<IpAddr, usize>>,
     /// 固定的控制码。加锁顺序：hosts → reserved → bindings → waiters
     bindings: Mutex<Bindings>,
     /// 控制码 → 等它上线的控制端
@@ -182,14 +352,31 @@ impl Broker {
         let bindings = Bindings::open(cfg.db.as_deref());
         Arc::new(Self {
             cfg,
+            key: bindings.server_key(),
             hosts: Mutex::default(),
             reserved: Mutex::default(),
             pending: Mutex::default(),
-            failures: Mutex::default(),
+            failures: Limiter::new(FAIL_WINDOW),
+            new_codes: Limiter::new(NEW_CODE_WINDOW),
+            conns: Mutex::default(),
             bindings: Mutex::new(bindings),
             waiters: Mutex::default(),
             next_conn: AtomicU64::new(1),
         })
+    }
+
+    /// 为控制码 `code` 签发一个新的密钥（见 [`secret_mac`]）
+    fn issue_secret(&self, code: u32) -> [u8; 16] {
+        let nonce: [u8; 8] = rand::random();
+        let mut s = [0u8; 16];
+        s[..8].copy_from_slice(&nonce);
+        s[8..].copy_from_slice(&secret_mac(&self.key, code, &nonce));
+        s
+    }
+
+    /// `secret` 是不是本服务器为 `code` 签发的（服务器重启之后也认得）
+    fn issued_here(&self, code: u32, secret: &[u8; 16]) -> bool {
+        ct_eq(&secret[8..], &secret_mac(&self.key, code, &secret[..8]))
     }
 
     /// 周期性清理过期数据。
@@ -216,10 +403,8 @@ impl Broker {
                     let _ = r.stop(VarInt::from_u32(1));
                 }
             }
-            self.failures.lock().unwrap().retain(|_, v| {
-                v.retain(|t| now - *t < FAIL_WINDOW);
-                !v.is_empty()
-            });
+            self.failures.cleanup();
+            self.new_codes.cleanup();
             if now >= next_expiry {
                 let hosts = self.hosts.lock().unwrap();
                 let mut bindings = self.bindings.lock().unwrap();
@@ -229,16 +414,19 @@ impl Broker {
         }
     }
 
-    pub async fn flush_bindings(&self) {
-        let flush = self.bindings.lock().unwrap().flush_barrier();
-        if !tokio::task::spawn_blocking(move || flush(Duration::from_secs(6)))
-            .await
-            .unwrap_or(false)
-        {
+    /// 等绑定表落盘（在任何 broker 锁之外等）。超时记日志，按内存里的状态继续
+    async fn persisted(&self, barrier: Barrier) {
+        if !barrier.wait(PERSIST_WAIT).await {
             warn!(
                 "fixed control codes: persistence barrier did not complete; keeping in-memory ownership"
             );
         }
+    }
+
+    /// 等到现在为止的绑定变化都落盘（退出时调用）
+    pub async fn flush_bindings(&self) {
+        let barrier = self.bindings.lock().unwrap().barrier();
+        self.persisted(barrier).await;
     }
 
     /// (在线的被控端, 等待配对的会话, 固定的控制码)
@@ -248,6 +436,20 @@ impl Broker {
             self.pending.lock().unwrap().len(),
             self.bindings.lock().unwrap().len(),
         )
+    }
+
+    /// 占用来源 `key` 的一个连接名额；满了返回 `None`
+    fn admit(&self, key: IpAddr) -> Option<ConnSlot<'_>> {
+        let mut conns = self.conns.lock().unwrap();
+        let n = conns.entry(key).or_default();
+        if *n >= self.cfg.max_conns_per_ip {
+            return None;
+        }
+        *n += 1;
+        Some(ConnSlot {
+            conns: &self.conns,
+            key,
+        })
     }
 
     pub async fn handle_incoming(self: Arc<Self>, incoming: quinn::Incoming) {
@@ -262,6 +464,15 @@ impl Broker {
                 debug!(%peer, "handshake timed out");
                 return;
             }
+        };
+        // 握手完成之后才算（地址已经验证过，伪造源地址占不了别人的名额）
+        let Some(_slot) = self.admit(limiter_key(peer.ip())) else {
+            info!(%peer, "too many connections from this network, refusing");
+            conn.close(
+                VarInt::from_u32(close::TOO_MANY_CONNECTIONS),
+                b"too many connections from this network",
+            );
+            return;
         };
         if let Err(e) = self.handle_conn(conn.clone(), peer).await {
             debug!(%peer, "connection ended: {e:#}");
@@ -327,14 +538,23 @@ impl Broker {
         let writer_conn = conn.clone();
         let writer = tokio::spawn(async move {
             writer_loop(send, rx).await;
-            writer_conn.close(VarInt::from_u32(3), b"signal writer ended");
+            writer_conn.close(VarInt::from_u32(close::SIGNAL), b"signal writer ended");
         });
         let acceptor = tokio::spawn(self.clone().accept_sessions(conn.clone(), conn_id, role));
 
+        // 被控端注册到的控制码：断开时按它直接找到自己的登记，不用遍历所有被控端
+        let mut host_code = None;
         let res = match role {
             Role::Host => {
-                self.host_loop(&conn, conn_id, peer, name, os, tx, recv, &mut buf)
-                    .await
+                let host = HostConn {
+                    conn: &conn,
+                    conn_id,
+                    peer,
+                    name: &name,
+                    os: &os,
+                    tx: &tx,
+                };
+                self.host_loop(&host, recv, &mut buf, &mut host_code).await
             }
             Role::Controller => {
                 self.controller_loop(conn_id, peer, name, tx, recv, &mut buf)
@@ -344,126 +564,163 @@ impl Broker {
 
         acceptor.abort();
         writer.abort();
-        if role == Role::Host {
-            self.unregister(conn_id);
+        if let Some(code) = host_code {
+            self.unregister(conn_id, code);
         }
         info!(%peer, conn_id, ?role, "client disconnected");
         res
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn host_loop(
         self: &Arc<Self>,
-        conn: &quinn::Connection,
-        conn_id: u64,
-        peer: SocketAddr,
-        name: String,
-        os: String,
-        tx: SignalTx,
+        host: &HostConn<'_>,
         mut recv: RecvStream,
         buf: &mut Vec<u8>,
+        code: &mut Option<u32>,
     ) -> Result<()> {
-        let mut registered = false;
+        let peer = host.peer;
+        let conn_id = host.conn_id;
         while let Some(msg) = read_msg::<_, ClientMsg>(&mut recv, MAX_SIGNAL_MSG, buf).await? {
-            match msg {
-                ClientMsg::Register { reclaim, keep } if !registered => {
-                    let code = self.register(conn, conn_id, &name, &os, &tx, reclaim, keep)?;
-                    // Persistence waits outside ALL broker locks. Ordinary
-                    // registrations are committed before they become visible.
-                    self.flush_bindings().await;
-                    self.announce(conn_id, code);
-                    registered = true;
-                    info!(%peer, conn_id, code, keep, reclaimed = reclaim.is_some_and(|r| r.code == code), "host registered");
+            match (msg, *code) {
+                (ClientMsg::Register { reclaim, keep }, None) => {
+                    let (got, barrier) = match self.register(host, reclaim, keep) {
+                        Ok(r) => r,
+                        Err(refused) => {
+                            info!(%peer, conn_id, ?refused, "registration refused");
+                            host.conn
+                                .close(VarInt::from_u32(close::REGISTER_REFUSED), refused.reason());
+                            return Ok(());
+                        }
+                    };
+                    *code = Some(got);
+                    // 绑定有实质变化（新绑定、换了密钥）时，落盘之后才告诉被控端（在所有 broker 锁之外等）
+                    if let Some(barrier) = barrier {
+                        self.persisted(barrier).await;
+                    }
+                    self.announce(conn_id, got);
+                    info!(%peer, conn_id, code = got, keep, reclaimed = reclaim.is_some_and(|r| r.code == got), "host registered");
                 }
-                ClientMsg::Release if registered => {
-                    if let Some(code) = self.release(conn_id) {
-                        info!(%peer, conn_id, code, "host released its control code");
+                (ClientMsg::Release, Some(c)) => {
+                    if self.release(conn_id, c) {
+                        info!(%peer, conn_id, code = c, "host released its control code");
                     }
                 }
-                other => warn!(%peer, "invalid message from host: {other:?}"),
+                (ClientMsg::Rekey, Some(c)) => {
+                    let Some((secret, barrier)) = self.rekey(conn_id, c) else {
+                        continue;
+                    };
+                    if let Some(barrier) = barrier {
+                        self.persisted(barrier).await;
+                    }
+                    let _ = host.tx.send(ServerMsg::Rekeyed { secret });
+                    info!(%peer, conn_id, code = c, "host changed its secret, earlier reconnect tokens are void");
+                }
+                (other, _) => warn!(%peer, "invalid message from host: {other:?}"),
             }
         }
         Ok(())
     }
 
-    /// 分配（或者还回原来的）控制码，发 `Registered`，并通知在等这个被控端的控制端。
-    /// `keep`：被控端保存了控制码，一直为它保留（绑定）。
-    #[allow(clippy::too_many_arguments)]
+    /// 分配（或者还回原来的）控制码并登记被控端（还不发布，见 [`Broker::announce`]）。
+    /// 返回控制码，以及绑定有实质变化时要等它落盘的屏障
     fn register(
         &self,
-        conn: &quinn::Connection,
-        conn_id: u64,
-        name: &str,
-        os: &str,
-        tx: &SignalTx,
+        host: &HostConn<'_>,
         reclaim: Option<Reclaim>,
         keep: bool,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<Barrier>), Refused> {
         let mut hosts = self.hosts.lock().unwrap();
         let mut reserved = self.reserved.lock().unwrap();
         let mut bindings = self.bindings.lock().unwrap();
         let now = Instant::now();
-        let mut rng = rand::rng();
 
-        let mut chosen: Option<(u32, [u8; 16])> = None;
+        let mut chosen: Option<(u32, Secrets)> = None;
         if let Some(r) = reclaim.filter(|r| (CODE_MIN..=CODE_MAX).contains(&r.code)) {
-            if let Some(old) = hosts.get(&r.code) {
-                // 旧连接尚未超时（例如网络切换后立即重连）：密钥匹配则顶替旧连接
-                if old.secret == r.secret {
-                    old.conn.close(VarInt::from_u32(2), b"replaced");
-                    hosts.remove(&r.code);
-                    chosen = Some((r.code, r.secret));
+            let owner = if let Some(old) = hosts.get(&r.code) {
+                old.secrets.owner(&r.secret)
+            } else if let Some(res) = reserved.get(&r.code).filter(|res| res.until > now) {
+                res.secrets.owner(&r.secret)
+            } else {
+                match bindings.check(r.code, &r.secret) {
+                    // 空闲的控制码（服务器重启过，或者保留期过了、还没给别人）：只还给出示了本服务器为它签发的密钥的
+                    Owner::Free if self.issued_here(r.code, &r.secret) => Owner::Current,
+                    Owner::Free => Owner::Other,
+                    owner => owner,
                 }
-            } else if let Some(res) = reserved.get(&r.code) {
-                if res.secret == r.secret && res.until > now {
-                    reserved.remove(&r.code);
-                    chosen = Some((r.code, r.secret));
+            };
+            let secrets = match owner {
+                Owner::Current => Some(Secrets::new(r.secret)),
+                // 被控端没来得及保存上次换的密钥：再签发一个新的给它，它手里的旧密钥继续认到它保存了新的为止
+                Owner::Previous => Some(Secrets {
+                    cur: self.issue_secret(r.code),
+                    prev: Some(r.secret),
+                }),
+                Owner::Free | Owner::Other => None,
+            };
+            if let Some(secrets) = secrets {
+                // 旧连接尚未超时（例如网络切换后立即重连）：顶替旧连接
+                if let Some(old) = hosts.remove(&r.code) {
+                    old.conn
+                        .close(VarInt::from_u32(close::REPLACED), b"replaced");
                 }
-            } else if bindings.check(r.code, &r.secret) != Some(false) {
-                // 绑定给这台被控端的，或者控制码空闲（服务器重启过，或者保留期过了、还没给别人）：还给原设备
-                chosen = Some((r.code, r.secret));
+                reserved.remove(&r.code);
+                chosen = Some((r.code, secrets));
             }
         }
 
-        let (code, secret) = match chosen {
+        let (code, secrets) = match chosen {
             Some(chosen) => chosen,
             None => {
-                let count = CODE_MAX - CODE_MIN + 1;
-                let start = rng.random_range(0..count);
-                let code = (0..count)
-                    .map(|i| CODE_MIN + (start + i) % count)
-                    .find(|c| {
-                        !hosts.contains_key(c)
-                            && !reserved.contains_key(c)
-                            && !bindings.contains(*c)
+                let source = registration_key(host.peer.ip());
+                if self.new_codes.count(source) >= self.cfg.new_codes_per_ip {
+                    return Err(Refused::Limited);
+                }
+                let free = |c: &u32| {
+                    !hosts.contains_key(c) && !reserved.contains_key(c) && !bindings.contains(*c)
+                };
+                let mut rng = rand::rng();
+                // 随机挑几次（平常第一次就是空闲的），挑不到再从随机位置开始逐个找
+                let code = (0..64)
+                    .map(|_| rng.random_range(CODE_MIN..=CODE_MAX))
+                    .find(free)
+                    .or_else(|| {
+                        let count = CODE_MAX - CODE_MIN + 1;
+                        let start = rng.random_range(0..count);
+                        (0..count)
+                            .map(|i| CODE_MIN + (start + i) % count)
+                            .find(free)
                     })
-                    .ok_or_else(|| anyhow!("control code namespace exhausted"))?;
-                (code, rng.random())
+                    .ok_or(Refused::Exhausted)?;
+                self.new_codes.hit(source);
+                (code, Secrets::new(self.issue_secret(code)))
             }
         };
-        if keep {
-            bindings.bind(code, &secret);
-        } else if bindings.check(code, &secret) == Some(true) {
-            // 这台被控端不再保存控制码了
+        let barrier = if keep {
+            bindings
+                .bind(code, &secrets.cur, secrets.prev.as_ref())
+                .then(|| bindings.barrier())
+        } else {
+            // 这个控制码是它的（取回的或者新分配的），它不再保存控制码了：解除绑定
             bindings.remove(code);
-        }
+            None
+        };
         drop(bindings);
 
         hosts.insert(
             code,
             HostEntry {
-                conn_id,
+                conn_id: host.conn_id,
                 ready: false,
-                secret,
+                secrets,
                 released: false,
-                name: name.to_string(),
-                os: os.to_string(),
-                tx: tx.clone(),
-                conn: conn.clone(),
+                name: host.name.to_string(),
+                os: host.os.to_string(),
+                tx: host.tx.clone(),
+                conn: host.conn.clone(),
                 sessions: Arc::new(AtomicUsize::new(0)),
             },
         );
-        Ok(code)
+        Ok((code, barrier))
     }
 
     fn announce(&self, conn_id: u64, code: u32) {
@@ -472,7 +729,7 @@ impl Broker {
             return;
         };
         h.ready = true;
-        let secret = h.secret;
+        let secret = h.secrets.cur;
         let tx = &h.tx;
         // 在通知控制端之前（并且还持有锁）发出：被控端收到的第一条消息必须是 Registered，
         // 控制端收到通知后马上发起的会话（Incoming）只能排在它后面
@@ -481,7 +738,7 @@ impl Broker {
         // 叫醒在等这个被控端的控制端。凭证对不上的直接忘掉：它们等的是以前用过这个控制码的另一台被控端
         if let Some(list) = self.waiters.lock().unwrap().remove(&code) {
             let token = resume_token(code, &secret);
-            for w in list.iter().filter(|w| same_token(&w.resume, &token)) {
+            for w in list.iter().filter(|w| ct_eq(&w.resume, &token)) {
                 debug!(
                     code,
                     ctrl = w.conn_id,
@@ -492,36 +749,57 @@ impl Broker {
         }
     }
 
-    fn unregister(&self, conn_id: u64) {
+    /// 被控端断开：控制码保留一段时间（固定的控制码一直保留）
+    fn unregister(&self, conn_id: u64, code: u32) {
         let mut hosts = self.hosts.lock().unwrap();
-        let code = hosts
-            .iter()
-            .find(|(_, h)| h.conn_id == conn_id)
-            .map(|(c, _)| *c);
-        if let Some(code) = code {
-            let h = hosts.remove(&code).unwrap();
-            if h.released {
-                return;
-            }
-            self.reserved.lock().unwrap().insert(
-                code,
-                Reserved {
-                    secret: h.secret,
-                    until: Instant::now() + RESERVE_TTL,
-                },
-            );
-            self.bindings.lock().unwrap().touch(code);
+        // 被同一台被控端的新连接顶替了：登记已经是新连接的
+        if !hosts.get(&code).is_some_and(|h| h.conn_id == conn_id) {
+            return;
         }
+        let h = hosts.remove(&code).unwrap();
+        if h.released {
+            return;
+        }
+        self.reserved.lock().unwrap().insert(
+            code,
+            Reserved {
+                secrets: h.secrets,
+                until: Instant::now() + RESERVE_TTL,
+            },
+        );
+        self.bindings.lock().unwrap().touch(code);
     }
 
-    /// 被控端放弃控制码：解除绑定，断开后也不保留。返回它的控制码
-    fn release(&self, conn_id: u64) -> Option<u32> {
+    /// 被控端放弃控制码：解除绑定，断开后也不保留
+    fn release(&self, conn_id: u64, code: u32) -> bool {
         let mut hosts = self.hosts.lock().unwrap();
-        let (code, h) = hosts.iter_mut().find(|(_, h)| h.conn_id == conn_id)?;
+        let Some(h) = hosts.get_mut(&code).filter(|h| h.conn_id == conn_id) else {
+            return false;
+        };
         h.released = true;
-        let code = *code;
         self.bindings.lock().unwrap().remove(code);
-        Some(code)
+        true
+    }
+
+    /// 被控端的用户断开了所有控制端：换一个密钥，之前发出的重连凭证随之作废。
+    /// 被控端手里的旧密钥继续认，直到它带着新密钥回来（它可能没来得及保存新的）。
+    /// 返回新的密钥，以及固定的控制码要等它落盘的屏障
+    fn rekey(&self, conn_id: u64, code: u32) -> Option<([u8; 16], Option<Barrier>)> {
+        let mut hosts = self.hosts.lock().unwrap();
+        let h = hosts
+            .get_mut(&code)
+            .filter(|h| h.conn_id == conn_id && !h.released)?;
+        let secrets = Secrets {
+            cur: self.issue_secret(code),
+            prev: Some(h.secrets.cur),
+        };
+        h.secrets = secrets;
+        let mut bindings = self.bindings.lock().unwrap();
+        let barrier = bindings.contains(code).then(|| {
+            bindings.bind(code, &secrets.cur, secrets.prev.as_ref());
+            bindings.barrier()
+        });
+        Some((secrets.cur, barrier))
     }
 
     async fn controller_loop(
@@ -588,7 +866,7 @@ impl Broker {
             // 带凭证：凭证对得上才回答实情，否则（被控端不在线、凭证不对、控制码不存在）一律"不在线"。
             // 回答不透露控制码是否存在，所以不算猜错，也不必限速
             Some(resume) => match hosts.get(&code) {
-                Some(h) if same_token(&resume_token(code, &h.secret), &resume) => h,
+                Some(h) if ct_eq(&resume_token(code, &h.secrets.cur), &resume) => h,
                 _ => {
                     self.wait(ctrl, code, resume, waiting);
                     return Err(Denied::Offline);
@@ -659,7 +937,7 @@ impl Broker {
             session_id,
             host_name: host.name.clone(),
             host_os: host.os.clone(),
-            resume: resume_token(code, &host.secret),
+            resume: resume_token(code, &host.secrets.cur),
         })
     }
 
@@ -683,24 +961,12 @@ impl Broker {
     }
 
     fn failure_count(&self, ip: IpAddr) -> usize {
-        let now = Instant::now();
-        self.failures
-            .lock()
-            .unwrap()
-            .get(&ip)
-            .map(|v| v.iter().filter(|t| now - **t < FAIL_WINDOW).count())
-            .unwrap_or(0)
+        self.failures.count(ip)
     }
 
     fn record_failure(&self, ip: IpAddr) {
-        self.failures
-            .lock()
-            .unwrap()
-            .entry(ip)
-            .or_default()
-            .push(Instant::now());
+        self.failures.hit(ip);
     }
-
     async fn accept_sessions(self: Arc<Self>, conn: quinn::Connection, conn_id: u64, role: Role) {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -843,6 +1109,29 @@ fn forget_waiter(all: &mut HashMap<u32, Vec<Waiter>>, code: u32, conn_id: u64) {
     }
 }
 
+/// 被控端的一条连接（注册、换密钥时用）
+struct HostConn<'a> {
+    conn: &'a quinn::Connection,
+    conn_id: u64,
+    peer: SocketAddr,
+    name: &'a str,
+    os: &'a str,
+    tx: &'a SignalTx,
+}
+
+/// 新分配控制码的限量按这个来源统计：IPv6 按 /48 归并（一个用户手里通常有一整个 /56 或 /48，
+/// 按 /64 算的话换个子网就绕过去了；正常使用时新分配控制码很少，归并得粗一点也不会误伤）
+fn registration_key(ip: IpAddr) -> IpAddr {
+    match limiter_key(ip) {
+        IpAddr::V6(v6) => {
+            let mut seg = v6.segments();
+            seg[3..].fill(0);
+            IpAddr::V6(seg.into())
+        }
+        v4 => v4,
+    }
+}
+
 /// IPv6 按 /64 归并，防止换地址绕过限速。
 fn limiter_key(ip: IpAddr) -> IpAddr {
     match ip {
@@ -879,14 +1168,55 @@ mod tests {
         assert_eq!(key("2001:db8:1:2:bbbb::9"), "2001:db8:1:2::");
         // IPv4 映射地址按 IPv4 计
         assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
+        // 新分配控制码的限量：IPv6 按 /48
+        let reg = |s: &str| registration_key(s.parse().unwrap()).to_string();
+        assert_eq!(reg("2001:db8:1:2:aaaa::1"), "2001:db8:1::");
+        assert_eq!(reg("2001:db8:1:ff00::1"), "2001:db8:1::");
+        assert_eq!(reg("::ffff:203.0.113.9"), "203.0.113.9");
     }
 
     #[test]
     fn resume_token_binds_code_and_secret() {
         let t = resume_token(123_456, &[1; 16]);
-        assert!(same_token(&t, &resume_token(123_456, &[1; 16])));
-        assert!(!same_token(&t, &resume_token(123_457, &[1; 16])));
-        assert!(!same_token(&t, &resume_token(123_456, &[2; 16])));
+        assert!(ct_eq(&t, &resume_token(123_456, &[1; 16])));
+        assert!(!ct_eq(&t, &resume_token(123_457, &[1; 16])));
+        assert!(!ct_eq(&t, &resume_token(123_456, &[2; 16])));
+        assert!(!ct_eq(&t, &t[..15]));
+    }
+
+    /// RFC 4231 测试用例 2（密钥 "Jefe" 补零到 32 字节，按 HMAC 的规则和原来一样）
+    #[test]
+    fn hmac_matches_rfc4231() {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(b"Jefe");
+        let mac = hmac_sha256(&key, &[b"what do ya ", b"want for nothing?"]);
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn secrets_are_signed_for_one_code() {
+        let broker = Broker::new(test_config(None));
+        let s = broker.issue_secret(123_456);
+        assert!(broker.issued_here(123_456, &s));
+        assert!(!broker.issued_here(123_457, &s));
+        let mut forged = s;
+        forged[15] ^= 1;
+        assert!(!broker.issued_here(123_456, &forged));
+        // 别的服务器（不同的密钥）签发的不认
+        assert!(!Broker::new(test_config(None)).issued_here(123_456, &s));
+    }
+
+    fn test_config(db: Option<std::path::PathBuf>) -> Config {
+        Config {
+            max_sessions_per_host: 8,
+            db,
+            max_conns_per_ip: Config::DEFAULT_MAX_CONNS_PER_IP,
+            new_codes_per_ip: 1000,
+        }
     }
 
     /// 进程内的服务器（只监听 127.0.0.1），固定控制码只记在内存里
@@ -895,6 +1225,10 @@ mod tests {
     }
 
     async fn start_with(db: Option<std::path::PathBuf>) -> (Arc<Broker>, LinkConfig) {
+        start_cfg(test_config(db)).await
+    }
+
+    async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
         let ck = rcgen::generate_simple_self_signed(vec!["airhand".into()]).unwrap();
         let chain = vec![CertificateDer::from(ck.cert.der().to_vec())];
         let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into();
@@ -904,10 +1238,7 @@ mod tests {
         )
         .unwrap();
         let server = endpoint.local_addr().unwrap().to_string();
-        let broker = Broker::new(Config {
-            max_sessions_per_host: 8,
-            db,
-        });
+        let broker = Broker::new(cfg);
         let b = broker.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -1216,36 +1547,232 @@ mod tests {
         assert!(connect(token).await.is_ok());
     }
 
-    /// 服务器重启之后（什么都不记得了），控制端可能比被控端先回来：凭证照样可以用
+    /// 测试用的数据库文件。放在 target/ 里：服务器的后台任务在测试结束前一直开着数据库，Windows 上删不掉
+    fn temp_db() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/test-tmp")
+            .join(format!("broker-{:016x}", rand::random::<u64>()));
+        let file = dir.join("airhand.db");
+        (dir, file)
+    }
+
+    /// 服务器重启之后（只剩数据库，内存里的东西都不记得了），控制端可能比被控端先回来：凭证照样可以用；
+    /// 不保存控制码的被控端也能取回原来的控制码（密钥是这台服务器签发的）
     #[tokio::test]
     async fn resume_survives_a_server_restart() {
-        let (_old, cfg) = start().await;
+        let (dir, file) = temp_db();
+        let (old, cfg) = start_with(Some(file.clone())).await;
         let (host, id) = register(&cfg, None).await;
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
         let token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
-        drop((host, ctrl));
+        old.flush_bindings().await;
+        drop((host, ctrl, old));
 
-        let (_new, cfg) = start().await;
+        let (_new, cfg) = start_with(Some(file)).await;
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
         assert_eq!(
             ask(&mut ctrl, 1, id.code, Some(token)).await.unwrap_err(),
             ConnectError::Offline
         );
         let (_host, again) = register(&cfg, Some(id)).await;
-        assert_eq!(again.code, id.code);
+        assert_eq!(again, id);
         assert!(matches!(next(&mut ctrl).await, ServerMsg::HostOnline { code } if code == id.code));
         assert!(ask(&mut ctrl, 2, id.code, Some(token)).await.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 注册不能用来探测控制码有没有人用：拿不出服务器为这个控制码签发的密钥，不管它有没有人用都分配一个新的
+    #[tokio::test]
+    async fn registration_does_not_reveal_whether_a_code_is_taken() {
+        let (broker, cfg) = start().await;
+        let (_victim, v) = register(&cfg, None).await;
+        let free = if v.code == CODE_MAX {
+            CODE_MIN
+        } else {
+            v.code + 1
+        };
+        assert!(!broker.hosts.lock().unwrap().contains_key(&free));
+        for code in [v.code, free] {
+            let (_s, got) = register(
+                &cfg,
+                Some(Reclaim {
+                    code,
+                    secret: [0xAB; 16],
+                }),
+            )
+            .await;
+            assert_ne!(got.code, code);
+        }
+        // 服务器为它签发的密钥：控制码空闲（例如保留期过了）时还给它
+        let (host, own) = register(&cfg, None).await;
+        host.conn.close(VarInt::from_u32(0), b"");
+        wait_until("the host is gone", || {
+            !broker.hosts.lock().unwrap().contains_key(&own.code)
+        })
+        .await;
+        broker.reserved.lock().unwrap().clear();
+        let (_host, again) = register(&cfg, Some(own)).await;
+        assert_eq!(again, own);
+    }
+
+    /// 本机用户断开所有控制端时换密钥：之前的重连凭证作废，控制码不变。
+    /// 被控端用新密钥取回控制码；没来得及保存新密钥时，旧密钥也还认（同时再换一个），保存了之后旧的就不认了
+    #[tokio::test]
+    async fn rekey_voids_tokens_and_keeps_the_code() {
+        let (dir, file) = temp_db();
+        let (broker, cfg) = start_with(Some(file.clone())).await;
+        let (mut host, id) = register_with(&cfg, None, true).await;
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let old_token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
+        assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+
+        write_msg(&mut host.send, &ClientMsg::Rekey).await.unwrap();
+        let ServerMsg::Rekeyed { secret } = next(&mut host).await else {
+            panic!("expected Rekeyed");
+        };
+        assert_ne!(secret, id.secret);
+        // 旧凭证：和被控端不在线时的回答一样
+        assert_eq!(
+            ask(&mut ctrl, 2, id.code, Some(old_token))
+                .await
+                .unwrap_err(),
+            ConnectError::Offline
+        );
+        // 控制码本身照样能连，拿到的是新凭证
+        let fresh = ask(&mut ctrl, 3, id.code, None).await.unwrap().resume;
+        assert_ne!(fresh, old_token);
+        assert!(ask(&mut ctrl, 4, id.code, Some(fresh)).await.is_ok());
+
+        // 服务器重启（新的绑定在回答 Rekeyed 之前就落盘了）
+        host.conn.close(VarInt::from_u32(0), b"");
+        wait_until("the host is gone", || broker.stats().0 == 0).await;
+        broker.flush_bindings().await;
+        drop((host, ctrl, broker));
+        let (broker, cfg) = start_with(Some(file)).await;
+        // 被控端没来得及保存新密钥，拿着旧的来：控制码还给它，并且换一个新的
+        let (h1, again) = register_with(&cfg, Some(id), true).await;
+        assert_eq!(again.code, id.code);
+        assert!(again.secret != id.secret && again.secret != secret);
+        h1.conn.close(VarInt::from_u32(0), b"");
+        wait_until("the host is gone", || broker.stats().0 == 0).await;
+        // 带着新密钥回来：之后旧密钥不再认
+        let (h2, back) = register_with(&cfg, Some(again), true).await;
+        assert_eq!(back, again);
+        h2.conn.close(VarInt::from_u32(0), b"");
+        wait_until("the host is gone", || broker.stats().0 == 0).await;
+        broker.reserved.lock().unwrap().clear();
+        let (_h3, stolen) = register_with(&cfg, Some(id), true).await;
+        assert_ne!(stolen.code, id.code);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 被控端服务（airhand-link）：本机用户断开所有控制端时请服务器换密钥，并保存新密钥；被断开的控制端拿着旧凭证连不回来
+    #[tokio::test]
+    async fn host_service_rekeys_on_kick_all() {
+        use airhand_link::host::{HostCmd, HostEvents};
+        struct Events(mpsc::UnboundedSender<(Reclaim, bool)>);
+        impl HostEvents for Events {
+            fn server(&self, _: airhand_link::ServerState) {}
+            async fn registered(&self, code: Reclaim, changed: bool) {
+                let _ = self.0.send((code, changed));
+            }
+            async fn released(&self) {}
+            fn incoming(&self, _: u64, _: &Peer) {}
+            fn ended(&self, _: u64) {}
+            fn offline(&self) {}
+        }
+        let (_broker, cfg) = start().await;
+        let (tx, mut saved) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(airhand_link::host::run(
+            Arc::new(cfg.clone()),
+            true,
+            None,
+            Arc::new(Events(tx)),
+            |_conn, _id, _kick| async {},
+            cmd_rx,
+        ));
+        let next_saved = async |saved: &mut mpsc::UnboundedReceiver<(Reclaim, bool)>| {
+            timeout(Duration::from_secs(5), saved.recv())
+                .await
+                .expect("the host didn't save its code")
+                .unwrap()
+        };
+        let (first, changed) = next_saved(&mut saved).await;
+        assert!(changed);
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let token = ask(&mut ctrl, 1, first.code, None).await.unwrap().resume;
+
+        cmd_tx.send(HostCmd::KickAll).unwrap();
+        let (second, changed) = next_saved(&mut saved).await;
+        assert!(changed);
+        assert_eq!(second.code, first.code);
+        assert_ne!(second.secret, first.secret);
+        assert_eq!(
+            ask(&mut ctrl, 2, first.code, Some(token))
+                .await
+                .unwrap_err(),
+            ConnectError::Offline
+        );
+        task.abort();
+    }
+
+    /// 新分配的控制码按来源限量；取回自己原来的控制码不算
+    #[tokio::test]
+    async fn new_codes_are_limited_per_network() {
+        let (_broker, cfg) = start_cfg(Config {
+            new_codes_per_ip: 2,
+            ..test_config(None)
+        })
+        .await;
+        let (_a, a) = register(&cfg, None).await;
+        let (_b, _) = register(&cfg, None).await;
+        let mut sig = connect_signal(&cfg, Role::Host).await.unwrap();
+        write_msg(
+            &mut sig.send,
+            &ClientMsg::Register {
+                reclaim: None,
+                keep: false,
+            },
+        )
+        .await
+        .unwrap();
+        let reason = timeout(Duration::from_secs(5), sig.conn.closed())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c)
+                if c.error_code == VarInt::from_u32(close::REGISTER_REFUSED)),
+            "{reason:?}"
+        );
+        let (_again, back) = register(&cfg, Some(a)).await;
+        assert_eq!(back, a);
+    }
+
+    #[tokio::test]
+    async fn connections_are_limited_per_network() {
+        let (broker, cfg) = start_cfg(Config {
+            max_conns_per_ip: 2,
+            ..test_config(None)
+        })
+        .await;
+        let a = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let _b = connect_signal(&cfg, Role::Controller).await.unwrap();
+        assert!(connect_signal(&cfg, Role::Controller).await.is_err());
+        a.conn.close(VarInt::from_u32(0), b"");
+        drop(a);
+        wait_until("a connection slot is free", || {
+            broker.conns.lock().unwrap().values().sum::<usize>() < 2
+        })
+        .await;
+        assert!(connect_signal(&cfg, Role::Controller).await.is_ok());
     }
 
     /// 固定的控制码：服务器重启（只剩数据库里的绑定）之后，只有原来的被控端能取回，别人拿不走；
     /// 被控端放弃（Release）后解除绑定，也不再保留
     #[tokio::test]
     async fn fixed_codes_are_never_handed_out() {
-        // 放在 target/ 里：两个服务器的后台任务在测试结束前一直开着数据库，Windows 上删不掉
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/test-tmp")
-            .join(format!("broker-{:016x}", rand::random::<u64>()));
-        let file = dir.join("airhand.db");
+        let (dir, file) = temp_db();
         let (old, cfg) = start_with(Some(file.clone())).await;
         let (host, id) = register_with(&cfg, None, true).await;
         host.conn.close(VarInt::from_u32(0), b"");

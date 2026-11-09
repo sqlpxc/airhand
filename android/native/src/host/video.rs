@@ -24,8 +24,9 @@ use tracing::{debug, info};
 
 use crate::queue::Queue;
 
-/// 每个会话的画面队列（打包好的画面包）。在途帧控制之下一般只有一两帧
-pub const QUEUE: usize = 8;
+/// 每个会话的画面队列（打包好的画面包）。在途帧控制之下一般只有一两帧；容量和在途帧窗口的上限一样，
+/// 网络慢、写不进流的时候在途的帧也都放得下，不会因为队列满了丢帧、再去要关键帧
+pub const QUEUE: usize = airhand_link::flow::MAX_WINDOW as usize;
 
 pub struct VideoHub {
     st: Mutex<State>,

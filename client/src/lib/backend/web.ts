@@ -4,7 +4,7 @@
 // * 命令 `{"id", "cmd", ...参数}`；对会话的操作就是 Command（与桌面版相同）。
 //   画面确认、输入事件这类高频消息不带 id，不等回复；
 // * 媒体包是二进制：前 4 字节是会话的 ch（connect 时由这里选），后面与桌面版相同（见 media.ts）；
-// * 每收到一帧画面就回 ack，被控端的在途帧控制因此把浏览器这段网络也算进去；
+// * 收到画面就回确认（二进制，见 ack.ts；连着到的几帧只确认最后一帧），被控端的在途帧控制因此把浏览器这段网络也算进去；
 // * 剪贴板在浏览器里同步（navigator.clipboard），规则与桌面版相同：只同步连接之后的变化，并抑制回声；
 // * 显示的延迟 = 控制端服务到被控端的往返 + 浏览器到控制端服务的往返。
 import type {
@@ -18,6 +18,7 @@ import type {
   SessionInfo,
   SessionSink,
 } from "../api";
+import { AckCoalescer, ackMessage } from "../ack";
 import { getLang } from "../i18n";
 import { HEADER_LEN, videoSeq } from "../media";
 
@@ -37,6 +38,8 @@ interface Chan {
   synced: string | null;
   /** sid 还不知道时收到的最新一帧，知道之后补发确认（确认是累积的） */
   unacked: number | null;
+  /** 画面确认（合并连着到的几帧） */
+  acks: AckCoalescer;
 }
 
 /** 与 airhand-web 的连接断了 */
@@ -115,6 +118,7 @@ class WebConsole implements Backend {
     // 服务那边的会话随这条连接一起结束了：告诉正在进行的会话，它们会自己重试
     const chans = [...this.chans.values()];
     this.chans.clear();
+    for (const c of chans) c.acks.dispose();
     for (const c of chans) if (c.sid !== null) c.sink.event({ type: "closed", reason: LOST, retry: true });
     this.setStatus({ state: "disconnected", reason: LOST });
     const delay = Math.min(500 * 2 ** this.retries, RECONNECT_MAX_MS);
@@ -226,11 +230,23 @@ class WebConsole implements Backend {
     if (!chan) return;
     // 画面：收到就确认
     const seq = videoSeq(new DataView(buf, 4));
-    if (seq !== null) {
-      if (chan.sid !== null) void this.notify("ack", { sid: chan.sid, seq }).catch(() => {});
-      else chan.unacked = seq;
-    }
+    if (seq !== null) chan.acks.push(seq);
     chan.sink.packet(new Uint8Array(buf, 4));
+  }
+
+  /** 确认画面（二进制消息，不走 JSON）；还不知道 sid 时先记下来 */
+  private ack(chan: Chan, seq: number) {
+    if (chan.sid === null) {
+      chan.unacked = seq;
+      return;
+    }
+    const ws = this.socket();
+    if (!ws) return;
+    if (ws.bufferedAmount > 2 * 1024 * 1024) {
+      ws.close(1013, "outgoing queue overflow");
+      return;
+    }
+    ws.send(ackMessage(chan.sid, seq));
   }
 
   private onEvent(ch: number, ev: SessionEvent) {
@@ -246,6 +262,7 @@ class WebConsole implements Backend {
         break;
       case "closed":
         this.chans.delete(ch);
+        chan.acks.dispose();
         break;
     }
     chan.sink.event(ev);
@@ -348,17 +365,25 @@ class WebConsole implements Backend {
     clipboard: boolean,
   ): Promise<SessionInfo> {
     const ch = this.nextCh++;
-    const chan: Chan = { sink, sid: null, clipboard, synced: this.clipSeen, unacked: null };
+    const chan: Chan = {
+      sink,
+      sid: null,
+      clipboard,
+      synced: this.clipSeen,
+      unacked: null,
+      acks: new AckCoalescer((seq) => this.ack(chan, seq)),
+    };
     this.chans.set(ch, chan);
     try {
       const info = await this.call<SessionInfo>("connect", { code, resume, settings, ch });
       chan.sid = info.sid;
       if (chan.unacked !== null) {
-        void this.notify("ack", { sid: info.sid, seq: chan.unacked }).catch(() => {});
+        this.ack(chan, chan.unacked);
         chan.unacked = null;
       }
       return info;
     } catch (e) {
+      chan.acks.dispose();
       if (this.chans.get(ch) === chan) this.chans.delete(ch);
       throw e;
     }
@@ -373,7 +398,12 @@ class WebConsole implements Backend {
       case "ack":
         return this.notify(c.cmd, c);
       case "disconnect":
-        for (const [ch, chan] of this.chans) if (chan.sid === c.sid) this.chans.delete(ch);
+        for (const [ch, chan] of this.chans) {
+          if (chan.sid === c.sid) {
+            chan.acks.dispose();
+            this.chans.delete(ch);
+          }
+        }
         return this.notify(c.cmd, c);
       default:
         return this.call<void>(c.cmd, c);

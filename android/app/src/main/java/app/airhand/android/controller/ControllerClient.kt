@@ -82,6 +82,7 @@ class ControllerClient(private val settings: SettingsStore) {
         val cfg = JSONObject()
             .put("server", s.server)
             .put("fingerprint", s.fingerprint)
+            .put("trust", s.trustJson())
             .put("name", settings.deviceName())
             .put("os", osName())
         val h = try {
@@ -111,6 +112,8 @@ class ControllerClient(private val settings: SettingsStore) {
             when (e.optString("type")) {
                 "server" -> if (handle == h) _server.value = ServerState.parse(e.getJSONObject("state"))
                 "hostOnline" -> _hostOnline.tryEmit(e.optInt("code").toString())
+                // 第一次连上服务器：记下它的证书指纹（不重新连接）
+                "serverTrust" -> settings.learnTrust(e.optString("server"), e.optString("fp"))
             }
         }
     }

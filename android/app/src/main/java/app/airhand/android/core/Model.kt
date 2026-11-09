@@ -11,7 +11,8 @@ enum class Codec(val id: Int, val wire: String, val mime: String, val label: Str
 
     companion object {
         fun fromWire(s: String?): Codec? = entries.firstOrNull { it.wire == s }
-        fun fromId(id: Int): Codec = entries.firstOrNull { it.id == id } ?: H264
+        /** 媒体包头里的编号；不认识的格式（对方版本更新）为 null，不猜成 H.264 */
+        fun fromId(id: Int): Codec? = entries.firstOrNull { it.id == id }
 
         /** 压缩率从高到低（与桌面控制台相同：AV1 > HEVC > H.264） */
         val PRIORITY = listOf(AV1, H265, H264)

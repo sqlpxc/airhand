@@ -41,11 +41,14 @@ export function kind(dv: DataView): number {
   return dv.byteLength < HEADER_LEN ? 0 : dv.getUint8(0);
 }
 
-export function videoHeader(dv: DataView): VideoHeader {
+/** 画面包的头；编码格式不认识（对方的版本更新）时为 null：和 Rust、Android 一样丢掉这一帧，不猜成 H.264 */
+export function videoHeader(dv: DataView): VideoHeader | null {
+  const codec = CODECS[dv.getUint8(2)];
+  if (codec === undefined) return null;
   return {
     seq: dv.getUint32(4, true),
     key: (dv.getUint8(1) & 1) !== 0,
-    codec: CODECS[dv.getUint8(2)] ?? "H264",
+    codec,
     width: dv.getUint16(8, true),
     height: dv.getUint16(10, true),
     captureUs: Number(dv.getBigUint64(16, true)),

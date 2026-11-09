@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AppInfo, Backend, Command, SavedDevice, ServerState, SessionEvent, SessionInfo, WindowFrame } from "../api";
 import type { Lang } from "../i18n";
+import { AckCoalescer } from "../ack";
 import { videoSeq } from "../media";
 
 /** 把异步注册的监听变成同步返回的取消函数 */
@@ -48,26 +49,37 @@ export function tauriBackend(): Backend {
       let sid: number | null = null;
       let unacked: number | null = null;
       let closed = false;
-      const ack = (seq: number) => {
+      // 确认是累积的：连着到的几帧只确认最后一帧，少几次 IPC（见 ack.ts）
+      const acks = new AckCoalescer((seq) => {
         if (sid !== null) void ctrl({ cmd: "ack", sid, seq }).catch(() => {});
         else unacked = seq;
-      };
+      });
       const video = new Channel<ArrayBuffer>();
       video.onmessage = (buf) => {
         if (closed) return;
         // 画面到了 WebView 才确认（把 IPC 这一段也算进在途帧控制）
         const seq = videoSeq(new DataView(buf));
-        if (seq !== null) ack(seq);
+        if (seq !== null) acks.push(seq);
         sink.packet(new Uint8Array(buf));
       };
       const events = new Channel<SessionEvent>();
       events.onmessage = (ev) => {
-        if (ev.type === "closed") closed = true;
+        if (ev.type === "closed") {
+          closed = true;
+          acks.dispose();
+        }
         sink.event(ev);
       };
-      const info = await invoke<SessionInfo>("ctrl_connect", { code, resume, settings, video, events, clipboard });
+      let info: SessionInfo;
+      try {
+        info = await invoke<SessionInfo>("ctrl_connect", { code, resume, settings, video, events, clipboard });
+      } catch (e) {
+        acks.dispose();
+        throw e;
+      }
       sid = info.sid;
-      if (!closed && unacked !== null) ack(unacked);
+      // 连上之前就收到的画面：现在知道 sid 了，马上补发确认（不等合并）
+      if (!closed && unacked !== null) void ctrl({ cmd: "ack", sid, seq: unacked }).catch(() => {});
       return info;
     },
     onHostOnline: (cb) => unlistenLater(listen<number>("host-online", (e) => cb(e.payload))),

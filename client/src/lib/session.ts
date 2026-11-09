@@ -288,8 +288,24 @@ export class RemoteSession {
     try {
       await this.start();
     } catch (e) {
-      const p = toProblem(e);
+      let p = toProblem(e);
       if (p.kind !== "hostOffline" || this.disposed) throw e;
+      // 保存的凭证可能已经作废（对方断开过所有控制端，服务器换了它的密钥），带着作废的凭证服务器也只回答
+      // "不在线"：用控制码直接连一次。对方确实不在线的话，再带着凭证等它上线
+      const saved = this.resume;
+      if (saved !== null) {
+        this.resume = null;
+        try {
+          await this.start();
+          return;
+        } catch (e2) {
+          if (this.disposed) return;
+          const p2 = toProblem(e2);
+          if (p2.kind !== "codeNotFound" && p2.kind !== "rateLimited") throw e2;
+          this.resume = saved;
+          p = { kind: "hostOffline" };
+        }
+      }
       this.scheduleRetry(p);
     }
   }
@@ -457,8 +473,9 @@ export class RemoteSession {
           this.sid = null;
           this.syncAudio();
           this.closedReason = ev.reason;
-          // 对方换了控制码：凭证跟着旧控制码作废，之后手动重连就是普通的连接请求
-          if (ev.reason.kind === "codeChanged") this.resume = null;
+          // 对方换了控制码 / 断开了所有控制端：凭证作废了（断开所有控制端时对方换了密钥），
+          // 之后手动重连就是普通的连接请求
+          if (ev.reason.kind === "codeChanged" || ev.reason.kind === "kicked") this.resume = null;
           this.state = "closed";
           this.emit();
         }
@@ -472,9 +489,12 @@ export class RemoteSession {
     const dv = new DataView(pkt.buffer, pkt.byteOffset, pkt.byteLength);
     const data = pkt.subarray(media.HEADER_LEN);
     switch (media.kind(dv)) {
-      case media.VIDEO:
-        this.video.push(media.videoHeader(dv), data);
+      case media.VIDEO: {
+        // 编码格式不认识就丢掉（确认在后端收到时已经发了，见 backend/）
+        const h = media.videoHeader(dv);
+        if (h) this.video.push(h, data);
         break;
+      }
       case media.CURSOR:
         this.onCursor(media.cursorHeader(dv), data);
         break;

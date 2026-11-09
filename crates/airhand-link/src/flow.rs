@@ -1,9 +1,18 @@
 //! Shared video flow control and adaptive bitrate. Sequence numbers belong to a
 //! session, not an encoder/display; rebuilding a pipeline must retain its Flow.
+//!
+//! 在途帧窗口 ≈ 基础 RTT × 帧率 + 2（即带宽时延积换算成帧数），最多 [`MAX_WINDOW`] 帧：
+//! RTT 300 ms、60 fps 时是 20 帧，窗口太小的话长距离链路上帧率上不去。
+//! 基础 RTT 是最近 [`MIN_RTT_WINDOW`] 里的最小样本（单调队列实现的滑动窗口最小值）。
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+/// 在途帧窗口的上限
+pub const MAX_WINDOW: u32 = 32;
+/// 基础 RTT 取这么长时间里的最小样本
+pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct FlowState {
@@ -11,7 +20,8 @@ pub struct FlowState {
     acked: u32,
     pending: VecDeque<(u32, Instant)>,
     srtt_ms: f64,
-    min_rtt: (f64, Instant),
+    /// 滑动窗口最小值：样本按时间排列、RTT 严格递增，队头就是窗口里的最小值
+    min_rtt: VecDeque<(f64, Instant)>,
 }
 
 impl Default for FlowState {
@@ -21,7 +31,7 @@ impl Default for FlowState {
             acked: 0,
             pending: VecDeque::new(),
             srtt_ms: 0.0,
-            min_rtt: (f64::MAX, Instant::now()),
+            min_rtt: VecDeque::new(),
         }
     }
 }
@@ -55,33 +65,42 @@ impl FlowState {
                 } else {
                     self.srtt_ms * 0.875 + rtt * 0.125
                 };
-                if rtt < self.min_rtt.0
-                    || now.duration_since(self.min_rtt.1) > Duration::from_secs(10)
-                {
-                    self.min_rtt = (rtt, now);
-                }
+                self.sample_min_rtt(rtt, now);
             }
         }
+    }
+
+    /// 记一个 RTT 样本。窗口里只有一个样本时即使过了期也留着（画面静止时不发帧，没有新样本）
+    fn sample_min_rtt(&mut self, rtt: f64, now: Instant) {
+        while self.min_rtt.back().is_some_and(|&(r, _)| r >= rtt) {
+            self.min_rtt.pop_back();
+        }
+        self.min_rtt.push_back((rtt, now));
+        while self.min_rtt.len() > 1
+            && self
+                .min_rtt
+                .front()
+                .is_some_and(|&(_, t)| now.duration_since(t) > MIN_RTT_WINDOW)
+        {
+            self.min_rtt.pop_front();
+        }
+    }
+
+    fn min_rtt_ms(&self) -> Option<f64> {
+        self.min_rtt.front().map(|&(r, _)| r)
     }
 
     pub fn inflight(&self) -> u32 {
         self.pending.len() as u32
     }
     pub fn window(&self, fps: u8) -> u32 {
-        if self.min_rtt.0 == f64::MAX {
+        let Some(min_rtt) = self.min_rtt_ms() else {
             return 3;
-        }
-        ((self.min_rtt.0 / 1000.0 * fps as f64).ceil() as u32 + 2).clamp(2, 8)
+        };
+        ((min_rtt / 1000.0 * fps as f64).ceil() as u32 + 2).clamp(2, MAX_WINDOW)
     }
     pub fn rtt(&self) -> (f64, f64) {
-        (
-            self.srtt_ms,
-            if self.min_rtt.0 == f64::MAX {
-                0.0
-            } else {
-                self.min_rtt.0
-            },
-        )
+        (self.srtt_ms, self.min_rtt_ms().unwrap_or(0.0))
     }
 }
 
@@ -206,5 +225,37 @@ mod tests {
     #[test]
     fn stopped_pipeline_cannot_emit_another_frame() {
         assert!(!Flow::default().wait_window(30, &AtomicBool::new(true), Duration::ZERO));
+    }
+
+    #[test]
+    fn min_rtt_is_a_sliding_window_minimum() {
+        let mut f = FlowState::default();
+        assert_eq!(f.window(60), 3);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        f.sample_min_rtt(50.0, at(0));
+        f.sample_min_rtt(120.0, at(1));
+        f.sample_min_rtt(80.0, at(2));
+        assert_eq!(f.min_rtt_ms(), Some(50.0));
+        // 50 过了窗口：最小值是窗口里剩下的 80，而不是刚来的那个样本
+        f.sample_min_rtt(200.0, at(11));
+        assert_eq!(f.min_rtt_ms(), Some(80.0));
+        f.sample_min_rtt(300.0, at(13));
+        assert_eq!(f.min_rtt_ms(), Some(200.0));
+        // 很久没有样本（画面静止）也保留最后的值，下一个样本来了再替换
+        f.sample_min_rtt(250.0, at(100));
+        assert_eq!(f.min_rtt_ms(), Some(250.0));
+    }
+
+    #[test]
+    fn window_covers_long_round_trips() {
+        let mut f = FlowState::default();
+        f.sample_min_rtt(300.0, Instant::now());
+        // 300 ms × 60 fps = 18 帧在路上，再加 2
+        assert_eq!(f.window(60), 20);
+        assert_eq!(f.window(120), MAX_WINDOW);
+        let mut near = FlowState::default();
+        near.sample_min_rtt(5.0, Instant::now());
+        assert_eq!(near.window(30), 3);
     }
 }

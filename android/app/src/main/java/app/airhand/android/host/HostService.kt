@@ -107,6 +107,7 @@ class HostService : Service() {
         val cfg = JSONObject()
             .put("server", s.server)
             .put("fingerprint", s.fingerprint)
+            .put("trust", s.trustJson())
             .put("name", app.settings.deviceName())
             .put("os", ControllerClient.osName())
             .put("version", BuildConfig.VERSION_NAME)
@@ -204,6 +205,8 @@ class HostService : Service() {
                 }
             }
             "clipboard" -> app.clipboard.write(e.optString("text"))
+            // 第一次连上服务器：记下它的证书指纹（不重新连接）
+            "serverTrust" -> app.settings.learnTrust(e.optString("server"), e.optString("fp"))
         }
     }
 

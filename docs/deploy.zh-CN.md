@@ -15,6 +15,8 @@
 | `AIRHAND_CERT_NAMES` | `airhand,localhost` | 自动生成证书时写入的 SAN |
 | `AIRHAND_DB` | 证书旁边的 `airhand.db` | SQLite 数据库，存固定的控制码（控制码、被控端密钥的哈希、最后在线时间）。丢了它，离线的被控端的控制码就可能分给别人（没人占用的话仍然能取回）。打不开时服务器把控制码记在内存里，并在日志里报错 |
 | `AIRHAND_MAX_SESSIONS` | `4` | 每台被控端同时允许的控制端数量 |
+| `AIRHAND_MAX_CONNS_PER_IP` | `128` | 同一个 IPv4 地址 / IPv6 的 /64 同时最多几条连接（网页控制台每个标签页一条；很多被控端共用一个出口 IP 时调大） |
+| `AIRHAND_NEW_CODES_PER_IP` | `30` | 同一个 IPv4 地址 / IPv6 的 /48 每 10 分钟最多分配几个新控制码（取回原来的控制码不算） |
 | `RUST_LOG` | `info` | 日志级别 |
 
 镜像基于 distroless、以非 root 用户运行，约 28 MB。
@@ -41,7 +43,7 @@ AIRHAND_SERVER=relay.example.com:4433 AIRHAND_SERVER_FP=<服务器证书指纹> 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `AIRHAND_SERVER` | （必填） | 中转服务器地址 `host:port` |
-| `AIRHAND_SERVER_FP` | 空 | 中转服务器的证书指纹。留空则**不校验证书**，只适合开发环境（控制台显示“未固定证书”） |
+| `AIRHAND_SERVER_FP` | 空 | 中转服务器的证书指纹。留空则第一次连上时记住服务器的证书（`data/server-trust.txt`），之后证书变了就拒绝连接；服务器确实换了证书时删掉这个文件 |
 | `AIRHAND_NAME` | `Airhand Web` | 被控端托盘里“谁在控制”显示的名称 |
 | `AIRHAND_WEB_PASSWORD` | 空 | 访问密码：浏览器弹出登录框，用户名随意。留空则任何能访问这个端口的人都能使用控制台（连接每台电脑仍然需要它的控制码） |
 | `AIRHAND_WEB_PORT` | `8080` | 映射到宿主机的端口 |

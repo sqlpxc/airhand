@@ -34,12 +34,16 @@ object Media {
     private fun le(b: ByteArray): ByteBuffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
     private fun ByteBuffer.u16(i: Int) = getShort(i).toInt() and 0xffff
 
-    fun video(b: ByteArray): Video {
+    /** 画面包的序号（编码格式不认识时也要确认） */
+    fun seq(b: ByteArray): Int = le(b).getInt(4)
+
+    /** 画面包的头；编码格式不认识时为 null（和 Rust、桌面控制台一样丢掉这一帧，不猜成 H.264） */
+    fun video(b: ByteArray): Video? {
         val bb = le(b)
         return Video(
             seq = bb.getInt(4),
             key = b[1].toInt() and 1 != 0,
-            codec = Codec.fromId(b[2].toInt() and 0xff),
+            codec = Codec.fromId(b[2].toInt() and 0xff) ?: return null,
             width = bb.u16(8),
             height = bb.u16(10),
             captureUs = bb.getLong(16),

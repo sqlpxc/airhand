@@ -93,6 +93,8 @@ where
 
 /// 读取一帧的原始负载（媒体包），读进一块新内存：之后原样交给界面，不再拷贝。
 /// 对端在帧边界处正常关闭时返回 `Ok(None)`
+///
+/// 直接读进未初始化的空间（`read_buf`），不先把整块内存清零：画面包可能有几 MiB，每帧都清零一遍是白做的
 pub async fn read_packet<R>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, FrameError>
 where
     R: AsyncRead + Unpin,
@@ -100,8 +102,15 @@ where
     let Some(len) = read_len(r, max).await? else {
         return Ok(None);
     };
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
+    let mut buf = Vec::with_capacity(len);
+    while buf.len() < len {
+        // take 限制住这一帧剩下的长度，不会读进下一帧；buf 的容量正好够，不会再分配
+        let left = (len - buf.len()) as u64;
+        if (&mut *r).take(left).read_buf(&mut buf).await? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+    }
+    debug_assert_eq!(buf.capacity(), len);
     Ok(Some(buf))
 }
 
@@ -198,6 +207,35 @@ mod tests {
             read_packet(&mut &wire[..], 10).await,
             Err(FrameError::TooLarge(26))
         ));
+        // 一个字节一个字节地到（流上的数据通常是分几次到的）：照样拼成完整的一帧，不多读下一帧
+        let mut slow = tokio_test_reader(&wire);
+        let a = read_packet(&mut slow, 1024).await.unwrap().unwrap();
+        assert_eq!(a.len(), HEADER_LEN + 2);
+        assert_eq!(a.capacity(), a.len());
+        let b = read_packet(&mut slow, 1024).await.unwrap().unwrap();
+        assert_eq!(b.len(), HEADER_LEN);
+        assert!(read_packet(&mut slow, 1024).await.unwrap().is_none());
+    }
+
+    /// 每次最多读出一个字节的读取端
+    fn tokio_test_reader(data: &[u8]) -> impl AsyncRead + Unpin + '_ {
+        struct OneByte<'a>(&'a [u8]);
+        impl AsyncRead for OneByte<'_> {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some((&b, rest)) = self.0.split_first()
+                    && buf.remaining() > 0
+                {
+                    buf.put_slice(&[b]);
+                    self.0 = rest;
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        OneByte(data)
     }
 
     #[tokio::test]
@@ -253,6 +291,12 @@ mod tests {
             back,
             ClientMsg::Connect { req_id: 4, code: 123_456, resume: Some(t) } if t == token
         ));
+        let wire = encode(&ClientMsg::Rekey).unwrap();
+        let back: ClientMsg = read_msg(&mut &wire[..], 1024, &mut buf)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(back, ClientMsg::Rekey));
         for m in [
             ServerMsg::ConnectResult {
                 req_id: 5,
@@ -268,6 +312,7 @@ mod tests {
                 result: Err(ConnectError::Offline),
             },
             ServerMsg::HostOnline { code: 123_456 },
+            ServerMsg::Rekeyed { secret: [3; 16] },
         ] {
             let wire = encode(&m).unwrap();
             let back: ServerMsg = read_msg(&mut &wire[..], 1024, &mut buf)

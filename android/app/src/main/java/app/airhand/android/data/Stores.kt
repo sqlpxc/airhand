@@ -60,8 +60,11 @@ enum class ScaleMode(val id: String) {
 data class Settings(
     /** 中转服务器 host:port */
     val server: String = BuildConfig.DEFAULT_SERVER,
-    /** 服务器证书指纹，空字符串表示不校验 */
+    /** 服务器证书指纹，空字符串表示第一次连上时记下服务器的证书（[trustedFp]），之后只认它 */
     val fingerprint: String = BuildConfig.DEFAULT_SERVER_FP,
+    /** 没有填指纹时，第一次连上服务器时记下的指纹（Rust 的 serverTrust 事件），和记下它时的服务器地址 */
+    val trustedServer: String = "",
+    val trustedFp: String = "",
     /** 告诉对方的本机名称，空字符串表示用系统里的设备名称 */
     val deviceName: String = "",
     /** 默认画质预设 */
@@ -82,9 +85,18 @@ data class Settings(
     /** 已经看过的手势说明（trackpad / touch / tv） */
     val tipsSeen: Set<String> = emptySet(),
 ) {
+    /** 为现在的服务器记下的指纹（换了服务器就不算） */
+    val learnedFp: String? get() = trustedFp.takeIf { it.isNotBlank() && trustedServer.trim() == server.trim() }
+
+    /** 传给 Rust 的 `trust`（`airhand_android::ctl::LinkSettings`） */
+    fun trustJson(): Any =
+        if (trustedFp.isBlank()) JSONObject.NULL else JSONObject().put("server", trustedServer).put("fp", trustedFp)
+
     fun toJson(): JSONObject = JSONObject()
         .put("server", server)
         .put("fingerprint", fingerprint)
+        .put("trustedServer", trustedServer)
+        .put("trustedFp", trustedFp)
         .put("deviceName", deviceName)
         .put("preset", preset)
         .put("touchMode", touchMode.id)
@@ -103,6 +115,8 @@ data class Settings(
             return Settings(
                 server = o.optString("server", d.server).ifBlank { d.server },
                 fingerprint = o.optString("fingerprint", d.fingerprint),
+                trustedServer = o.optString("trustedServer", ""),
+                trustedFp = o.optString("trustedFp", ""),
                 deviceName = o.optString("deviceName", ""),
                 preset = o.optString("preset", d.preset),
                 touchMode = TouchMode.of(o.optStringOrNull("touchMode")),
@@ -135,6 +149,12 @@ class SettingsStore(context: Context) {
         if (next == _flow.value) return
         _flow.value = next
         JsonFile.write(file, next.toJson().toString())
+    }
+
+    /** 第一次连上服务器时记下的证书指纹（Rust 的 serverTrust 事件）。设置里填了指纹时用不到，也照样记着 */
+    fun learnTrust(server: String, fp: String) {
+        if (server.isBlank() || fp.isBlank()) return
+        update { it.copy(trustedServer = server, trustedFp = fp) }
     }
 
     /** 告诉对方的本机名称 */
