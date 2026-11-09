@@ -4,7 +4,7 @@
 
 <p align="center"><b>高性能、低延迟的远程桌面</b><br>QUIC 传输 · 硬件编解码 · 最高 120 fps<br>Windows · macOS · Linux · Android · 浏览器</p>
 
-<p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
+<p align="center"><a href="README.md">English</a> · <b>简体中文</b> · <a href="README.ja.md">日本語</a></p>
 
 ---
 
