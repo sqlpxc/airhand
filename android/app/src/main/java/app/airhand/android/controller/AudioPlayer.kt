@@ -66,7 +66,6 @@ class AudioPlayer(
                         if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) check(f.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_16BIT)
                         continue
                     }
-                    if (index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) continue
                     if (index < 0) return
                     try {
                         if (info.size == 0 || info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) continue
