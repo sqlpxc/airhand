@@ -32,7 +32,7 @@ export class VideoPlayer {
   private options: VideoOptions;
   private decoder: VideoDecoder | null = null;
   private configKey = "";
-  private codec: Codec = "H264";
+  private codec: Codec = "h264";
   private avc = false;
   private waitKey = true;
   private chunks = 0;
@@ -105,7 +105,7 @@ export class VideoPlayer {
 
   private unsupported(codec: Codec) {
     this.reset();
-    if (codec === "H264" && !h264NeedsAvc()) markH264NeedsAvc();
+    if (codec === "h264" && !h264NeedsAvc()) markH264NeedsAvc();
     else this.options.unsupported(codec);
     this.options.requestKeyframe();
   }
@@ -115,7 +115,7 @@ export class VideoPlayer {
     if (v.key) {
       const codec = codecString(v.codec, v.data);
       let description: Uint8Array | undefined;
-      if (v.codec === "H264" && h264NeedsAvc()) {
+      if (v.codec === "h264" && h264NeedsAvc()) {
         const conv = annexBToAvc(v.data);
         if (!conv.sps || !conv.pps) { this.waitKey = true; this.options.requestKeyframe(); return; }
         description = avcC(conv.sps, conv.pps);

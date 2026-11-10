@@ -32,12 +32,12 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const t = useT();
   useSession(s);
   const decoders = useStore((st) => st.decoders);
-  const [draftKbps, setDraftKbps] = useState(s.settings.bitrate_kbps);
+  const [draftKbps, setDraftKbps] = useState(s.settings.bitrateKbps);
   const timer = useRef<number | undefined>(undefined);
   const cur = s.settings;
   const preset = matchPreset(cur);
 
-  useEffect(() => setDraftKbps(cur.bitrate_kbps), [cur.bitrate_kbps]);
+  useEffect(() => setDraftKbps(cur.bitrateKbps), [cur.bitrateKbps]);
 
   const apply = (patch: Partial<QualitySettings>) => s.updateSettings({ ...s.settings, ...patch });
   const codecOk = (c: Codec) => codecUsable(c, decoders, s.hostCodecs);
@@ -71,7 +71,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
         <label>{t("quality.resolution")}</label>
         <div className="segmented">
           {RES.map((r) => (
-            <button key={r.v} className={cur.max_short === r.v ? "active" : ""} onClick={() => apply({ max_short: r.v })}>
+            <button key={r.v} className={cur.maxShort === r.v ? "active" : ""} onClick={() => apply({ maxShort: r.v })}>
               {r.label ?? t("quality.native")}
             </button>
           ))}
@@ -103,7 +103,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
             const k = fromSlider(Number(e.target.value));
             setDraftKbps(k);
             clearTimeout(timer.current);
-            timer.current = window.setTimeout(() => apply({ bitrate_kbps: k }), 250);
+            timer.current = window.setTimeout(() => apply({ bitrateKbps: k }), 250);
           }}
         />
         <div className="range-legend muted small">

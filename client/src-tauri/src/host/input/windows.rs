@@ -91,6 +91,8 @@ fn button_flags(b: MouseButton, down: bool) -> (MOUSE_EVENT_FLAGS, u32) {
         (MouseButton::Back, false) => (MOUSEEVENTF_XUP, 1),
         (MouseButton::Forward, true) => (MOUSEEVENTF_XDOWN, 2),
         (MouseButton::Forward, false) => (MOUSEEVENTF_XUP, 2),
+        // 不会用到：不认识的按钮不注入（见 handle）
+        (MouseButton::Unknown(_), _) => (MOUSE_EVENT_FLAGS(0), 0),
     }
 }
 
@@ -131,6 +133,10 @@ impl WinInjector {
                     self.batch.push(mouse(MOUSEEVENTF_MOVE, *dx, *dy, 0));
                 }
                 InputEvent::MouseButton { button, down } => {
+                    // 不认识的按钮（对方版本新增的）HostSession 已经滤掉了，这里再防一手
+                    if !button.is_known() {
+                        continue;
+                    }
                     if *down {
                         self.buttons.insert(*button);
                     } else {

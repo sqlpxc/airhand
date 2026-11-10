@@ -12,7 +12,7 @@ use airhand_link::secure::{self, FrameSealer, Identity, InitiatorParams};
 use airhand_link::transport::{FromHost, HostReceiver, Openers, open_session, session_datagrams};
 use airhand_proto::framing::{read_msg, write_msg};
 use airhand_proto::handshake::TAG_LEN;
-use airhand_proto::media::{AudioHeader, HEADER_LEN, VideoHeader};
+use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerMsg, HostMsg, InputEvent, Notice, QualitySettings,
 };
@@ -24,7 +24,7 @@ use airhand_link::ServerState;
 use crate::host::HostService;
 use crate::status;
 
-/// 控制流的发送端：加密之后写进去
+/// 控制流（或者大块通道）的发送端：加密之后写进去
 struct Ctl {
     send: quinn::SendStream,
     sealer: FrameSealer,
@@ -164,7 +164,13 @@ async fn e2e_roundtrip() {
     let mut send = send;
     // 端到端握手：第一次连，用配对码（测试里的被控端默认要配对码）
     let me = Identity::generate();
-    let intro = secure::controller_intro("e2e", "test");
+    // 和真正的控制端一样：开始时的画质和声音在握手里（被控端一开始就按它建编码器、采集声音）
+    let settings = QualitySettings {
+        codec: Codec::H264,
+        fps: 30,
+        ..Default::default()
+    };
+    let intro = secure::controller_intro("e2e", "test", settings, true);
     let init = secure::initiate(
         &mut recv,
         &mut send,
@@ -182,36 +188,37 @@ async fn e2e_roundtrip() {
     println!("端到端握手完成，安全码 {}", init.secured.safety);
     // 声音走数据报（放不进一个数据报的才走声音流）
     let datagrams = session_datagrams(&sig.conn, grant.session_id);
+    // 控制流的发送端接着握手里的确认往下数
     let mut ctl = Ctl {
         send,
-        sealer: init.secured.sealer(SessionLane::Control),
+        sealer: init.sealer,
+    };
+    let (bulk_send, bulk_recv) = streams.bulk;
+    // 剪贴板走大块通道
+    let mut bulk = Ctl {
+        send: bulk_send,
+        sealer: init.secured.sealer(SessionLane::Bulk),
     };
     let mut recv = HostReceiver::new(
         recv,
+        bulk_recv,
         streams.video,
         streams.audio,
         Some(datagrams),
         Openers {
+            bulk: init.secured.opener(SessionLane::Bulk),
             video: init.secured.opener(SessionLane::Video),
             audio: init.secured.opener(SessionLane::Audio),
             datagrams: init.secured.datagram_opener(),
             control: init.opener,
         },
     );
-    // 和真正的控制端一样：握手之后先发画质设置
-    let settings = QualitySettings {
-        codec: Codec::H264,
-        fps: 30,
-        ..Default::default()
-    };
-    ctl.send(&ControllerMsg::Settings(settings)).await;
     ctl.send(&ControllerMsg::Input {
         t: 1,
         events: vec![InputEvent::ReleaseAll],
     })
     .await;
-    // 声音：在本机以 -60 dBFS（几乎听不见）播放测试音，被控端环回采集后应能收到并解码
-    ctl.send(&ControllerMsg::Audio { enabled: true }).await;
+    // 声音（握手里已经打开了）：在本机以 -60 dBFS（几乎听不见）播放测试音，被控端环回采集后应能收到并解码
     let tone = match crate::host::audio::TonePlayer::start(440.0, 0.001) {
         Ok(t) => Some(t),
         Err(e) => {
@@ -253,7 +260,7 @@ async fn e2e_roundtrip() {
     let original_clip = crate::clipboard::get_text().ok();
     let to_host = format!("airhand-e2e-to-host-{}", rand::random::<u32>());
     let from_host = format!("airhand-e2e-from-host-{}", rand::random::<u32>());
-    ctl.send(&ControllerMsg::Clipboard {
+    bulk.send(&ControllerMsg::Clipboard {
         text: to_host.clone(),
     })
     .await;
@@ -297,7 +304,7 @@ async fn e2e_roundtrip() {
         let msg = match msg {
             FromHost::Video(p) => {
                 let v = VideoHeader::decode(&p).expect("画面包的头");
-                let data = &p[HEADER_LEN..];
+                let data = media::payload(&p).expect("画面包的负载");
                 let age = age_ms(v.capture_us);
                 assert!(age >= 0.0, "画面时间戳在未来: {age} ms");
                 rep.video_age_ms = rep.video_age_ms.max(age);
@@ -324,7 +331,7 @@ async fn e2e_roundtrip() {
                 rep.audio += 1;
                 rep.audio_starts += a.start as u32;
                 let n = audio_dec
-                    .decode_float(&p[HEADER_LEN..], &mut pcm, false)
+                    .decode_float(media::payload(&p).unwrap(), &mut pcm, false)
                     .expect("Opus 解码");
                 // 跳过开头几包（播放刚启动、编码器收敛）
                 if rep.audio > 10 {
@@ -373,7 +380,7 @@ async fn e2e_roundtrip() {
             HostMsg::AwaitingApproval => panic!("桌面被控端不会请本机用户同意"),
             HostMsg::Notice(notice) => {
                 println!("提示: {notice:?}");
-                match notice {
+                match notice.expect("同一个版本的提示都认识") {
                     Notice::MissingPermissions { screen, .. } => rep.no_screen_permission = screen,
                     Notice::CaptureFailed { .. } => rep.capture_failed += 1,
                     Notice::AudioFailed { .. } => rep.audio_failed += 1,

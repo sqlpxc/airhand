@@ -1,6 +1,7 @@
 package app.airhand.android.ui
 
 import app.airhand.android.R
+import app.airhand.android.core.Codec
 import app.airhand.android.core.Notice
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Problem
@@ -166,20 +167,33 @@ class MessagesTest {
         assertEquals(failed, Messages.forViewer(failed))
     }
 
-    /** Kotlin 这边的 SystemAction / OsKind 和 Rust 的枚举一一对应（JSON 里是变体名），每个系统操作都有文案 */
+    /** 从 Rust 源码里取出一个开放枚举（`open_enum!`）在 JSON 里的名字：`Back = 0 => "back",` 里的 "back" */
+    private fun rustOpenEnumNames(path: String, enumName: String): List<String> {
+        val file = File(repo, path)
+        assertTrue("找不到 ${file.absolutePath}", file.isFile)
+        val body = file.readText().replace("\r\n", "\n").substringAfter("pub enum $enumName {", "").substringBefore("\n    }")
+        assertTrue("$path 里没有找到 enum $enumName", body.isNotBlank())
+        return Regex("^\\s+[A-Z]\\w* = \\d+ => \"(\\w+)\",", RegexOption.MULTILINE).findAll(body).map { it.groupValues[1] }.toList()
+    }
+
+    /** Kotlin 这边的 SystemAction / OsKind / Codec 和 Rust 的枚举一一对应（JSON 里的名字是 camelCase），每个系统操作都有文案 */
     @Test
     fun systemActionsAndPlatformsMatchRust() {
         val proto = "crates/airhand-proto/src/session.rs"
-        val pascal = { v: Variant -> v.kind[0].uppercaseChar() + v.kind.substring(1) }
         assertEquals(
             "SystemAction 和 Rust 不一致（Rust 新增的操作要在 core/Model.kt 和 actionLabel 里补上）",
-            rustVariants(proto, "SystemAction").map(pascal),
+            rustOpenEnumNames(proto, "SystemAction"),
             SystemAction.entries.map { it.wire },
         )
         assertEquals(
             "Platform 和 Rust 不一致（core/Model.kt 的 OsKind）",
-            rustVariants(proto, "Platform").map(pascal),
+            rustOpenEnumNames(proto, "Platform"),
             OsKind.entries.filter { it != OsKind.UNKNOWN }.map { it.wire },
+        )
+        assertEquals(
+            "Codec 和 Rust 不一致（core/Model.kt）",
+            rustOpenEnumNames(proto, "Codec"),
+            Codec.entries.map { it.wire },
         )
         for (a in SystemAction.entries) {
             val name = "action_" + a.name.lowercase()

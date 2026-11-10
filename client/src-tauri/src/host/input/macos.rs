@@ -97,6 +97,10 @@ impl MacInjector {
                 }
                 InputEvent::MouseDelta { dx, dy } => self.mouse_delta(*dx, *dy),
                 InputEvent::MouseButton { button, down } => {
+                    // 不认识的按钮（对方版本新增的）HostSession 已经滤掉了，这里再防一手
+                    if !button.is_known() {
+                        continue;
+                    }
                     if *down {
                         self.buttons.insert(*button);
                     } else if !self.buttons.remove(button) {
@@ -421,6 +425,8 @@ fn cg_button(b: MouseButton) -> CGMouseButton {
         MouseButton::Middle => CGMouseButton::Center,
         MouseButton::Back => CGMouseButton(3),
         MouseButton::Forward => CGMouseButton(4),
+        // 不会用到：不认识的按钮不注入（见 handle）
+        MouseButton::Unknown(_) => CGMouseButton::Left,
     }
 }
 

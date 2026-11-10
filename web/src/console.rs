@@ -3,7 +3,7 @@
 //!
 //! # 协议
 //!
-//! 浏览器 → 服务：文本（JSON），`{"id": 1, "cmd": "connect", ...参数}`，命令见 [`Call`]：网页版自己的几个，
+//! 浏览器 → 服务：文本（JSON，camelCase），`{"id": 1, "cmd": "connect", ...参数}`，命令见 [`Call`]：网页版自己的几个，
 //! 加上对会话的操作 [`Command`]（和桌面版、Android 一样）。
 //! 带 `id` 的会收到回复；不带的（输入事件这类高频消息）不回复。
 //! 画面确认每帧都有，不走 JSON：二进制 `1u8 | sid u32 LE | seq u32 LE`（[`parse_ack`]），不回复。
@@ -32,8 +32,6 @@ use airhand_link::controller::{
 };
 use airhand_link::net::Report;
 use airhand_link::{Problem, ServerState};
-use airhand_proto::session::QualitySettings;
-use airhand_proto::signal::ResumeToken;
 use anyhow::{anyhow, bail};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -82,19 +80,13 @@ fn parse_ack(b: &[u8]) -> Option<(u32, u32)> {
 enum Call {
     AppInfo,
     ServerStatus,
+    /// 连接被控端：`code`、`ch`，加上 [`ConnectOptions`] 的字段（重连凭证、记下的对方公钥、配对码、
+    /// 开始时的画质和声音，和桌面版、Android 一样）
     Connect {
         code: String,
-        /// 重连凭证（上次连上时 connect 回复里的 resume），第一次连接时不带
-        #[serde(default)]
-        resume: Option<ResumeToken>,
-        /// 上次连上时记下的对方公钥（connect 回复里的 hostKey），见 `ConnectOptions`
-        #[serde(default)]
-        host_key: Option<String>,
-        /// 配对码（对方要求配对时）
-        #[serde(default)]
-        pairing: Option<String>,
-        settings: QualitySettings,
         ch: u32,
+        #[serde(flatten)]
+        opts: ConnectOptions,
     },
     /// 测量浏览器到这里的往返时间
     Ping,
@@ -405,14 +397,7 @@ impl Console {
                 hostname: &self.app.link.name,
             }),
             Call::ServerStatus => to_value(&*self.state.borrow()),
-            Call::Connect {
-                code,
-                resume,
-                host_key,
-                pairing,
-                settings,
-                ch,
-            } => {
+            Call::Connect { code, ch, opts } => {
                 while self.tasks.try_join_next().is_some() {}
                 if self.tasks.len() >= 64 {
                     self.out
@@ -425,14 +410,7 @@ impl Console {
                         ch,
                         out: out.clone(),
                     });
-                    let opts = ConnectOptions {
-                        resume,
-                        host_key,
-                        pairing,
-                    };
-                    let r = svc
-                        .connect(&code, opts, settings, ui, Frontend::Browser)
-                        .await;
+                    let r = svc.connect(&code, opts, ui, Frontend::Browser).await;
                     out.reply(req.id, r.and_then(to_value));
                 });
                 // 顺便回收已经结束的
@@ -449,7 +427,7 @@ impl Console {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use airhand_proto::session::{Codec, InputEvent};
+    use airhand_proto::session::{Codec, InputEvent, QualitySettings};
     use axum::http::HeaderValue;
     use serde_json::json;
 
@@ -484,44 +462,52 @@ mod tests {
     #[test]
     fn parse_requests() {
         let r: Request = serde_json::from_value(json!({
-            "id": 7, "cmd": "connect", "code": "123 456", "ch": 3,
-            "settings": { "fps": 60, "bitrate_kbps": 8000, "max_short": 1080, "adaptive": true, "codec": "AV1" }
+            "id": 7, "cmd": "connect", "code": "123 456", "ch": 3, "audio": true,
+            "settings": { "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }
         }))
         .unwrap();
         assert_eq!(r.id, Some(7));
-        let Call::Connect {
-            code,
-            resume,
-            host_key,
-            pairing,
-            settings,
-            ch,
-        } = r.call
-        else {
+        let Call::Connect { code, ch, opts } = r.call else {
             panic!("{:?}", r.call)
         };
-        assert_eq!((code.as_str(), ch, resume), ("123 456", 3, None));
-        assert_eq!((host_key, pairing), (None, None));
-        assert_eq!((settings.fps, settings.codec), (60, Codec::AV1));
-
-        // 重连：带上凭证
-        let token = [7u8; 16];
-        let r: Request = serde_json::from_value(json!({
-            "id": 8, "cmd": "connect", "code": "123456", "ch": 4, "resume": token,
-            "hostKey": "ab".repeat(32), "pairing": "482913",
-            "settings": { "fps": 30, "bitrate_kbps": 4000, "max_short": 0, "adaptive": false, "codec": "H264" }
-        }))
-        .unwrap();
-        assert!(matches!(r.call, Call::Connect { resume: Some(t), .. } if t == token));
-        assert!(
-            matches!(r.call, Call::Connect { ref host_key, ref pairing, .. }
-                if host_key.as_deref() == Some(&"ab".repeat(32)[..]) && pairing.as_deref() == Some("482913"))
+        assert_eq!((code.as_str(), ch, opts.resume), ("123 456", 3, None));
+        assert_eq!((opts.host_key, opts.pairing), (None, None));
+        assert_eq!(
+            opts.settings,
+            QualitySettings {
+                fps: 60,
+                bitrate_kbps: 8000,
+                max_short: 1080,
+                adaptive: true,
+                codec: Codec::AV1
+            }
         );
+        assert!(opts.audio);
+
+        // 重连：带上凭证。和桌面版、Android 共用的连接选项样例（crates/airhand-link/tests/protocol.json）
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../crates/airhand-link/tests/protocol.json"
+        ))
+        .unwrap();
+        let mut connect = fixture["connectOptions"].clone();
+        connect["id"] = json!(8);
+        connect["cmd"] = json!("connect");
+        connect["code"] = json!("123456");
+        connect["ch"] = json!(4);
+        let r: Request = serde_json::from_value(connect).unwrap();
+        let Call::Connect { opts, .. } = r.call else {
+            panic!("{:?}", r.call)
+        };
+        assert_eq!(
+            opts,
+            serde_json::from_value::<ConnectOptions>(fixture["connectOptions"].clone()).unwrap()
+        );
+        assert!(opts.resume.is_some() && opts.host_key.is_some() && opts.pairing.is_some());
 
         // 不带 id：不回复
         let r: Request = serde_json::from_value(json!({
             "cmd": "input", "sid": 1,
-            "events": [{ "MouseMove": { "x": 0.5, "y": 0.25 } }, { "MouseDelta": { "dx": -2, "dy": 3 } }, "ReleaseAll"]
+            "events": [{ "type": "mouseMove", "x": 0.5, "y": 0.25 }, { "type": "mouseDelta", "dx": -2, "dy": 3 }, { "type": "releaseAll" }]
         }))
         .unwrap();
         assert_eq!(r.id, None);
@@ -548,11 +534,7 @@ mod tests {
         assert!(matches!(r.call, Call::Ping));
         assert!(serde_json::from_str::<Request>(r#"{"id":1,"cmd":"nope"}"#).is_err());
 
-        // 和桌面版、Android 共用的命令样例（crates/airhand-link/tests/protocol.json）
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../crates/airhand-link/tests/protocol.json"
-        ))
-        .unwrap();
+        // 和桌面版、Android 共用的命令样例
         for c in fixture["commands"].as_array().unwrap() {
             let mut with_id = c.clone();
             with_id["id"] = json!(9);

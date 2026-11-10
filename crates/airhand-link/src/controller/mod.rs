@@ -2,9 +2,13 @@
 //!
 //! 与界面无关。三种界面（桌面版的 WebView、网页控制台的浏览器、Android）用同一套接口：
 //!
-//! * 界面 → 服务：[`ControllerService::connect`] 开始会话，之后都是 [`Command`]（JSON 形状三边一样）；
+//! * 界面 → 服务：[`ControllerService::connect`] 开始会话（[`ConnectOptions`]），之后都是 [`Command`]（JSON 形状三边一样）；
 //! * 服务 → 界面：会话的画面、光标、声音是媒体包（[`airhand_proto::media`]，原样转交），
 //!   其它是 [`SessionEvent`]（JSON），都交给 [`SessionUi`]。
+//!
+//! 界面的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`）、
+//! 带字段的枚举用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。
+//! 样例见 `crates/airhand-link/tests/protocol.json`，三种界面的测试都读它。
 //!
 //! 界面和本服务可以在同一台电脑上（桌面版、Android），也可以是经网络连过来的浏览器（网页版），
 //! 区别见 [`Frontend`]。
@@ -50,7 +54,8 @@ use std::time::{Duration, Instant};
 
 use crate::secure::{self, Identity, InitiatorParams};
 use crate::transport::{HostReceiver, Openers, open_session};
-use airhand_proto::framing::{read_msg, write_msg};
+use airhand_proto::framing::{self, read_msg, write_msg};
+use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
 use airhand_proto::{MAX_SIGNAL_MSG, Role, SessionLane, datagram};
@@ -72,6 +77,8 @@ pub const CLIPBOARD_POLL: Duration = Duration::from_millis(300);
 
 /// 每个会话最多排着这么多个还没交出去的声音数据报（再多就丢：本来就可能丢）
 const DATAGRAM_QUEUE: usize = 16;
+/// 大块通道（剪贴板）最多排着这么多条：网络慢的时候再复制，丢掉的是这一次（之前排着的发完了就轮到下一次）
+const BULK_QUEUE: usize = 4;
 
 /// 控制端的时钟（微秒）：Ping 和输入里的 `t` 都是它
 fn now_us() -> u64 {
@@ -106,7 +113,7 @@ pub enum Frontend {
 /// 服务器通知：控制码为 `code` 的被控端重新上线了，在等它的会话（[`Problem::HostOffline`]）现在重连
 pub type HostOnline = Arc<dyn Fn(u32) + Send + Sync>;
 
-/// 界面对一个会话的操作。JSON：`{"cmd": "input", "sid": 1, "events": [...]}`，三种界面一样
+/// 界面对一个会话的操作。JSON：`{"cmd": "input", "sid": 1, "events": [{"type": "releaseAll"}]}`，三种界面一样
 /// （桌面版经 Tauri 的 `ctrl` 命令，网页版经 WebSocket，Android 经 JNI）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -134,7 +141,8 @@ pub enum Command {
         sid: u32,
         enabled: bool,
     },
-    /// 把界面复制的文本发给被控端（网页版、Android：剪贴板由界面自己读）
+    /// 把界面复制的文本发给被控端（网页版、Android：剪贴板由界面自己读）。走大块通道，网络慢、
+    /// 前面还排着好几次没发完时丢掉这一次
     Clipboard {
         sid: u32,
         text: String,
@@ -174,7 +182,9 @@ impl Command {
 
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<SessionGrant, Problem>>>>>;
 
-/// 怎样连这台被控端（除了控制码）。界面保管这些，下次连时带上。JSON 是 camelCase
+/// 怎样连这台被控端（除了控制码），开始时的画质和声音。界面保管这些，下次连时带上。
+///
+/// JSON 是 camelCase，三种界面一样：`connect` 命令是它的字段加上 `code`（和各自的通道需要的，例如网页版的 `ch`）
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectOptions {
@@ -187,6 +197,12 @@ pub struct ConnectOptions {
     /// 配对码（被控端要求配对时用户输入的，6 位数字）
     #[serde(default)]
     pub pairing: Option<String>,
+    /// 开始时的画质：在端到端握手里交给被控端，它一开始就按这个建编码器
+    #[serde(default)]
+    pub settings: QualitySettings,
+    /// 开始时要不要声音（同上）
+    #[serde(default)]
+    pub audio: bool,
 }
 
 /// 会话 ID → 交给这个会话的声音数据报
@@ -217,6 +233,8 @@ struct Live {
 
 struct SessionHandle {
     tx: queue::Sender,
+    /// 大块通道（剪贴板）：编码好的消息
+    bulk: mpsc::Sender<Bytes>,
     task: AbortHandle,
     /// 桌面版：是否同步剪贴板
     clipboard: Option<Arc<AtomicBool>>,
@@ -283,12 +301,11 @@ impl ControllerService {
     }
 
     /// 连接控制码为 `code` 的被控端（用户输入的样子，允许空格 / 短横线）。
-    /// `opts`：重连凭证、记下的被控端公钥、配对码（见 [`ConnectOptions`]）
+    /// `opts`：重连凭证、记下的被控端公钥、配对码、开始时的画质和声音（见 [`ConnectOptions`]）
     pub async fn connect(
         &self,
         code: &str,
         opts: ConnectOptions,
-        settings: QualitySettings,
         ui: Arc<dyn SessionUi>,
         frontend: Frontend,
     ) -> Result<SessionInfo, Problem> {
@@ -360,8 +377,14 @@ impl ControllerService {
             .await
             .map_err(Problem::failed)?;
         let (mut send, mut recv) = streams.control;
-        // 端到端握手：确认对方的身份、让对方确认本机（见模块说明的"端到端加密"）
-        let intro = secure::controller_intro(&self.inner.cfg.name, &self.inner.cfg.os);
+        // 端到端握手：确认对方的身份、让对方确认本机（见模块说明的"端到端加密"）。
+        // 开始时的画质和声音在介绍里：被控端一开始就按它建编码器，不用先按默认设置建一个再重建
+        let intro = secure::controller_intro(
+            &self.inner.cfg.name,
+            &self.inner.cfg.os,
+            opts.settings,
+            opts.audio,
+        );
         let init = secure::initiate(
             &mut recv,
             &mut send,
@@ -377,13 +400,16 @@ impl ControllerService {
         .await
         .map_err(|e| Problem::from_error(e, Problem::failed))?;
         let secured = init.secured;
+        let (bulk_send, bulk_recv) = streams.bulk;
         let recv = HostReceiver::new(
             recv,
+            bulk_recv,
             streams.video,
             streams.audio,
             Some(dgram_rx),
             Openers {
                 control: init.opener,
+                bulk: secured.opener(SessionLane::Bulk),
                 video: secured.opener(SessionLane::Video),
                 audio: secured.opener(SessionLane::Audio),
                 datagrams: secured.datagram_opener(),
@@ -392,8 +418,7 @@ impl ControllerService {
 
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
-        // 先发画质设置（命令队列里排在最前面）
-        tx.send(ControllerMsg::Settings(settings.sanitized()))?;
+        let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
         let (mode, clipboard) = match frontend {
             Frontend::Desktop { clipboard, sync } => {
                 let enabled = Arc::new(AtomicBool::new(sync));
@@ -407,10 +432,13 @@ impl ControllerService {
         };
         let io = session::SessionIo {
             send,
-            sealer: secured.sealer(SessionLane::Control),
+            sealer: init.sealer,
+            bulk: (bulk_send, bulk_rx, secured.sealer(SessionLane::Bulk)),
+            bulk_tx: bulk_tx.clone(),
             recv,
             ui,
             mode,
+            negotiated: init.negotiated,
         };
         let inner = self.inner.clone();
         let tx2 = tx.clone();
@@ -427,6 +455,7 @@ impl ControllerService {
             sid,
             SessionHandle {
                 tx,
+                bulk: bulk_tx,
                 task: handle.abort_handle(),
                 clipboard,
             },
@@ -454,10 +483,10 @@ impl ControllerService {
             Command::Display { sid, index } => (sid, ControllerMsg::SelectDisplay { index }),
             Command::Audio { sid, enabled } => (sid, ControllerMsg::Audio { enabled }),
             Command::Clipboard { sid, text } => {
-                if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT {
-                    return Ok(());
-                }
-                (sid, ControllerMsg::Clipboard { text })
+                let sessions = self.inner.sessions.lock().unwrap();
+                let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+                send_clipboard(&s.bulk, text);
+                return Ok(());
             }
             Command::ClipboardSync { sid, enabled } => {
                 let sessions = self.inner.sessions.lock().unwrap();
@@ -499,6 +528,17 @@ impl ControllerService {
                 task.abort();
             });
         }
+    }
+}
+
+/// 把剪贴板文本排进大块通道（见 [`Command::Clipboard`]）。太大的、空的不发；前面还排着好几次没发完时丢掉这一次
+fn send_clipboard(bulk: &mpsc::Sender<Bytes>, text: String) {
+    if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT {
+        return;
+    }
+    let msg = framing::encode_with_spare(&ControllerMsg::Clipboard { text }, TAG_LEN);
+    if let Err(mpsc::error::TrySendError::Full(_)) = bulk.try_send(Bytes::from(msg)) {
+        warn!("the clipboard lane is busy (slow network), dropped this clipboard update");
     }
 }
 
@@ -589,11 +629,7 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
                     error,
                 } => {
                     if let Some(tx) = pending.lock().unwrap().remove(&req_id) {
-                        let _ = tx.send(connect_outcome(grant, error).map_err(|e| match e {
-                            Some(e) => e.into(),
-                            // 服务器的版本更新，拒绝的原因这边不认识
-                            None => Problem::failed("the server refused the connection"),
-                        }));
+                        let _ = tx.send(connect_outcome(grant, error).map_err(Problem::from));
                     }
                 }
                 ServerMsg::HostOnline { code } => {

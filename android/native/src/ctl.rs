@@ -21,8 +21,6 @@ use airhand_link::controller::{
 use airhand_link::net::{MemoryTrust, Report, TrustStore, format_fingerprint, parse_fingerprint};
 use airhand_link::secure::{Identity, hex, unhex32};
 use airhand_link::{LinkConfig, Problem, ServerState};
-use airhand_proto::session::QualitySettings;
-use airhand_proto::signal::ResumeToken;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
@@ -121,17 +119,12 @@ impl LinkSettings {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Cmd {
-    /// 连接被控端（阻塞到有结果），回复 `SessionInfo`。`resume`：之前连上这台时得到的重连凭证；
-    /// `hostKey`：之前记下的对方公钥；`pairing`：配对码（见 `ConnectOptions`）
+    /// 连接被控端（阻塞到有结果），回复 `SessionInfo`。`code` 加上 [`ConnectOptions`] 的字段：重连凭证、
+    /// 记下的对方公钥、配对码、开始时的画质和声音（和桌面版、网页版一样）
     Connect {
         code: String,
-        #[serde(default)]
-        resume: Option<ResumeToken>,
-        #[serde(default)]
-        host_key: Option<String>,
-        #[serde(default)]
-        pairing: Option<String>,
-        settings: QualitySettings,
+        #[serde(flatten)]
+        opts: ConnectOptions,
     },
     /// 对会话的操作
     #[serde(untagged)]
@@ -211,20 +204,7 @@ impl Ctl {
             Err(e) => return err(Problem::failed(format!("bad command: {e}"))),
         };
         let r = match cmd {
-            Cmd::Connect {
-                code,
-                resume,
-                host_key,
-                pairing,
-                settings,
-            } => {
-                let opts = ConnectOptions {
-                    resume,
-                    host_key,
-                    pairing,
-                };
-                return self.connect(&code, opts, settings);
-            }
+            Cmd::Connect { code, opts } => return self.connect(&code, opts),
             Cmd::Session(c) => {
                 if let Command::Disconnect { sid } = c
                     && let Some(q) = self.sessions.lock().unwrap().remove(&sid)
@@ -240,13 +220,10 @@ impl Ctl {
         }
     }
 
-    fn connect(&self, code: &str, opts: ConnectOptions, settings: QualitySettings) -> String {
+    fn connect(&self, code: &str, opts: ConnectOptions) -> String {
         let queue = Arc::new(Queue::new(SESSION_QUEUE));
         let ui = Arc::new(QueueUi(queue.clone()));
-        let result = rt().block_on(
-            self.svc
-                .connect(code, opts, settings, ui, Frontend::Browser),
-        );
+        let result = rt().block_on(self.svc.connect(code, opts, ui, Frontend::Browser));
         match result {
             Ok(info) => {
                 self.sessions.lock().unwrap().insert(info.sid, queue);
@@ -287,31 +264,22 @@ mod tests {
             assert!(matches!(parsed, Cmd::Session(_)), "{c}");
         }
 
-        let c: Cmd = serde_json::from_str(
-            r#"{"cmd":"connect","code":"123 456","resume":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"settings":{"fps":30,"bitrate_kbps":4000,"max_short":1080,"adaptive":true,"codec":"H265"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(c, Cmd::Connect { resume: Some(r), .. } if r[15] == 16));
-        let c: Cmd = serde_json::from_str(
-            r#"{"cmd":"connect","code":"123456","settings":{"fps":30,"bitrate_kbps":4000,"max_short":1080,"adaptive":true,"codec":"H264"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            c,
-            Cmd::Connect {
-                resume: None,
-                host_key: None,
-                pairing: None,
-                ..
-            }
-        ));
-        let c: Cmd = serde_json::from_str(
-            r#"{"cmd":"connect","code":"123456","hostKey":"ab","pairing":"482913","settings":{"fps":30,"bitrate_kbps":4000,"max_short":1080,"adaptive":true,"codec":"H264"}}"#,
-        )
-        .unwrap();
-        assert!(
-            matches!(c, Cmd::Connect { host_key: Some(ref k), pairing: Some(ref p), .. } if k == "ab" && p == "482913")
+        // connect：`code` 加上共用的连接选项（同一个样例）
+        let mut connect = fixture["connectOptions"].clone();
+        connect["cmd"] = json!("connect");
+        connect["code"] = json!("123 456");
+        let Cmd::Connect { code, opts } = serde_json::from_value(connect).unwrap() else {
+            panic!("not a connect");
+        };
+        assert_eq!(code, "123 456");
+        assert_eq!(
+            opts,
+            serde_json::from_value::<ConnectOptions>(fixture["connectOptions"].clone()).unwrap()
         );
+        assert!(opts.audio && opts.resume.is_some_and(|r| r[15] == 16));
+        // 第一次连：只有控制码
+        let c: Cmd = serde_json::from_str(r#"{"cmd":"connect","code":"123456"}"#).unwrap();
+        assert!(matches!(c, Cmd::Connect { opts, .. } if opts == ConnectOptions::default()));
     }
 
     #[test]
@@ -368,7 +336,7 @@ mod tests {
         })
         .unwrap();
         let r: serde_json::Value = serde_json::from_str(&ctl.call(
-            r#"{"cmd":"connect","code":"12","resume":null,"settings":{"fps":30,"bitrate_kbps":4000,"max_short":1080,"adaptive":true,"codec":"H264"}}"#,
+            r#"{"cmd":"connect","code":"12","resume":null,"settings":{"fps":30,"bitrateKbps":4000,"maxShort":1080,"adaptive":true,"codec":"h264"},"audio":false}"#,
         ))
         .unwrap();
         assert_eq!(r, json!({ "err": { "kind": "invalidCode" } }));

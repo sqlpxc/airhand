@@ -3,14 +3,15 @@ package app.airhand.android.core
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** 视频编码格式，与 Rust 的 `airhand_proto::session::Codec` 对应 */
+/** 视频编码格式，与 Rust 的 `airhand_proto::session::Codec` 对应（JSON 里是 `wire`，媒体包头里是 `id`） */
 enum class Codec(val id: Int, val wire: String, val mime: String, val label: String) {
-    H264(0, "H264", "video/avc", "H.264"),
-    H265(1, "H265", "video/hevc", "H.265 / HEVC"),
-    AV1(2, "AV1", "video/av01", "AV1");
+    H264(0, "h264", "video/avc", "H.264"),
+    H265(1, "h265", "video/hevc", "H.265 / HEVC"),
+    AV1(2, "av1", "video/av01", "AV1");
 
     companion object {
-        fun fromWire(s: String?): Codec? = entries.firstOrNull { it.wire == s }
+        /** 不分大小写：之前的版本在设置里存的是 "H264" 这样的 */
+        fun fromWire(s: String?): Codec? = entries.firstOrNull { it.wire.equals(s, ignoreCase = true) }
         /** 媒体包头里的编号；不认识的格式（对方版本更新）为 null，不猜成 H.264 */
         fun fromId(id: Int): Codec? = entries.firstOrNull { it.id == id }
 
@@ -19,7 +20,7 @@ enum class Codec(val id: Int, val wire: String, val mime: String, val label: Str
     }
 }
 
-/** 画质设置，与 `QualitySettings` 对应（JSON 字段名是 snake_case） */
+/** 画质设置，与 `QualitySettings` 对应（JSON 是 camelCase，和其它界面 JSON 一样） */
 data class Quality(
     val fps: Int,
     val kbps: Int,
@@ -29,8 +30,8 @@ data class Quality(
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("fps", fps)
-        .put("bitrate_kbps", kbps)
-        .put("max_short", maxShort)
+        .put("bitrateKbps", kbps)
+        .put("maxShort", maxShort)
         .put("adaptive", adaptive)
         .put("codec", codec.wire)
 }
@@ -132,18 +133,18 @@ data class HostHello(
     val actions: List<SystemAction>,
 )
 
-/** 系统操作，与 Rust 的 `airhand_proto::session::SystemAction` 对应（JSON 里是变体名） */
+/** 系统操作，与 Rust 的 `airhand_proto::session::SystemAction` 对应（JSON 里的名字是 camelCase） */
 enum class SystemAction(val wire: String) {
-    BACK("Back"),
-    HOME("Home"),
-    RECENTS("Recents"),
-    NOTIFICATIONS("Notifications"),
-    QUICK_SETTINGS("QuickSettings"),
-    SCREENSHOT("Screenshot"),
-    LOCK_SCREEN("LockScreen"),
-    POWER_MENU("PowerMenu"),
-    VOLUME_UP("VolumeUp"),
-    VOLUME_DOWN("VolumeDown");
+    BACK("back"),
+    HOME("home"),
+    RECENTS("recents"),
+    NOTIFICATIONS("notifications"),
+    QUICK_SETTINGS("quickSettings"),
+    SCREENSHOT("screenshot"),
+    LOCK_SCREEN("lockScreen"),
+    POWER_MENU("powerMenu"),
+    VOLUME_UP("volumeUp"),
+    VOLUME_DOWN("volumeDown");
 
     companion object {
         fun fromWire(s: String?) = entries.firstOrNull { it.wire == s }
@@ -162,7 +163,7 @@ data class Stats(val fps: Float, val kbps: Float, val rttMs: Float?, val width: 
  * 连上之后以被控端报告的平台（`HostHello.platform`）为准；连上之前（例如"我的设备"里的图标）按系统名称猜
  */
 enum class OsKind(val wire: String) {
-    WINDOWS("Windows"), MAC("Mac"), LINUX("Linux"), ANDROID("Android"), UNKNOWN("");
+    WINDOWS("windows"), MAC("mac"), LINUX("linux"), ANDROID("android"), UNKNOWN("");
 
     companion object {
         fun fromWire(s: String?): OsKind = entries.firstOrNull { it.wire == s && s.isNotEmpty() } ?: UNKNOWN

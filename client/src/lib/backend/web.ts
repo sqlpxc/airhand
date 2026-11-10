@@ -49,7 +49,7 @@ const MAX_CLIPBOARD = 1 << 20;
 const RECONNECT_MAX_MS = 5000;
 const PING_MS = 2000;
 const CLIPBOARD_POLL_MS = 1000;
-/** 二进制消息：ch(4) + 媒体包的头 */
+/** 二进制消息：ch(4) + 媒体包的头（最短的） */
 const MIN_BINARY = 4 + HEADER_LEN;
 
 class WebConsole implements Backend {
@@ -357,13 +357,7 @@ class WebConsole implements Backend {
     return () => void this.onlineListeners.delete(cb);
   }
 
-  async connect(
-    code: string,
-    opts: ConnectOptions,
-    settings: object,
-    sink: SessionSink,
-    clipboard: boolean,
-  ): Promise<SessionInfo> {
+  async connect(code: string, opts: ConnectOptions, sink: SessionSink, clipboard: boolean): Promise<SessionInfo> {
     const ch = this.nextCh++;
     const chan: Chan = {
       sink,
@@ -375,8 +369,8 @@ class WebConsole implements Backend {
     };
     this.chans.set(ch, chan);
     try {
-      const { resume, hostKey, pairing } = opts;
-      const info = await this.call<SessionInfo>("connect", { code, resume, hostKey, pairing, settings, ch });
+      // connect 命令是控制码、ch 加上 ConnectOptions 的字段（和桌面版、Android 一样）
+      const info = await this.call<SessionInfo>("connect", { ...opts, code, ch });
       chan.sid = info.sid;
       if (chan.unacked !== null) {
         this.ack(chan, chan.unacked);

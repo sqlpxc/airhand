@@ -74,7 +74,7 @@ class GesturesTest {
     }
 
     private fun p(x: Float, y: Float, id: Int = 0) = Gestures.P(id, x, y)
-    private fun buttons() = log.filter { it.startsWith("Left") || it.startsWith("Right") }
+    private fun buttons() = log.filter { it.startsWith("left") || it.startsWith("right") }
 
     @Before
     fun setUp() {
@@ -87,7 +87,7 @@ class GesturesTest {
         g.setCursor(0.25f, 0.5f)
         g.down(p(800f, 400f), 0)
         g.up(p(800f, 400f), 80)
-        assertEquals(listOf("move 0.25 0.50", "Left down", "Left up"), log)
+        assertEquals(listOf("move 0.25 0.50", "left down", "left up"), log)
     }
 
     @Test
@@ -110,7 +110,7 @@ class GesturesTest {
         // 点一下：不先把光标挪到本机指针的位置（游戏里视角会跳）
         g.down(p(800f, 400f), 0)
         g.up(p(800f, 400f), 80)
-        assertEquals(listOf("Left down", "Left up"), log)
+        assertEquals(listOf("left down", "left up"), log)
         log.clear()
         // 滑动：发移动量（画面的几分之几），本机画的指针不动
         g.down(p(100f, 100f), 1000)
@@ -129,13 +129,13 @@ class GesturesTest {
         g.down(p(500f, 250f), 0)
         g.move(listOf(p(540f, 250f)), 50)
         // 拖动开始时还是绝对坐标：移到按下的位置、按下左键
-        assertEquals(listOf("move 0.50 0.50", "move 0.50 0.50", "Left down", "move 0.54 0.50"), log)
+        assertEquals(listOf("move 0.50 0.50", "move 0.50 0.50", "left down", "move 0.54 0.50"), log)
         log.clear()
         // 游戏开始转视角，光标隐藏了：之后发手指移动了多少
         g.relative = true
         g.move(listOf(p(640f, 300f)), 100)
         g.up(p(640f, 300f), 150)
-        assertEquals(listOf("delta 0.100 0.100", "Left up"), log)
+        assertEquals(listOf("delta 0.100 0.100", "left up"), log)
     }
 
     @Test
@@ -144,7 +144,7 @@ class GesturesTest {
         g.down(p(100f, 100f), 0)
         timers.advance(Gestures.LONG_PRESS_MS + 10)
         g.up(p(100f, 100f), 600)
-        assertEquals(listOf("Right down", "Right up"), buttons())
+        assertEquals(listOf("right down", "right up"), buttons())
     }
 
     @Test
@@ -156,9 +156,9 @@ class GesturesTest {
         g.move(listOf(p(160f, 101f)), 200)
         g.move(listOf(p(220f, 101f)), 250)
         g.up(p(220f, 101f), 300)
-        assertEquals(listOf("Left down", "Left up", "Left down", "Left up"), buttons())
+        assertEquals(listOf("left down", "left up", "left down", "left up"), buttons())
         // 拖动期间指针在动
-        val i = log.indexOfLast { it == "Left down" }
+        val i = log.indexOfLast { it == "left down" }
         assertTrue(log.subList(i, log.size).any { it.startsWith("move") })
     }
 
@@ -169,7 +169,7 @@ class GesturesTest {
         g.pointerDown(p(200f, 100f, 1), listOf(p(100f, 100f), p(200f, 100f, 1)), 20)
         g.pointerUp(p(0f, 0f, 1), 1, 120)
         g.up(p(100f, 100f), 130)
-        assertEquals(listOf("Right down", "Right up"), buttons())
+        assertEquals(listOf("right down", "right up"), buttons())
     }
 
     @Test
@@ -204,7 +204,7 @@ class GesturesTest {
         g.mode = Gestures.Mode.TOUCH
         g.down(p(500f, 250f), 0)
         g.up(p(500f, 250f), 60)
-        assertEquals(listOf("move 0.50 0.50", "move 0.50 0.50", "Left down", "Left up"), log)
+        assertEquals(listOf("move 0.50 0.50", "move 0.50 0.50", "left down", "left up"), log)
     }
 
     @Test
@@ -213,7 +213,7 @@ class GesturesTest {
         g.down(p(250f, 125f), 0)
         timers.advance(Gestures.LONG_PRESS_MS + 10)
         g.up(p(250f, 125f), 600)
-        assertEquals(listOf("Right down", "Right up"), buttons())
+        assertEquals(listOf("right down", "right up"), buttons())
         assertEquals(0.25f, g.cursorX, 0.001f)
     }
 
@@ -223,9 +223,9 @@ class GesturesTest {
         g.down(p(100f, 100f), 0)
         g.move(listOf(p(300f, 100f)), 50)
         g.up(p(400f, 100f), 100)
-        val down = log.indexOf("Left down")
+        val down = log.indexOf("left down")
         assertEquals("move 0.10 0.20", log[down - 1])
-        assertEquals("Left up", log.last())
+        assertEquals("left up", log.last())
         assertEquals(0.4f, g.cursorX, 0.001f)
     }
 
@@ -234,7 +234,7 @@ class GesturesTest {
         g.mode = Gestures.Mode.PASSTHROUGH
         g.down(p(100f, 100f), 0)
         g.up(p(100f, 100f), 30)
-        assertEquals(listOf("Left down", "Left up"), buttons())
+        assertEquals(listOf("left down", "left up"), buttons())
     }
 
     @Test
@@ -242,10 +242,10 @@ class GesturesTest {
         g.mode = Gestures.Mode.PASSTHROUGH
         g.down(p(100f, 100f), 0)
         timers.advance(Gestures.PASSTHROUGH_DELAY_MS + 5)
-        assertEquals(listOf("Left down"), buttons())
+        assertEquals(listOf("left down"), buttons())
         timers.advance(800)
         g.up(p(100f, 100f), 900)
-        assertEquals(listOf("Left down", "Left up"), buttons())
+        assertEquals(listOf("left down", "left up"), buttons())
     }
 
     @Test
@@ -267,8 +267,8 @@ class GesturesTest {
         g.down(p(500f, 400f), 0)
         g.move(listOf(p(500f, 300f)), 16)
         g.up(p(500f, 100f), 40)
-        assertEquals(listOf("Left down", "Left up"), buttons())
-        val down = log.indexOf("Left down")
+        assertEquals(listOf("left down", "left up"), buttons())
+        val down = log.indexOf("left down")
         assertEquals("move 0.50 0.80", log[down - 1])
     }
 
@@ -297,13 +297,13 @@ class GesturesTest {
         g.up(p(300f, 250f, 5), 70)
         assertEquals(
             listOf(
-                "touch 0 Down 0.40 0.50",
-                "touch 1 Down 0.60 0.50",
-                "touch 0 Move 0.30 0.50",
-                "touch 1 Move 0.70 0.50",
-                "touch 1 Move 0.75 0.50",
-                "touch 1 Up 0.75 0.50",
-                "touch 0 Up 0.30 0.50",
+                "touch 0 down 0.40 0.50",
+                "touch 1 down 0.60 0.50",
+                "touch 0 move 0.30 0.50",
+                "touch 1 move 0.70 0.50",
+                "touch 1 move 0.75 0.50",
+                "touch 1 up 0.75 0.50",
+                "touch 0 up 0.30 0.50",
             ),
             log,
         )
@@ -321,9 +321,9 @@ class GesturesTest {
         g.pointerDown(p(400f, 100f, id = 3), listOf(p(200f, 100f, 1), p(300f, 100f, 2), p(400f, 100f, 3)), 35)
         g.cancel()
         val events = log.map { it.split(" ").take(3).joinToString(" ") }
-        assertEquals(listOf("touch 0 Down", "touch 1 Down", "touch 0 Up", "touch 0 Down", "touch 2 Down"), events.take(5))
+        assertEquals(listOf("touch 0 down", "touch 1 down", "touch 0 up", "touch 0 down", "touch 2 down"), events.take(5))
         // 打断时还按着的三个点都松开（顺序不重要）
-        assertEquals(setOf("touch 0 Cancel", "touch 1 Cancel", "touch 2 Cancel"), events.drop(5).toSet())
+        assertEquals(setOf("touch 0 cancel", "touch 1 cancel", "touch 2 cancel"), events.drop(5).toSet())
         assertEquals(8, events.size)
         assertTrue(log.none { it == "keyboard" })
         assertTrue(buttons().isEmpty())

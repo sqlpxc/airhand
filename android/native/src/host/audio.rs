@@ -62,9 +62,9 @@ impl AudioHub {
     pub fn subscribe(&self, id: u64, tx: mpsc::Sender<Bytes>, ctl: Control) {
         let mut st = self.st.lock().unwrap();
         if let Some(detail) = &st.failure {
-            let _ = ctl.send(&HostMsg::Notice(Notice::AudioFailed {
+            let _ = ctl.send(&HostMsg::Notice(Some(Notice::AudioFailed {
                 detail: detail.clone(),
-            }));
+            })));
         }
         let first = st.subs.is_empty();
         st.subs.insert(
@@ -119,10 +119,10 @@ impl AudioHub {
             return;
         }
         st.failure = failure.clone();
-        let notice = Control::encode(&HostMsg::Notice(match failure {
+        let notice = Control::encode(&HostMsg::Notice(Some(match failure {
             Some(detail) => Notice::AudioFailed { detail },
             None => Notice::AudioRecovered,
-        }));
+        })));
         for s in st.subs.values() {
             let _ = s.ctl.send_encoded(notice.clone());
         }
@@ -137,7 +137,7 @@ mod tests {
     fn notice(rx: &mut mpsc::Receiver<Bytes>) -> Notice {
         let b = rx.try_recv().unwrap();
         match framing::decode_known::<HostMsg>(&b[4..]).unwrap() {
-            HostMsg::Notice(n) => n,
+            HostMsg::Notice(Some(n)) => n,
             other => panic!("{other:?}"),
         }
     }
@@ -159,7 +159,7 @@ mod tests {
         let a = AudioHeader::decode(&p[4..]).unwrap();
         assert!(a.start);
         assert_eq!((a.seq, a.capture_us), (1, 10));
-        assert_eq!(&p[4 + media::HEADER_LEN..], &[1, 2]);
+        assert_eq!(media::payload(&p[4..]), Some(&[1, 2][..]));
         let b = AudioHeader::decode(&rx.try_recv().unwrap()[4..]).unwrap();
         assert!(!b.start);
         assert_eq!(b.seq, 2);

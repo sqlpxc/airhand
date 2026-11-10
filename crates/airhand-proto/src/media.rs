@@ -1,18 +1,18 @@
 //! 媒体包：画面流和声音流上的数据，以及控制端交给界面的光标。
 //!
-//! 控制流上的消息不多，用 postcard 编码（见 [`crate::framing`]）；画面和声音量大、格式固定，
-//! 用一个 24 字节的定长头加原始数据，**同一份字节**从被控端一路传到控制端的界面：
+//! 控制消息不多，用 CBOR 编码（见 [`crate::framing`]）；画面和声音量大、格式固定，
+//! 用一个头加原始数据，**同一份字节**从被控端一路传到控制端的界面：
 //!
 //! ```text
-//! 线上（画面流 / 声音流）：长度 u32 LE | 头（24 字节）| 负载
-//! 交给界面（WebView / 浏览器 / Android）：  头（24 字节）| 负载
+//! 线上（画面流 / 声音流）：长度 u32 LE | 头（现在 24 字节）| 负载
+//! 交给界面（WebView / 浏览器 / Android）：  头（现在 24 字节）| 负载
 //! ```
 //!
 //! 线上的包是加密的（见 [`crate::handshake`] 的"之后的每一帧"）：控制端读到一个包后原地解密，只看一眼头（统计、校验），
 //! 不解码、不拷贝，原样交给界面；
 //! 界面按同一个格式解析（`client/src/lib/media.ts`、`android/.../controller/Protocol.kt` 里的 `Media`，
 //! 三边都用 `crates/airhand-link/tests/protocol.json` 里的样例检查）。
-//! 光标形状走控制流（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor)），控制端把它转成同样格式的光标包。
+//! 光标形状走大块通道（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor)），控制端把它转成同样格式的光标包。
 //!
 //! 声音包平时不走声音流，而是一包一个 QUIC 数据报（[`crate::datagram`]，不带长度前缀）：丢了的不重传，
 //! 后面的包也不用等它。放不进一个数据报的（很少见）才走声音流。数据报可能乱序，控制端按包序号丢掉迟到的包。
@@ -23,13 +23,24 @@
 //! |-----:|---------|----------------------|-----------------------------------|----------------------|
 //! | 0    | u8      | 类型                 | 类型                              | 类型                 |
 //! | 1    | u8      | 标志：bit0 关键帧    | bit0 可见，bit1 新形状，bit2 旧形状 | bit0 停顿后的第一包  |
-//! | 2    | u8      | [`Codec::id`]        | 形状的槽位                        | 0                    |
-//! | 3    | u8      | 0                    | 0                      | 0                    |
+//! | 2    | u8      | [`Codec`] 的编号     | 形状的槽位                        | 0                    |
+//! | 3    | u8      | **头的长度**（现在是 24） | 同左                         | 同左                 |
 //! | 4    | u32     | 帧序号               | 0                      | 包序号               |
 //! | 8    | u16 × 2 | 画面宽、高           | 形状宽、高             | 0                    |
 //! | 12   | u16 × 2 | 0                    | 热点 x、y              | 0                    |
 //! | 16   | u64     | 采集时间（微秒）     | 0                      | 采集时间（微秒）     |
-//! | 24   |         | 码流（Annex-B / OBU）| RGBA（非预乘）         | 一个 Opus 包         |
+//! | 头的长度 |     | 码流（Annex-B / OBU）| RGBA（非预乘）         | 一个 Opus 包         |
+//!
+//! # 以后加字段
+//!
+//! 头的长度在第 3 个字节里（[`header_len`]）：以后要加字段（色彩空间、显示器编号……）就加在第 24 字节之后，
+//! 把头变长，负载照样从"头的长度"处开始，旧的界面不认识新字段、跳过它们就行。所以读的一方必须：
+//!
+//! * 从第 3 个字节读头的长度、从那里开始取负载，**不能**写死 24；
+//! * 忽略不认识的标志位、为 0 的保留字节（以后可能有值）、24 字节之后不认识的部分；
+//! * 头的长度小于 24 或者超出了包的长度时丢掉这个包（[`Kind::of`] 为 `None`）。
+//!
+//! 现在的三种实现（这里、`client/src/lib/media.ts`、Android 的 `Media`）都按这个规则读。
 //!
 //! 采集时间是被控端的时钟，画面和声音是同一个时钟，控制端据此做音画同步。
 //!
@@ -41,7 +52,7 @@
 
 use crate::session::{Codec, CursorState};
 
-/// 媒体包头的长度
+/// 本版本写的媒体包头的长度，也是头最短的长度（读的时候按第 3 个字节，见 [`header_len`]）
 pub const HEADER_LEN: usize = 24;
 /// 画面包上限（一个 4K 关键帧也远小于这个值）
 pub const MAX_VIDEO_PACKET: usize = 32 * 1024 * 1024;
@@ -62,12 +73,30 @@ pub enum Kind {
     Audio = 3,
 }
 
+/// 包的头有多长（第 3 个字节，见模块说明的"以后加字段"）：负载从这里开始。
+/// 小于 [`HEADER_LEN`]、或者比包还长时为 `None`（不是合法的包）
+pub fn header_len(packet: &[u8]) -> Option<usize> {
+    let n = *packet.get(3)? as usize;
+    (HEADER_LEN..=packet.len()).contains(&n).then_some(n)
+}
+
+/// 包的负载（头后面的部分）；不是合法的包时为 `None`
+pub fn payload(packet: &[u8]) -> Option<&[u8]> {
+    Some(&packet[header_len(packet)?..])
+}
+
+/// 一个新的头：类型和头的长度填好了，其余是 0
+fn new_header(kind: Kind) -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    h[0] = kind as u8;
+    h[3] = HEADER_LEN as u8;
+    h
+}
+
 impl Kind {
-    /// 包的类型；不到一个头长、或者类型不认识时为 `None`
+    /// 包的类型；头不完整（见 [`header_len`]）、或者类型不认识时为 `None`
     pub fn of(packet: &[u8]) -> Option<Kind> {
-        if packet.len() < HEADER_LEN {
-            return None;
-        }
+        header_len(packet)?;
         match packet[0] {
             1 => Some(Kind::Video),
             2 => Some(Kind::Cursor),
@@ -109,10 +138,10 @@ pub struct VideoHeader {
 
 impl VideoHeader {
     pub fn encode(&self) -> [u8; HEADER_LEN] {
-        let mut h = [0u8; HEADER_LEN];
-        h[0] = Kind::Video as u8;
+        debug_assert!(self.codec.is_known(), "encoding with an unknown codec");
+        let mut h = new_header(Kind::Video);
         h[1] = if self.key { FLAG_KEY } else { 0 };
-        h[2] = self.codec.id();
+        h[2] = self.codec.code() as u8;
         h[4..8].copy_from_slice(&self.seq.to_le_bytes());
         h[8..10].copy_from_slice(&self.width.to_le_bytes());
         h[10..12].copy_from_slice(&self.height.to_le_bytes());
@@ -125,10 +154,14 @@ impl VideoHeader {
         if Kind::of(packet)? != Kind::Video {
             return None;
         }
+        let codec = Codec::from_code(packet[2] as u32);
+        if !codec.is_known() {
+            return None;
+        }
         Some(Self {
             seq: u32_at(packet, 4),
             key: packet[1] & FLAG_KEY != 0,
-            codec: Codec::from_id(packet[2])?,
+            codec,
             width: u16_at(packet, 8),
             height: u16_at(packet, 10),
             capture_us: u64_at(packet, 16),
@@ -149,8 +182,7 @@ pub struct AudioHeader {
 
 impl AudioHeader {
     pub fn encode(&self) -> [u8; HEADER_LEN] {
-        let mut h = [0u8; HEADER_LEN];
-        h[0] = Kind::Audio as u8;
+        let mut h = new_header(Kind::Audio);
         h[1] = if self.start { FLAG_START } else { 0 };
         h[4..8].copy_from_slice(&self.seq.to_le_bytes());
         h[16..24].copy_from_slice(&self.capture_us.to_le_bytes());
@@ -172,8 +204,7 @@ impl AudioHeader {
 /// 光标包（控制端交给界面，不在线上传）
 pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
     let image = c.shape.as_ref().and_then(|s| s.image.as_ref());
-    let mut h = [0u8; HEADER_LEN];
-    h[0] = Kind::Cursor as u8;
+    let mut h = new_header(Kind::Cursor);
     h[1] = if c.visible { FLAG_VISIBLE } else { 0 };
     if let Some(s) = &c.shape {
         h[2] = s.slot;
@@ -231,12 +262,38 @@ mod tests {
         assert_eq!(Kind::of(p), Some(Kind::Video));
         assert_eq!(VideoHeader::decode(p), Some(h));
         assert_eq!(AudioHeader::decode(p), None);
-        assert_eq!(&p[HEADER_LEN..], &[7, 7, 7, 8, 8]);
+        assert_eq!(p[3], 24);
+        assert_eq!(payload(p), Some(&[7, 7, 7, 8, 8][..]));
         // 编码格式不认识
         let mut bad = p.to_vec();
         bad[2] = 9;
         assert_eq!(VideoHeader::decode(&bad), None);
         assert_eq!(Kind::of(&p[..HEADER_LEN - 1]), None);
+    }
+
+    /// 以后的版本把头加长了：旧的读法照样找得到负载，不认识的部分跳过；头的长度不对的包丢掉
+    #[test]
+    fn longer_headers_from_a_newer_version() {
+        let h = AudioHeader {
+            seq: 3,
+            start: false,
+            capture_us: 77,
+        };
+        let mut p = h.encode().to_vec();
+        p[3] = 32;
+        p.extend_from_slice(&[0xee; 8]);
+        p.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(AudioHeader::decode(&p), Some(h));
+        assert_eq!(payload(&p), Some(&[1, 2, 3][..]));
+        // 头比包还长、比 24 字节短
+        p[3] = 200;
+        assert_eq!((Kind::of(&p), payload(&p)), (None, None));
+        p[3] = 23;
+        assert_eq!(Kind::of(&p), None);
+        // 保留的字节有了值也不影响
+        let mut q = h.encode().to_vec();
+        q[13] = 0x55;
+        assert_eq!(AudioHeader::decode(&q), Some(h));
     }
 
     #[test]
@@ -248,7 +305,7 @@ mod tests {
         };
         let wire = frame(&h.encode(), &[&[1, 2, 3]]);
         assert_eq!(AudioHeader::decode(&wire[4..]), Some(h));
-        assert_eq!(&wire[4 + HEADER_LEN..], &[1, 2, 3]);
+        assert_eq!(payload(&wire[4..]), Some(&[1, 2, 3][..]));
     }
 
     #[test]
@@ -269,6 +326,7 @@ mod tests {
         assert_eq!(Kind::of(&p), Some(Kind::Cursor));
         assert_eq!(p[1], FLAG_VISIBLE | FLAG_SHAPE);
         assert_eq!(p[2], 5);
+        assert_eq!(p[3], HEADER_LEN as u8);
         assert_eq!((u16_at(&p, 8), u16_at(&p, 10)), (2, 1));
         assert_eq!((u16_at(&p, 12), u16_at(&p, 14)), (1, 0));
         assert_eq!(&p[HEADER_LEN..], &[9; 8]);

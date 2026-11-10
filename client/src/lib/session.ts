@@ -95,7 +95,7 @@ export class RemoteSession {
   hostVersion = "";
   displays: DisplayInfo[] = [];
   currentDisplay = 0;
-  hostCodecs: Codec[] = ["H264"];
+  hostCodecs: Codec[] = ["h264"];
   /** 对方报告的平台（hello 之前为 null，这时按 hostOs 猜） */
   hostPlatform: Platform | null = null;
   /** 对方支持的系统操作（手机的返回、主页……）；电脑为空 */
@@ -273,12 +273,13 @@ export class RemoteSession {
     this.audioError = null;
     this.attemptAt = performance.now();
     let info;
+    // 开始时的画质和要不要声音在端到端握手里就告诉对方：它一开始就按这个建编码器，不用先建一个默认的再重建
     const sent = this.effectiveSettings();
+    const audio = this.audioEnabled && this.foreground;
     try {
       info = await api.connect(
         this.code,
-        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing },
-        sent,
+        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing, settings: sent, audio },
         sink,
         this.clipboardSync,
       );
@@ -309,8 +310,10 @@ export class RemoteSession {
     this.closedReason = null;
     // 连接过程中设置变了（例如 Hello 先到，换了编码格式、按显示区域改了分辨率，那时还没有 sid 发不出去）：重发
     if (!sameQuality(this.effectiveSettings(), sent)) this.pushSettings();
-    // 新的会话流默认不发声音，需要重新请求
-    this.audioOn = false;
+    // 对方已经按握手里说的开始（或者没有开始）发声音；连接期间变了（例如切换了标签）再告诉对方
+    this.audioOn = audio;
+    if (audio) this.audio.enable();
+    this.applySyncState();
     this.syncAudio();
     this.emit();
     this.onConnected?.(this);
@@ -500,7 +503,7 @@ export class RemoteSession {
         } else if (n.kind === "missingPermissions" && !n.screen && !n.input) {
           // 对方把权限都打开了：撤下之前的权限提示
           if (this.notice?.kind === "missingPermissions" || this.notice?.kind === "androidNoInput") this.notice = null;
-        } else if (n.kind === "missingPermissions" && this.hostPlatform === "Android") {
+        } else if (n.kind === "missingPermissions" && this.hostPlatform === "android") {
           // 对方是手机：缺的是 Airhand 的"远程操作"（无障碍服务），不是 Mac 的系统权限
           this.notice = { kind: "androidNoInput" };
         } else if (n.kind === "audioFailed") {
@@ -539,7 +542,8 @@ export class RemoteSession {
   /** 一个媒体包（可能是更大的缓冲区中的一段：网页版前面还有 4 字节的 ch） */
   private onBinary(pkt: Uint8Array) {
     const dv = new DataView(pkt.buffer, pkt.byteOffset, pkt.byteLength);
-    const data = pkt.subarray(media.HEADER_LEN);
+    // 负载从头里写的长度处开始（以后的版本可能把头加长）
+    const data = media.payload(pkt, dv);
     switch (media.kind(dv)) {
       case media.VIDEO: {
         // 编码格式不认识就丢掉（确认在后端收到时已经发了，见 backend/）
@@ -582,7 +586,7 @@ export class RemoteSession {
    * H.264 改用 AVC 格式重试；其它格式从可用列表里去掉，并让被控端按优先级改用下一个能用的格式。
    */
   private onUndecodable(codec: Codec) {
-    if (codec === "H264") {
+    if (codec === "h264") {
       this.notice = { kind: "h264Undecodable" };
       this.emit();
       return;
@@ -837,7 +841,7 @@ export class RemoteSession {
 
   /** 实际发给被控端的画质：分辨率不超过画面的显示区域，不可见时降帧率 */
   private effectiveSettings(): QualitySettings {
-    const s = { ...this.settings, max_short: stricter(this.settings.max_short, this.viewLimit) };
+    const s = { ...this.settings, maxShort: stricter(this.settings.maxShort, this.viewLimit) };
     if (!this.visible) s.fps = Math.min(s.fps, BACKGROUND_FPS);
     return s;
   }
@@ -869,21 +873,21 @@ export class RemoteSession {
   /** 发送一组按键（例如 Win、Alt+Tab 等无法在本地直接按下的组合键） */
   sendCombo(codes: string[]) {
     const evs: InputEvent[] = [];
-    for (const code of codes) evs.push({ Key: { code, down: true } });
-    for (const code of [...codes].reverse()) evs.push({ Key: { code, down: false } });
+    for (const code of codes) evs.push({ type: "key", code, down: true });
+    for (const code of [...codes].reverse()) evs.push({ type: "key", code, down: false });
     this.enqueue(evs, true);
   }
 
   /** 系统操作（对方是手机时的返回、主页……；只发对方在 hello 里列出的） */
   sendSystem(action: SystemAction) {
-    if (this.hostActions.includes(action)) this.enqueue([{ System: { action } }], true);
+    if (this.hostActions.includes(action)) this.enqueue([{ type: "system", action }], true);
   }
 
   sendText(text: string) {
     if (!text) return;
     // 统一换行，分块发送避免单条消息过大
     const t = text.replace(/\r\n/g, "\n").replace(/\n/g, "\r");
-    for (let i = 0; i < t.length; i += 512) this.enqueue([{ Text: { text: t.slice(i, i + 512) } }], true);
+    for (let i = 0; i < t.length; i += 512) this.enqueue([{ type: "text", text: t.slice(i, i + 512) }], true);
   }
 
   /** 用户手动锁定了鼠标（发相对移动） */
@@ -913,6 +917,6 @@ interface CursorImage {
 }
 
 function sameQuality(a: QualitySettings, b: QualitySettings): boolean {
-  return a.fps === b.fps && a.bitrate_kbps === b.bitrate_kbps && a.max_short === b.max_short
+  return a.fps === b.fps && a.bitrateKbps === b.bitrateKbps && a.maxShort === b.maxShort
     && a.adaptive === b.adaptive && a.codec === b.codec;
 }

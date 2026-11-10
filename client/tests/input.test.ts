@@ -20,22 +20,22 @@ function fakeCanvas() {
 test("pending input cannot leak into a replacement session", async () => {
   const batches: unknown[] = [];
   const input = new RemoteInput({ addEventListener() {} } as any, () => true, events => batches.push(events));
-  input.enqueue([{ Key: { code: "KeyA", down: true } }], true);
+  input.enqueue([{ type: "key", code: "KeyA", down: true }], true);
   input.reset();
-  input.enqueue([{ Key: { code: "KeyB", down: false } }], true);
+  input.enqueue([{ type: "key", code: "KeyB", down: false }], true);
   await Promise.resolve();
-  assert.deepEqual(batches, [[{ Key: { code: "KeyB", down: false } }]]);
+  assert.deepEqual(batches, [[{ type: "key", code: "KeyB", down: false }]]);
   input.dispose();
 });
 
 test("mouse moves coalesce, ordered key edges stay in bounded batches", async () => {
   const batches: any[][] = [];
   const input = new RemoteInput({ addEventListener() {} } as any, () => true, events => batches.push(events));
-  for (let i = 0; i < 1000; i++) input.enqueue([{ MouseMove: { x: i / 1000, y: 0 } }], false);
-  input.enqueue(["ReleaseAll"], true);
+  for (let i = 0; i < 1000; i++) input.enqueue([{ type: "mouseMove", x: i / 1000, y: 0 }], false);
+  input.enqueue([{ type: "releaseAll" }], true);
   await Promise.resolve();
   assert.equal(batches[0].length, 2);
-  for (let i = 0; i < 200; i++) input.enqueue([{ Key: { code: "KeyA", down: i % 2 === 0 } }], true);
+  for (let i = 0; i < 200; i++) input.enqueue([{ type: "key", code: "KeyA", down: i % 2 === 0 }], true);
   await Promise.resolve();
   assert.ok(batches.every(b => b.length <= 64));
   assert.equal(batches.slice(1).flat().length, 200);
@@ -45,14 +45,14 @@ test("mouse moves coalesce, ordered key edges stay in bounded batches", async ()
 test("相对移动加起来，不越过点击", async () => {
   const batches: any[][] = [];
   const input = new RemoteInput({ addEventListener() {} } as any, () => true, events => batches.push(events));
-  for (let i = 0; i < 10; i++) input.enqueue([{ MouseDelta: { dx: 2, dy: -1 } }], false);
-  input.enqueue([{ MouseButton: { button: "Right", down: false } }], true);
-  input.enqueue([{ MouseDelta: { dx: 1, dy: 1 } }], true);
+  for (let i = 0; i < 10; i++) input.enqueue([{ type: "mouseDelta", dx: 2, dy: -1 }], false);
+  input.enqueue([{ type: "mouseButton", button: "right", down: false }], true);
+  input.enqueue([{ type: "mouseDelta", dx: 1, dy: 1 }], true);
   await Promise.resolve();
   assert.deepEqual(batches[0], [
-    { MouseDelta: { dx: 20, dy: -10 } },
-    { MouseButton: { button: "Right", down: false } },
-    { MouseDelta: { dx: 1, dy: 1 } },
+    { type: "mouseDelta", dx: 20, dy: -10 },
+    { type: "mouseButton", button: "right", down: false },
+    { type: "mouseDelta", dx: 1, dy: 1 },
   ]);
   input.dispose();
 });
@@ -68,7 +68,7 @@ test("被控端光标隐藏时：按着右键就锁定、发相对移动，松�
   // 光标可见：绝对坐标，按下右键前先移到按下的位置
   fire("pointerdown", { button: 2, buttons: 2, clientX: 50, clientY: 25, pointerId: 1, movementX: 0, movementY: 0 });
   await Promise.resolve();
-  assert.deepEqual(batches.shift(), [{ MouseMove: { x: 0.5, y: 0.25 } }, { MouseButton: { button: "Right", down: true } }]);
+  assert.deepEqual(batches.shift(), [{ type: "mouseMove", x: 0.5, y: 0.25 }, { type: "mouseButton", button: "right", down: true }]);
   assert.equal(input.relative, false);
 
   // 游戏开始转视角：光标隐藏了。按着键，马上请求锁定（原始计数）
@@ -85,9 +85,9 @@ test("被控端光标隐藏时：按着右键就锁定、发相对移动，松�
   fire("pointerup", { button: 2, buttons: 1, movementX: 0, movementY: 0, clientX: 100, clientY: 100 });
   await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual(batches.flat(), [
-    { MouseDelta: { dx: 4, dy: -2 } },
-    { MouseButton: { button: "Left", down: true } },
-    { MouseButton: { button: "Right", down: false } },
+    { type: "mouseDelta", dx: 4, dy: -2 },
+    { type: "mouseButton", button: "left", down: true },
+    { type: "mouseButton", button: "right", down: false },
   ]);
   batches.length = 0;
 
@@ -97,7 +97,7 @@ test("被控端光标隐藏时：按着右键就锁定、发相对移动，松�
   fire("pointermove", { buttons: 0, movementX: 1, movementY: 1, clientX: 10, clientY: 10 });
   await new Promise((r) => setTimeout(r, 20));
   // 先移到松开的位置再松开
-  assert.deepEqual(batches.flat(), [{ MouseMove: { x: 0.1, y: 0.1 } }, { MouseButton: { button: "Left", down: false } }]);
+  assert.deepEqual(batches.flat(), [{ type: "mouseMove", x: 0.1, y: 0.1 }, { type: "mouseButton", button: "left", down: false }]);
   input.dispose();
 });
 

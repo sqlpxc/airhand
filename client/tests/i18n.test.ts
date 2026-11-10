@@ -101,12 +101,19 @@ test("Rust 的 Problem / NoticeView 在两种语言里都有词条", async () =>
   }
 });
 
-/** 系统操作（对方是手机时的快捷键菜单）：每一种在两种语言里都有词条（JSON 里是变体名本身，不转 camelCase） */
+/** 从 Rust 源码里取出一个开放枚举（open_enum!）在 JSON 里的名字：`Back = 0 => "back",` 里的 "back" */
+async function rustOpenEnumNames(file: string, enumName: string): Promise<string[]> {
+  const fs = await import("node:fs/promises");
+  const src = await fs.readFile(new URL(file, import.meta.url), "utf8");
+  const body = src.split(`pub enum ${enumName} {`)[1]?.split("\n    }")[0];
+  assert.ok(body, `${file} 里没有找到 enum ${enumName}`);
+  return [...body.matchAll(/^\s+[A-Z]\w* = \d+ => "(\w+)",/gm)].map((m) => m[1]);
+}
+
+/** 系统操作（对方是手机时的快捷键菜单）：每一种在两种语言里都有词条（词条用 JSON 里的名字） */
 test("Rust 的 SystemAction 在两种语言里都有词条", async () => {
-  const actions = (await rustVariants("../../crates/airhand-proto/src/session.rs", "SystemAction")).map(
-    (k) => k[0].toUpperCase() + k.slice(1),
-  );
-  assert.ok(actions.includes("Back") && actions.includes("Home"), `解析结果不对: ${actions}`);
+  const actions = await rustOpenEnumNames("../../crates/airhand-proto/src/session.rs", "SystemAction");
+  assert.ok(actions.includes("back") && actions.includes("quickSettings") && actions.length >= 10, `解析结果不对: ${actions}`);
   const before = getLang();
   try {
     for (const lang of ["zh", "en"] as const) {

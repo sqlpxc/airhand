@@ -27,13 +27,14 @@ test("desktop ACK follows WebView receipt and handles frames before connect repl
   // 沙箱里建的对象原型不同，按 JSON 比较
   const call = (i: number) => JSON.parse(JSON.stringify(calls[i]));
   let received = 0;
-  const opts = { resume: null, hostKey: "ab".repeat(32), pairing: "482913" };
-  const connected = sandbox.backend.connect("123456", opts, {}, { packet() { received++; }, event() {} }, true);
-  // 记下的对方公钥、配对码原样交给 Rust 的 ctrl_connect（参数名是 camelCase，Tauri 转成 snake_case）
-  assert.equal(calls[0][1].hostKey, opts.hostKey);
-  assert.equal(calls[0][1].pairing, opts.pairing);
+  const settings = { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: "h264" };
+  const opts = { resume: null, hostKey: "ab".repeat(32), pairing: "482913", settings, audio: true };
+  const connected = sandbox.backend.connect("123456", opts, { packet() { received++; }, event() {} }, true);
+  // 连接选项（记下的对方公钥、配对码、开始时的画质和声音）原样交给 Rust 的 ctrl_connect（就是 ConnectOptions 的 JSON）
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0][1].opts)), opts);
+  assert.equal(calls[0][1].code, "123456");
   const pkt = new ArrayBuffer(24);
-  const dv = new DataView(pkt); dv.setUint8(0, 1); dv.setUint32(4, 9, true);
+  const dv = new DataView(pkt); dv.setUint8(0, 1); dv.setUint8(3, 24); dv.setUint32(4, 9, true);
   assert.equal(calls.length, 1);
   channels[0].onmessage(pkt);
   assert.equal(received, 1);
@@ -53,6 +54,7 @@ test("desktop ACK follows WebView receipt and handles frames before connect repl
   // 光标包、声音包不确认
   const cursor = new ArrayBuffer(24);
   new DataView(cursor).setUint8(0, 2);
+  new DataView(cursor).setUint8(3, 24);
   channels[0].onmessage(cursor);
   await new Promise((r) => setTimeout(r, ACK_INTERVAL_MS + 20));
   assert.equal(calls.length, acked);

@@ -4,18 +4,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::secure::FrameSealer;
+use crate::secure::{FrameSealer, Negotiated};
 use crate::transport::{self, FromHost, HostReceiver};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
-    Codec, ControllerMsg, DisplayInfo, HostMsg, Notice, Platform, SystemAction,
+    ByeReason, Codec, ControllerMsg, DisplayInfo, HostMsg, Notice, Platform, SystemAction,
 };
 use anyhow::Result;
+use bytes::Bytes;
 use quinn::SendStream;
 use serde::Serialize;
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
-use super::{CLIPBOARD_POLL, ClipboardSync, now_us};
+use super::{CLIPBOARD_POLL, ClipboardSync, now_us, send_clipboard};
 use crate::Problem;
 
 /// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
@@ -26,7 +28,7 @@ const HOST_TIMEOUT: Duration = Duration::from_secs(20);
 ///
 /// 返回 `Err` 表示界面已经不在了（窗口关了、浏览器断开了），会话随之结束。
 pub trait SessionUi: Send + Sync + 'static {
-    /// 画面 / 光标 / 声音包（[`airhand_proto::media`] 的格式：24 字节头 + 数据）。
+    /// 画面 / 光标 / 声音包（[`airhand_proto::media`] 的格式：头 + 数据）。
     /// 界面收到画面包后确认（[`super::Command::Ack`]），被控端的在途帧控制因此把界面这一段也算进去
     fn packet(&self, packet: Vec<u8>) -> Result<(), UiClosed>;
     /// 会话事件（控制台那边是 JSON）
@@ -37,7 +39,7 @@ pub trait SessionUi: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy)]
 pub struct UiClosed;
 
-/// 发往控制台的会话事件（JSON）。
+/// 发往控制台的会话事件（JSON，camelCase，以 `type` 区分）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "type",
@@ -45,6 +47,7 @@ pub struct UiClosed;
     rename_all_fields = "camelCase"
 )]
 pub enum SessionEvent {
+    /// 会话开始了。`codecs` / `actions` 里只有本机认识的；本机不认识的平台（对方的版本更新）报成 `linux`
     Hello {
         hostname: String,
         os: String,
@@ -86,7 +89,7 @@ pub enum SessionEvent {
 }
 
 /// [`Notice`] 发给控制台时的 JSON 形状：`{ "kind": "captureFailed", "detail": "..." }`
-///（协议里的 `Notice` 用 postcard 编码，不能直接加 serde 的 `tag`）。
+///（协议里的 `Notice` 是 CBOR，和界面的 JSON 分开定义，各改各的）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "kind",
@@ -155,11 +158,17 @@ impl Default for Stats {
 
 pub(super) struct SessionIo {
     pub send: SendStream,
-    /// 控制流上控制端 → 被控端的加密
+    /// 控制流上控制端 → 被控端的加密（已经发过确认，计数接着往下数）
     pub sealer: FrameSealer,
+    /// 大块通道（剪贴板）：发送的一半、排着队的消息（编码好的）、加密
+    pub bulk: (SendStream, mpsc::Receiver<Bytes>, FrameSealer),
+    /// 往大块通道排消息（桌面版自己同步剪贴板时用）
+    pub bulk_tx: mpsc::Sender<Bytes>,
     pub recv: HostReceiver,
     pub ui: Arc<dyn SessionUi>,
     pub mode: Mode,
+    /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
+    pub negotiated: Negotiated,
 }
 
 /// 见 [`super::Frontend`]
@@ -182,10 +191,14 @@ pub(super) async fn run(
     let SessionIo {
         mut send,
         mut sealer,
+        bulk: (bulk_send, bulk_rx, bulk_sealer),
+        bulk_tx,
         mut recv,
         ui,
         mode,
+        negotiated,
     } = io;
+    info!(sid, ?negotiated, "session started");
     let local_clip = match mode {
         Mode::Desktop { clip, enabled } => Some((clip, enabled)),
         Mode::Browser => None,
@@ -197,6 +210,13 @@ pub(super) async fn run(
             tokio::time::timeout(HOST_TIMEOUT, send.write_chunk(bytes)).await??;
         }
         #[allow(unreachable_code)]
+        anyhow::Ok(())
+    };
+    // 大块通道（剪贴板）：和画面一样的优先级，慢了不挡控制消息
+    let bulk_writer = async move {
+        transport::write_lane(bulk_send, bulk_rx, bulk_sealer).await?;
+        // 只有会话结束时才会关闭（发送端在会话手里）
+        std::future::pending::<()>().await;
         anyhow::Ok(())
     };
 
@@ -239,16 +259,17 @@ pub(super) async fn run(
             st.lock().unwrap().last_msg = Instant::now();
             match msg {
                 HostMsg::Hello(h) => {
+                    // 对方版本新增的编码格式、系统操作这里用不了；新的平台当作一台普通的电脑
                     let _ = out.event(SessionEvent::Hello {
                         hostname: h.hostname,
                         os: h.os,
                         version: h.version,
                         displays: h.displays,
                         current: h.current_display,
-                        codecs: h.codecs,
-                        platform: h.platform,
+                        codecs: h.codecs.into_iter().filter(|c| c.is_known()).collect(),
+                        platform: h.platform.or_linux(),
                         touch: h.touch,
-                        actions: h.actions,
+                        actions: h.actions.into_iter().filter(|a| a.is_known()).collect(),
                     });
                 }
                 HostMsg::AwaitingApproval => {
@@ -265,9 +286,11 @@ pub(super) async fn run(
                         None => sample,
                     });
                 }
-                HostMsg::Notice(n) => {
+                HostMsg::Notice(Some(n)) => {
                     let _ = out.event(SessionEvent::Notice { notice: n.into() });
                 }
+                // 对方版本新增的提示：不显示
+                HostMsg::Notice(None) => debug!(sid, "skipping a notice from a newer host"),
                 HostMsg::Clipboard { text } => match &clip_in {
                     Some((clip, enabled)) => {
                         if enabled.load(Ordering::Relaxed) {
@@ -278,7 +301,16 @@ pub(super) async fn run(
                         let _ = out.event(SessionEvent::Clipboard { text });
                     }
                 },
-                HostMsg::Bye(reason) => return Err(Problem::from(reason).into()),
+                HostMsg::Bye(reason) => {
+                    if let ByeReason::Unknown(n) = reason {
+                        info!(
+                            sid,
+                            reason = n,
+                            "the host ended the session for a reason this version doesn't know"
+                        );
+                    }
+                    return Err(Problem::from(reason).into());
+                }
                 HostMsg::Cursor(c) => {
                     out.packet(media::cursor_packet(&c))
                         .map_err(|_| ui_closed())?;
@@ -345,20 +377,18 @@ pub(super) async fn run(
             let mut c = clip.lock().await;
             // 关闭同步时也要消费变化，否则重新打开时会把旧内容发过去
             let Some(text) = c.poll().await else { continue };
-            if enabled.load(Ordering::Relaxed)
-                && tx.send(ControllerMsg::Clipboard { text }).is_err()
-            {
-                break;
+            if enabled.load(Ordering::Relaxed) {
+                send_clipboard(&bulk_tx, text);
             }
         }
-        anyhow::Ok(())
     };
 
     let result: Result<()> = tokio::select! {
         r = reader => r,
         r = ticker => r,
-        r = clipper => r,
+        () = clipper => Ok(()),
         r = writer => r.and(Err(Problem::SessionEnded.into())),
+        r = bulk_writer => r.and(Err(Problem::SessionEnded.into())),
     };
     let reason = match result {
         Ok(()) => Problem::SessionEnded,
@@ -449,10 +479,30 @@ mod tests {
             actions: vec![SystemAction::Back, SystemAction::QuickSettings],
         };
         let v = serde_json::to_value(&h).unwrap();
-        assert_eq!(v["platform"], json!("Android"));
+        assert_eq!(v["platform"], json!("android"));
         assert_eq!(v["touch"], json!(true));
-        assert_eq!(v["actions"], json!(["Back", "QuickSettings"]));
-        assert_eq!(v["codecs"], json!(["H265"]));
+        assert_eq!(v["actions"], json!(["back", "quickSettings"]));
+        assert_eq!(v["codecs"], json!(["h265"]));
+        let e = SessionEvent::Encoder {
+            codec: Codec::AV1,
+            name: "NVENC".into(),
+            hardware: true,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            json!({ "type": "encoder", "codec": "av1", "name": "NVENC", "hardware": true, "width": 1920, "height": 1080 })
+        );
+        let s = SessionEvent::Stats {
+            fps: 30.0,
+            kbps: 1.0,
+            rtt_ms: None,
+            width: 1,
+            height: 1,
+            frames: 2,
+        };
+        assert_eq!(serde_json::to_value(&s).unwrap()["rttMs"], json!(null));
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::Declined),
             retry: false,

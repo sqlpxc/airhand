@@ -20,7 +20,8 @@ use super::{EncodedFrame, VideoEncoder, annexb_nal_types};
 
 fn subtype(c: Codec) -> GUID {
     match c {
-        Codec::H264 => MFVideoFormat_H264,
+        // 不认识的格式不会走到这里：Encoder::new 只用认识的格式
+        Codec::H264 | Codec::Unknown(_) => MFVideoFormat_H264,
         Codec::H265 => MFVideoFormat_HEVC,
         Codec::AV1 => MFVideoFormat_AV1,
     }
@@ -210,7 +211,7 @@ impl MfEncoder {
                 Codec::H265 => {
                     out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?
                 }
-                Codec::AV1 => {}
+                Codec::AV1 | Codec::Unknown(_) => {}
             }
             transform
                 .SetOutputType(0, &out, 0)
@@ -418,7 +419,7 @@ impl MfEncoder {
                 Codec::H265 => {
                     clean || annexb_nal_types(&data, true).any(|t| (16..=21).contains(&t))
                 }
-                Codec::AV1 => clean,
+                Codec::AV1 | Codec::Unknown(_) => clean,
             };
             // 部分编码器只把参数集放在媒体类型里，关键帧前补上，保证控制端可以从任意关键帧开始解码
             if key && !self.seq_header.is_empty() {
@@ -426,7 +427,7 @@ impl MfEncoder {
                     Codec::H264 => annexb_nal_types(&data, false).any(|t| t == 7),
                     Codec::H265 => annexb_nal_types(&data, true).any(|t| t == 33),
                     // AV1 编码器会在关键帧中自带 Sequence Header OBU
-                    Codec::AV1 => true,
+                    Codec::AV1 | Codec::Unknown(_) => true,
                 };
                 if !has_ps {
                     let mut v = Vec::with_capacity(self.seq_header.len() + data.len());

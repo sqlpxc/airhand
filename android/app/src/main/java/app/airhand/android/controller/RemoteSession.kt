@@ -158,6 +158,10 @@ class RemoteSession(
     /** 最近发给对方的画质设置 */
     @Volatile
     private var sentSettings: Quality? = null
+
+    /** 这次连接在握手里让对方发声音了没有 */
+    @Volatile
+    private var sentAudio = false
     @Volatile private var audio: AudioPlayer? = null
     private var audioToken = 0L
     private val sender = InputSender { events ->
@@ -206,7 +210,10 @@ class RemoteSession(
                 val h = client.handle()
                 val settings = currentSettings()
                 sentSettings = settings
-                val cmd = Commands.connect(code, resume, settings, hostKey, pairing)
+                // 开始时的画质和要不要声音在端到端握手里就告诉对方：它一开始就按这个建编码器
+                val withAudio = audioOn.value && !background
+                sentAudio = withAudio
+                val cmd = Commands.connect(code, resume, settings, hostKey, pairing, withAudio)
                 val r = runCatching { JSONObject(Native.ctlCall(h, cmd.toString())) }
                     .getOrElse { JSONObject().put("err", JSONObject().put("kind", "failed").put("detail", it.toString())) }
                 if (closed) {
@@ -311,8 +318,8 @@ class RemoteSession(
         grantOs = ok.optString("hostOs")
         if (grantName.isNotBlank() && saved?.alias.isNullOrBlank()) hostName.value = grantName
         hostOs.value = grantOs
-        // 声音和后台帧率现在就告诉对方（对方同意之前只是记下来）
-        if (audioOn.value) startAudio()
+        // 开始时要不要声音已经在握手里告诉对方了；连接期间变了（例如切到了后台）再告诉它（对方同意之前只是记下来）
+        if (audioOn.value && !background) startAudio(tell = !sentAudio) else if (sentAudio) command { Commands.audio(it, false) }
         if (background) applyBackground()
         Log.i(TAG, "connected to $code ($grantName, $grantOs)")
     }
@@ -371,8 +378,9 @@ class RemoteSession(
                         height = v.height,
                         ptsUs = v.captureUs,
                         data = b,
-                        offset = Media.HEADER,
-                        length = b.size - Media.HEADER,
+                        // 负载从头里写的长度处开始（以后的版本可能把头加长）
+                        offset = Media.payload(b),
+                        length = b.size - Media.payload(b),
                         ack = { Native.ctlAck(h, sid, v.seq) },
                     ),
                 )
@@ -392,7 +400,8 @@ class RemoteSession(
             }
             Media.AUDIO -> {
                 val a = Media.audio(b)
-                audio?.submit(AudioPacket(a.start, a.captureUs, b, Media.HEADER, b.size - Media.HEADER))
+                val o = Media.payload(b)
+                audio?.submit(AudioPacket(a.start, a.captureUs, b, o, b.size - o))
             }
         }
     }
@@ -570,8 +579,9 @@ class RemoteSession(
         decoder.refreshTiming()
     }
 
+    /** `tell`：告诉对方开始发声音（连上的时候对方已经按握手里说的开始了，不用） */
     @Synchronized
-    private fun startAudio() {
+    private fun startAudio(tell: Boolean = true) {
         if (closed || background || !audioOn.value) return
         if (audio == null) {
             audioError.value = null
@@ -590,7 +600,7 @@ class RemoteSession(
                 }
             }
         }
-        command { Commands.audio(it, true) }
+        if (tell) command { Commands.audio(it, true) }
     }
 
     @Synchronized
@@ -659,9 +669,9 @@ class RemoteSession(
 
         /** 光标形状：头后面的 RGBA（非预乘）→ Bitmap */
         fun cursorBitmap(b: ByteArray, w: Int, h: Int): Bitmap? {
-            if (w == 0 || h == 0 || b.size < Media.HEADER + w * h * 4) return null
+            var o = Media.payload(b)
+            if (w == 0 || h == 0 || b.size < o + w * h * 4) return null
             val px = IntArray(w * h)
-            var o = Media.HEADER
             for (i in px.indices) {
                 px[i] = Color.argb(b[o + 3].toInt() and 0xff, b[o].toInt() and 0xff, b[o + 1].toInt() and 0xff, b[o + 2].toInt() and 0xff)
                 o += 4

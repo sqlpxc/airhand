@@ -118,14 +118,15 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 - 加消息：给枚举加一个**新编号**的变体，旧版本会跳过它；对方可能不认识的话，先在 `features` 里分一个能力位，对方报了才发
 - 加字段：只能加 `Option`（或者带 `#[cbor(default)]`）的字段，用新的编号；必填字段要永远存在
-- 枚举加变体：列表里用 `crate::cbor::open_vec`，单个值用 `crate::cbor::or_default`，可选的用 `crate::cbor::opt`（不要直接写 `Option<只有编号的枚举>`：minicbor 派生对它的处理有问题，见 `cbor.rs` 的说明）
+- 枚举加值：只有编号的枚举用 `open_enum!`（`crate::cbor`）声明，不认识的值在哪里都解成 `Unknown(原值)`；收的一方要想好怎么对待它（不管、换成默认值、当成"对方的版本更新"）
+- 带字段的枚举加变体：只有三个地方能跳过：整条消息、标了 `crate::cbor::opt` 的 `Option` 字段、标了 `crate::cbor::open_vec` 的列表元素。别的地方遇到不认识的变体故意是解码错误。不要把带字段的枚举直接放进派生的 `Option<…>`（也不要放进结构体、结构体再放进 `Option`）：minicbor 派生会把里面任何深度的不认识的变体当成 `None`，再从错的位置跳过（见 `cbor.rs` 的说明）
 - 编号一旦发布就不能改、不能复用；只有改不下去（例如要删掉必填字段）才加版本号
 
 版本握手的开头（`ClientHello` / `ServerHello` 的 postcard 部分）和 ALPN **永远不能改**，否则不同版本之间连“版本不一致”都无法告诉对方；`version_handshake_prefix_is_frozen` 测试守着这一点。`airhand-proto` 的测试里有“新版本的对方”发来新消息、新字段、新枚举值的例子，加兼容规则时照着写一个。
 
 ### 一份协议，三份实现
 
-Rust、控制台（TypeScript）和 Android（Kotlin）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令（`airhand_link::controller::Command`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）和 `./gradlew testDebugUnitTest`（`ProtocolTest`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边的测试通过。
+Rust、控制台（TypeScript）和 Android（Kotlin）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令、连接选项（`airhand_link::controller::Command`、`ConnectOptions`）。界面和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`），带字段的联合类型用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）和 `./gradlew testDebugUnitTest`（`ProtocolTest`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边的测试通过。
 
 ### 消息是类型，不是文字
 

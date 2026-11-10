@@ -151,10 +151,7 @@ class Injector(private val svc: AccessibilityService) {
             screen()
             for (i in 0 until events.length()) {
                 try {
-                    when (val e = events.get(i)) {
-                        "ReleaseAll" -> releaseAll()
-                        is JSONObject -> event(e)
-                    }
+                    (events.get(i) as? JSONObject)?.let { event(it) }
                 } catch (ex: Exception) {
                     Log.w(TAG, "can't inject an event: $ex")
                 }
@@ -177,56 +174,52 @@ class Injector(private val svc: AccessibilityService) {
     private fun px(nx: Double) = (nx.toFloat() * w).coerceIn(0f, (w - 1).toFloat())
     private fun py(ny: Double) = (ny.toFloat() * h).coerceIn(0f, (h - 1).toFloat())
 
+    /**
+     * 一个输入事件（Rust 的 `airhand_proto::session::InputEvent`，JSON 以 `type` 区分，名字都是 camelCase）。
+     * 不认识的事件、按钮、系统操作不执行
+     */
     private fun event(e: JSONObject) {
-        e.optJSONObject("MouseMove")?.let {
-            x = px(it.optDouble("x"))
-            y = py(it.optDouble("y"))
-            fingers[MOUSE]?.let { f -> move(f, x, y) }
-            return
-        }
-        // 相对移动（控制端只在被控端的光标隐藏时发，手机没有光标；收到了就当作按像素移动）
-        e.optJSONObject("MouseDelta")?.let {
-            x = (x + it.optInt("dx")).coerceIn(0f, (w - 1).toFloat())
-            y = (y + it.optInt("dy")).coerceIn(0f, (h - 1).toFloat())
-            fingers[MOUSE]?.let { f -> move(f, x, y) }
-            return
-        }
-        e.optJSONObject("Touch")?.let {
-            val id = it.optInt("id")
-            if (id !in 0 until MAX_FINGERS) return
-            val tx = px(it.optDouble("x"))
-            val ty = py(it.optDouble("y"))
-            when (it.optString("phase")) {
-                "Down" -> fingerDown(id, tx, ty)
-                "Move" -> fingers[id]?.let { f -> move(f, tx, ty) }
-                "Up", "Cancel" -> fingers[id]?.let { f -> lift(f, tx, ty) }
+        when (e.optString("type")) {
+            "mouseMove" -> {
+                x = px(e.optDouble("x"))
+                y = py(e.optDouble("y"))
+                fingers[MOUSE]?.let { f -> move(f, x, y) }
             }
-            return
-        }
-        e.optJSONObject("MouseButton")?.let {
-            val isDown = it.optBoolean("down")
-            when (it.optString("button")) {
-                "Left" -> if (isDown) fingerDown(MOUSE, x, y) else fingers[MOUSE]?.let { f -> lift(f, x, y) }
-                "Right", "Back" -> if (!isDown) global(AccessibilityService.GLOBAL_ACTION_BACK)
-                "Middle" -> if (!isDown) global(AccessibilityService.GLOBAL_ACTION_HOME)
+            // 相对移动（控制端只在被控端的光标隐藏时发，手机没有光标；收到了就当作按像素移动）
+            "mouseDelta" -> {
+                x = (x + e.optInt("dx")).coerceIn(0f, (w - 1).toFloat())
+                y = (y + e.optInt("dy")).coerceIn(0f, (h - 1).toFloat())
+                fingers[MOUSE]?.let { f -> move(f, x, y) }
             }
-            return
+            "touch" -> {
+                val id = e.optInt("id")
+                if (id !in 0 until MAX_FINGERS) return
+                val tx = px(e.optDouble("x"))
+                val ty = py(e.optDouble("y"))
+                when (e.optString("phase")) {
+                    "down" -> fingerDown(id, tx, ty)
+                    "move" -> fingers[id]?.let { f -> move(f, tx, ty) }
+                    "up", "cancel" -> fingers[id]?.let { f -> lift(f, tx, ty) }
+                }
+            }
+            "mouseButton" -> {
+                val isDown = e.optBoolean("down")
+                when (e.optString("button")) {
+                    "left" -> if (isDown) fingerDown(MOUSE, x, y) else fingers[MOUSE]?.let { f -> lift(f, x, y) }
+                    "right", "back" -> if (!isDown) global(AccessibilityService.GLOBAL_ACTION_BACK)
+                    "middle" -> if (!isDown) global(AccessibilityService.GLOBAL_ACTION_HOME)
+                }
+            }
+            "system" -> system(e.optString("action"))
+            "wheel" -> {
+                wheelDx += e.optInt("dx")
+                wheelDy += e.optInt("dy")
+                if (!wheelBusy && fingers.isEmpty()) scroll()
+            }
+            "key" -> key(e.optString("code"), e.optBoolean("down"))
+            "text" -> insertText(e.optString("text"))
+            "releaseAll" -> releaseAll()
         }
-        e.optJSONObject("System")?.let {
-            system(it.optString("action"))
-            return
-        }
-        e.optJSONObject("Wheel")?.let {
-            wheelDx += it.optInt("dx")
-            wheelDy += it.optInt("dy")
-            if (!wheelBusy && fingers.isEmpty()) scroll()
-            return
-        }
-        e.optJSONObject("Key")?.let {
-            key(it.optString("code"), it.optBoolean("down"))
-            return
-        }
-        e.optJSONObject("Text")?.let { insertText(it.optString("text")) }
     }
 
     // ───────────────────────────── 手指 ─────────────────────────────
@@ -363,20 +356,20 @@ class Injector(private val svc: AccessibilityService) {
     /** 控制端发来的系统操作（只会是 [supportedActions] 里列出的） */
     private fun system(action: String) {
         when (action) {
-            "Back" -> global(AccessibilityService.GLOBAL_ACTION_BACK)
-            "Home" -> global(AccessibilityService.GLOBAL_ACTION_HOME)
-            "Recents" -> global(AccessibilityService.GLOBAL_ACTION_RECENTS)
-            "Notifications" -> global(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS)
-            "QuickSettings" -> global(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS)
-            "PowerMenu" -> global(AccessibilityService.GLOBAL_ACTION_POWER_DIALOG)
-            "Screenshot" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            "back" -> global(AccessibilityService.GLOBAL_ACTION_BACK)
+            "home" -> global(AccessibilityService.GLOBAL_ACTION_HOME)
+            "recents" -> global(AccessibilityService.GLOBAL_ACTION_RECENTS)
+            "notifications" -> global(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS)
+            "quickSettings" -> global(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS)
+            "powerMenu" -> global(AccessibilityService.GLOBAL_ACTION_POWER_DIALOG)
+            "screenshot" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 global(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT)
             }
-            "LockScreen" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            "lockScreen" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 global(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN)
             }
-            "VolumeUp" -> volume(AudioManager.ADJUST_RAISE)
-            "VolumeDown" -> volume(AudioManager.ADJUST_LOWER)
+            "volumeUp" -> volume(AudioManager.ADJUST_RAISE)
+            "volumeDown" -> volume(AudioManager.ADJUST_LOWER)
         }
     }
 
@@ -559,11 +552,11 @@ class Injector(private val svc: AccessibilityService) {
         private const val MOUSE = 100
         private const val MAX_FINGERS = 10
 
-        /** 这台手机能执行的系统操作（告诉控制端，它只显示这些） */
+        /** 这台手机能执行的系统操作（告诉控制端，它只显示这些），JSON 里的名字（和 `SystemAction.wire` 一样） */
         fun supportedActions(): List<String> = buildList {
-            addAll(listOf("Back", "Home", "Recents", "Notifications", "QuickSettings", "PowerMenu"))
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) addAll(listOf("Screenshot", "LockScreen"))
-            addAll(listOf("VolumeUp", "VolumeDown"))
+            addAll(listOf("back", "home", "recents", "notifications", "quickSettings", "powerMenu"))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) addAll(listOf("screenshot", "lockScreen"))
+            addAll(listOf("volumeUp", "volumeDown"))
         }
 
         /** 能不能多点触控（Android 8 起才有连续手势） */

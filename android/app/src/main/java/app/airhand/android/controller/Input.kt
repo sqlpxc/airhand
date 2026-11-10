@@ -7,52 +7,55 @@ import app.airhand.android.core.SystemAction
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** 输入事件（与 Rust 的 `airhand_proto::session::InputEvent` 的 JSON 形状相同，样例见 ProtocolTest） */
+/**
+ * 输入事件（与 Rust 的 `airhand_proto::session::InputEvent` 的 JSON 形状相同，样例见 ProtocolTest）：
+ * `{"type":"mouseMove","x":0.5,"y":0.5}`、`{"type":"releaseAll"}`，名字都是 camelCase
+ */
 object Input {
+    private fun event(type: String): JSONObject = JSONObject().put("type", type)
+
     /** 移到这个位置（0..1，相对画面） */
     fun move(x: Float, y: Float): JSONObject =
-        JSONObject().put("MouseMove", JSONObject().put("x", x.coerceIn(0f, 1f).toDouble()).put("y", y.coerceIn(0f, 1f).toDouble()))
+        event("mouseMove").put("x", x.coerceIn(0f, 1f).toDouble()).put("y", y.coerceIn(0f, 1f).toDouble())
 
     /**
      * 相对移动（被控端的光标隐藏了，例如游戏里转视角）：鼠标的原始计数，约等于被控端的像素。
      * 被控端按真实鼠标的移动注入，游戏自己把光标拉回原位、只看移动了多少
      */
-    fun delta(dx: Int, dy: Int): JSONObject = JSONObject().put("MouseDelta", JSONObject().put("dx", dx).put("dy", dy))
+    fun delta(dx: Int, dy: Int): JSONObject = event("mouseDelta").put("dx", dx).put("dy", dy)
 
-    fun button(button: String, down: Boolean): JSONObject =
-        JSONObject().put("MouseButton", JSONObject().put("button", button).put("down", down))
+    fun button(button: String, down: Boolean): JSONObject = event("mouseButton").put("button", button).put("down", down)
 
     /** 滚轮：120 = 一格，向上 / 向右为正（Windows 的约定） */
     fun wheel(dx: Int, dy: Int): JSONObject =
-        JSONObject().put("Wheel", JSONObject().put("dx", dx.coerceIn(-32000, 32000)).put("dy", dy.coerceIn(-32000, 32000)))
+        event("wheel").put("dx", dx.coerceIn(-32000, 32000)).put("dy", dy.coerceIn(-32000, 32000))
 
     /** 物理按键，取值为 W3C `KeyboardEvent.code` */
-    fun key(code: String, down: Boolean): JSONObject = JSONObject().put("Key", JSONObject().put("code", code).put("down", down))
+    fun key(code: String, down: Boolean): JSONObject = event("key").put("code", code).put("down", down)
 
-    fun text(text: String): JSONObject = JSONObject().put("Text", JSONObject().put("text", text))
+    fun text(text: String): JSONObject = event("text").put("text", text)
 
-    /** 触摸点：`phase` 是 Down / Move / Up / Cancel，`id` 小于 10 */
-    fun touch(id: Int, phase: String, x: Float, y: Float): JSONObject = JSONObject().put(
-        "Touch",
-        JSONObject().put("id", id).put("phase", phase)
-            .put("x", x.coerceIn(0f, 1f).toDouble()).put("y", y.coerceIn(0f, 1f).toDouble()),
-    )
+    /** 触摸点：`phase` 是 [DOWN] / [MOVE] / [UP] / [CANCEL]，`id` 小于 10 */
+    fun touch(id: Int, phase: String, x: Float, y: Float): JSONObject =
+        event("touch").put("id", id).put("phase", phase)
+            .put("x", x.coerceIn(0f, 1f).toDouble()).put("y", y.coerceIn(0f, 1f).toDouble())
 
     /** 系统操作（被控端在 Hello 里列出的） */
-    fun system(action: SystemAction): JSONObject = JSONObject().put("System", JSONObject().put("action", action.wire))
+    fun system(action: SystemAction): JSONObject = event("system").put("action", action.wire)
 
-    const val DOWN = "Down"
-    const val MOVE = "Move"
-    const val UP = "Up"
-    const val CANCEL = "Cancel"
+    /** 松开所有按着的键和鼠标按钮 */
+    fun releaseAll(): JSONObject = event("releaseAll")
 
-    const val RELEASE_ALL = "ReleaseAll"
+    const val DOWN = "down"
+    const val MOVE = "move"
+    const val UP = "up"
+    const val CANCEL = "cancel"
 
-    const val LEFT = "Left"
-    const val RIGHT = "Right"
-    const val MIDDLE = "Middle"
-    const val BACK = "Back"
-    const val FORWARD = "Forward"
+    const val LEFT = "left"
+    const val RIGHT = "right"
+    const val MIDDLE = "middle"
+    const val BACK = "back"
+    const val FORWARD = "forward"
 
     /**
      * 把一个事件加到待发的一批里：紧挨着的绝对移动只留最后一个，相对移动加起来（不越过点击、按键）。
@@ -60,11 +63,13 @@ object Input {
      */
     fun append(pending: MutableList<Any>, e: Any) {
         val last = pending.lastOrNull()
-        if (e is JSONObject && e.has("MouseMove") && last is JSONObject && last.has("MouseMove")) {
+        val type = (e as? JSONObject)?.optString("type")
+        val lastType = (last as? JSONObject)?.optString("type")
+        if (type == "mouseMove" && lastType == "mouseMove") {
             pending[pending.size - 1] = e
-        } else if (e is JSONObject && e.has("MouseDelta") && last is JSONObject && last.has("MouseDelta")) {
-            val a = last.getJSONObject("MouseDelta")
-            val b = e.getJSONObject("MouseDelta")
+        } else if (type == "mouseDelta" && lastType == "mouseDelta") {
+            val a = last as JSONObject
+            val b = e as JSONObject
             pending[pending.size - 1] = delta(a.getInt("dx") + b.getInt("dx"), a.getInt("dy") + b.getInt("dy"))
         } else {
             pending.add(e)

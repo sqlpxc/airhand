@@ -18,22 +18,22 @@ const hex2 = (v: number) => v.toString(16).padStart(2, "0");
 /** 从关键帧推导 codec 字符串（H.264 读取 SPS 的 profile/level，其余使用足够高的 level） */
 export function codecString(codec: Codec, keyframe: Uint8Array): string {
   switch (codec) {
-    case "H264": {
+    case "h264": {
       const sps = findNal(keyframe, (h) => (h & 0x1f) === 7);
       if (sps && sps.length >= 4) return `avc1.${hex2(sps[1])}${hex2(sps[2])}${hex2(sps[3])}`;
       return "avc1.640033"; // High@5.1
     }
-    case "H265":
+    case "h265":
       return "hvc1.1.6.L153.B0"; // Main@5.1
-    case "AV1":
+    case "av1":
       return "av01.0.13M.08"; // Main@5.1, 8bit
   }
 }
 
 const PROBE: Record<Codec, string> = {
-  H264: "avc1.640033",
-  H265: "hvc1.1.6.L153.B0",
-  AV1: "av01.0.13M.08",
+  h264: "avc1.640033",
+  h265: "hvc1.1.6.L153.B0",
+  av1: "av01.0.13M.08",
 };
 
 // ───────────────────── Annex-B → AVC（长度前缀）─────────────────────
@@ -116,19 +116,19 @@ export function markH264NeedsAvc() {
 }
 
 /** 编码格式的优先级：同画质下压缩率从高到低（界面上也按这个顺序列出） */
-export const CODEC_PRIORITY: readonly Codec[] = ["AV1", "H265", "H264"];
+export const CODEC_PRIORITY: readonly Codec[] = ["av1", "h265", "h264"];
 
 /**
  * 这种格式能不能用：本机能解码，并且被控端能编码。H.264 双方都一定支持。
  * `hostCodecs` 为 undefined 表示还不知道被控端支持什么（还没连上），这时只看本机。
  */
 export function codecUsable(c: Codec, decoders: Codec[], hostCodecs?: Codec[]): boolean {
-  return c === "H264" || (decoders.includes(c) && (hostCodecs?.includes(c) ?? true));
+  return c === "h264" || (decoders.includes(c) && (hostCodecs?.includes(c) ?? true));
 }
 
 /** 按 {@link CODEC_PRIORITY} 选出能用的格式里压缩率最高的一个 */
 export function bestCodec(decoders: Codec[], hostCodecs?: Codec[]): Codec {
-  return CODEC_PRIORITY.find((c) => codecUsable(c, decoders, hostCodecs)) ?? "H264";
+  return CODEC_PRIORITY.find((c) => codecUsable(c, decoders, hostCodecs)) ?? "h264";
 }
 
 let probeCache: Promise<Codec[]> | null = null;
@@ -137,13 +137,13 @@ let probeCache: Promise<Codec[]> | null = null;
 export function supportedDecoders(): Promise<Codec[]> {
   probeCache ??= (async () => {
     const out: Codec[] = [];
-    for (const c of ["H264", "H265", "AV1"] as Codec[]) {
+    for (const c of ["h264", "h265", "av1"] as Codec[]) {
       try {
         const r = await VideoDecoder.isConfigSupported({
           codec: PROBE[c],
           codedWidth: 1920,
           codedHeight: 1080,
-          hardwareAcceleration: c === "H264" ? "no-preference" : "prefer-hardware",
+          hardwareAcceleration: c === "h264" ? "no-preference" : "prefer-hardware",
           optimizeForLatency: true,
         });
         if (r.supported) out.push(c);
@@ -151,7 +151,7 @@ export function supportedDecoders(): Promise<Codec[]> {
         /* 不支持 */
       }
     }
-    if (!out.includes("H264")) out.unshift("H264");
+    if (!out.includes("h264")) out.unshift("h264");
     return out;
   })();
   return probeCache;

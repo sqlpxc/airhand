@@ -1,4 +1,4 @@
-//! 被控端的单个远控会话（对应桌面版的 `client/src-tauri/src/host/session.rs`，三条流的收发用
+//! 被控端的单个远控会话（对应桌面版的 `client/src-tauri/src/host/session.rs`，各条通道的收发用
 //! [`airhand_link::host::HostSession`]，两边一样）。
 //!
 //! 手机默认要先请坐在它面前的人同意（见 `airhand_proto::session` 的模块说明）。认不认识这个控制端看的是它在
@@ -17,14 +17,14 @@ use std::time::{Duration, Instant};
 
 use airhand_link::host::{Admission, HostSession, Incoming, PEER_TIMEOUT};
 use airhand_proto::session::{
-    ByeReason, ControllerMsg, HostHello, HostMsg, Notice, Platform, QualitySettings,
+    ByeReason, ControllerMsg, HostHello, HostMsg, InputEvent, Notice, Platform, QualitySettings,
 };
 use anyhow::Result;
 use serde_json::json;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 
-use super::{Shared, audio, video};
+use super::{Broadcast, Shared, audio, video};
 /// 本机用户这么久没有回应连接请求就当作拒绝
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -62,7 +62,7 @@ impl Drop for SessionGuard {
         self.shared.video.remove(self.id);
         self.shared.audio.unsubscribe(self.id);
         self.shared
-            .event(json!({ "type": "input", "events": ["ReleaseAll"] }));
+            .event(json!({ "type": "input", "events": [InputEvent::ReleaseAll] }));
     }
 }
 
@@ -72,7 +72,8 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
         shared: shared.clone(),
         id: session_id,
     };
-    // 端到端握手：控制端是谁（公钥）、要不要问本机用户，由 Shared 的 Gate 决定
+    // 端到端握手：控制端是谁（公钥）、要不要问本机用户，由 Shared 的 Gate 决定。
+    // 返回的时候控制端已经确认过了（重放的握手消息走不到这里），这时才在列表里显示它、开始采集
     let (mut io, admitted) = HostSession::open(&inc, video::QUEUE, audio::QUEUE, &*shared).await?;
     let mut kick = inc.kick;
     // 列表里换成控制端在加密握手里报的名称，加上安全码（问本机用户时一起显示）
@@ -83,11 +84,12 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
         c.safety = Some(admitted.safety.clone());
     });
     let ctl = io.ctl.clone();
+    let bulk = io.bulk.clone();
     let mut bcast = shared.broadcast.subscribe();
 
-    // 同意之前收到的设置，同意之后再生效
-    let mut settings: Option<QualitySettings> = None;
-    let mut want_audio = false;
+    // 开始时的画质和声音在握手里；同意之前收到的变化也记下来，同意之后一起生效
+    let mut settings: Option<QualitySettings> = Some(admitted.settings);
+    let mut want_audio = admitted.audio;
     let mut phase = Phase::Open;
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut watchdog = tokio::time::interval(Duration::from_secs(5));
@@ -119,18 +121,18 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
             actions: info.actions.clone(),
         }))?;
         if !info.input {
-            ctl.send(&HostMsg::Notice(Notice::MissingPermissions {
+            ctl.send(&HostMsg::Notice(Some(Notice::MissingPermissions {
                 screen: false,
                 input: true,
-            }))?;
+            })))?;
         }
         if let Some(e) = &info.encoder {
             ctl.send(&HostMsg::Encoder(e.clone()))?;
         }
         if let Some(detail) = &info.capture_failure {
-            ctl.send(&HostMsg::Notice(Notice::CaptureFailed {
+            ctl.send(&HostMsg::Notice(Some(Notice::CaptureFailed {
                 detail: detail.clone(),
-            }))?;
+            })))?;
         }
         drop(info);
         if let Some(s) = settings {
@@ -162,7 +164,7 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
                 "this controller was allowed before during this sharing"
             );
         }
-        open(&mut phase, &mut deadline, None, false)?;
+        open(&mut phase, &mut deadline, settings.take(), want_audio)?;
     }
 
     let result: Result<()> = async {
@@ -223,8 +225,11 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
                 }
                 b = bcast.recv() => match b {
                     // 同意之前不转发（Hello 里会带上那时的状态）
-                    Ok(b) => if is_open {
-                        ctl.send_encoded(b)?;
+                    Ok(_) if !is_open => {}
+                    Ok(Broadcast::Control(b)) => ctl.send_encoded(b)?,
+                    // 剪贴板：网络慢、前面排满了就丢掉这一次
+                    Ok(Broadcast::Bulk(b)) => if let Err(e) = bulk.send_encoded(b) {
+                        warn!(session_id, "dropped a clipboard update: {e:#}");
                     },
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(session_id, n, "missed broadcast messages");
@@ -245,7 +250,7 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
 
     // 先让画面 / 声音分发放开这个会话的发送端，写任务才能把排着队的（例如 Bye）发完
     drop(guard);
-    drop(ctl);
+    drop((ctl, bulk));
     io.close(session_id, result).await
 }
 
@@ -260,7 +265,7 @@ mod tests {
     async fn cancellation_releases_subscriptions_and_pending_approval() {
         let cfg: HostConfig = serde_json::from_value(json!({
             "server": "127.0.0.1:1", "fingerprint": "", "name": "test", "os": "test",
-            "version": "test", "reclaim": null, "displays": [], "codecs": ["H264"],
+            "version": "test", "reclaim": null, "displays": [], "codecs": ["h264"],
             "input": false, "approval": true
         }))
         .unwrap();

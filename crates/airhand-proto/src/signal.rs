@@ -69,6 +69,7 @@ use std::net::IpAddr;
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::cbor::open_enum;
 use crate::framing::FrameError;
 use crate::{Features, Role};
 
@@ -325,15 +326,15 @@ pub enum ServerMsg {
         #[cbor(n(1), with = "minicbor::bytes")]
         secret: [u8; 16],
     },
-    /// 对 [`ClientMsg::Connect`] 的应答：成功时有 `grant`，失败时有 `error`
-    /// （两个都没有：服务器的版本更新、拒绝的原因这边不认识）。用 [`ServerMsg::connect_result`] 构造、[`connect_outcome`] 读
+    /// 对 [`ClientMsg::Connect`] 的应答：成功时有 `grant`，失败时有 `error`（服务器的版本更新时可能是
+    /// [`ConnectError::Unknown`]）。用 [`ServerMsg::connect_result`] 构造、[`connect_outcome`] 读
     #[n(2)]
     ConnectResult {
         #[n(0)]
         req_id: u32,
         #[n(1)]
         grant: Option<SessionGrant>,
-        #[cbor(n(2), with = "crate::cbor::opt", has_nil)]
+        #[n(2)]
         error: Option<ConnectError>,
     },
     /// 通知被控端：有控制端发起会话，请打开会话流。
@@ -374,14 +375,14 @@ impl ServerMsg {
     }
 }
 
-/// [`ServerMsg::ConnectResult`] 的结果；`Err(None)` 表示服务器拒绝了、原因这个版本不认识
+/// [`ServerMsg::ConnectResult`] 的结果。两个都没有（不该发生）当作 [`ConnectError::Unknown`]
 pub fn connect_outcome(
     grant: Option<SessionGrant>,
     error: Option<ConnectError>,
-) -> Result<SessionGrant, Option<ConnectError>> {
+) -> Result<SessionGrant, ConnectError> {
     match (grant, error) {
         (Some(g), _) => Ok(g),
-        (None, e) => Err(e),
+        (None, e) => Err(e.unwrap_or(ConnectError::Unknown(u32::MAX))),
     }
 }
 
@@ -408,25 +409,21 @@ pub struct SessionGrant {
     pub resume: ResumeToken,
 }
 
-#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
-#[cbor(index_only)]
-pub enum ConnectError {
-    /// 控制码不存在或对方不在线
-    #[n(0)]
-    NotFound,
-    /// 尝试过于频繁
-    #[n(1)]
-    RateLimited,
-    /// 对方会话数已满
-    #[n(2)]
-    Busy,
-    /// 对方暂时不在线，上线时会收到 [`ServerMsg::HostOnline`]（只回答带凭证的请求，见模块说明）
-    #[n(3)]
-    Offline,
-    /// 重连凭证作废了（被控端的用户断开过所有控制端、控制码换了主人），或者不是这台服务器为这个控制码发的
-    ///（只回答带凭证的请求，见模块说明）
-    #[n(4)]
-    Revoked,
+open_enum! {
+    /// 服务器为什么不让连。不认识的原因（服务器的版本更新）是 `Unknown`
+    pub enum ConnectError {
+        /// 控制码不存在或对方不在线
+        NotFound = 0 => "notFound",
+        /// 尝试过于频繁
+        RateLimited = 1 => "rateLimited",
+        /// 对方会话数已满
+        Busy = 2 => "busy",
+        /// 对方暂时不在线，上线时会收到 [`ServerMsg::HostOnline`]（只回答带凭证的请求，见模块说明）
+        Offline = 3 => "offline",
+        /// 重连凭证作废了（被控端的用户断开过所有控制端、控制码换了主人），或者不是这台服务器为这个控制码发的
+        ///（只回答带凭证的请求，见模块说明）
+        Revoked = 4 => "revoked",
+    }
 }
 
 #[cfg(test)]
@@ -572,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_connect_errors_are_none() {
+    fn unknown_connect_errors_keep_their_value() {
         #[derive(minicbor::Encode)]
         enum NewServerMsg {
             #[n(2)]
@@ -606,6 +603,9 @@ mod tests {
         else {
             panic!("{m:?}")
         };
-        assert!(matches!(connect_outcome(grant, error), Err(None)));
+        assert_eq!(
+            connect_outcome(grant, error).unwrap_err(),
+            ConnectError::Unknown(40)
+        );
     }
 }

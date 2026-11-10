@@ -45,7 +45,7 @@ export function tauriBackend(): Backend {
     appInfo: () => invoke<AppInfo>("app_info"),
     serverStatus: () => invoke<ServerState>("server_status"),
     onServerStatus: (cb) => unlistenLater(listen<ServerState>("server-status", (e) => cb(e.payload))),
-    connect: async (code, opts, settings, sink, clipboard) => {
+    connect: async (code, opts, sink, clipboard) => {
       let sid: number | null = null;
       let unacked: number | null = null;
       let closed = false;
@@ -72,10 +72,8 @@ export function tauriBackend(): Backend {
       };
       let info: SessionInfo;
       try {
-        const { resume, hostKey, pairing } = opts;
-        info = await invoke<SessionInfo>("ctrl_connect", {
-          code, resume, hostKey, pairing, settings, video, events, clipboard,
-        });
+        // opts 就是 Rust 的 ConnectOptions（和网页版、Android 一样的 JSON）
+        info = await invoke<SessionInfo>("ctrl_connect", { code, opts, video, events, clipboard });
       } catch (e) {
         acks.dispose();
         throw e;

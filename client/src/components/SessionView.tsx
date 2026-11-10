@@ -80,9 +80,9 @@ const MAC_COMBOS: Combo[] = [
 
 /** 被控端平台对应的快捷键。hello 之前不知道平台，按系统名称猜（Windows 报告 "Windows 11 ..."，macOS 报告 "macOS 15.3"） */
 const combosFor = (platform: Platform | null, os: string) => {
-  if (platform === "Mac") return MAC_COMBOS;
-  if (platform === "Linux") return LINUX_COMBOS;
-  if (platform === "Windows") return WINDOWS_COMBOS;
+  if (platform === "mac") return MAC_COMBOS;
+  if (platform === "linux") return LINUX_COMBOS;
+  if (platform === "windows") return WINDOWS_COMBOS;
   return os === "" || /windows/i.test(os) ? WINDOWS_COMBOS : /^macos/i.test(os) ? MAC_COMBOS : LINUX_COMBOS;
 };
 
@@ -422,7 +422,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
               </Dropdown>
             )}
           </div>
-          {s.hostPlatform !== "Android" && (
+          {s.hostPlatform !== "android" && (
             // 游戏：鼠标锁定在画面上、发相对移动（被控端隐藏光标时会自动这样做，这里是手动的）
             <button
               className={`tb-btn icon ${s.mouseLocked ? "on" : ""}`}

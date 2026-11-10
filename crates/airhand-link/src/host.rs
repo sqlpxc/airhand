@@ -1,13 +1,14 @@
-//! 被控端：与服务器的连接（注册、取回控制码、断开所有控制端、更换控制码），以及每个会话的三条流。
+//! 被控端：与服务器的连接（注册、取回控制码、断开所有控制端、更换控制码），以及每个会话的四条流。
 //!
 //! 桌面版（`client/src-tauri/src/host/`）和 Android（`android/native/src/host/`）共用这里，
 //! 采集、编码、注入输入、请本机用户同意这些各平台不同的事情由它们自己做：
 //!
 //! * [`run`]：一直连着服务器（掉线自动重连，取回原来的控制码），每来一个控制端就调用 `session` 开始一个会话；
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
-//! * [`HostSession`]：会话的三条流。先在控制流上做端到端握手（[`crate::secure::respond`]）：让不让这个控制端进来
-//!   由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……）。之后控制消息、画面包、声音包分别排进
-//!   三个有界队列，各自的写任务把它们加密后写进流（声音包优先发成数据报）；控制端的消息由读任务解密后交给
+//! * [`HostSession`]：会话的四条流。先在控制流上做端到端握手（[`crate::secure::respond`]）：让不让这个控制端进来
+//!   由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），控制端确认了才算进来
+//!   （重放的握手消息走不到这一步）。之后控制消息、大块消息（剪贴板、光标）、画面包、声音包分别排进四个有界队列，
+//!   各自的写任务把它们加密后写进流（声音包优先发成数据报）；控制端的消息由读任务解密后交给
 //!   [`HostSession::incoming`]，过时的输入在这里换成"释放所有按键"（见 [`InputClock`]）；
 //! * [`CursorCache`]：控制端缓存了哪些光标形状。
 
@@ -18,13 +19,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use airhand_proto::framing::{self, Decoded, read_frame, read_msg, write_msg};
-use airhand_proto::handshake::{PublicKey, TAG_LEN};
+use airhand_proto::handshake::{Negotiated, PublicKey, TAG_LEN};
 use airhand_proto::session::{
     ByeReason, CURSOR_SLOTS, ControllerMsg, CursorShape, CursorSlot, HostMsg, INPUT_MAX_AGE,
-    InputEvent,
+    InputEvent, QualitySettings,
 };
 use airhand_proto::signal::{ClientMsg, Peer, Reclaim, ServerMsg};
-use airhand_proto::{Features, MAX_CONTROL_MSG, MAX_SIGNAL_MSG, Role, SessionLane};
+use airhand_proto::{MAX_CONTROL_MSG, MAX_SIGNAL_MSG, Role, SessionLane};
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use quinn::Connection;
@@ -44,6 +45,8 @@ pub use crate::secure::{Access, Admission, Gate};
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 控制流的发送队列。控制消息都很小，排满了说明对方早就不收了
 const CONTROL_QUEUE: usize = 32;
+/// 大块通道的发送队列（剪贴板、光标）。光标由编码线程发，满了它会等着；剪贴板满了就丢掉这一次
+const BULK_QUEUE: usize = 32;
 
 /// 本机用户的命令（托盘菜单、Android 的界面）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,9 +292,9 @@ where
     }
 }
 
-// ───────────────────────────── 会话的三条流 ─────────────────────────────
+// ───────────────────────────── 会话的四条流 ─────────────────────────────
 
-/// 控制流的发送端（可以复制，例如交给编码线程）。消息编码好之后排进有界队列，排满了算对方失联
+/// 控制流（或者大块通道）的发送端（可以复制，例如交给编码线程）。消息编码好之后排进有界队列，排满了算对方失联
 #[derive(Clone)]
 pub struct Control(mpsc::Sender<Bytes>);
 
@@ -323,19 +326,21 @@ impl Control {
     }
 }
 
-/// 被控端一个会话的三条流。
+/// 被控端一个会话的四条流。
 ///
-/// 结束时调用 [`HostSession::close`]：在那之前要先停掉还拿着 `video` / `audio` 发送端的东西
+/// 结束时调用 [`HostSession::close`]：在那之前要先停掉还拿着 `video` / `audio` / `bulk` 发送端的东西
 /// （编码管线、声音订阅），写任务才能把队列里剩下的（例如 Bye）发完、正常结束流。
 pub struct HostSession {
     pub ctl: Control,
+    /// 大块通道：剪贴板、光标（见 `airhand_proto::session` 的"走哪条通道"）
+    pub bulk: Control,
     /// 画面包（[`airhand_proto::media::frame`] 编好的）
     pub video: mpsc::Sender<Bytes>,
     /// 声音包（同上）
     pub audio: mpsc::Sender<Bytes>,
     /// 控制端发来的消息
     pub incoming: mpsc::Receiver<ControllerMsg>,
-    /// 写任务（三条流一起）：意外结束就是连接出了问题
+    /// 写任务（四条流一起）：意外结束就是连接出了问题
     pub writer: Writer,
     reader: OwnedTask<Result<()>>,
 }
@@ -465,8 +470,8 @@ impl CursorCache {
     }
 }
 
-/// 三条流的写任务
-pub struct Writer(OwnedTask<Result<((), (), ())>>);
+/// 四条流的写任务
+pub struct Writer(OwnedTask<Result<((), (), (), ())>>);
 
 impl Writer {
     /// 等到写任务意外结束（可以放在 `select!` 里）
@@ -478,7 +483,8 @@ impl Writer {
     }
 }
 
-/// 端到端握手之后，被控端知道的这个控制端（见 [`crate::secure::respond`]）
+/// 端到端握手之后，被控端知道的这个控制端（见 [`crate::secure::respond`]）。它已经确认过了：是真的在连，
+/// 这时才在托盘、Android 的列表里显示它，开始采集
 #[derive(Debug, Clone)]
 pub struct Admitted {
     /// 控制端的公钥（它的身份）
@@ -491,8 +497,11 @@ pub struct Admitted {
     /// 为什么让它进来；[`Admission::NeedsApproval`] 时会话要先请本机用户同意
     pub admission: Admission,
     /// 选定的会话版本、双方都支持的会话能力位
-    pub version: u16,
-    pub features: Features,
+    pub negotiated: Negotiated,
+    /// 开始时的画质（已经做过范围校验）：编码管线一开始就按它建
+    pub settings: QualitySettings,
+    /// 开始时要不要声音
+    pub audio: bool,
 }
 
 /// 读一条控制端的消息（解密、解码）；对方版本新增的消息跳过。流在消息边界处结束时为 `None`
@@ -508,13 +517,16 @@ async fn next_controller_msg(
         opener.open(buf)?;
         match framing::decode(buf)? {
             Decoded::Msg(m) => return Ok(Some(m)),
-            Decoded::Unknown => debug!("skipping a message from a newer controller"),
+            Decoded::Unknown(variant) => {
+                debug!(variant, "skipping a message from a newer controller")
+            }
         }
     }
 }
 
 impl HostSession {
-    /// 打开会话的三条流，在控制流上做端到端握手（让不让这个控制端进来由 `gate` 决定，拒绝时返回错误）。
+    /// 打开会话的四条流，在控制流上做端到端握手（让不让这个控制端进来由 `gate` 决定，拒绝时返回错误）。
+    /// 控制端确认了才返回（见 `airhand_proto::handshake` 的"确认"）：返回之前不要显示它、不要开始采集。
     /// `video_queue` / `audio_queue`：画面、声音的发送队列有多长（满了由发送方决定丢弃还是等待）
     pub async fn open(
         inc: &Incoming,
@@ -527,6 +539,7 @@ impl HostSession {
             control: (mut send, mut recv),
             video: (video_send, _),
             audio: (audio_send, _),
+            bulk: (bulk_send, mut bulk_recv),
         } = open_session(&inc.conn, session_id, Role::Host).await?;
         let r = secure::respond(
             &mut recv,
@@ -544,30 +557,36 @@ impl HostSession {
             os: r.intro.os.chars().take(64).collect(),
             safety: r.secured.safety.clone(),
             admission: r.admission,
-            version: r.version,
-            features: r.features,
+            negotiated: r.negotiated,
+            settings: r.intro.settings.sanitized(),
+            audio: r.intro.audio,
         };
         info!(
             session_id,
             admission = ?admitted.admission,
             controller = %secure::hex(&admitted.key),
             safety = %admitted.safety,
+            negotiated = ?admitted.negotiated,
             "end-to-end session established"
         );
-        let (video_sealer, audio_sealer, datagrams) = (
+        let (video_sealer, audio_sealer, bulk_sealer, datagrams) = (
             r.secured.sealer(SessionLane::Video),
             r.secured.sealer(SessionLane::Audio),
+            r.secured.sealer(SessionLane::Bulk),
             r.secured.datagram_sealer(),
         );
-        let mut opener = r.secured.opener(SessionLane::Control);
+        let mut opener = r.opener;
+        let mut bulk_opener = r.secured.opener(SessionLane::Bulk);
         let control_sealer = r.sealer;
         let (ctl_tx, ctl_rx) = mpsc::channel(CONTROL_QUEUE);
+        let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
         let conn = inc.conn.clone();
         let writer = OwnedTask(tokio::spawn(async move {
             tokio::try_join!(
                 write_lane(send, ctl_rx, control_sealer),
+                write_lane(bulk_send, bulk_rx, bulk_sealer),
                 write_lane(video_send, video_rx, video_sealer),
                 write_audio(
                     conn,
@@ -581,44 +600,71 @@ impl HostSession {
         }));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话
         let (in_tx, incoming) = mpsc::channel(64);
+        let bulk_in = in_tx.clone();
         let reader = OwnedTask(tokio::spawn(async move {
-            let mut buf = Vec::with_capacity(1024);
-            let mut clock = InputClock::default();
-            // 这一串过时的输入已经换成了一个"释放所有按键"
-            let mut released = false;
-            while let Some(m) = next_controller_msg(&mut recv, &mut opener, &mut buf).await? {
-                let m = match m {
-                    ControllerMsg::Ping { t } => {
-                        clock.stale(t, Instant::now());
-                        m
+            // 大块通道（剪贴板）：结束了不算会话结束，控制流结束才是
+            let bulk = async move {
+                let mut buf = Vec::new();
+                while let Some(m) =
+                    next_controller_msg(&mut bulk_recv, &mut bulk_opener, &mut buf).await?
+                {
+                    if matches!(m, ControllerMsg::Input { .. }) {
+                        // 输入只走控制流（过时的输入要在那里挡掉）
+                        warn!(session_id, "ignoring input sent on the bulk lane");
+                        continue;
                     }
-                    ControllerMsg::Input { t, events } => {
-                        if !clock.stale(t, Instant::now()) {
-                            released = false;
-                            ControllerMsg::Input { t, events }
-                        } else if released {
-                            continue;
-                        } else {
-                            // 不在网络恢复后重放过时的操作；丢掉的里面可能有松开按键，所以松开所有按键
-                            warn!(session_id, "dropping input that arrived too late");
-                            released = true;
-                            ControllerMsg::Input {
-                                t,
-                                events: vec![InputEvent::ReleaseAll],
+                    if bulk_in.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                std::future::pending::<Result<()>>().await
+            };
+            let control = async move {
+                let mut buf = Vec::with_capacity(1024);
+                let mut clock = InputClock::default();
+                // 这一串过时的输入已经换成了一个"释放所有按键"
+                let mut released = false;
+                while let Some(m) = next_controller_msg(&mut recv, &mut opener, &mut buf).await? {
+                    let m = match m {
+                        ControllerMsg::Ping { t } => {
+                            clock.stale(t, Instant::now());
+                            m
+                        }
+                        ControllerMsg::Input { t, mut events } => {
+                            // 对方版本新增的按钮、系统操作……：不执行
+                            events.retain(InputEvent::understood);
+                            if !clock.stale(t, Instant::now()) {
+                                released = false;
+                                ControllerMsg::Input { t, events }
+                            } else if released {
+                                continue;
+                            } else {
+                                // 不在网络恢复后重放过时的操作；丢掉的里面可能有松开按键，所以松开所有按键
+                                warn!(session_id, "dropping input that arrived too late");
+                                released = true;
+                                ControllerMsg::Input {
+                                    t,
+                                    events: vec![InputEvent::ReleaseAll],
+                                }
                             }
                         }
+                        m => m,
+                    };
+                    if in_tx.send(m).await.is_err() {
+                        break;
                     }
-                    m => m,
-                };
-                if in_tx.send(m).await.is_err() {
-                    break;
                 }
+                Ok(())
+            };
+            tokio::select! {
+                r = control => r,
+                r = bulk => r,
             }
-            Ok(())
         }));
         Ok((
             Self {
                 ctl: Control(ctl_tx),
+                bulk: Control(bulk_tx),
                 video: video_tx,
                 audio: audio_tx,
                 incoming,
@@ -634,13 +680,14 @@ impl HostSession {
     pub async fn close(self, session_id: u64, result: Result<()>) -> Result<()> {
         let HostSession {
             ctl,
+            bulk,
             video,
             audio,
             incoming,
             mut writer,
             mut reader,
         } = self;
-        drop((ctl, video, audio, incoming));
+        drop((ctl, bulk, video, audio, incoming));
         reader.abort();
         if !writer.0.is_finished() {
             let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer.0.0).await;

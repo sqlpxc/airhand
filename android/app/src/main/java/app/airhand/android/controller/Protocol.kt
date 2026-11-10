@@ -11,14 +11,18 @@ import java.nio.ByteOrder
  * 媒体包：画面、光标、声音（格式见 `crates/airhand-proto/src/media.rs`；被控端打包，Rust 核心原样交过来）。
  * 样例在 `crates/airhand-link/tests/protocol.json`，ProtocolTest 检查这里的解析和它一致。
  *
- * 24 字节的头（小端）+ 数据：
- * `0 类型 u8（1 画面 / 2 光标 / 3 声音）| 1 标志 u8 | 2 编码格式 u8（光标：槽位）| 4 序号 u32 | 8 宽 u16 | 10 高 u16 |
- *  12 热点 x u16 | 14 热点 y u16 | 16 采集时间 u64（微秒，被控端时钟）`
+ * 头（小端）+ 数据：
+ * `0 类型 u8（1 画面 / 2 光标 / 3 声音）| 1 标志 u8 | 2 编码格式 u8（光标：槽位）| 3 头的长度 u8（现在是 24）|
+ *  4 序号 u32 | 8 宽 u16 | 10 高 u16 | 12 热点 x u16 | 14 热点 y u16 | 16 采集时间 u64（微秒，被控端时钟）`
+ *
+ * 头可以变长：以后的版本把新字段加在第 24 字节之后，负载从"头的长度"处开始。所以负载一定从 [payload] 给出的位置取，
+ * 不认识的标志位、保留字节、24 字节之后的部分都不管；头的长度不对的包丢掉（[kind] 为 0）。
  *
  * 光标形状按槽位缓存（动画光标反复用到的那几帧只传一次）：标志 bit1 = 新形状（RGBA 在头后面），存进槽位并换成它；
  * bit2 = 换成槽位里已有的形状；都没有 = 形状没变。槽位只在一个会话里有效。
  */
 object Media {
+    /** 头最短的长度（本版本写的长度） */
     const val HEADER = 24
     const val VIDEO = 1
     const val CURSOR = 2
@@ -34,8 +38,18 @@ object Media {
      */
     data class Cursor(val visible: Boolean, val shape: Shape?, val slot: Int = 0, val cached: Boolean = false)
 
-    /** 包的类型；不到一个头长时为 0 */
-    fun kind(b: ByteArray): Int = if (b.size < HEADER) 0 else b[0].toInt() and 0xff
+    /** 头的长度（第 3 个字节）；不到 24、或者比包还长时为 0（不是合法的包） */
+    fun headerLen(b: ByteArray): Int {
+        if (b.size < HEADER) return 0
+        val n = b[3].toInt() and 0xff
+        return if (n >= HEADER && n <= b.size) n else 0
+    }
+
+    /** 包的类型；头不完整时为 0 */
+    fun kind(b: ByteArray): Int = if (headerLen(b) == 0) 0 else b[0].toInt() and 0xff
+
+    /** 负载从哪里开始（头的长度）；不是合法的包时是包的末尾（没有负载） */
+    fun payload(b: ByteArray): Int = headerLen(b).takeIf { it > 0 } ?: b.size
 
     private fun le(b: ByteArray): ByteBuffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
     private fun ByteBuffer.u16(i: Int) = getShort(i).toInt() and 0xffff
@@ -77,17 +91,28 @@ object Commands {
     private fun cmd(name: String, sid: Int): JSONObject = JSONObject().put("cmd", name).put("sid", sid)
 
     /**
+     * 控制码加上连接选项（Rust 的 `airhand_link::controller::ConnectOptions`，和桌面版、网页版一样）：
      * `resume`：之前连上时得到的重连凭证（十六进制，见 [Resume]）；`hostKey`：之前记下的对方公钥（只认它）；
-     * `pairing`：配对码（对方要求配对时用户输入的）。见 Rust 的 `airhand_link::controller::ConnectOptions`
+     * `pairing`：配对码（对方要求配对时用户输入的）；`settings` / `audio`：开始时的画质和要不要声音（在端到端握手里
+     * 交给对方，它一开始就按这个建编码器）
      */
-    fun connect(code: String, resume: String?, settings: Quality, hostKey: String? = null, pairing: String? = null): JSONObject =
+    fun connect(
+        code: String,
+        resume: String?,
+        settings: Quality,
+        hostKey: String? = null,
+        pairing: String? = null,
+        audio: Boolean = false,
+    ): JSONObject = options(resume, settings, hostKey, pairing, audio).put("cmd", "connect").put("code", code)
+
+    /** 连接选项（`ConnectOptions`） */
+    fun options(resume: String?, settings: Quality, hostKey: String?, pairing: String?, audio: Boolean): JSONObject =
         JSONObject()
-            .put("cmd", "connect")
-            .put("code", code)
             .put("resume", Resume.toJson(resume))
             .put("hostKey", hostKey ?: JSONObject.NULL)
             .put("pairing", pairing ?: JSONObject.NULL)
             .put("settings", settings.toJson())
+            .put("audio", audio)
 
     fun input(sid: Int, events: JSONArray): JSONObject = cmd("input", sid).put("events", events)
     fun settings(sid: Int, q: Quality): JSONObject = cmd("settings", sid).put("settings", q.toJson())

@@ -284,7 +284,8 @@ fn starts_with_parameter_set(data: &[u8], codec: Codec) -> bool {
     match codec {
         Codec::H264 => h & 0x1f == 7,                      // SPS
         Codec::H265 => matches!((h >> 1) & 0x3f, 32 | 33), // VPS / SPS
-        Codec::AV1 => true,
+        // AV1 的关键帧自带 Sequence Header；不认识的格式不会走到这里（Kotlin 只编认识的格式）
+        Codec::AV1 | Codec::Unknown(_) => true,
     }
 }
 

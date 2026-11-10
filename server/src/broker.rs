@@ -1559,9 +1559,7 @@ mod tests {
                 req_id: r,
                 grant,
                 error,
-            } if r == req_id => {
-                connect_outcome(grant, error).map_err(|e| e.expect("a known error"))
-            }
+            } if r == req_id => connect_outcome(grant, error),
             other => panic!("{other:?}"),
         }
     }
@@ -1661,7 +1659,7 @@ mod tests {
             .unwrap();
         let gate = OpenGate(Identity::generate());
         let me = Identity::generate();
-        let intro = secure::controller_intro("ctl", "test");
+        let intro = secure::controller_intro("ctl", "test", QualitySettings::default(), false);
         let (mut ctl, mut ctl_rx) = h.control;
         let (mut csend, mut crecv) = c.control;
         let (init, resp) = tokio::join!(
@@ -1690,11 +1688,13 @@ mod tests {
         let (init, mut resp) = (init.unwrap(), resp.unwrap());
         let mut receiver = HostReceiver::new(
             crecv,
+            c.bulk.1,
             c.video,
             c.audio,
             None,
             Openers {
                 control: init.opener,
+                bulk: init.secured.opener(SessionLane::Bulk),
                 video: init.secured.opener(SessionLane::Video),
                 audio: init.secured.opener(SessionLane::Audio),
                 datagrams: init.secured.datagram_opener(),
@@ -1833,7 +1833,6 @@ mod tests {
                     resume,
                     ..Default::default()
                 },
-                QualitySettings::default(),
                 Arc::new(NoUi),
                 Frontend::Browser,
             )
@@ -2392,8 +2391,14 @@ mod tests {
                 let r = svc
                     .connect(
                         &code,
-                        ConnectOptions::default(),
-                        QualitySettings::default(),
+                        ConnectOptions {
+                            settings: QualitySettings {
+                                fps: 50,
+                                ..QualitySettings::default()
+                            },
+                            audio: true,
+                            ..ConnectOptions::default()
+                        },
                         ui.clone(),
                         Frontend::Browser,
                     )
@@ -2424,8 +2429,9 @@ mod tests {
         };
         let (info, (sid, session, admitted)) = tokio::join!(connecting, accepting);
         let info = info.unwrap();
-        // 两端的安全码一样；控制端记下的是被控端真正的公钥
+        // 两端的安全码一样；控制端记下的是被控端真正的公钥；开始时的画质和声音在握手里就到了
         assert_eq!(info.safety, admitted.safety);
+        assert_eq!((admitted.settings.fps, admitted.audio), (50, true));
         assert_eq!(info.host_key, airhand_link::secure::hex(gate.0.public()));
         wait_until("the session is established", || {
             broker.routes.lock().unwrap().contains_key(&sid)

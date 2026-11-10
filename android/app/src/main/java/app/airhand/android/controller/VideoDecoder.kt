@@ -13,7 +13,7 @@ import android.view.Surface
 import app.airhand.android.core.Codec
 import java.nio.ByteBuffer
 
-/** 一帧画面（`airhand_link` 的视频包去掉 24 字节头），确认回调至多执行一次。 */
+/** 一帧画面（`airhand_link` 的视频包去掉头），确认回调至多执行一次。 */
 class VideoPacket(
     val seq: Int,
     val key: Boolean,

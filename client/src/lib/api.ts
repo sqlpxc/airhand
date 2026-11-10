@@ -6,19 +6,22 @@
 //
 // 对会话的操作是 Command（与 Rust 的 airhand_link::controller::Command 相同，Android 也一样），
 // 画面 / 光标 / 声音是媒体包（见 media.ts）。样例见 crates/airhand-link/tests/protocol.json。
+//
+// 和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（"h264"、"android"、"quickSettings"），
+// 带字段的联合类型用一个字段标明是哪一种（命令 cmd、事件和输入 type、问题和提示 kind）。
 import { isTauri } from "@tauri-apps/api/core";
 import { tauriBackend } from "./backend/tauri";
 import { webBackend } from "./backend/web";
 import type { Lang } from "./i18n";
 
-export type Codec = "H264" | "H265" | "AV1";
+export type Codec = "h264" | "h265" | "av1";
 
-/** 与 airhand_proto::session::QualitySettings 对应（字段名保持 snake_case） */
+/** 与 airhand_proto::session::QualitySettings 对应 */
 export interface QualitySettings {
   fps: number;
-  bitrate_kbps: number;
+  bitrateKbps: number;
   /** 输出画面短边上限，0 = 原始分辨率 */
-  max_short: number;
+  maxShort: number;
   adaptive: boolean;
   codec: Codec;
 }
@@ -154,7 +157,10 @@ export interface SessionInfo {
   safety: string;
 }
 
-/** 怎样连这台电脑（除了控制码），与 Rust 的 airhand_link::controller::ConnectOptions 对应 */
+/**
+ * 怎样连这台电脑（除了控制码），开始时的画质和声音。与 Rust 的 airhand_link::controller::ConnectOptions 对应，
+ * 三种界面的 connect 都是这些字段加上控制码
+ */
 export interface ConnectOptions {
   /** 重连凭证：之前连上时得到的，第一次连接时为 null */
   resume: ResumeToken | null;
@@ -162,23 +168,27 @@ export interface ConnectOptions {
   hostKey: string | null;
   /** 配对码（对方要求配对时） */
   pairing: string | null;
+  /** 开始时的画质：在端到端握手里交给对方，它一开始就按这个建编码器 */
+  settings: QualitySettings;
+  /** 开始时要不要声音（同上） */
+  audio: boolean;
 }
 
-/** 被控端的平台，与 airhand_proto::session::Platform 对应 */
-export type Platform = "Windows" | "Mac" | "Linux" | "Android";
+/** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
+export type Platform = "windows" | "mac" | "linux" | "android";
 
 /** 系统操作（手机的导航键等），与 airhand_proto::session::SystemAction 对应 */
 export type SystemAction =
-  | "Back"
-  | "Home"
-  | "Recents"
-  | "Notifications"
-  | "QuickSettings"
-  | "Screenshot"
-  | "LockScreen"
-  | "PowerMenu"
-  | "VolumeUp"
-  | "VolumeDown";
+  | "back"
+  | "home"
+  | "recents"
+  | "notifications"
+  | "quickSettings"
+  | "screenshot"
+  | "lockScreen"
+  | "powerMenu"
+  | "volumeUp"
+  | "volumeDown";
 
 export type SessionEvent =
   | {
@@ -213,20 +223,24 @@ export type SessionEvent =
   | { type: "clipboard"; text: string }
   | { type: "closed"; reason: Problem; retry: boolean };
 
-export type MouseButton = "Left" | "Right" | "Middle" | "Back" | "Forward";
+export type MouseButton = "left" | "right" | "middle" | "back" | "forward";
 
-/** 与 airhand_proto::session::InputEvent 对应（serde 外部标记） */
+export type TouchPhase = "down" | "move" | "up" | "cancel";
+
+/** 与 airhand_proto::session::InputEvent 对应（以 type 区分） */
 export type InputEvent =
   /** 移到这个位置（0..1，相对当前显示器的画面） */
-  | { MouseMove: { x: number; y: number } }
+  | { type: "mouseMove"; x: number; y: number }
   /** 相对移动（被控端光标隐藏时，例如游戏里转视角）：鼠标的原始计数，约等于被控端的像素 */
-  | { MouseDelta: { dx: number; dy: number } }
-  | { MouseButton: { button: MouseButton; down: boolean } }
-  | { Wheel: { dx: number; dy: number } }
-  | { Key: { code: string; down: boolean } }
-  | { Text: { text: string } }
-  | { System: { action: SystemAction } }
-  | "ReleaseAll";
+  | { type: "mouseDelta"; dx: number; dy: number }
+  | { type: "mouseButton"; button: MouseButton; down: boolean }
+  | { type: "wheel"; dx: number; dy: number }
+  | { type: "key"; code: string; down: boolean }
+  | { type: "text"; text: string }
+  /** 触摸点（只发给能接收触摸的被控端；控制台用鼠标，不发） */
+  | { type: "touch"; id: number; phase: TouchPhase; x: number; y: number }
+  | { type: "system"; action: SystemAction }
+  | { type: "releaseAll" };
 
 /** 对会话的操作，与 airhand_link::controller::Command 对应（JSON 以 cmd 区分） */
 export type Command =
@@ -248,7 +262,7 @@ export type Command =
 
 /** 会话的输出 */
 export interface SessionSink {
-  /** 媒体包：画面 / 光标 / 声音（24 字节头 + 数据，见 media.ts） */
+  /** 媒体包：画面 / 光标 / 声音（头 + 数据，见 media.ts） */
   packet(data: Uint8Array): void;
   event(ev: SessionEvent): void;
 }
@@ -261,14 +275,8 @@ export interface Backend {
   serverStatus(): Promise<ServerState>;
   /** 返回取消订阅的函数 */
   onServerStatus(cb: (s: ServerState) => void): () => void;
-  /** `opts`：重连凭证、记下的对方公钥、配对码（见 ConnectOptions） */
-  connect(
-    code: string,
-    opts: ConnectOptions,
-    settings: QualitySettings,
-    sink: SessionSink,
-    clipboard: boolean,
-  ): Promise<SessionInfo>;
+  /** `opts`：重连凭证、记下的对方公钥、配对码、开始时的画质和声音（见 ConnectOptions） */
+  connect(code: string, opts: ConnectOptions, sink: SessionSink, clipboard: boolean): Promise<SessionInfo>;
   /** 在等的被控端（connect 返回过 hostOffline）重新上线了，参数是控制码（数字）。返回取消订阅的函数 */
   onHostOnline(cb: (code: number) => void): () => void;
   /** 对会话的操作（画面的确认由 Backend 在收到画面时自己发） */

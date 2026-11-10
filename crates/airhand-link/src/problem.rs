@@ -59,7 +59,8 @@ pub enum Problem {
     PairingFailed,
     /// 对方现在不接受配对（有人多次输错了配对码，要对方的用户换一个配对码）
     PairingUnavailable,
-    /// 和对方的会话版本不兼容。`peer` 比 `ours` 大：要更新本机的 Airhand；否则要对方更新
+    /// 和对方的协议不兼容（会话版本，或者对方不会本机用的端到端握手模式）。`peer` 比 `ours` 大：要更新本机的 Airhand；
+    /// 否则要对方更新。数字只用来比较（会话版本或者握手模式的编号）
     PeerIncompatible { peer: u16, ours: u16 },
 
     // ── 会话 ──
@@ -162,7 +163,7 @@ impl fmt::Display for Problem {
             }
             Problem::PeerIncompatible { peer, ours } => write!(
                 f,
-                "incompatible session protocol (host {peer}, this computer {ours})"
+                "incompatible end-to-end protocol (host {peer}, this computer {ours})"
             ),
             Problem::HostEnded => f.write_str("the host ended the session"),
             Problem::HostUnresponsive => f.write_str("the host stopped responding"),
@@ -191,6 +192,10 @@ impl From<ConnectError> for Problem {
             ConnectError::Busy => Problem::HostBusy,
             ConnectError::Offline => Problem::HostOffline,
             ConnectError::Revoked => Problem::Kicked,
+            // 服务器的版本更新，拒绝的原因这边不认识
+            ConnectError::Unknown(n) => {
+                Problem::failed(format!("the server refused the connection (reason {n})"))
+            }
         }
     }
 }
@@ -202,7 +207,8 @@ impl From<ByeReason> for Problem {
             ByeReason::CodeChanged => Problem::CodeChanged,
             ByeReason::Declined => Problem::Declined,
             ByeReason::Unanswered => Problem::Unanswered,
-            ByeReason::Other => Problem::HostEnded,
+            // 对方版本新增的原因：会话照样结束
+            ByeReason::Unknown(_) => Problem::HostEnded,
         }
     }
 }

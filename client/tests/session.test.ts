@@ -21,7 +21,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
     fitSize, stricter, viewMaxShort, media,
     toProblem: (e: any) => e,
     api: {
-      connect: (c: any, o: any, _s: any, output: any) => {
+      connect: (c: any, o: any, output: any) => {
         sink = output;
         return connect ? connect(c, o.resume, o) : new Promise(res => { resolve = res; });
       },
@@ -38,7 +38,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
     video: { reset() {} }, audio: { reset() {} }, sync: { reset() {} }, input: { reset() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
     onlineAt: -1, attemptAt: 0, retries: 0,
-    emit() {}, syncAudio() {}, onConnected() { calls.push("connected"); },
+    emit() {}, syncAudio() {}, applySyncState() {}, onConnected() { calls.push("connected"); },
   });
   return { session, calls, timers, event: (ev: any) => sink.event(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
 }
@@ -60,10 +60,10 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
   const s = h.session;
   Object.assign(s, {
     sid: 7, scaleMode: "fit", interactive: true,
-    settings: { fps: 30, bitrate_kbps: 4000, max_short: 1080, adaptive: true, codec: "H264" },
+    settings: { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: "h264" },
     displays: [{ index: 0, width: 2880, height: 1800 }], viewport: { w: 1600, h: 1000 },
   });
-  const sent = () => h.calls.filter((c) => c[0] === "settings").map((c) => c[2].max_short);
+  const sent = () => h.calls.filter((c) => c[0] === "settings").map((c) => c[2].maxShort);
 
   s.updateViewLimit();
   assert.deepEqual(sent(), [1000], "空闲时马上发");
@@ -80,12 +80,12 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
   assert.deepEqual(sent(), [1000, 850]);
 
   // 用户选的上限更严时按用户的
-  s.settings = { ...s.settings, max_short: 720 };
+  s.settings = { ...s.settings, maxShort: 720 };
   s.pushSettings();
   assert.equal(sent().at(-1), 720);
 
   // 原始大小：不按窗口限制
-  s.settings = { ...s.settings, max_short: 0 };
+  s.settings = { ...s.settings, maxShort: 0 };
   s.scaleMode = "native";
   s.viewLimitAt = -Infinity;
   s.updateViewLimit();
@@ -93,6 +93,40 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
 });
 
 const granted = { sid: 7, resume: [9], hostName: "host", hostOs: "Windows", hostKey: "ab".repeat(32), safety: "123-456" };
+
+test("开始时的画质和要不要声音在连接选项里（对方在握手里就知道），连上之后不再另外发", async () => {
+  let opts: any;
+  const h = sessionHarness(async (_code, _resume, o) => {
+    opts = o;
+    return granted;
+  });
+  const s = h.session;
+  let enabled = 0;
+  const settings = { fps: 60, bitrateKbps: 8000, maxShort: 1080, adaptive: true, codec: "h265" };
+  Object.assign(s, {
+    settings, audioEnabled: true, foreground: true, audioOn: false,
+    audio: { reset() {}, enable() { enabled++; }, disable() {} },
+  });
+  // 用真正的 syncAudio：连上之后声音已经开着，不用再发 audio 命令
+  delete s.syncAudio;
+  await s.start();
+  // 沙箱里建的对象原型不同，按 JSON 比较
+  assert.deepEqual(JSON.parse(JSON.stringify(opts.settings)), settings);
+  assert.equal(opts.audio, true);
+  assert.equal(s.audioOn, true);
+  assert.equal(enabled, 1);
+  assert.deepEqual(h.calls.filter((c) => Array.isArray(c) && (c[0] === "audio" || c[0] === "settings")), []);
+
+  // 不在前台（例如切到了别的标签）：开始时不要声音
+  let opts2: any;
+  const h2 = sessionHarness(async (_code, _resume, o) => {
+    opts2 = o;
+    return granted;
+  });
+  Object.assign(h2.session, { settings, audioEnabled: true, foreground: false });
+  await h2.session.start();
+  assert.equal(opts2.audio, false);
+});
 
 test("端到端：记下对方的公钥、之后只认它；要配对码时不自动重连，输入之后带着它连一次", async () => {
   const tried: any[] = [];
@@ -174,6 +208,7 @@ test("光标形状按槽位缓存：只带槽位的包换成缓存里的形状�
     b[0] = media.CURSOR;
     b[1] = flags;
     b[2] = slot;
+    b[3] = media.HEADER_LEN;
     const dv = new DataView(b.buffer);
     dv.setUint16(8, w, true);
     dv.setUint16(10, w, true);

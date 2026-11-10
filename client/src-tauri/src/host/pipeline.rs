@@ -48,13 +48,15 @@ struct Ctrl {
 }
 
 impl Pipeline {
-    /// `video`：画面流的发送队列；`control`：控制流（光标、编码器、采集失败的提示）；
-    /// `cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
+    /// `video`：画面流的发送队列；`control`：控制流（编码器、采集失败的提示）；`bulk`：大块通道（光标，
+    /// 形状图像有几十 KB，不能挡控制消息）；`cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         display: u8,
         settings: QualitySettings,
         video: mpsc::Sender<Bytes>,
         control: Control,
+        bulk: Control,
         flow: Arc<Flow>,
         cursors: Arc<Mutex<CursorCache>>,
     ) -> Self {
@@ -69,7 +71,7 @@ impl Pipeline {
         let c = ctrl.clone();
         let thread = std::thread::Builder::new()
             .name("airhand-encoder".into())
-            .spawn(move || run(c, display, video, control))
+            .spawn(move || run(c, display, video, control, bulk))
             .expect("spawn encoder");
         Self {
             ctrl,
@@ -122,7 +124,7 @@ fn send_cancellable(out: &mpsc::Sender<Bytes>, stop: &AtomicBool, mut bytes: Byt
     }
 }
 
-fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control) {
+fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control, bulk: Control) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
@@ -132,6 +134,8 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
     // 硬件编码器连续失败时改用软件编码
     let mut hw_failures = 0u32;
     let (mut frame_seq, mut cursor_seq, mut shape_seq) = (0u64, 0u64, 0u64);
+    // 光标有变化还没发出去（大块通道的队列满了）：下一轮再发最新的
+    let mut cursor_pending = false;
     let mut last_frame: Option<Arc<Frame>> = None;
     let mut next_due = Instant::now();
     let mut abr = Abr::new(settings.bitrate_kbps);
@@ -141,8 +145,9 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
     let mut refine_due = Instant::now();
     info!(screen, ?settings, "encoding pipeline started");
 
-    // 队列满了（网络跟不上）就等着，直到管线被停下
+    // 控制流的队列满了（网络跟不上）就等着，直到管线被停下
     let send = |msg: &HostMsg| send_cancellable(control.queue(), &ctrl.stop, Control::encode(msg));
+    let notice = |n: Notice| send(&HostMsg::Notice(Some(n)));
 
     while !ctrl.stop.load(Ordering::Acquire) {
         let v = ctrl.settings_ver.load(Ordering::Acquire);
@@ -173,25 +178,37 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
         };
         let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
 
-        // 光标变化：只发送可见性 +（如有变化）形状。控制端已经有的形状（动画光标循环到的帧）只发槽位
+        // 光标变化：只发送可见性 +（如有变化）形状。控制端已经有的形状（动画光标循环到的帧）只发槽位。
+        // 走大块通道，和剪贴板共用、和画面分带宽：队列满了不等（不能让编码线程卡在一个大剪贴板后面），
+        // 下一轮（最多 40 ms 之后）再发那时最新的状态
         if cs > cursor_seq {
             cursor_seq = cs;
+            cursor_pending = true;
+        }
+        if cursor_pending {
             let c = slot.cursor();
             let shape = match &c.shape {
                 Some(s) if c.shape_seq > shape_seq => Some(ctrl.cursors.lock().unwrap().place(s)),
                 _ => None,
             };
-            shape_seq = c.shape_seq;
             let msg = HostMsg::Cursor(CursorState {
                 visible: c.visible,
                 shape,
             });
-            if !send(&msg) {
-                // 没发出去：控制端没有这个形状，下次还得带图像
-                if let HostMsg::Cursor(CursorState { shape: Some(s), .. }) = &msg {
-                    ctrl.cursors.lock().unwrap().forget(s);
+            match bulk.queue().try_send(Control::encode(&msg)) {
+                Ok(()) => {
+                    shape_seq = c.shape_seq;
+                    cursor_pending = false;
                 }
-                break;
+                Err(e) => {
+                    // 没发出去：控制端没有这个形状，下次还得带图像
+                    if let HostMsg::Cursor(CursorState { shape: Some(s), .. }) = &msg {
+                        ctrl.cursors.lock().unwrap().forget(s);
+                    }
+                    if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -200,9 +217,9 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
             if let Some(err) = slot.error()
                 && reported_error.as_ref() != Some(&err)
             {
-                if !send(&HostMsg::Notice(Notice::CaptureFailed {
+                if !notice(Notice::CaptureFailed {
                     detail: err.clone(),
-                })) {
+                }) {
                     break;
                 }
                 reported_error = Some(err);
@@ -218,7 +235,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
             }
         } else if reported_error.take().is_some() {
             // 报告过采集失败，现在又有新画面了：让控制端撤下提示
-            if !send(&HostMsg::Notice(Notice::CaptureRecovered)) {
+            if !notice(Notice::CaptureRecovered) {
                 break;
             }
         }

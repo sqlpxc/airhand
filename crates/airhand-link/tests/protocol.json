@@ -5,12 +5,13 @@
       "cmd": "input",
       "events": [
         {
-          "MouseDelta": {
-            "dx": 1,
-            "dy": 2
-          }
+          "dx": 1,
+          "dy": 2,
+          "type": "mouseDelta"
         },
-        "ReleaseAll"
+        {
+          "type": "releaseAll"
+        }
       ],
       "sid": 3
     },
@@ -18,10 +19,10 @@
       "cmd": "settings",
       "settings": {
         "adaptive": true,
-        "bitrate_kbps": 8000,
-        "codec": "H265",
+        "bitrateKbps": 8000,
+        "codec": "h265",
         "fps": 60,
-        "max_short": 1080
+        "maxShort": 1080
       },
       "sid": 3
     },
@@ -59,63 +60,87 @@
       "sid": 3
     }
   ],
+  "connectOptions": {
+    "audio": true,
+    "hostKey": "abababababababababababababababababababababababababababababababab",
+    "pairing": "482913",
+    "resume": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ],
+    "settings": {
+      "adaptive": true,
+      "bitrateKbps": 8000,
+      "codec": "h265",
+      "fps": 60,
+      "maxShort": 1080
+    }
+  },
   "input": [
     {
-      "MouseMove": {
-        "x": 0.5,
-        "y": 0.25
-      }
+      "type": "mouseMove",
+      "x": 0.5,
+      "y": 0.25
     },
     {
-      "MouseDelta": {
-        "dx": -3,
-        "dy": 7
-      }
+      "dx": -3,
+      "dy": 7,
+      "type": "mouseDelta"
     },
     {
-      "MouseButton": {
-        "button": "Right",
-        "down": true
-      }
+      "button": "right",
+      "down": true,
+      "type": "mouseButton"
     },
     {
-      "Wheel": {
-        "dx": 0,
-        "dy": -120
-      }
+      "dx": 0,
+      "dy": -120,
+      "type": "wheel"
     },
     {
-      "Key": {
-        "code": "KeyA",
-        "down": false
-      }
+      "code": "KeyA",
+      "down": false,
+      "type": "key"
     },
     {
-      "Text": {
-        "text": "你好"
-      }
-    },
-    "ReleaseAll",
-    {
-      "Touch": {
-        "id": 1,
-        "phase": "Down",
-        "x": 0.25,
-        "y": 0.75
-      }
+      "text": "你好",
+      "type": "text"
     },
     {
-      "System": {
-        "action": "Back"
-      }
+      "type": "releaseAll"
+    },
+    {
+      "id": 1,
+      "phase": "down",
+      "type": "touch",
+      "x": 0.25,
+      "y": 0.75
+    },
+    {
+      "action": "back",
+      "type": "system"
     }
   ],
   "media": [
     {
       "captureUs": 123456789012,
-      "codec": "AV1",
+      "codec": "av1",
       "height": 1080,
-      "hex": "01010200090000008007380400000000141a99be1c000000070809",
+      "hex": "01010218090000008007380400000000141a99be1c000000070809",
       "key": true,
       "kind": 1,
       "name": "keyframe",
@@ -125,9 +150,9 @@
     },
     {
       "captureUs": 123456805679,
-      "codec": "H265",
+      "codec": "h265",
       "height": 720,
-      "hex": "010001000a0000000005d002000000002f5b99be1c00000001",
+      "hex": "010001180a0000000005d002000000002f5b99be1c00000001",
       "key": false,
       "kind": 1,
       "name": "delta frame",
@@ -137,7 +162,7 @@
     },
     {
       "captureUs": 123456809012,
-      "hex": "03010000030000000000000000000000346899be1c000000fcfffe",
+      "hex": "03010018030000000000000000000000346899be1c000000fcfffe",
       "kind": 3,
       "name": "audio",
       "payload": "fcfffe",
@@ -146,7 +171,7 @@
     },
     {
       "cached": false,
-      "hex": "020307000000000002000100010000000000000000000000ff0000ff0000ff80",
+      "hex": "020307180000000002000100010000000000000000000000ff0000ff0000ff80",
       "kind": 2,
       "name": "cursor",
       "payload": "ff0000ff0000ff80",
@@ -161,7 +186,7 @@
     },
     {
       "cached": true,
-      "hex": "020507000000000000000000000000000000000000000000",
+      "hex": "020507180000000000000000000000000000000000000000",
       "kind": 2,
       "name": "cached cursor",
       "payload": "",
@@ -171,13 +196,22 @@
     },
     {
       "cached": false,
-      "hex": "020000000000000000000000000000000000000000000000",
+      "hex": "020000180000000000000000000000000000000000000000",
       "kind": 2,
       "name": "hidden cursor",
       "payload": "",
       "shape": null,
       "slot": 0,
       "visible": false
+    },
+    {
+      "captureUs": 123456829012,
+      "hex": "0300002004000000000000000000000054b699be1c000000eeeeeeeeeeeeeeeeabcd",
+      "kind": 3,
+      "name": "audio with a longer header from a newer version",
+      "payload": "abcd",
+      "seq": 4,
+      "start": false
     }
   ]
 }

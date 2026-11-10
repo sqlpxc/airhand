@@ -13,7 +13,7 @@ import {
   restoreDevice,
 } from "../src/lib/devices.ts";
 
-const q = { fps: 30, bitrate_kbps: 4000, max_short: 1080, adaptive: true, codec: "H264" as const };
+const q = { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: "h264" as const };
 const seen = (code: string, name = `PC-${code}`) => ({ code, name, os: "Windows 11", resume: [1, 2, 3], quality: q });
 
 test("连上就记下，最近的在前面，再连一次只是更新", () => {

@@ -7,7 +7,7 @@
 //! alias = "设计部"
 //! os = "Windows 11 Pro"
 //! last_used = 2026-11-08T10:20:30Z
-//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "H264" }
+//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264" }
 //! resume = "q83vEjRWeJCrze8SNFZ4kA=="
 //! host_key = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 //! ```
@@ -151,12 +151,8 @@ fn from_table(t: &Table) -> Option<Device> {
 fn quality_from(item: &Item) -> Option<QualitySettings> {
     let t = item.as_table_like()?;
     let int = |k: &str| t.get(k).and_then(Item::as_integer);
-    let codec = match t.get("codec").and_then(Item::as_str)? {
-        "H264" => Codec::H264,
-        "H265" => Codec::H265,
-        "AV1" => Codec::AV1,
-        _ => return None,
-    };
+    // 和界面的 JSON 一样的名字（"h264"）；之前的版本写的是 "H264"，也认
+    let codec = Codec::from_name(&t.get("codec").and_then(Item::as_str)?.to_ascii_lowercase())?;
     Some(QualitySettings {
         fps: u8::try_from(int("fps")?).ok().filter(|f| (1..=120).contains(f))?,
         bitrate_kbps: u32::try_from(int("bitrate_kbps")?).ok()?,
@@ -227,12 +223,7 @@ pub fn to_table(d: &Device) -> Option<Table> {
         it.insert("adaptive", q.adaptive.into());
         it.insert(
             "codec",
-            match q.codec {
-                Codec::H264 => "H264",
-                Codec::H265 => "H265",
-                Codec::AV1 => "AV1",
-            }
-            .into(),
+            q.codec.or_h264().name().unwrap_or("h264").into(),
         );
         t["quality"] = toml_edit::value(it);
     }
@@ -361,17 +352,23 @@ last_used = 2026-01-02T03:04:05Z
 quality = { fps = 999, bitrate_kbps = 1, max_short = 0, adaptive = true, codec = "H264" }
 
 [[device]]
+code = "777777"
+quality = { fps = 30, bitrate_kbps = 4000, max_short = 720, adaptive = false, codec = "H265" }
+
+[[device]]
 name = "no code"
 "#
         .parse()
         .unwrap();
         let list = entries(&doc);
-        assert_eq!(list.len(), 2);
+        assert_eq!(list.len(), 3);
         assert_eq!(list[0].code, "123456");
         assert_eq!(list[1].name, "Mac");
         assert!(list[1].last_used > 0);
         // 帧率超出范围：画质整个不要，用控制台的默认
         assert_eq!(list[1].quality, None);
+        // 之前的版本写的编码格式是 "H265" 这样的：照样认
+        assert_eq!(list[2].quality.map(|q| q.codec), Some(Codec::H265));
         assert!(list.into_iter().all(|d| open(d).is_some()));
     }
 

@@ -13,18 +13,24 @@
 //! 消息是 minicbor 派生的 CBOR：每个枚举变体、每个字段都有一个**显式的编号**（`#[n(…)]`），线上只有编号，
 //! 没有名字，也和声明的先后无关。编号一旦发布就不能改、不能复用。
 //!
-//! * **不认识的消息跳过，不断开**：一条消息（顶层的枚举变体）不认识、或者里面有不认识的枚举变体，[`decode`] 返回
-//!   [`Decoded::Unknown`]，读的一方跳过它（帧有长度，跳过不会错位）。认识但是解不出来的是协议错误，照样断开
-//!   （那是 bug，不能悄悄吞掉）；
+//! * **不认识的消息跳过，不断开**：一条消息**本身**（顶层的枚举变体）不认识，[`decode`] 返回 [`Decoded::Unknown`]，
+//!   读的一方跳过它（帧有长度，跳过不会错位）。认识这条消息、但是里面有解不出来的东西（包括没标明可以跳过的地方
+//!   出现了不认识的变体）是协议错误，照样断开：那是 bug，不能悄悄吞掉——例如被控端的 `Hello` 里多了一个新的枚举值，
+//!   旧的控制端要是把整条 `Hello` 跳过，会话就卡在那里，也没有任何报错；
 //! * **加字段**：只能加 `Option` 字段（或者带 `#[cbor(default)]` 的）。旧版本不认识新字段，跳过；
 //!   新版本读旧版本的消息，缺的字段是 `None`。必填的字段要永远存在；
-//! * **枚举加变体**：作为一整条消息时，旧版本跳过整条消息；作为字段时写成 `Option<枚举>`（不认识的是 `None`），
-//!   或者用 [`crate::cbor::or_default`] 换成默认值；在列表里用 [`crate::cbor::open_vec`]，只跳过不认识的元素；
+//! * **枚举加值**：只有编号的枚举都是开放枚举（`open_enum!`，见 [`crate::cbor`]），不认识的值是 `Unknown(原值)`，
+//!   放在哪里都不会出错，由收的一方决定怎么对待；
+//! * **带字段的枚举加变体**：作为一整条消息时，旧版本跳过整条消息；作为字段时写成 `Option<枚举>` 并且用
+//!   [`crate::cbor::opt`]（不认识的是 `None`）；在列表里用 [`crate::cbor::open_vec`]，只跳过不认识的元素。
+//!   只有这三个地方能跳过，别的地方不能放带字段的枚举（为什么见 [`crate::cbor`]）；
 //! * **对方可能不认识的新消息**：只在对方的能力位（[`crate::Features`]）表明它认识时才发。
 //!
 //! 只有改不下去的时候（例如要删掉必填字段）才加版本号（[`crate::SIGNAL_VERSION`] / [`crate::SESSION_VERSION`]）。
 
 use minicbor::{Decode, Encode};
+
+use crate::cbor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
@@ -63,22 +69,25 @@ pub fn to_vec<T: Encode<()>>(msg: &T) -> Vec<u8> {
 #[derive(Debug)]
 pub enum Decoded<T> {
     Msg(T),
-    /// 对方版本新增的消息（或者里面有新增的枚举变体）：跳过
-    Unknown,
+    /// 对方版本新增的消息（顶层的变体不认识）：跳过。带着变体的编号（日志用）
+    Unknown(i64),
 }
 
-/// 解码一条消息的负载（不带长度前缀）。不认识的返回 [`Decoded::Unknown`]，解不出来的是错误（见模块说明）
+/// 解码一条消息的负载（不带长度前缀）。消息本身不认识的返回 [`Decoded::Unknown`]，
+/// 其它解不出来的（包括里面没标明可以跳过的地方有不认识的变体）是错误（见模块说明）
 pub fn decode<'b, T: Decode<'b, ()>>(payload: &'b [u8]) -> Result<Decoded<T>, FrameError> {
     match minicbor::decode(payload) {
         Ok(m) => Ok(Decoded::Msg(m)),
-        Err(e) if e.is_unknown_variant() => Ok(Decoded::Unknown),
-        Err(e) => Err(e.into()),
+        Err(e) if cbor::unknown_here(&e, payload) => Ok(Decoded::Unknown(
+            cbor::variant_of(payload).unwrap_or_default(),
+        )),
+        Err(e) => Err(cbor::strict(e).into()),
     }
 }
 
 /// 解码一条一定认识的消息（握手这类没有"跳过"可言的）
 pub fn decode_known<'b, T: Decode<'b, ()>>(payload: &'b [u8]) -> Result<T, FrameError> {
-    Ok(minicbor::decode(payload)?)
+    minicbor::decode(payload).map_err(|e| cbor::strict(e).into())
 }
 
 /// 写一帧：长度前缀 + `payload`
@@ -159,8 +168,12 @@ where
         }
         match decode(buf)? {
             Decoded::Msg(m) => return Ok(Some(m)),
-            Decoded::Unknown => {
-                tracing::debug!(len = buf.len(), "skipping a message from a newer version");
+            Decoded::Unknown(variant) => {
+                tracing::debug!(
+                    variant,
+                    len = buf.len(),
+                    "skipping a message from a newer version"
+                );
             }
         }
     }
@@ -199,17 +212,17 @@ mod tests {
     async fn roundtrip() {
         let msgs = vec![
             HostMsg::Pong { t: 99 },
-            HostMsg::Notice(Notice::CaptureFailed {
+            HostMsg::Notice(Some(Notice::CaptureFailed {
                 detail: "AcquireNextFrame: 0x887A0026".into(),
-            }),
-            HostMsg::Notice(Notice::MissingPermissions {
+            })),
+            HostMsg::Notice(Some(Notice::MissingPermissions {
                 screen: true,
                 input: false,
-            }),
-            HostMsg::Notice(Notice::AudioFailed {
+            })),
+            HostMsg::Notice(Some(Notice::AudioFailed {
                 detail: "no default audio output device".into(),
-            }),
-            HostMsg::Notice(Notice::AudioRecovered),
+            })),
+            HostMsg::Notice(Some(Notice::AudioRecovered)),
             HostMsg::Bye(ByeReason::CodeChanged),
             HostMsg::Cursor(CursorState {
                 visible: false,
@@ -237,7 +250,7 @@ mod tests {
         assert!(c.is_none());
     }
 
-    /// 对方版本新增的消息：跳过，后面的照常读；认识但解不出来的是错误
+    /// 对方版本新增的消息：跳过，后面的照常读；新的提示是 None；认识但解不出来的是错误
     #[tokio::test]
     async fn unknown_messages_are_skipped() {
         #[derive(minicbor::Encode)]
@@ -256,15 +269,26 @@ mod tests {
         #[derive(minicbor::Encode)]
         enum Smell {
             #[n(99)]
-            Burnt,
+            Burnt {
+                #[n(0)]
+                how: u32,
+            },
         }
         let mut wire = encode(&Future::Hologram { depth: 3 });
-        wire.extend(encode(&FutureNotice::Notice(Smell::Burnt)));
+        wire.extend(encode(&FutureNotice::Notice(Smell::Burnt { how: 1 })));
         wire.extend(encode(&HostMsg::Pong { t: 5 }));
         let mut r = &wire[..];
         let mut buf = Vec::new();
         let m: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        assert!(matches!(m, HostMsg::Notice(None)), "{m:?}");
+        let m: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
         assert!(matches!(m, HostMsg::Pong { t: 5 }));
+        let Decoded::<HostMsg>::Unknown(v) =
+            decode(&to_vec(&Future::Hologram { depth: 3 })).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(v, 200);
 
         // Pong 的必填字段是个字符串：认识的消息解不出来，是错误
         #[derive(minicbor::Encode)]
@@ -278,6 +302,50 @@ mod tests {
         let wire = encode(&Broken::Pong { t: "x".into() });
         let r: Result<Option<HostMsg>, _> = read_msg(&mut &wire[..], 1 << 20, &mut buf).await;
         assert!(matches!(r, Err(FrameError::Decode(_))));
+    }
+
+    /// 认识的消息里、没标明可以跳过的地方有不认识的变体：是错误，不是把整条消息悄悄跳过
+    /// （例如 Hello 里多了一个新的带字段的枚举，忘了标明：旧版本要是跳过整条 Hello，会话就卡住了，也没有报错）
+    #[test]
+    fn unknown_variants_inside_known_messages_are_errors() {
+        #[derive(minicbor::Encode, minicbor::Decode, Debug)]
+        enum Old {
+            #[n(1)]
+            Hello(#[n(0)] OldShape),
+        }
+        #[derive(minicbor::Encode, minicbor::Decode, Debug)]
+        enum OldShape {
+            #[n(0)]
+            Square {
+                #[n(0)]
+                side: u32,
+            },
+        }
+        #[derive(minicbor::Encode)]
+        enum New {
+            #[n(1)]
+            Hello(#[n(0)] NewShape),
+        }
+        #[derive(minicbor::Encode)]
+        enum NewShape {
+            #[n(1)]
+            Circle {
+                #[n(0)]
+                r: u32,
+            },
+        }
+        let wire = to_vec(&New::Hello(NewShape::Circle { r: 1 }));
+        assert!(matches!(decode::<Old>(&wire), Err(FrameError::Decode(_))));
+        // 消息本身不认识才跳过
+        #[derive(minicbor::Encode)]
+        enum Newer {
+            #[n(2)]
+            Bye,
+        }
+        assert!(matches!(
+            decode::<Old>(&to_vec(&Newer::Bye)),
+            Ok(Decoded::Unknown(2))
+        ));
     }
 
     #[tokio::test]
@@ -389,6 +457,7 @@ mod tests {
             ServerMsg::connect_result(6, Err(ConnectError::Offline)),
             ServerMsg::connect_result(7, Err(ConnectError::Revoked)),
             ServerMsg::connect_result(8, Err(ConnectError::Busy)),
+            ServerMsg::connect_result(10, Err(ConnectError::Unknown(77))),
             ServerMsg::Incoming {
                 session_id: 9,
                 peer: peer("10.0.0.7"),

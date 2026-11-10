@@ -1,5 +1,6 @@
 package app.airhand.android.ui.session
 
+import app.airhand.android.controller.Input
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
@@ -59,7 +60,7 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
         fun ripple(x: Float, y: Float)
         fun toggleKeyboard()
 
-        /** 触摸点（多点触摸方式）。`phase` 是 Down / Move / Up / Cancel，`id` 是 0..9 */
+        /** 触摸点（多点触摸方式）。`phase` 是 [DOWN] / [MOVE] / [UP] / [CANCEL]，`id` 是 0..9 */
         fun touch(id: Int, phase: String, nx: Float, ny: Float)
     }
 
@@ -520,12 +521,13 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
     }
 
     companion object {
-        const val LEFT = "Left"
-        const val RIGHT = "Right"
-        const val DOWN = "Down"
-        const val MOVE = "Move"
-        const val UP = "Up"
-        const val CANCEL = "Cancel"
+        // 和输入事件里的名字一样（Input，JSON 里是 camelCase）
+        const val LEFT = Input.LEFT
+        const val RIGHT = Input.RIGHT
+        const val DOWN = Input.DOWN
+        const val MOVE = Input.MOVE
+        const val UP = Input.UP
+        const val CANCEL = Input.CANCEL
 
         /** 同时传给对方的触摸点上限（协议的 MAX_TOUCH_POINTS） */
         const val MAX_TOUCH = 10

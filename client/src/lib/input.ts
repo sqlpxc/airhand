@@ -4,7 +4,7 @@
 // 鼠标有两种方式（见 airhand_proto::session 的模块说明）：
 // * 绝对坐标（平时）：本机指针在画面的哪里，被控端的光标就在哪里；
 // * 相对移动（被控端的光标隐藏了，例如游戏里按住右键转视角、第一人称游戏；或者用户手动锁定了鼠标）：
-//   发移动了多少（MouseDelta）。这时尽量锁定本机指针（Pointer Lock）：指针不会碰到屏幕边就停下，
+//   发移动了多少（mouseDelta）。这时尽量锁定本机指针（Pointer Lock）：指针不会碰到屏幕边就停下，
 //   移动量也是鼠标的原始计数（unadjustedMovement）。锁定不了（浏览器不支持、被拒绝）也照样发相对移动。
 //
 // 什么时候锁定：
@@ -20,7 +20,7 @@ const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform
 const META_KEYS = new Set(["MetaLeft", "MetaRight"]);
 const MODIFIERS = new Set(["ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Fn"]);
 /** PointerEvent.buttons 的位 → 鼠标键 */
-const BUTTON_BITS: [number, MouseButton][] = [[1, "Left"], [2, "Right"], [4, "Middle"], [8, "Back"], [16, "Forward"]];
+const BUTTON_BITS: [number, MouseButton][] = [[1, "left"], [2, "right"], [4, "middle"], [8, "back"], [16, "forward"]];
 /** 被控端光标隐藏着、只是移动（没按键）时，持续这么久光标还是隐藏的才锁定（见文件开头） */
 const AUTO_LOCK_AFTER_MS = 300;
 
@@ -114,7 +114,7 @@ export class RemoteInput {
     this.unlock();
   }
   dispose() { this.manual = false; this.reset(); this.abort.abort(); }
-  releaseAll() { this.pressed.clear(); this.buttons = 0; this.enqueue(["ReleaseAll"], true); }
+  releaseAll() { this.pressed.clear(); this.buttons = 0; this.enqueue([{ type: "releaseAll" }], true); }
   focus() { this.canvas.focus({ preventScroll: true }); }
 
   enqueue(events: InputEvent[], urgent: boolean) {
@@ -122,12 +122,10 @@ export class RemoteInput {
     for (const event of events) {
       const last = this.queue[this.queue.length - 1];
       // 连续的绝对移动只留最后一个，连续的相对移动加起来（不越过点击和按键）
-      if (typeof event === "object" && typeof last === "object" && "MouseMove" in event && "MouseMove" in last) {
+      if (event.type === "mouseMove" && last?.type === "mouseMove") {
         this.queue[this.queue.length - 1] = event;
-      } else if (typeof event === "object" && typeof last === "object" && "MouseDelta" in event && "MouseDelta" in last) {
-        this.queue[this.queue.length - 1] = {
-          MouseDelta: { dx: last.MouseDelta.dx + event.MouseDelta.dx, dy: last.MouseDelta.dy + event.MouseDelta.dy },
-        };
+      } else if (event.type === "mouseDelta" && last?.type === "mouseDelta") {
+        this.queue[this.queue.length - 1] = { type: "mouseDelta", dx: last.dx + event.dx, dy: last.dy + event.dy };
       } else this.queue.push(event);
       // Bound even a synchronous sendText loop. Keyboard edges stay ordered.
       if (this.queue.length >= 64) this.flush();
@@ -228,7 +226,7 @@ export class RemoteInput {
     const dx = Math.trunc(this.frac.x), dy = Math.trunc(this.frac.y);
     if (!dx && !dy) return;
     this.frac.x -= dx; this.frac.y -= dy;
-    this.enqueue([{ MouseDelta: { dx, dy } }], false);
+    this.enqueue([{ type: "mouseDelta", dx, dy }], false);
   }
 
   // ───────────────────────── 事件 ─────────────────────────
@@ -244,7 +242,7 @@ export class RemoteInput {
     const out: InputEvent[] = [];
     const changed = now ^ this.buttons;
     for (const [bit, button] of BUTTON_BITS) {
-      if (changed & bit) out.push({ MouseButton: { button, down: (now & bit) !== 0 } });
+      if (changed & bit) out.push({ type: "mouseButton", button, down: (now & bit) !== 0 });
     }
     this.buttons = now;
     return out;
@@ -265,7 +263,7 @@ export class RemoteInput {
       return;
     }
     // 绝对坐标：先移到按下 / 松开的位置
-    this.enqueue([{ MouseMove: this.pos(e) }, ...buttons], urgent || buttons.length > 0);
+    this.enqueue([{ type: "mouseMove", ...this.pos(e) }, ...buttons], urgent || buttons.length > 0);
   }
 
   private bind() {
@@ -308,7 +306,7 @@ export class RemoteInput {
       if (!dx && !dy) return;
       this.wheel.x -= dx; this.wheel.y -= dy;
       const clamp = (n: number) => Math.max(-32000, Math.min(32000, n));
-      this.enqueue([{ Wheel: { dx: clamp(dx), dy: clamp(dy) } }], true);
+      this.enqueue([{ type: "wheel", dx: clamp(dx), dy: clamp(dy) }], true);
     }, { passive: false });
     on("keydown", e => {
       if (!this._interactive) return;
@@ -322,7 +320,7 @@ export class RemoteInput {
       if (IS_MAC && e.code === "CapsLock") return this.tapCaps();
       if (e.repeat && !this.pressed.has(e.code)) return;
       this.pressed.add(e.code);
-      this.enqueue([{ Key: { code: e.code, down: true } }], true);
+      this.enqueue([{ type: "key", code: e.code, down: true }], true);
     });
     on("keyup", e => {
       if (!this._interactive) return;
@@ -336,16 +334,16 @@ export class RemoteInput {
         for (const code of this.pressed) {
           if (MODIFIERS.has(code)) continue;
           this.pressed.delete(code);
-          events.push({ Key: { code, down: false } });
+          events.push({ type: "key", code, down: false });
         }
       }
-      events.push({ Key: { code: e.code, down: false } });
+      events.push({ type: "key", code: e.code, down: false });
       this.enqueue(events, true);
     });
     on("blur", () => this.releaseAll());
   }
 
   private tapCaps() {
-    this.enqueue([{ Key: { code: "CapsLock", down: true } }, { Key: { code: "CapsLock", down: false } }], true);
+    this.enqueue([{ type: "key", code: "CapsLock", down: true }, { type: "key", code: "CapsLock", down: false }], true);
   }
 }

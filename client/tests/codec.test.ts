@@ -38,16 +38,16 @@ test("avcC：profile/level 来自 SPS，NAL 长度字段 4 字节", () => {
 
 test("编码格式优先级：AV1 > HEVC > H.264，取双方都支持的里最好的", () => {
   // 还不知道对方支持什么：只看本机能解码的
-  assert.equal(bestCodec(["H264", "H265", "AV1"]), "AV1");
-  assert.equal(bestCodec(["H264", "H265"]), "H265");
-  assert.equal(bestCodec(["H264"]), "H264");
+  assert.equal(bestCodec(["h264", "h265", "av1"]), "av1");
+  assert.equal(bestCodec(["h264", "h265"]), "h265");
+  assert.equal(bestCodec(["h264"]), "h264");
   // Mac 被控端没有 AV1 编码器：改用 HEVC，而不是让对方回退到 H.264
-  assert.equal(bestCodec(["H264", "H265", "AV1"], ["H264", "H265"]), "H265");
-  assert.equal(bestCodec(["H264", "AV1"], ["H264", "H265", "AV1"]), "AV1");
-  assert.equal(bestCodec(["H264", "AV1"], ["H264", "H265"]), "H264");
+  assert.equal(bestCodec(["h264", "h265", "av1"], ["h264", "h265"]), "h265");
+  assert.equal(bestCodec(["h264", "av1"], ["h264", "h265", "av1"]), "av1");
+  assert.equal(bestCodec(["h264", "av1"], ["h264", "h265"]), "h264");
   // H.264 双方都一定支持
-  assert.equal(bestCodec([], []), "H264");
-  assert.ok(codecUsable("H264", [], []));
-  assert.ok(!codecUsable("AV1", ["H264", "AV1"], ["H264", "H265"]));
-  assert.ok(codecUsable("H265", ["H264", "H265"], ["H264", "H265"]));
+  assert.equal(bestCodec([], []), "h264");
+  assert.ok(codecUsable("h264", [], []));
+  assert.ok(!codecUsable("av1", ["h264", "av1"], ["h264", "h265"]));
+  assert.ok(codecUsable("h265", ["h264", "h265"], ["h264", "h265"]));
 });

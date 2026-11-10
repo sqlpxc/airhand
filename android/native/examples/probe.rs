@@ -2,7 +2,7 @@
 //! 用来在电脑上测试 Android 被控端，不需要图形界面：
 //!
 //! ```text
-//! cargo run --example probe -- <控制码> [秒数] [--tap x,y] [--touch] [--pinch] [--action Back]
+//! cargo run --example probe -- <控制码> [秒数] [--tap x,y] [--touch] [--pinch] [--action back]
 //!                                [--text 文字] [--audio] [--server host:port] [--pairing 配对码]
 //! ```
 //!
@@ -143,14 +143,16 @@ fn main() {
         adaptive: true,
         codec: Codec::H264,
     };
+    // 开始时的画质和声音在握手里就告诉被控端
     let info = rt()
         .block_on(svc.connect(
             &code,
             ConnectOptions {
                 pairing: flag("--pairing"),
+                settings,
+                audio,
                 ..Default::default()
             },
-            settings,
             Arc::new(Ui(counters.clone(), slot.clone())),
             Frontend::Browser,
         ))
@@ -162,10 +164,6 @@ fn main() {
         svc.command(Command::Input { sid, events })
             .unwrap_or_else(|p| panic!("input failed: {p}"))
     };
-    if audio {
-        svc.command(Command::Audio { sid, enabled: true })
-            .unwrap_or_else(|p| panic!("audio failed: {p}"));
-    }
     // 被控端可能要先请它的用户同意：等到 Hello 再开始计时
     let asked = std::time::Instant::now();
     while !counters.hello.load(Ordering::Relaxed) {

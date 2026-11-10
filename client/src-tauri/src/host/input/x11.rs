@@ -103,6 +103,10 @@ impl X11Injector {
                     c.fake(xproto::MOTION_NOTIFY_EVENT, 1, clamp(*dx), clamp(*dy))?;
                 }
                 InputEvent::MouseButton { button, down } => {
+                    // 不认识的按钮（对方版本新增的）HostSession 已经滤掉了，这里再防一手
+                    if !button.is_known() {
+                        continue;
+                    }
                     if *down {
                         self.buttons.insert(*button);
                     } else if !self.buttons.remove(button) {
@@ -176,6 +180,8 @@ fn button_number(b: MouseButton) -> u8 {
         MouseButton::Right => 3,
         MouseButton::Back => 8,
         MouseButton::Forward => 9,
+        // 不会用到：不认识的按钮不注入（见 apply）
+        MouseButton::Unknown(_) => 0,
     }
 }
 

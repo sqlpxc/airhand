@@ -8,7 +8,7 @@
 //!   正在控制的设备、需不需要画面 / 声音、控制端发来的输入和剪贴板；
 //! * 画面的节奏由 [`video::VideoHub`] 控制（Kotlin 的渲染线程每一轮调用 `tick` 和 `wait_window`）。
 //!
-//! 与服务器的连接和会话的三条流和桌面版共用 [`airhand_link::host`]。控制码像桌面版一样固定
+//! 与服务器的连接和会话的各条通道和桌面版共用 [`airhand_link::host`]。控制码像桌面版一样固定
 //!（`Register::keep`）：Kotlin 把服务器分配的控制码和密钥保存在应用自己的数据目录里，
 //! 下次启动时带上（[`HostConfig::reclaim`]）取回同一个控制码。
 
@@ -98,6 +98,15 @@ pub enum Op {
     Approval { required: bool },
 }
 
+/// 发给所有会话的消息（已编码），和走哪条通道（见 `airhand_proto::session` 的"走哪条通道"）
+#[derive(Debug, Clone)]
+pub(crate) enum Broadcast {
+    /// 控制通道：显示器变化、编码器信息、提示……
+    Control(Bytes),
+    /// 大块通道：剪贴板
+    Bulk(Bytes),
+}
+
 /// 会话开始时告诉控制端的信息，以及之后的变化
 pub(crate) struct Info {
     pub hostname: String,
@@ -118,8 +127,8 @@ pub(crate) struct Shared {
     pub events: Arc<Queue<String>>,
     pub video: video::VideoHub,
     pub audio: audio::AudioHub,
-    /// 发给所有会话的控制消息（显示器变化、编码器信息、提示……），已编码
-    pub broadcast: broadcast::Sender<Bytes>,
+    /// 发给所有会话的消息（显示器变化、编码器信息、提示、剪贴板……），已编码
+    pub broadcast: broadcast::Sender<Broadcast>,
     controllers: Mutex<Vec<ControllerView>>,
     /// 有人连接时先请本机用户同意
     approval: AtomicBool,
@@ -159,7 +168,16 @@ impl Shared {
     }
 
     fn broadcast(&self, msg: &HostMsg) {
-        let _ = self.broadcast.send(Control::encode(msg));
+        let encoded = Control::encode(msg);
+        // 剪贴板（最多 1 MiB）走大块通道，不挡控制消息
+        let _ = self.broadcast.send(match msg {
+            HostMsg::Clipboard { .. } | HostMsg::Cursor(_) => Broadcast::Bulk(encoded),
+            _ => Broadcast::Control(encoded),
+        });
+    }
+
+    fn notice(&self, n: Notice) {
+        self.broadcast(&HostMsg::Notice(Some(n)));
     }
 
     fn report_controllers(&self) {
@@ -324,10 +342,10 @@ impl Host {
                 if info.input != input {
                     info.input = input;
                     drop(info);
-                    sh.broadcast(&HostMsg::Notice(Notice::MissingPermissions {
+                    sh.notice(Notice::MissingPermissions {
                         screen: false,
                         input: !input,
-                    }));
+                    });
                 }
             }
             Op::Capture { failure } => {
@@ -335,10 +353,10 @@ impl Host {
                 if info.capture_failure != failure {
                     info.capture_failure = failure.clone();
                     drop(info);
-                    sh.broadcast(&HostMsg::Notice(match failure {
+                    sh.notice(match failure {
                         Some(detail) => Notice::CaptureFailed { detail },
                         None => Notice::CaptureRecovered,
-                    }));
+                    });
                 }
             }
             Op::Audio { failure } => sh.audio.set_failure(failure),
@@ -440,7 +458,7 @@ mod tests {
             r#"{"server":"127.0.0.1:4433","fingerprint":"","name":"Pixel 8","os":"Android 15",
                 "version":"0.1.0","reclaim":{"code":123456,"secret":"00112233445566778899aabbccddeeff"},
                 "displays":[{"index":0,"name":"Screen","x":0,"y":0,"width":1080,"height":2400,"primary":true}],
-                "codecs":["H264","H265"],"input":false,"touch":true,"actions":["Back","Home","VolumeUp"],"approval":true}"#,
+                "codecs":["h264","h265"],"input":false,"touch":true,"actions":["back","home","volumeUp"],"approval":true}"#,
         )
         .unwrap();
         assert_eq!(cfg.link.name, "Pixel 8");
@@ -463,7 +481,7 @@ mod tests {
             r#"{"op":"capture","failure":null}"#,
             r#"{"op":"audio","failure":"no RECORD_AUDIO permission"}"#,
             r#"{"op":"clipboard","text":"hi"}"#,
-            r#"{"op":"encoder","info":{"codec":"H264","name":"c2.qti.avc.encoder","hardware":true,"width":1080,"height":2400}}"#,
+            r#"{"op":"encoder","info":{"codec":"h264","name":"c2.qti.avc.encoder","hardware":true,"width":1080,"height":2400}}"#,
             r#"{"op":"displays","displays":[]}"#,
             r#"{"op":"approve","id":"18303851325851793452","allow":true}"#,
             r#"{"op":"approval","required":false}"#,

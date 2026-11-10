@@ -68,7 +68,7 @@ let state: State = {
   confirm: null,
   server: { state: "connecting" },
   app: null,
-  decoders: ["H264"],
+  decoders: ["h264"],
   immersive: false,
 };
 

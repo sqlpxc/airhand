@@ -42,8 +42,6 @@ use airhand_link::controller::{
     SessionUi, UiClosed,
 };
 use airhand_link::{Problem, ServerState};
-use airhand_proto::session::QualitySettings;
-use airhand_proto::signal::ResumeToken;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -526,16 +524,12 @@ impl SessionUi for ConsoleUi {
     }
 }
 
-/// 连接被控端。`resume` / `host_key` / `pairing` 见 [`ConnectOptions`]
+/// 连接被控端。`opts`：重连凭证、记下的对方公钥、配对码、开始时的画质和声音（见 [`ConnectOptions`]，三种界面一样）
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 async fn ctrl_connect(
     state: tauri::State<'_, AppState>,
     code: String,
-    resume: Option<ResumeToken>,
-    host_key: Option<String>,
-    pairing: Option<String>,
-    settings: QualitySettings,
+    opts: ConnectOptions,
     video: Channel<InvokeResponseBody>,
     events: Channel<SessionEvent>,
     clipboard: bool,
@@ -546,12 +540,7 @@ async fn ctrl_connect(
         clipboard: Box::new(clipboard::ClipSync::new()),
         sync: clipboard,
     };
-    let opts = ConnectOptions {
-        resume,
-        host_key,
-        pairing,
-    };
-    svc.connect(&code, opts, settings, ui, frontend).await
+    svc.connect(&code, opts, ui, frontend).await
 }
 
 /// 对会话的操作（输入、画质、确认画面……），和网页版、Android 一样的 [`Command`]

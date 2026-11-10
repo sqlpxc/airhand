@@ -48,7 +48,8 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 fn codec_type(c: Codec) -> CMVideoCodecType {
     match c {
-        Codec::H264 => kCMVideoCodecType_H264,
+        // 不认识的格式不会走到这里：Encoder::new 只用认识的格式
+        Codec::H264 | Codec::Unknown(_) => kCMVideoCodecType_H264,
         Codec::H265 => kCMVideoCodecType_HEVC,
         Codec::AV1 => kCMVideoCodecType_AV1,
     }
@@ -200,7 +201,7 @@ impl VtEncoder {
                 name: format!(
                     "VideoToolbox {}",
                     match codec {
-                        Codec::H264 => "H.264",
+                        Codec::H264 | Codec::Unknown(_) => "H.264",
                         Codec::H265 => "HEVC",
                         Codec::AV1 => "AV1",
                     }

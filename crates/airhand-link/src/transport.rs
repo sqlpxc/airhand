@@ -1,12 +1,12 @@
-//! 一个会话的三条 QUIC 流（控制、画面、声音，见 `airhand_proto` 的模块说明），端到端加密。
+//! 一个会话的四条 QUIC 流（控制、画面、声音、大块，见 `airhand_proto` 的模块说明），端到端加密。
 //!
-//! 每条流有自己的流量控制和丢包重传，画面堵住不影响声音和控制消息（整条连接的拥塞控制还是共用的，
-//! 网络满了声音也会慢）。
+//! 每条流有自己的流量控制和丢包重传，画面堵住不影响声音和控制消息，1 MiB 的剪贴板也不挡输入和确认
+//! （整条连接的拥塞控制还是共用的，网络满了声音也会慢）。
 //!
-//! * 双方：[`open_session`] 打开三条流，之后在控制流上握手（[`crate::secure`]）；
-//! * 被控端：[`write_lane`] 把排好队的帧加密后写进一条流，[`write_audio`] 把声音包加密后发成数据报
+//! * 双方：[`open_session`] 打开四条流，之后在控制流上握手（[`crate::secure`]）；
+//! * 双方：[`write_lane`] 把排好队的帧加密后写进一条流；被控端的 [`write_audio`] 把声音包加密后发成数据报
 //!   （见 [`crate::host::HostSession`]）；
-//! * 控制端：[`HostReceiver`] 从三条流和数据报读被控端发来的东西，解密。
+//! * 控制端：[`HostReceiver`] 从四条流和数据报读被控端发来的东西，解密。
 //!
 //! 声音走 QUIC 数据报（`airhand_proto::datagram`）：不重传，也不排在丢了的包后面等重传，
 //! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流。
@@ -36,7 +36,8 @@ pub fn seal(frame: Bytes, sealer: &mut FrameSealer) -> Result<Bytes> {
     Ok(Bytes::from(v))
 }
 
-/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 关闭后正常结束这条流
+/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 关闭后正常结束这条流。
+/// 十秒钟写不进去一帧算对方失联
 pub async fn write_lane(
     mut send: SendStream,
     mut rx: mpsc::Receiver<Bytes>,
@@ -108,6 +109,8 @@ pub struct SessionStreams {
     pub control: Stream,
     pub video: Stream,
     pub audio: Stream,
+    /// 大块通道（剪贴板、光标），双向
+    pub bulk: Stream,
 }
 
 pub async fn open_session(
@@ -131,10 +134,12 @@ pub async fn open_session(
         let control = lane(conn, session_id, role, SessionLane::Control).await?;
         let video = lane(conn, session_id, role, SessionLane::Video).await?;
         let audio = lane(conn, session_id, role, SessionLane::Audio).await?;
+        let bulk = lane(conn, session_id, role, SessionLane::Bulk).await?;
         Ok(SessionStreams {
             control,
             video,
             audio,
+            bulk,
         })
     })
     .await
@@ -144,7 +149,7 @@ pub async fn open_session(
 /// 被控端发来的一样东西（已经解密）
 #[derive(Debug)]
 pub enum FromHost {
-    /// 控制流上的消息
+    /// 控制流、大块通道上的消息
     Control(HostMsg),
     /// 画面包（[`media`] 格式：头 + 码流），原样交给界面
     Video(Vec<u8>),
@@ -152,22 +157,25 @@ pub enum FromHost {
     Audio(Vec<u8>),
 }
 
-/// 控制端读被控端的三条流和声音数据报的解密端
+/// 控制端读被控端的四条流和声音数据报的解密端
 pub struct Openers {
     pub control: FrameOpener,
+    pub bulk: FrameOpener,
     pub video: FrameOpener,
     pub audio: FrameOpener,
     pub datagrams: DatagramOpener,
 }
 
-/// 控制端读被控端的三条流和声音数据报。
+/// 控制端读被控端的四条流和声音数据报。
 ///
 /// 每条流一个读任务，读任务活到流结束：`select!` / 超时只会取消通道上的接收，不会切断半帧。
-/// 三个有界的信箱互相独立，画面再多也挡不住 Pong 和 Bye。
+/// 几个有界的信箱互相独立，画面、剪贴板再多也挡不住 Pong 和 Bye。
 pub struct HostReceiver {
     control: mpsc::Receiver<Result<FromHost>>,
+    bulk: mpsc::Receiver<Result<FromHost>>,
     video: mpsc::Receiver<Result<FromHost>>,
     audio: mpsc::Receiver<Result<FromHost>>,
+    bulk_open: bool,
     video_open: bool,
     audio_open: bool,
     audio_order: AudioOrder,
@@ -177,9 +185,11 @@ pub struct HostReceiver {
 }
 
 impl HostReceiver {
+    /// `control` / `bulk`：控制流、大块通道收的一半（发的一半由控制端的会话自己用）；
     /// `datagrams`：发给这个会话的数据报（去掉了会话 ID），里面是加密的声音包
     pub fn new(
         control: RecvStream,
+        bulk: RecvStream,
         video: Stream,
         audio: Stream,
         datagrams: Option<mpsc::Receiver<Bytes>>,
@@ -194,9 +204,11 @@ impl HostReceiver {
         let (video_tx, video_rx) = mpsc::channel(2);
         media_reader(&mut tasks, video.1, Kind::Video, openers.video, video_tx);
         Self {
-            control: control_reader(&mut tasks, control, openers.control),
+            control: message_reader(&mut tasks, control, openers.control),
+            bulk: message_reader(&mut tasks, bulk, openers.bulk),
             video: video_rx,
             audio: audio_rx,
+            bulk_open: true,
             video_open: true,
             audio_open: true,
             audio_order: AudioOrder::default(),
@@ -205,12 +217,16 @@ impl HostReceiver {
         }
     }
 
-    /// 下一样东西。控制消息优先；控制流结束了就是会话结束了（画面流、声音流先结束不算）
+    /// 下一样东西。控制消息优先；控制流结束了就是会话结束了（其它流先结束不算）
     pub async fn recv(&mut self) -> Result<FromHost> {
         loop {
             tokio::select! {
                 biased;
                 m = self.control.recv() => return m.context("control stream ended")?,
+                m = self.bulk.recv(), if self.bulk_open => match m {
+                    Some(m) => return m,
+                    None => self.bulk_open = false,
+                },
                 m = self.audio.recv(), if self.audio_open => match m {
                     Some(Ok(FromHost::Audio(p))) => {
                         if self.audio_order.accept(&p, Instant::now()) {
@@ -280,12 +296,13 @@ async fn next_host_msg(
         opener.open(buf)?;
         match framing::decode(buf)? {
             Decoded::Msg(m) => return Ok(Some(m)),
-            Decoded::Unknown => debug!("skipping a message from a newer host"),
+            Decoded::Unknown(variant) => debug!(variant, "skipping a message from a newer host"),
         }
     }
 }
 
-fn control_reader(
+/// 读一条消息流（控制流、大块通道）
+fn message_reader(
     tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
     mut opener: FrameOpener,

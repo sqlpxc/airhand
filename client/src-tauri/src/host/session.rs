@@ -55,9 +55,15 @@ fn permission_notice((screen, input): (bool, bool)) -> Notice {
     Notice::MissingPermissions { screen, input }
 }
 
+/// 发一条提示
+fn notice(n: Notice) -> HostMsg {
+    HostMsg::Notice(Some(n))
+}
+
 pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
     let session_id = inc.session_id;
-    // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）
+    // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）。
+    // 返回的时候控制端已经确认过了（重放的握手消息走不到这里），这时才在托盘里显示它、开始采集
     let (mut io, admitted) = match HostSession::open(&inc, VIDEO_QUEUE, audio::QUEUE, &*gate).await {
         Ok(r) => r,
         Err(e) => {
@@ -70,8 +76,9 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
     gate.admitted(session_id, &admitted);
     let mut kick = inc.kick;
     let ctl = io.ctl.clone();
+    let bulk = io.bulk.clone();
 
-    let (mut displays, codecs, notice) = tokio::task::spawn_blocking(|| {
+    let (mut displays, codecs, env_notice) = tokio::task::spawn_blocking(|| {
         (
             capture::displays(),
             super::encoder::available_codecs(),
@@ -97,18 +104,19 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
         actions: Vec::new(),
     }))?;
     if displays.is_empty() {
-        ctl.send(&HostMsg::Notice(Notice::NoDisplays))?;
+        ctl.send(&notice(Notice::NoDisplays))?;
     }
-    if let Some(notice) = notice {
-        ctl.send(&HostMsg::Notice(notice))?;
+    if let Some(n) = env_notice {
+        ctl.send(&notice(n))?;
     }
     // 缺少系统权限（macOS）：告诉控制端为什么没有画面 / 不能操作；之后权限有变化时再发
     let mut missing = super::missing_permissions();
     if missing != (false, false) {
-        ctl.send(&HostMsg::Notice(permission_notice(missing)))?;
+        ctl.send(&notice(permission_notice(missing)))?;
     }
 
-    let mut settings = QualitySettings::default();
+    // 开始时的画质在握手里：编码器一开始就按它建，不用先建一个默认的、等设置到了再重建
+    let mut settings = admitted.settings;
     let flow = Arc::new(Flow::default());
     // 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
     let cursors = Arc::new(Mutex::new(CursorCache::default()));
@@ -118,13 +126,27 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
             settings,
             io.video.clone(),
             ctl.clone(),
+            bulk.clone(),
             flow.clone(),
             cursors.clone(),
         )
     };
     let mut pipeline = (!displays.is_empty()).then(|| start(current, settings));
     let mut injector = Injector::new();
-    let mut sound: Option<AudioSubscription> = None;
+    // 开始时要不要声音也在握手里
+    let subscribe_audio = || -> Result<AudioSubscription> {
+        let s = audio::subscribe(io.audio.clone());
+        // 别的会话已经在采集、并且正打不开：马上告诉这个控制端
+        if let Some(detail) = s.failure() {
+            ctl.send(&notice(Notice::AudioFailed { detail }))?;
+        }
+        Ok(s)
+    };
+    let mut sound: Option<AudioSubscription> = if admitted.audio {
+        Some(subscribe_audio()?)
+    } else {
+        None
+    };
     let fallback = DisplayInfo {
         index: 0,
         name: String::new(),
@@ -184,19 +206,17 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
                             if !enabled {
                                 sound = None;
                             } else if sound.is_none() {
-                                let s = audio::subscribe(io.audio.clone());
-                                // 别的会话已经在采集、并且正打不开：马上告诉这个控制端
-                                if let Some(detail) = s.failure() {
-                                    ctl.send(&HostMsg::Notice(Notice::AudioFailed { detail }))?;
-                                }
-                                sound = Some(s);
+                                sound = Some(subscribe_audio()?);
                             }
                         }
                     }
                 }
                 _ = clip_tick.tick() => {
-                    if let Some(text) = clip.poll().await {
-                        ctl.send(&HostMsg::Clipboard { text })?;
+                    // 走大块通道：1 MiB 的剪贴板不挡控制消息。网络慢、前面排满了就丢掉这一次
+                    if let Some(text) = clip.poll().await
+                        && let Err(e) = bulk.send(&HostMsg::Clipboard { text })
+                    {
+                        warn!(session_id, "dropped a clipboard update: {e:#}");
                     }
                 }
                 _ = kick.changed() => {
@@ -213,7 +233,7 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
                 }
                 // 声音采集打不开 / 恢复了（只在控制端开着声音时）
                 failure = audio_failure(&mut sound) => {
-                    ctl.send(&HostMsg::Notice(match failure {
+                    ctl.send(&notice(match failure {
                         Some(detail) => Notice::AudioFailed { detail },
                         None => Notice::AudioRecovered,
                     }))?;
@@ -224,7 +244,7 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
                     if now != missing {
                         info!(session_id, screen = !now.0, input = !now.1, "permissions changed");
                         missing = now;
-                        ctl.send(&HostMsg::Notice(permission_notice(now)))?;
+                        ctl.send(&notice(permission_notice(now)))?;
                     }
                 }
                 // 显示器变了：鼠标坐标是按这里的列表换算的，旧列表会让点击落到别的位置
@@ -258,7 +278,7 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
         p.stop().await;
     }
     drop(sound);
-    drop(ctl);
+    drop((ctl, bulk));
     io.close(session_id, result).await
 }
 

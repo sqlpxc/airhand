@@ -74,6 +74,7 @@ dependencies = [
  "minicbor",
  "postcard",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

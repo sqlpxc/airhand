@@ -11,9 +11,11 @@ class KeyboardControllerTest {
 
     private fun describe(e: Any): String {
         if (e !is JSONObject) return e.toString()
-        e.optJSONObject("Key")?.let { return "${it.getString("code")}${if (it.getBoolean("down")) "↓" else "↑"}" }
-        e.optJSONObject("Text")?.let { return "text:${it.getString("text")}" }
-        return e.toString()
+        return when (e.optString("type")) {
+            "key" -> "${e.getString("code")}${if (e.getBoolean("down")) "↓" else "↑"}"
+            "text" -> "text:${e.getString("text")}"
+            else -> e.toString()
+        }
     }
 
     @Test

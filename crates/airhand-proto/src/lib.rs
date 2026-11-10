@@ -22,23 +22,25 @@
 //! 会话版本由两端在端到端握手里协商（握手是加密、认证过的，服务器改不了，也就没法让两端降级）。
 //!
 //! 版本号只在**没法兼容**的改动时加 1。加功能用能力位（[`Features`]）：两端（或者客户端和服务器）各自报上自己支持的，
-//! 双方都支持才用。消息是带编号的 CBOR（见 [`framing`]）：不认识的消息、字段跳过，不断开。
+//! 双方都支持才用。消息是带编号的 CBOR（见 [`framing`]）：不认识的消息、字段跳过，不认识的枚举值留着原值，不断开。
+//! 端到端握手本身没有版本号：握手要改就加一个新的模式（[`handshake::Pattern`]）。
 //!
 //! # 会话
 //!
 //! * 每条 QUIC 连接上客户端打开的**第一条**双向流是"信令流"，承载 [`signal`] 消息。
-//! * 每个远控会话双方各打开几条双向流（"通道"，[`SessionLane`]：控制、画面、声音），先写入 [`SessionHeader`]。
+//! * 每个远控会话双方各打开几条双向流（"通道"，[`SessionLane`]：控制、画面、声音、大块），先写入 [`SessionHeader`]。
 //!   服务器按会话 ID 和通道编号配对，然后**零拷贝透传**。服务器不管会话有几条通道、各是什么：
 //!   以后加通道（例如传文件）不用改服务器。
 //! * 控制通道上先做端到端握手（[`handshake`]，Noise），之后每条通道上的每一帧、每个数据报都是加密的：
 //!   服务器看不到画面、声音、键盘输入和剪贴板，也没法篡改、插入。
-//! * 三条流各自有序，跨流没有顺序保证（音画用采集时间同步），一条流堵住不影响其它两条：
+//! * 每条流各自有序，跨流没有顺序保证（音画用采集时间同步），一条流堵住不影响其它的：
 //!
 //! | 通道 | 方向                | 内容                                              | 编码 |
 //! |------|---------------------|---------------------------------------------------|------|
-//! | 控制 | 双向                | [`session::HostMsg`] / [`session::ControllerMsg`] | CBOR（[`framing`]） |
+//! | 控制 | 双向                | 小而急的 [`session::HostMsg`] / [`session::ControllerMsg`]：输入、确认、Ping…… | CBOR（[`framing`]） |
 //! | 画面 | 被控端 → 控制端     | 画面包                                            | 媒体包（[`media`]） |
 //! | 声音 | 被控端 → 控制端     | 放不进数据报的声音包（很少见）                    | 媒体包（[`media`]） |
+//! | 大块 | 双向                | 大的消息：剪贴板、光标（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密文（见 `airhand_link::secure`）。
 //! 媒体包是定长头 + 原始数据，控制端解密后原样交给界面，不重新编码。
@@ -82,7 +84,7 @@ pub const PAIRING_DIGITS: usize = 6;
 
 /// 信令流单条消息上限。
 pub const MAX_SIGNAL_MSG: usize = 64 * 1024;
-/// 会话控制流单条消息上限（最大的是 1 MiB 的剪贴板文本和光标形状），含加密的开销。
+/// 会话控制通道、大块通道单条消息的上限（最大的是大块通道上 1 MiB 的剪贴板文本和光标形状），含加密的开销。
 pub const MAX_CONTROL_MSG: usize = 2 * 1024 * 1024;
 
 /// 会话流头部魔数（"AHS1" 是 v9 之前的格式：固定三条通道）。
@@ -107,22 +109,26 @@ pub enum SessionLane {
     Control = 0,
     Video = 1,
     Audio = 2,
+    /// 大的消息（剪贴板、光标）：不挡控制通道上的输入、确认（见 [`session`] 的"走哪条通道"）
+    Bulk = 3,
 }
 
 impl SessionLane {
-    pub const ALL: [Self; 3] = [Self::Control, Self::Video, Self::Audio];
+    pub const ALL: [Self; 4] = [Self::Control, Self::Video, Self::Audio, Self::Bulk];
 
-    /// 服务器往这条通道写数据时的优先级（越大越先发）：控制消息不能排在画面后面
+    /// 服务器往这条通道写数据时的优先级（越大越先发）：控制消息不能排在画面后面。
+    /// 大块和画面一样：一样的优先级 QUIC 轮流发，1 MiB 的剪贴板不会把画面完全挡住，光标也不会排在一串画面后面
     pub const fn priority(self) -> u8 {
         match self {
             SessionLane::Control => 10,
             SessionLane::Audio => 5,
-            SessionLane::Video => 0,
+            SessionLane::Video | SessionLane::Bulk => 0,
         }
     }
 }
 
 /// 会话流头部（固定 16 字节）：`magic[4] | session_id u64 LE | role u8 | lane u8 | priority u8 | 0`。
+/// 服务器不管会话有几条通道（最多 [`MAX_LANES`]），加通道不用升级服务器。
 ///
 /// 服务器按 `(session_id, lane)` 把两端的流配对，往这一端写数据时用这里给的优先级。
 /// 通道 0（控制）结束时整个会话结束。
@@ -335,6 +341,9 @@ mod tests {
         assert_eq!(SessionHeader::decode(&other), None);
         let c = SessionHeader::new(1, Role::Host, SessionLane::Control);
         assert_eq!(c.encode()[12..], [1, 0, 10, 0]);
+        let b = SessionHeader::new(1, Role::Controller, SessionLane::Bulk);
+        assert_eq!(b.encode()[12..], [2, 3, 0, 0]);
+        assert!(SessionLane::ALL.iter().all(|l| (*l as u8) < MAX_LANES));
     }
 
     #[test]
