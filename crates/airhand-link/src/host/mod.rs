@@ -5,8 +5,8 @@
 //!
 //! * [`run`]：一直连着服务器（掉线自动重连，取回原来的控制码），每来一个控制端就调用 `session` 开始一个会话；
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
-//! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：同意流程、Pong、失联检测、踢人时发 Bye、
-//!   画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
+//! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：同意流程（同时在等本机用户回答的请求有上限，
+//!   [`ApprovalSlots`]）、Pong、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
 //! * [`HostStreams`]：会话的四条流。先在控制流上做端到端握手（[`crate::secure::respond`]）：让不让这个控制端进来
 //!   由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），控制端确认了才算进来
 //!   （重放的握手消息走不到这一步）。过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
@@ -43,7 +43,10 @@ pub use crate::secure::{Access, Admission, Gate};
 pub use clock::InputClock;
 pub use cursor::CursorCache;
 pub use queue::{Encoded, Outbox, SendError};
-pub use session::{APPROVAL_TIMEOUT, PEER_TIMEOUT, Platform, Request, Senders, Start, serve};
+pub use session::{
+    APPROVAL_TIMEOUT, ApprovalSlots, MAX_PENDING_APPROVALS, PEER_TIMEOUT, Platform, Request,
+    Senders, Start, serve,
+};
 pub use streams::{Admitted, HostStreams, Writer};
 
 /// 本机用户的命令（托盘菜单、Android 的界面）
@@ -94,6 +97,8 @@ pub struct Incoming {
     pub peer: Peer,
     /// 本机用户断开所有控制端时收到原因：会话应发 Bye 然后结束
     pub kick: watch::Receiver<ByeReason>,
+    /// 在等本机用户回答的连接请求的名额，这个被控端服务的所有会话共用（见 [`MAX_PENDING_APPROVALS`]）
+    pub approvals: ApprovalSlots,
 }
 
 /// 被控端服务：一直连着服务器，直到 future 被丢掉（丢掉时依次释放会话、QUIC 连接）。
@@ -122,9 +127,13 @@ pub async fn run<E, S, F>(
         reclaim,
         rekey: false,
     };
+    let approvals = ApprovalSlots::default();
     loop {
         reconnect.begin();
-        let result = connect_once(&link, keep, &mut id, &*events, &session, &mut cmds).await;
+        let result = connect_once(
+            &link, keep, &mut id, &*events, &session, &mut cmds, &approvals,
+        )
+        .await;
         events.offline();
         reconnect.end("host", result).await;
     }
@@ -147,6 +156,7 @@ async fn connect_once<E, S, F>(
     events: &E,
     session: &S,
     cmds: &mut mpsc::UnboundedReceiver<HostCmd>,
+    approvals: &ApprovalSlots,
 ) -> Result<()>
 where
     E: HostEvents,
@@ -228,6 +238,7 @@ where
                         code,
                         peer,
                         kick: kick_tx.subscribe(),
+                        approvals: approvals.clone(),
                     });
                     sessions.spawn(async move {
                         run.await;

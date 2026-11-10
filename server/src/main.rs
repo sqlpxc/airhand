@@ -11,6 +11,8 @@
 //!   （网页控制台每个标签页一条；公司出口 IP 后面可能有很多台被控端）
 //! * `AIRHAND_NEW_CODES_PER_IP` 同一个来源（IPv4 地址 / IPv6 的 /48）10 分钟内最多分配几个新控制码，默认 30
 //!   （取回原来的控制码不算）
+//! * `AIRHAND_CONNECTS_PER_MINUTE` 同一个来源（IPv4 地址 / IPv6 的 /64）一分钟内最多向同一台被控端发起几个会话，默认 6
+//!   （不低于 `AIRHAND_MAX_SESSIONS`；带重连凭证的也算）
 //! * `RUST_LOG`              日志级别，默认 `info`
 
 mod broker;
@@ -122,6 +124,12 @@ async fn main() -> Result<()> {
         "AIRHAND_NEW_CODES_PER_IP",
         broker::Config::DEFAULT_NEW_CODES_PER_IP,
     );
+    // 不低于每台被控端的会话数：不然同一个出口 IP 后面的人坐不满一台被控端
+    let connects_per_minute = number(
+        "AIRHAND_CONNECTS_PER_MINUTE",
+        broker::Config::DEFAULT_CONNECTS_PER_MINUTE,
+    )
+    .max(max_sessions);
 
     let cert = tls::load_or_generate(&cert_path, &key_path, &names)?;
     info!("Certificate SHA-256 fingerprint: {}", cert.fingerprint);
@@ -138,6 +146,7 @@ async fn main() -> Result<()> {
         db: Some(db_path),
         max_conns_per_ip,
         new_codes_per_ip,
+        connects_per_minute,
     });
     tokio::spawn(broker.clone().janitor());
     {

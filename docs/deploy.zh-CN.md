@@ -17,6 +17,7 @@
 | `AIRHAND_MAX_SESSIONS` | `4` | 每台被控端同时允许的控制端数量 |
 | `AIRHAND_MAX_CONNS_PER_IP` | `128` | 同一个 IPv4 地址 / IPv6 的 /64 同时最多几条连接（网页控制台每个标签页一条；很多被控端共用一个出口 IP 时调大） |
 | `AIRHAND_NEW_CODES_PER_IP` | `30` | 同一个 IPv4 地址 / IPv6 的 /48 每 10 分钟最多分配几个新控制码（取回原来的控制码不算） |
+| `AIRHAND_CONNECTS_PER_MINUTE` | `6` | 同一个 IPv4 地址 / IPv6 的 /64 一分钟内最多向同一台被控端发起几次连接（不低于 `AIRHAND_MAX_SESSIONS`；很多控制端共用一个出口 IP 连同一台被控端时调大） |
 | `RUST_LOG` | `info` | 日志级别 |
 
 镜像基于 distroless、以非 root 用户运行，约 28 MB。

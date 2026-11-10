@@ -1,4 +1,7 @@
 //! 输入注入。每个会话一个 [`Injector`]，记录按下的键/鼠标键，会话结束时全部释放，避免粘键。
+//!
+//! 注入是同步的，有的还很慢（X11 上输入文字）：会话不直接用 [`Injector`]，而是把输入交给自己的注入线程
+//! （[`InjectorThread`]），`Injector` 在那个线程上创建、使用、释放。
 
 #[cfg(target_os = "linux")]
 mod evdev;
@@ -8,12 +11,15 @@ mod keymap;
 mod mackeys;
 #[cfg(target_os = "macos")]
 mod macos;
+mod thread;
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]
 mod x11;
 
 use airhand_proto::session::{DisplayInfo, InputEvent};
+
+pub use thread::InjectorThread;
 
 pub struct Injector {
     #[cfg(windows)]

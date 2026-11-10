@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::audio::{self, AudioSubscription};
 use super::capture;
 use super::gate::DesktopGate;
-use super::input::Injector;
+use super::input::InjectorThread;
 use super::pipeline::Pipeline;
 use crate::clipboard::{self, ClipSync};
 use crate::config;
@@ -117,7 +117,8 @@ struct Desktop {
     /// 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
     cursors: Arc<Mutex<CursorCache>>,
     pipeline: Option<Pipeline>,
-    injector: Injector,
+    /// 注入输入的线程：注入可能很慢（X11 上输入文字），会话的任务不等它
+    injector: InjectorThread,
     sound: Option<AudioSubscription>,
     clip: ClipSync,
     clip_tick: Interval,
@@ -149,7 +150,7 @@ impl Desktop {
             flow: Arc::new(Flow::default()),
             cursors: Arc::default(),
             pipeline: None,
-            injector: Injector::new(),
+            injector: InjectorThread::new(),
             sound: None,
             clip: ClipSync::new(),
             clip_tick: ticker(clipboard::POLL),
@@ -242,14 +243,15 @@ impl Platform for Desktop {
 
     async fn request(&mut self, req: Request) -> Result<()> {
         match req {
-            // 晚到太久的输入已经换成了"释放所有按键"
+            // 晚到太久的输入已经换成了"释放所有按键"。交给注入线程就返回：在这里等它注入完的话，
+            // 这期间 Pong、画面的确认、本机用户的断开都处理不了（见 input::thread）
             Request::Input(events) => {
                 let fallback = fallback_display();
                 let d = self
                     .displays
                     .get(self.current as usize)
                     .unwrap_or(&fallback);
-                self.injector.handle(&events, d);
+                self.injector.handle(events, d);
             }
             Request::Ack(seq) => self.flow.ack(seq),
             Request::Settings(s) => {

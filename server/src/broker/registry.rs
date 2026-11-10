@@ -80,6 +80,8 @@ enum Denied {
     Revoked,
     /// 猜错次数过多
     Limited,
+    /// 这个来源短时间内向这台被控端发起了太多会话（[`super::Config::connects_per_minute`]）
+    Flooding,
     /// 对方会话数已满
     Busy,
 }
@@ -90,7 +92,7 @@ impl Denied {
             Denied::Unknown => ConnectError::NotFound,
             Denied::Offline => ConnectError::Offline,
             Denied::Revoked => ConnectError::Revoked,
-            Denied::Limited => ConnectError::RateLimited,
+            Denied::Limited | Denied::Flooding => ConnectError::RateLimited,
             Denied::Busy => ConnectError::Busy,
         }
     }
@@ -485,6 +487,12 @@ impl Broker {
                 }
             }
         };
+        // 控制码对了（带凭证的也一样）也限速：每批准一个，被控端就要开一个会话、可能还要问一次本机用户，
+        // 并且占着一个会话槽位直到配对超时。只数批准了的：被限速的来源本来就连上过这个控制码，这个回答不透露什么
+        let source = (ctrl.ip, code);
+        if self.connects.count(source) >= self.cfg.connects_per_minute {
+            return Err(Denied::Flooding);
+        }
         // 预占一个会话槽位（超过上限时随之归还）
         let (slot, before) = SlotGuard::take(&host.sessions);
         if before >= self.cfg.max_sessions_per_host {
@@ -515,6 +523,7 @@ impl Broker {
                 None => Denied::Unknown,
             });
         }
+        self.connects.hit(source);
         info!(session_id, "{label}: session created");
         Ok(SessionGrant {
             session_id,

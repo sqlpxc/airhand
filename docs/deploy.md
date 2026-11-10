@@ -17,6 +17,7 @@ Environment variables (see `docker-compose.yml`):
 | `AIRHAND_MAX_SESSIONS` | `4` | Max simultaneous controllers per host |
 | `AIRHAND_MAX_CONNS_PER_IP` | `128` | Max simultaneous connections per IPv4 address / IPv6 /64 (a web console uses one per browser tab; raise it if many hosts share one public IP) |
 | `AIRHAND_NEW_CODES_PER_IP` | `30` | Max fresh control codes per IPv4 address / IPv6 /48 per 10 minutes (getting an existing code back doesn't count) |
+| `AIRHAND_CONNECTS_PER_MINUTE` | `6` | Max connections per minute from one IPv4 address / IPv6 /64 to the same host (never lower than `AIRHAND_MAX_SESSIONS`; raise it if many controllers behind one public IP connect to the same host) |
 | `RUST_LOG` | `info` | Log level |
 
 The image is based on distroless, runs as a non-root user, and is about 28 MB.

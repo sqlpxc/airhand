@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 /// 锁的等级，从低到高：同时拿几把的时候按这个顺序（见模块说明）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Rank {
-    /// 在线的被控端（[`super::registry`]）。`connect` 拿着它去拿 pending、waiters、failures：
+    /// 在线的被控端（[`super::registry`]）。`connect` 拿着它去拿 pending、waiters、failures、connects：
     /// 拿着它检查控制码、预占会话槽位、登记会话、登记等待上线，中间不会有被控端上线或者下线
     Hosts,
     /// 掉线后保留着的控制码
@@ -28,6 +28,8 @@ pub(super) enum Rank {
     Routes,
     /// 猜错控制码的计数（[`super::limits`]）
     Failures,
+    /// 每个来源向每台被控端发起会话的计数
+    Connects,
     /// 新分配控制码的计数
     NewCodes,
     /// 每个来源有几条连接
@@ -36,7 +38,7 @@ pub(super) enum Rank {
 
 impl Rank {
     #[cfg(debug_assertions)]
-    const ALL: [Rank; 9] = [
+    const ALL: [Rank; 10] = [
         Rank::Hosts,
         Rank::Reserved,
         Rank::Pending,
@@ -44,6 +46,7 @@ impl Rank {
         Rank::Waiters,
         Rank::Routes,
         Rank::Failures,
+        Rank::Connects,
         Rank::NewCodes,
         Rank::Conns,
     ];

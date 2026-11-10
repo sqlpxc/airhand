@@ -64,6 +64,7 @@ fn answer(sig: Signal, code: u32) -> tokio::task::JoinHandle<()> {
                     code,
                     peer,
                     kick: kick.clone(),
+                    approvals: Default::default(),
                 };
                 if let Ok(s) = HostStreams::open(&inc, 2, 16, &gate).await {
                     sessions.push(s);
@@ -136,6 +137,7 @@ fn test_config(db: Option<std::path::PathBuf>) -> Config {
         db,
         max_conns_per_ip: Config::DEFAULT_MAX_CONNS_PER_IP,
         new_codes_per_ip: 1000,
+        connects_per_minute: 1000,
     }
 }
 
@@ -1093,6 +1095,7 @@ async fn controller_service_gets_audio_over_datagrams() {
             code: id.code,
             peer,
             kick,
+            approvals: Default::default(),
         };
         let (s, admitted) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
         (session_id, s, admitted)
@@ -1161,6 +1164,66 @@ async fn new_codes_are_limited_per_network() {
     );
     let (_again, back) = register(&cfg, Some(a)).await;
     assert_eq!(back, a);
+}
+
+/// 控制码对了的连接请求也限速（按来源和控制码），不然知道控制码的人反复发起连接，就能一直占满被控端的会话槽位、
+/// 让它不停地问本机用户。带凭证的也算，换一条连接也一样；被拒绝的请求到不了被控端、不占槽位、不算猜错；
+/// 别的被控端不受影响
+#[tokio::test]
+async fn sessions_are_limited_per_source_and_code() {
+    let (broker, cfg) = start_cfg(Config {
+        connects_per_minute: 3,
+        ..test_config(None)
+    })
+    .await;
+    let ip = limiter_key("127.0.0.1".parse().unwrap());
+    let (mut host, id) = register(&cfg, None).await;
+    let (mut other_host, other) = register(&cfg, None).await;
+    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut token = None;
+    for req in 0..3 {
+        let grant = ask(&mut ctrl, req, id.code, token).await.unwrap();
+        token = Some(grant.resume);
+        assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    }
+    assert_eq!(broker.stats().1, 3);
+
+    for (req, resume) in [(10, None), (11, token)] {
+        assert_eq!(
+            ask(&mut ctrl, req, id.code, resume).await.unwrap_err(),
+            ConnectError::RateLimited
+        );
+    }
+    let mut second = connect_signal(&cfg, Role::Controller).await.unwrap();
+    assert_eq!(
+        ask(&mut second, 1, id.code, None).await.unwrap_err(),
+        ConnectError::RateLimited
+    );
+    assert_eq!(broker.stats().1, 3);
+    assert_eq!(broker.failure_count(ip), 0);
+    // 被控端没有再收到请求：下一条消息是它自己换密钥的回答
+    write_msg(&mut host.send, &ClientMsg::Rekey).await.unwrap();
+    assert!(matches!(next(&mut host).await, ServerMsg::Rekeyed { .. }));
+
+    assert!(ask(&mut second, 2, other.code, None).await.is_ok());
+    assert!(matches!(
+        next(&mut other_host).await,
+        ServerMsg::Incoming { .. }
+    ));
+}
+
+/// 限速只看窗口之内的：过了窗口就不算了；不同的来源、不同的控制码各算各的
+#[test]
+fn limiter_counts_per_key_within_its_window() {
+    let limiter = Limiter::new(Rank::Connects, Duration::from_millis(100));
+    let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    limiter.hit((ip, 123_456));
+    limiter.hit((ip, 123_456));
+    assert_eq!(limiter.count((ip, 123_456)), 2);
+    assert_eq!(limiter.count((ip, 123_457)), 0);
+    assert_eq!(limiter.count(("203.0.113.10".parse().unwrap(), 123_456)), 0);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(limiter.count((ip, 123_456)), 0);
 }
 
 #[tokio::test]

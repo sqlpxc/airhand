@@ -26,6 +26,7 @@
 //! 被控端也可以先请坐在它面前的人同意（[`HostMsg::AwaitingApproval`]，例如手机默认这样做）：
 //! 同意之后才发 `Hello` 和画面，拒绝或者超时没人理会就发 [`HostMsg::Bye`]（[`ByeReason::Declined`] /
 //! [`ByeReason::Unanswered`]）。等待期间照常回应 Ping，控制端不会把它当成失联。
+//! 同时在等回答的请求有上限：再来的被控端不问，直接发 `Bye`（[`ByeReason::TooManyRequests`]）。
 //! 被控端认得出同意过的控制端（端到端握手里控制端的公钥），断线重连时可以不再询问。
 //!
 //! # 鼠标
@@ -172,6 +173,8 @@ open_enum! {
         Declined = 2 => "declined",
         /// 被控端的用户一直没有回应连接请求
         Unanswered = 3 => "unanswered",
+        /// 被控端上已经有好几个连接请求在等它的用户回答，这一个没有问（过一会儿再试）
+        TooManyRequests = 4 => "tooManyRequests",
     }
 }
 

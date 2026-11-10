@@ -55,7 +55,7 @@ fn modifier_flags(m: Modifier, right: bool) -> u64 {
     }
 }
 
-/// `CGEventSource` 只在持有注入器的那个任务里使用
+/// `CGEventSource` 只在持有注入器的那个线程上使用（会话的注入线程，见 `super::thread`）
 struct Source(CFRetained<CGEventSource>);
 unsafe impl Send for Source {}
 

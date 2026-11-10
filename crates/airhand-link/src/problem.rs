@@ -40,7 +40,8 @@ pub enum Problem {
     InvalidCode,
     /// 控制码不存在或对方不在线
     CodeNotFound,
-    /// 尝试过于频繁
+    /// 尝试过于频繁：猜错控制码太多次、短时间内向同一台被控端发起了太多次连接（服务器限速），
+    /// 或者对方已经有好几个连接请求在等它的用户回答（[`ByeReason::TooManyRequests`]）。过一会儿再试，不自动重连
     RateLimited,
     /// 对方的会话数已满
     HostBusy,
@@ -112,8 +113,8 @@ impl Problem {
         matches!(self, Problem::Incompatible { .. })
     }
 
-    /// 对方有意结束（或者对方的用户没有同意）的会话，或者要用户来决定的问题（身份变了、要配对码……），
-    /// 不应该自动重连
+    /// 对方有意结束（或者对方的用户没有同意）的会话，要用户来决定的问题（身份变了、要配对码……），
+    /// 或者对方让过一会儿再试（马上重连只会再被回绝），不应该自动重连
     pub fn is_final(&self) -> bool {
         matches!(
             self,
@@ -121,6 +122,7 @@ impl Problem {
                 | Problem::CodeChanged
                 | Problem::Declined
                 | Problem::Unanswered
+                | Problem::RateLimited
                 | Problem::HostKeyChanged
                 | Problem::PairingRequired
                 | Problem::PairingFailed
@@ -207,6 +209,7 @@ impl From<ByeReason> for Problem {
             ByeReason::CodeChanged => Problem::CodeChanged,
             ByeReason::Declined => Problem::Declined,
             ByeReason::Unanswered => Problem::Unanswered,
+            ByeReason::TooManyRequests => Problem::RateLimited,
             // 对方版本新增的原因：会话照样结束
             ByeReason::Unknown(_) => Problem::HostEnded,
         }

@@ -24,6 +24,8 @@ services:
       # AIRHAND_MAX_CONNS_PER_IP: "128"
       # 同一个来源（IPv4 地址 / IPv6 的 /48）10 分钟内最多分配几个新控制码（取回原来的不算）
       # AIRHAND_NEW_CODES_PER_IP: "30"
+      # 同一个来源（IPv4 地址 / IPv6 的 /64）一分钟内最多向同一台被控端发起几次连接（不低于 AIRHAND_MAX_SESSIONS）
+      # AIRHAND_CONNECTS_PER_MINUTE: "6"
       # 如需使用自己的证书，挂载到 /data 并修改以下路径
       # AIRHAND_CERT: /data/cert.pem
       # AIRHAND_KEY: /data/key.pem

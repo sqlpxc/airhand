@@ -9,6 +9,7 @@
 //!                                                                    └─ 拒绝 / 没人理 → Bye
 //! ```
 //!
+//! * 同时最多有 [`MAX_PENDING_APPROVALS`] 个请求在等本机用户回答，再来的不问、直接回绝（[`ApprovalSlots`]）；
 //! * 同意之前只回应 Ping、记下画质和声音设置（同意之后随 [`Start`] 一起生效），不发画面、不执行任何输入；
 //! * 一直回应 Ping（[`HostMsg::Pong`]），[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联；
 //! * 本机用户断开所有控制端（[`Incoming::kick`]）时发 [`HostMsg::Bye`]，然后结束；
@@ -19,6 +20,7 @@
 //! 各平台跟着实现，不会一边做了、一边忘了。
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use airhand_proto::session::{
@@ -26,7 +28,7 @@ use airhand_proto::session::{
 };
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -40,6 +42,30 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// 多久检查一次是不是失联了
 const WATCHDOG: Duration = Duration::from_secs(5);
+/// 同时最多有这么多个连接请求在等本机用户回答，再来的不问、直接回绝（[`ByeReason::TooManyRequests`]）。
+///
+/// 知道控制码的人可以反复发起连接：没有这个上限的话，每个请求都弹出一次"是否允许"、各占着服务器上这台被控端的
+/// 一个会话槽位直到 [`APPROVAL_TIMEOUT`]。回绝的会话马上结束，槽位随之归还。
+/// 配对过的、同意过的控制端不用问，不受影响
+pub const MAX_PENDING_APPROVALS: usize = 2;
+
+/// 在等本机用户回答的连接请求的名额（[`MAX_PENDING_APPROVALS`]）：一个被控端服务的所有会话共用
+/// （[`Incoming::approvals`]）
+#[derive(Clone)]
+pub struct ApprovalSlots(Arc<Semaphore>);
+
+impl Default for ApprovalSlots {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(MAX_PENDING_APPROVALS)))
+    }
+}
+
+impl ApprovalSlots {
+    /// 占一个名额（丢掉时归还）；满了为 `None`
+    fn take(&self) -> Option<OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+}
 
 /// 控制端要被控端做的事（会话开始之后才有，见模块说明）
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +113,8 @@ pub trait Platform: Send {
     type Event: Send;
 
     /// 请本机用户同意这次连接（握手时 [`Gate`] 要求的，[`Admission::NeedsApproval`]）。
-    /// 回答从返回的通道来，通道关了算拒绝；最多等 [`APPROVAL_TIMEOUT`]。
+    /// 回答从返回的通道来，通道关了算拒绝；最多等 [`APPROVAL_TIMEOUT`]。同时在等回答的请求最多
+    /// [`MAX_PENDING_APPROVALS`] 个，再来的不会问到这里。
     /// 默认直接拒绝：给不会要求同意的 [`Gate`] 用
     fn ask(&mut self, admitted: &Admitted) -> oneshot::Receiver<bool> {
         let _ = admitted;
@@ -164,6 +191,7 @@ where
         &mut io.incoming,
         &mut kick,
         &mut io.writer,
+        &inc.approvals,
     )
     .await;
     // 先停掉还拿着发送端的东西，写任务才能把排着的（例如 Bye）发完
@@ -178,6 +206,8 @@ enum Phase {
     Asking {
         answer: oneshot::Receiver<bool>,
         deadline: Instant,
+        /// 占着的名额（[`ApprovalSlots`]）：不再等了就归还
+        _slot: OwnedSemaphorePermit,
     },
     /// 开始了
     Open,
@@ -192,18 +222,19 @@ enum Answer {
 /// 等本机用户回答（会话开始之后一直等下去）
 async fn answer(phase: &mut Phase) -> Answer {
     match phase {
-        Phase::Asking { answer, deadline } => {
-            match tokio::time::timeout_at(*deadline, answer).await {
-                Ok(Ok(true)) => Answer::Allowed,
-                Ok(_) => Answer::Declined,
-                Err(_) => Answer::Unanswered,
-            }
-        }
+        Phase::Asking {
+            answer, deadline, ..
+        } => match tokio::time::timeout_at(*deadline, answer).await {
+            Ok(Ok(true)) => Answer::Allowed,
+            Ok(_) => Answer::Declined,
+            Err(_) => Answer::Unanswered,
+        },
         Phase::Open => std::future::pending().await,
     }
 }
 
 /// 会话的主循环（见模块说明）。正常结束（控制端断开、发了 Bye）时为 `Ok`
+#[allow(clippy::too_many_arguments)]
 async fn drive<P: Platform>(
     session_id: u64,
     admitted: &Admitted,
@@ -212,18 +243,29 @@ async fn drive<P: Platform>(
     incoming: &mut mpsc::Receiver<ControllerMsg>,
     kick: &mut watch::Receiver<ByeReason>,
     writer: &mut Writer,
+    approvals: &ApprovalSlots,
 ) -> Result<()> {
     let mut start = Start {
         settings: admitted.settings,
         audio: admitted.audio,
     };
     let mut phase = if admitted.admission == Admission::NeedsApproval {
+        // 在等本机用户回答的请求已经够多了：这一个不问（见 MAX_PENDING_APPROVALS）
+        let Some(slot) = approvals.take() else {
+            info!(
+                session_id,
+                "too many connection requests are waiting for the local user, turning this one away"
+            );
+            out.send(&HostMsg::Bye(ByeReason::TooManyRequests))?;
+            return Ok(());
+        };
         let answer = platform.ask(admitted);
         info!(session_id, safety = %admitted.safety, "asking the local user to allow the connection");
         out.send(&HostMsg::AwaitingApproval)?;
         Phase::Asking {
             answer,
             deadline: Instant::now() + APPROVAL_TIMEOUT,
+            _slot: slot,
         }
     } else {
         platform.start(start).await?;
@@ -411,6 +453,11 @@ mod tests {
     }
 
     fn session(admission: Admission) -> Harness {
+        session_with(admission, ApprovalSlots::default())
+    }
+
+    /// `approvals`：和别的会话共用的名额（同一个被控端服务的会话）
+    fn session_with(admission: Admission, approvals: ApprovalSlots) -> Harness {
         let log = Log::default();
         let (to_host, mut incoming) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(16);
@@ -433,6 +480,7 @@ mod tests {
                 &mut incoming,
                 &mut kick_rx,
                 &mut writer,
+                &approvals,
             )
             .await
         });
@@ -614,6 +662,50 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(h.log.take(), [Call::Ask]);
+    }
+
+    /// 同时在等本机用户回答的请求有上限：再来的不问、直接回绝；有一个不再等了（回答了、走了）才问下一个
+    #[tokio::test]
+    async fn only_a_few_requests_wait_for_the_local_user_at_once() {
+        let slots = ApprovalSlots::default();
+        let mut waiting = Vec::new();
+        for _ in 0..MAX_PENDING_APPROVALS {
+            let mut h = session_with(Admission::NeedsApproval, slots.clone());
+            assert!(matches!(
+                h.received().await[..],
+                [HostMsg::AwaitingApproval]
+            ));
+            assert_eq!(h.log.take(), [Call::Ask]);
+            waiting.push(h);
+        }
+        // 再来一个：本机用户看不到它，会话马上结束
+        let mut extra = session_with(Admission::NeedsApproval, slots.clone());
+        assert!((&mut extra.task).await.unwrap().is_ok());
+        let got = extra.received().await;
+        assert!(
+            matches!(got[..], [HostMsg::Bye(ByeReason::TooManyRequests)]),
+            "{got:?}"
+        );
+        assert!(extra.log.take().is_empty());
+        // 不用问的（同意过的、配对过的）不受影响
+        let known = session_with(Admission::Known, slots.clone());
+        known.settle().await;
+        assert!(matches!(known.log.take()[..], [Call::Start(_)]));
+
+        // 本机用户同意了一个：它不再占着名额，下一个请求又会问
+        let mut allowed = waiting.pop().unwrap();
+        allowed.answer.take().unwrap().send(true).unwrap();
+        allowed.settle().await;
+        let next = session_with(Admission::NeedsApproval, slots.clone());
+        next.settle().await;
+        assert_eq!(next.log.take(), [Call::Ask]);
+        // 控制端自己走了的也一样
+        let gone = waiting.pop().unwrap();
+        drop(gone.to_host);
+        assert!(gone.task.await.unwrap().is_ok());
+        let another = session_with(Admission::NeedsApproval, slots);
+        another.settle().await;
+        assert_eq!(another.log.take(), [Call::Ask]);
     }
 
     #[tokio::test]

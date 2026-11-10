@@ -1,9 +1,10 @@
-//! 限速：每个来源的连接数、猜错控制码的次数、新分配的控制码，以及每台被控端同时有几个会话。
+//! 限速：每个来源的连接数、猜错控制码的次数、新分配的控制码、向同一台被控端发起的会话，以及每台被控端同时有几个会话。
 //!
 //! "来源"按网络算，不按单个地址：IPv6 按 /64（[`limiter_key`]），新分配控制码按 /48（[`registration_key`]），
 //! 换个地址绕不过去。
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,9 @@ pub(super) const FAIL_LIMIT: usize = 20;
 
 /// 新分配控制码的统计窗口（上限见 [`super::Config::new_codes_per_ip`]）
 pub(super) const NEW_CODE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// 同一个来源向同一台被控端发起会话的统计窗口（上限见 [`super::Config::connects_per_minute`]）
+pub(super) const CONNECT_WINDOW: Duration = Duration::from_secs(60);
 
 /// 会话槽位，Drop 时自动归还。
 pub(super) struct SlotGuard(Arc<AtomicUsize>);
@@ -55,13 +59,13 @@ impl Drop for ConnSlot<'_> {
     }
 }
 
-/// 按来源统计一段时间内发生了几次（猜错的次数、新分配的控制码）
-pub(super) struct Limiter {
+/// 按来源统计一段时间内发生了几次（猜错的次数、新分配的控制码；向同一台被控端发起的会话按来源和控制码一起算）
+pub(super) struct Limiter<K = IpAddr> {
     window: Duration,
-    hits: Ranked<HashMap<IpAddr, VecDeque<Instant>>>,
+    hits: Ranked<HashMap<K, VecDeque<Instant>>>,
 }
 
-impl Limiter {
+impl<K: Hash + Eq> Limiter<K> {
     pub(super) fn new(rank: Rank, window: Duration) -> Self {
         Self {
             window,
@@ -69,7 +73,7 @@ impl Limiter {
         }
     }
 
-    pub(super) fn count(&self, key: IpAddr) -> usize {
+    pub(super) fn count(&self, key: K) -> usize {
         let now = Instant::now();
         let mut hits = self.hits.lock();
         let Some(v) = hits.get_mut(&key) else {
@@ -81,7 +85,7 @@ impl Limiter {
         v.len()
     }
 
-    pub(super) fn hit(&self, key: IpAddr) {
+    pub(super) fn hit(&self, key: K) {
         self.hits
             .lock()
             .entry(key)
