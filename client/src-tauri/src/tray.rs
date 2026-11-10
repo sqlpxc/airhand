@@ -330,7 +330,11 @@ fn pairing_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Re
                 "Pairing code: {p} (needed the first time a controller connects)"
             ),
         )?)?;
-        menu.append(&item(app, "copy_pairing", tr!("复制配对码", "Copy pairing code"))?)?;
+        menu.append(&item(
+            app,
+            "copy_pairing",
+            tr!("复制配对码", "Copy pairing code"),
+        )?)?;
         menu.append(&item(
             app,
             "new_pairing",

@@ -405,7 +405,10 @@ autostart = true
 fn template_user(server: &str, fp: &str) -> String {
     let access = access_comment();
     let quit = if cfg!(target_os = "macos") {
-        tr!("菜单栏图标的菜单里选\"退出\"", "\"Quit\" in the menu bar icon's menu")
+        tr!(
+            "菜单栏图标的菜单里选\"退出\"",
+            "\"Quit\" in the menu bar icon's menu"
+        )
     } else {
         tr!("托盘菜单\"退出\"", "tray menu \"Quit\"")
     };
@@ -565,7 +568,10 @@ fn write(path: &Path, text: &str) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
         }
         #[cfg(not(unix))]
         std::fs::create_dir_all(dir)?;
@@ -776,7 +782,9 @@ fn put_devices(doc: &mut DocumentMut, list: &[crate::devices::Device]) {
         arr.push(t);
     }
     if let Some(first) = arr.get_mut(0) {
-        first.decor_mut().set_prefix(format!("\n{}", devices_comment()));
+        first
+            .decor_mut()
+            .set_prefix(format!("\n{}", devices_comment()));
     }
     doc.remove("device");
     if !arr.is_empty() {
@@ -923,7 +931,9 @@ fn put_paired(doc: &mut DocumentMut, list: &[Paired]) {
         arr.push(t);
     }
     if let Some(first) = arr.get_mut(0) {
-        first.decor_mut().set_prefix(format!("\n{}", paired_comment()));
+        first
+            .decor_mut()
+            .set_prefix(format!("\n{}", paired_comment()));
     }
     doc.remove("paired");
     if !arr.is_empty() {
@@ -987,7 +997,8 @@ pub fn save_controller_key(sealed: &str) -> Result<()> {
     edit(|doc| {
         let item = doc.entry("controller").or_insert_with(|| {
             let mut t = toml_edit::Table::new();
-            t.decor_mut().set_prefix(format!("\n{}", controller_comment()));
+            t.decor_mut()
+                .set_prefix(format!("\n{}", controller_comment()));
             Item::Table(t)
         });
         let t = item
@@ -1284,7 +1295,8 @@ mod tests {
         host_table(&mut doc).unwrap()["key"] =
             toml_edit::value(secret::seal_bytes(&key, secret::Kind::HostKey).unwrap());
         let t = host_table(&mut doc).unwrap();
-        t["pairing"] = toml_edit::value(secret::seal_bytes(b"482913", secret::Kind::Pairing).unwrap());
+        t["pairing"] =
+            toml_edit::value(secret::seal_bytes(b"482913", secret::Kind::Pairing).unwrap());
         t["pairing_locked"] = toml_edit::value(true);
         let paired = vec![Paired {
             key: "cd".repeat(32),
@@ -1326,7 +1338,10 @@ mod tests {
         let first_line = comment.lines().next().unwrap();
         assert!(text.contains(first_line));
         let reread: DocumentMut = text.parse().unwrap();
-        assert_eq!(crate::devices::entries(&reread), vec![device("482913"), device("731205")]);
+        assert_eq!(
+            crate::devices::entries(&reread),
+            vec![device("482913"), device("731205")]
+        );
         // 设置不受影响
         assert_eq!(parse(&text).unwrap(), Settings::default());
 
@@ -1454,7 +1469,10 @@ mod tests {
     #[test]
     fn file_lifecycle() {
         use std::time::Instant;
-        let root = std::env::temp_dir().join(format!("airhand-config-test-{:016x}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "airhand-config-test-{:016x}",
+            rand::random::<u64>()
+        ));
         let dir = root.join("airhand");
         let file = dir.join(FILE_NAME);
         TEST_PATH.with(|p| *p.borrow_mut() = Some(file.clone()));
@@ -1504,7 +1522,10 @@ mod tests {
         assert_eq!(crate::devices::load(), vec![d.clone()]);
 
         // 手动给设备起了个名字，然后整个目录被删掉
-        let edited = text.replace("name = \"PC-482913\"", "name = \"PC-482913\"\nalias = \"书房\"");
+        let edited = text.replace(
+            "name = \"PC-482913\"",
+            "name = \"PC-482913\"\nalias = \"书房\"",
+        );
         assert_ne!(edited, text);
         std::fs::write(&file, edited).unwrap();
         d.alias = Some("书房".into());

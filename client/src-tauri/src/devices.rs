@@ -118,11 +118,19 @@ pub fn entries(doc: &toml_edit::DocumentMut) -> Vec<Device> {
     let Some(arr) = doc.get("device").and_then(Item::as_array_of_tables) else {
         return Vec::new();
     };
-    arr.iter().filter_map(from_table).take(MAX_IN_FILE).collect()
+    arr.iter()
+        .filter_map(from_table)
+        .take(MAX_IN_FILE)
+        .collect()
 }
 
 fn from_table(t: &Table) -> Option<Device> {
-    let str_of = |k: &str| t.get(k).and_then(Item::as_str).map(clip).unwrap_or_default();
+    let str_of = |k: &str| {
+        t.get(k)
+            .and_then(Item::as_str)
+            .map(clip)
+            .unwrap_or_default()
+    };
     let code = t.get("code")?.as_str()?.trim().to_string();
     if code.is_empty() || code.len() > MAX_CODE {
         return None;
@@ -154,7 +162,9 @@ fn quality_from(item: &Item) -> Option<QualitySettings> {
     // 和界面的 JSON 一样的名字（"h264"）；之前的版本写的是 "H264"，也认
     let codec = Codec::from_name(&t.get("codec").and_then(Item::as_str)?.to_ascii_lowercase())?;
     Some(QualitySettings {
-        fps: u8::try_from(int("fps")?).ok().filter(|f| (1..=120).contains(f))?,
+        fps: u8::try_from(int("fps")?)
+            .ok()
+            .filter(|f| (1..=120).contains(f))?,
         bitrate_kbps: u32::try_from(int("bitrate_kbps")?).ok()?,
         max_short: u16::try_from(int("max_short")?).ok()?,
         adaptive: t.get("adaptive").and_then(Item::as_bool)?,
@@ -185,8 +195,14 @@ pub fn for_file(mine: Vec<Device>) -> Result<Vec<Device>> {
     }
     // 别的账户保存的（本账户解不开）原样保留；本账户的以控制台发来的为准（删掉的就不要了）
     #[cfg(windows)]
-    if let Some(doc) = crate::config::read_text().and_then(|t| t.parse::<toml_edit::DocumentMut>().ok()) {
-        out.extend(entries(&doc).into_iter().filter(|e| open(e.clone()).is_none()));
+    if let Some(doc) =
+        crate::config::read_text().and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+    {
+        out.extend(
+            entries(&doc)
+                .into_iter()
+                .filter(|e| open(e.clone()).is_none()),
+        );
     }
     out.truncate(MAX_IN_FILE);
     Ok(out)
@@ -221,10 +237,7 @@ pub fn to_table(d: &Device) -> Option<Table> {
         it.insert("bitrate_kbps", i64::from(q.bitrate_kbps).into());
         it.insert("max_short", i64::from(q.max_short).into());
         it.insert("adaptive", q.adaptive.into());
-        it.insert(
-            "codec",
-            q.codec.or_h264().name().unwrap_or("h264").into(),
-        );
+        it.insert("codec", q.codec.or_h264().name().unwrap_or("h264").into());
         t["quality"] = toml_edit::value(it);
     }
     if let Some(r) = &d.resume {
@@ -242,7 +255,11 @@ pub fn to_table(d: &Device) -> Option<Table> {
 
 pub(crate) fn to_millis(d: &Datetime) -> Option<i64> {
     let date = d.date?;
-    let (y, m, day) = (i64::from(date.year), i64::from(date.month), i64::from(date.day));
+    let (y, m, day) = (
+        i64::from(date.year),
+        i64::from(date.month),
+        i64::from(date.day),
+    );
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -251,7 +268,11 @@ pub(crate) fn to_millis(d: &Datetime) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     let (h, min, s) = d.time.map_or((0, 0, 0), |t| {
-        (i64::from(t.hour), i64::from(t.minute), i64::from(t.second.unwrap_or(0)))
+        (
+            i64::from(t.hour),
+            i64::from(t.minute),
+            i64::from(t.second.unwrap_or(0)),
+        )
     });
     let offset_min = match d.offset {
         Some(toml_edit::Offset::Custom { minutes }) => i64::from(minutes),
@@ -321,7 +342,10 @@ mod tests {
             let dt = from_millis(ms).unwrap();
             assert_eq!(to_millis(&dt), Some(ms), "{dt}");
         }
-        assert_eq!(from_millis(1_762_597_230_000).unwrap().to_string(), "2025-11-08T10:20:30Z");
+        assert_eq!(
+            from_millis(1_762_597_230_000).unwrap().to_string(),
+            "2025-11-08T10:20:30Z"
+        );
         // 别的时区写的也认
         let dt: Datetime = "2025-11-08T18:20:30+08:00".parse().unwrap();
         assert_eq!(to_millis(&dt), Some(1_762_597_230_000));
@@ -335,7 +359,15 @@ mod tests {
         let t = to_table(&d).unwrap();
         assert_eq!(from_table(&t), Some(d.clone()));
         // 没有可选项的也行
-        let bare = Device { alias: None, os: String::new(), resume: None, quality: None, last_used: 0, host_key: None, ..d };
+        let bare = Device {
+            alias: None,
+            os: String::new(),
+            resume: None,
+            quality: None,
+            last_used: 0,
+            host_key: None,
+            ..d
+        };
         assert_eq!(from_table(&to_table(&bare).unwrap()), Some(bare));
     }
 
@@ -374,7 +406,9 @@ name = "no code"
 
     #[test]
     fn normalize_dedups_sorts_and_caps() {
-        let mut list: Vec<Device> = (0..60).map(|i| device(&format!("{}", 100_000 + i), i)).collect();
+        let mut list: Vec<Device> = (0..60)
+            .map(|i| device(&format!("{}", 100_000 + i), i))
+            .collect();
         list.push(device("100059", 1_000));
         list.push(device("012345", 5));
         list.push(device("12345", 5));
@@ -395,7 +429,10 @@ name = "no code"
         let back = from_table(&to_table(&sealed).unwrap()).unwrap();
         assert_eq!(open(back), Some(d));
         // 坏了的解不开：不显示（Windows 上原样保留）
-        let broken = Device { code: "AAAA".into(), ..device("482913", 1) };
+        let broken = Device {
+            code: "AAAA".into(),
+            ..device("482913", 1)
+        };
         assert_eq!(open(broken), None);
     }
 }

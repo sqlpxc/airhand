@@ -71,16 +71,22 @@ pub struct AgentStatus {
 pub enum ToAgent {
     KickAll,
     NewCode,
-    SetAutostart { on: bool },
+    SetAutostart {
+        on: bool,
+    },
     /// 控制台的"我的设备"：整个列表写进 config.toml（托盘没有写安装目录的权限）。
     /// 已经由托盘整理好、`code` 用那个用户的 DPAPI 加密过（见 [`crate::devices::for_file`]）
-    SaveDevices { devices: Vec<crate::devices::Device> },
+    SaveDevices {
+        devices: Vec<crate::devices::Device>,
+    },
     /// 换一个配对码（暂停了的配对随之恢复）
     NewPairingCode,
     /// 忘掉所有配对过的控制端
     ForgetPaired,
     /// 控制台的身份（那个用户的 DPAPI 加密过，见 [`crate::config::controller_identity`]）写进 config.toml
-    SaveControllerKey { key: String },
+    SaveControllerKey {
+        key: String,
+    },
 }
 
 async fn send_line<W: AsyncWrite + Unpin>(w: &mut W, msg: &impl Serialize) -> Result<()> {
@@ -239,7 +245,8 @@ async fn handle(msg: ToAgent, agent: &Agent) {
             let _ = tokio::task::spawn_blocking(move || gate.forget_paired()).await;
         }
         ToAgent::SaveControllerKey { key } => {
-            let r = tokio::task::spawn_blocking(move || crate::config::save_controller_key(&key)).await;
+            let r =
+                tokio::task::spawn_blocking(move || crate::config::save_controller_key(&key)).await;
             match r {
                 Ok(Ok(())) => debug!("saved a console identity"),
                 Ok(Err(e)) => warn!("can't save the console identity: {e:#}"),
@@ -264,7 +271,8 @@ async fn handle(msg: ToAgent, agent: &Agent) {
         ToAgent::SaveDevices { devices } => {
             // 只改 [[device]]，每一项写之前再检查一遍（见 devices::to_table）
             let n = devices.len();
-            let r = tokio::task::spawn_blocking(move || crate::config::save_devices(&devices)).await;
+            let r =
+                tokio::task::spawn_blocking(move || crate::config::save_devices(&devices)).await;
             match r {
                 Ok(Ok(())) => debug!(n, "saved the devices"),
                 Ok(Err(e)) => warn!("can't save the devices: {e:#}"),
