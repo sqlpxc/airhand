@@ -67,7 +67,6 @@ const en: Record<MsgKey, Msg> = {
   "connect.clear": "Clear",
   "connect.pairing": "Pairing code",
   "connect.pairingHint": "The 6-digit pairing code in the remote computer's tray menu. Once paired, that computer remembers this one",
-  "connect.trustNew": "Trust the new identity and connect",
   "connect.customQuality": "Custom quality",
 
   "devices.title": "My devices",
@@ -154,7 +153,6 @@ const en: Record<MsgKey, Msg> = {
   "session.lost": "Connection lost",
   "session.ended": "Session ended",
   "session.reconnect": "Reconnect",
-  "session.trustNew": "Trust the new identity and reconnect",
   "session.pairAndReconnect": "Pair and reconnect",
   "session.safety": "Safety code {code}",
   "session.safetyHint": "End-to-end encrypted. If the remote computer's tray shows the same safety code, nobody is in between",
@@ -254,7 +252,7 @@ const en: Record<MsgKey, Msg> = {
   "problem.serverTimeout": "The server didn't respond in time",
   "problem.hostOffline": "The remote computer is offline",
   "problem.hostKeyChanged":
-    "The remote computer's identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Trust the new identity only once you've confirmed it was reinstalled",
+    "The remote computer's identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Once you've confirmed it was reinstalled, enter its current pairing code to pair again (a phone has no pairing code: remove it from My devices and connect again)",
   "problem.pairingRequired": "First connection to this computer: enter its pairing code, shown in the Airhand tray menu on that computer",
   "problem.pairingFailed": "Wrong pairing code, check the one in the remote computer's tray menu",
   "problem.pairingUnavailable": "The remote computer paused pairing (too many wrong codes): ask its user to pick a new pairing code in the tray menu",

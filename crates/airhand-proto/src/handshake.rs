@@ -15,7 +15,9 @@
 //! 每台设备（被控端、控制端）有一对长期的 X25519 密钥，就是 Noise 的静态密钥，保存在本机（和控制码的密钥一样加密保存）。
 //!
 //! * 控制端记下被控端的公钥（"我的设备"，和 SSH 的 known_hosts 一样：第一次连上时记下），之后只认它。
-//!   对不上就是硬错误，不会悄悄改成相信新的（可能是中间人，也可能是对方重装了，由用户决定）；
+//!   对不上就是硬错误，不会悄悄改成相信新的（可能是中间人，也可能是对方重装了）。要换成新的身份只能**重新配对**
+//!   （[`Pattern::Pairing`]，输入对方现在的配对码），不能退回 [`Pattern::First`]：[`HandshakeError::UnknownKey`]
+//!   是明文、服务器伪造得出来，要是"信任新的身份"就是不验证地连，服务器随时能让控制端把它自己当成被控端记下来；
 //! * 被控端记下配对过的控制端的公钥。没配对过的控制端，按被控端的设置：要求配对码（桌面版默认），
 //!   请本机用户同意（手机默认），或者知道控制码就能连（等于信任中转服务器）。
 //!
@@ -82,12 +84,16 @@
 //!
 //! # 之后的每一帧
 //!
-//! 密钥从 Noise 的结果派生（HKDF-SHA256，salt 是握手的哈希），每条通道、每个方向、数据报各用一把
-//! （见 `airhand_link::secure`）。AEAD 是 ChaCha20-Poly1305：
+//! 密钥从 Noise 的结果派生（HKDF-SHA256，salt 是握手的哈希），每条通道、每个方向一把（见 `airhand_link::secure`）。
+//! AEAD 是 ChaCha20-Poly1305。加密的单位是**密封单元**：`密文 | 16 字节标签 | u64 LE 计数`（[`SEAL_OVERHEAD`]），
+//! nonce 就是后面的计数（这条通道这个方向从 0 开始递增）。计数写在线上，每个单元自己就能解开：
 //!
-//! * 流：`u32 LE 长度 | 密文 | 16 字节标签`，nonce 是这条通道这个方向的帧计数（从 0 开始，不上线）。
-//!   丢帧、重排、重放、从别的通道搬过来的帧都解不开；
-//! * 数据报：`会话 ID | u64 LE 计数 | 密文 | 标签`（会话 ID 给服务器转发用），收的一方用滑动窗口挡掉重放。
+//! * 流上一帧是 `u32 LE 长度 | 密封单元`；数据报是 `会话 ID | 密封单元`（会话 ID 给服务器转发用）；
+//! * 控制、大块通道的计数必须一个接一个：丢掉、重排、重放、从别的通道搬过来的消息都解不开（中转删不掉一个"松开按键"）；
+//! * 画面、声音通道只要求没收过（128 个计数的滑动窗口挡掉重放）：声音的数据报和声音流共用一把密钥、一串计数，
+//!   以后画面也可以分成几条流、丢掉过时的帧，不用再改加密格式。
+//!
+//! 计数放在最后而不是最前面：收到一帧之后原地解密、截掉尾巴，媒体包照样从缓冲区开头原样交给界面，不用挪动几 MiB 的数据。
 
 use minicbor::{Decode, Encode};
 
@@ -97,6 +103,10 @@ use crate::session::QualitySettings;
 
 /// AEAD 认证标签的长度
 pub const TAG_LEN: usize = 16;
+/// 密封单元末尾的计数（nonce）的长度
+pub const NONCE_LEN: usize = 8;
+/// 密封单元比明文多出来的：标签 + 计数（见模块说明的"之后的每一帧"）
+pub const SEAL_OVERHEAD: usize = TAG_LEN + NONCE_LEN;
 /// 公钥（X25519）
 pub type PublicKey = [u8; 32];
 
@@ -166,7 +176,7 @@ pub struct HandshakeReply {
     /// Noise 的第 2 条消息
     #[cbor(n(2), with = "minicbor::bytes")]
     pub noise: Option<Vec<u8>>,
-    /// 加密的 [`HostVerdict`]：控制通道上被控端 → 控制端的第一帧密文（不带长度前缀）
+    /// 加密的 [`HostVerdict`]：控制通道上被控端 → 控制端的第一个密封单元（计数 0，不带长度前缀）
     #[cbor(n(3), with = "minicbor::bytes")]
     pub verdict: Option<Vec<u8>>,
     /// 被控端会的握手模式（只在 [`HandshakeError::Unsupported`] 时有）
@@ -220,9 +230,6 @@ pub struct ControllerIntro {
     /// 开始时要不要声音（之后的变化是 `ControllerMsg::Audio`）
     #[n(6)]
     pub audio: bool,
-    /// Optional video contract. Legacy settings remain the fallback for peers without VIDEO_MODEL.
-    #[n(7)]
-    pub video: Option<crate::video::VideoOffer>,
 }
 
 /// 被控端的决定（加密，见 [`HandshakeReply::verdict`]）
@@ -255,7 +262,7 @@ open_enum! {
     }
 }
 
-/// 控制端的确认：控制通道上控制端 → 被控端的第一帧密文（计数器 0），收到决定之后马上发。
+/// 控制端的确认：控制通道上控制端 → 被控端的第一帧密文（计数 0），收到决定之后马上发。
 /// 被控端解开它才算这个控制端进来了（见模块说明的"确认"）。以后可以加字段
 #[derive(Encode, Decode, Debug, Clone, Default, PartialEq, Eq)]
 #[cbor(map)]

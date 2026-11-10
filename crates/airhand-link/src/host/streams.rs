@@ -106,31 +106,23 @@ pub struct Admitted {
     pub settings: QualitySettings,
     /// 开始时要不要声音
     pub audio: bool,
-    pub video: Option<airhand_proto::video::VideoOffer>,
 }
 
 /// 读一条控制端的消息（解密、解码）；对方版本新增的消息跳过。流在消息边界处结束时为 `None`
 async fn next_controller_msg(
     recv: &mut quinn::RecvStream,
-    opener: &mut secure::FrameOpener,
+    opener: &mut secure::Opener,
     buf: &mut Vec<u8>,
     lane: SessionLane,
-    features: airhand_proto::Features,
 ) -> Result<Option<ControllerMsg>> {
     loop {
-        if !read_frame(recv, lane.receive_frame_size(features), buf).await? {
+        if !read_frame(recv, lane.max_frame_size(), buf).await? {
             return Ok(None);
         }
         opener.open(buf)?;
         match framing::decode::<ControllerMsg>(buf)? {
             Decoded::Msg(m) => {
                 anyhow::ensure!(m.lane() == lane, "controller message on the wrong lane");
-                if matches!(m, ControllerMsg::View(_) | ControllerMsg::VideoFeedback(_)) {
-                    anyhow::ensure!(
-                        features.has(airhand_proto::features::session::VIDEO_MODEL),
-                        "video model was not negotiated"
-                    );
-                }
                 return Ok(Some(m));
             }
             Decoded::Unknown(variant) => {
@@ -176,11 +168,6 @@ impl HostStreams {
             negotiated: r.negotiated,
             settings: r.intro.settings.sanitized(),
             audio: r.intro.audio,
-            video: r
-                .negotiated
-                .has(airhand_proto::features::session::VIDEO_MODEL)
-                .then_some(r.intro.video)
-                .flatten(),
         };
         info!(
             session_id,
@@ -190,11 +177,10 @@ impl HostStreams {
             negotiated = ?admitted.negotiated,
             "end-to-end session established"
         );
-        let (video_sealer, audio_sealer, bulk_sealer, datagrams) = (
+        let (video_sealer, audio_sealer, bulk_sealer) = (
             r.secured.video.sealer,
             r.secured.audio.sealer,
             r.secured.bulk.sealer,
-            r.secured.datagram_sealer,
         );
         let mut opener = r.opener;
         let mut bulk_opener = r.secured.bulk.opener;
@@ -208,19 +194,11 @@ impl HostStreams {
                 write_lane(send, ctl_rx, control_sealer),
                 write_lane(bulk_send, bulk_rx, bulk_sealer),
                 write_lane(video_send, video_rx, video_sealer),
-                write_audio(
-                    conn,
-                    session_id,
-                    audio_send,
-                    audio_rx,
-                    audio_sealer,
-                    datagrams
-                )
+                write_audio(conn, session_id, audio_send, audio_rx, audio_sealer)
             )
         }));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话
-        let features = r.negotiated.features;
-        let capacity = 4 * 1024 * 1024 / SessionLane::Control.receive_frame_size(features);
+        let capacity = 4 * 1024 * 1024 / SessionLane::Control.max_frame_size();
         let (in_tx, control_in) = mpsc::channel(capacity);
         let (bulk_in, bulk_rx) = mpsc::channel(2);
         let incoming = ControllerReceiver::new(control_in, bulk_rx);
@@ -233,7 +211,6 @@ impl HostStreams {
                     &mut bulk_opener,
                     &mut buf,
                     SessionLane::Bulk,
-                    features,
                 )
                 .await?
                 {
@@ -248,14 +225,9 @@ impl HostStreams {
                 let mut clock = InputClock::default();
                 // 这一串过时的输入已经换成了一个"释放所有按键"
                 let mut released = false;
-                while let Some(m) = next_controller_msg(
-                    &mut recv,
-                    &mut opener,
-                    &mut buf,
-                    SessionLane::Control,
-                    features,
-                )
-                .await?
+                while let Some(m) =
+                    next_controller_msg(&mut recv, &mut opener, &mut buf, SessionLane::Control)
+                        .await?
                 {
                     let m = match m {
                         ControllerMsg::Ping { t } => {
@@ -363,10 +335,16 @@ mod tests {
             incoming.recv().await,
             Some(ControllerMsg::Ping { t: 7 })
         ));
-        control.send(ControllerMsg::Ack { seq: 3 }).await.unwrap();
+        control
+            .send(ControllerMsg::Ack {
+                seq: 3,
+                arrived: None,
+            })
+            .await
+            .unwrap();
         assert!(matches!(
             incoming.recv().await,
-            Some(ControllerMsg::Ack { seq: 3 })
+            Some(ControllerMsg::Ack { seq: 3, .. })
         ));
         drop(control);
         assert!(incoming.recv().await.is_none());

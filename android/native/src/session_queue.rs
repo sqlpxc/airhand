@@ -185,7 +185,7 @@ mod tests {
         let mut audio = Vec::new();
         while let Some(p) = q.pop(Duration::ZERO) {
             if let Some(h) = VideoHeader::decode(&p) {
-                flow.on_ack(h.seq);
+                flow.on_ack(h.seq, None);
             } else if let Some(h) = AudioHeader::decode(&p) {
                 audio.push(h.seq);
             }

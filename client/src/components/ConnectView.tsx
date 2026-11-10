@@ -12,8 +12,8 @@ import { CODEC_LABEL, PRESETS, matchPreset, presetDesc, presetName, presetSettin
 import type { RemoteSession } from "../lib/session";
 import { store, useSession, useStore, type Draft } from "../lib/store";
 
-/** 这些问题要用户输入配对码 */
-const PAIRING_PROBLEMS = new Set(["pairingRequired", "pairingFailed", "pairingUnavailable"]);
+/** 这些问题要用户输入配对码（对方的身份变了也是：重新配对才认新的身份） */
+const PAIRING_PROBLEMS = new Set(["pairingRequired", "pairingFailed", "pairingUnavailable", "hostKeyChanged"]);
 import { IconBolt, IconClose, IconMonitor, IconPencil, IconSearch, IconWarn } from "./Icons";
 
 export function ConnectView() {
@@ -80,12 +80,6 @@ export function ConnectView() {
   const connect = () => {
     if (!ready || busy || !online) return;
     void openSession(code, presetSettings(preset, codec), { pairing: pairingReady ? pairing : null });
-  };
-
-  /** 对方的身份变了：用户确认是对方重装了之后，不带记着的公钥再连，连上之后记下新的 */
-  const trustNew = () => {
-    if (!ready || busy || !online) return;
-    void openSession(code, presetSettings(preset, codec), { trustNew: true });
   };
 
   /** 我的设备：用上次的画质连（没记下画质的用默认预设） */
@@ -215,11 +209,6 @@ export function ConnectView() {
               <IconWarn size={15} />
               <span>{problemText(error)}</span>
             </div>
-          )}
-          {error?.kind === "hostKeyChanged" && (
-            <button className="text-btn" disabled={!ready || busy || !online} onClick={trustNew}>
-              {t("connect.trustNew")}
-            </button>
           )}
           {server.state === "disconnected" && (
             <div className="error-box soft">

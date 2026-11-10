@@ -24,14 +24,11 @@ class VideoPacket(
     val data: ByteArray,
     val offset: Int,
     val length: Int,
-    val context: VideoContext? = null,
-    val feedback: (org.json.JSONObject) -> Unit = {},
     ack: () -> Unit,
 ) {
     private val acknowledge = ack
     private var acknowledged = false
     var decodeDeadlineNs = 0L
-    var decodeReadyNs = 0L
 
     fun ack() {
         if (acknowledged) return
@@ -68,23 +65,7 @@ class VideoDecoder(
     private var released = false
     private var pendingBytes = 0L
     private var decodeAvgNs = 0L
-    private data class Decoding(val seq: Int, val context: VideoContext?, val at: Long)
-    private val decoding = LinkedHashMap<Long, Decoding>()
-    private val telemetry = VideoFeedbackCollector()
-    private var feedbackContext: VideoContext? = null
-    private var feedbackStarted = false
-    private var reportFeedback: ((org.json.JSONObject) -> Unit)? = null
-    private val feedbackTask = object : Runnable {
-        override fun run() {
-            if (released || !feedbackStarted) return
-            val now = System.nanoTime()
-            val active = decoding.values.filter { it.context == feedbackContext }
-            val waiting = pending.filter { it.context == feedbackContext && it.decodeReadyNs <= now }
-            val oldest = (active.map { it.at } + waiting.map { it.decodeReadyNs }).minOrNull()
-            telemetry.sample(active.size + waiting.size, oldest?.let { (now - it) / 1_000_000 } ?: 0)?.let { reportFeedback?.invoke(it) }
-            handler.postDelayed(this, 200)
-        }
-    }
+    private val decoding = LinkedHashMap<Long, Long>()
     private val feedTask = Runnable { feed() }
 
     /** 开关改变、声音结束：重新计算等待时间，让画面及时恢复低延迟。 */
@@ -96,7 +77,8 @@ class VideoDecoder(
         handler.post {
             if (surface === s) return@post
             surface = s
-            discardPending()
+            pending.forEach { it.ack() }
+            pending.clear()
             releaseCodec()
             needKey = true
             if (s != null) askKeyframe(force = true)
@@ -110,11 +92,6 @@ class VideoDecoder(
     /** 会话断了重连：之前排队的帧属于旧会话，丢掉（不再确认），从关键帧重新开始 */
     fun resetStream() {
         handler.post {
-            telemetry.reset()
-            feedbackContext = null
-            reportFeedback = null
-            feedbackStarted = false
-            handler.removeCallbacks(feedbackTask)
             pending.clear()
             releaseCodec()
             needKey = true
@@ -124,7 +101,6 @@ class VideoDecoder(
     fun release() {
         handler.post {
             released = true
-            handler.removeCallbacks(feedbackTask)
             pending.forEach { it.ack() }
             pending.clear()
             releaseCodec()
@@ -141,15 +117,7 @@ class VideoDecoder(
     }
 
     private fun onPacket(p: VideoPacket) {
-        feedbackContext = p.context
-        reportFeedback = p.feedback
-        telemetry.received(p.seq, p.context)
-        if (p.context != null && !released && !feedbackStarted) {
-            feedbackStarted = true
-            handler.postDelayed(feedbackTask, 200)
-        }
         if (released || surface == null) {
-            telemetry.dropped()
             p.ack()
             return
         }
@@ -157,7 +125,6 @@ class VideoDecoder(
         val changed = c == null || codec == null || c.first != p.codec || (p.key && (c.second != p.width || c.third != p.height))
         if (changed) {
             if (!p.key) {
-                telemetry.dropped()
                 p.ack()
                 needKey = true
                 askKeyframe()
@@ -168,15 +135,12 @@ class VideoDecoder(
                 onTooLarge(p.codec, p.width, p.height)
             }
             if (!configure(p)) {
-                telemetry.error()
-                telemetry.dropped()
                 p.ack()
                 return
             }
         }
         if (needKey) {
             if (!p.key) {
-                telemetry.dropped()
                 p.ack()
                 askKeyframe()
                 return
@@ -186,13 +150,13 @@ class VideoDecoder(
         val arrivalNs = System.nanoTime()
         sync.onVideo(p.ptsUs, arrivalNs, decodeAvgNs)
         p.decodeDeadlineNs = arrivalNs + 500_000_000L
-        p.decodeReadyNs = minOf(p.decodeDeadlineNs, sync.decodeTimeNs(p.ptsUs, arrivalNs, decodeAvgNs))
         pending.addLast(p)
         pendingBytes += p.length
         if (pending.size > (if (sync.enabled) MAX_SYNC_PENDING else MAX_PENDING) || pendingBytes > MAX_PENDING_BYTES) {
             // 解码器卡住了：丢掉排队的帧，等下一个关键帧
             Log.w(TAG, "decoder is not keeping up (${pending.size} frames queued), waiting for a keyframe")
-            discardPending()
+            pending.forEach { it.ack() }
+            pending.clear()
             releaseCodec()
             needKey = true
             askKeyframe(force = true)
@@ -210,7 +174,6 @@ class VideoDecoder(
             val now = System.nanoTime()
             // 等待期间音频可能停了或重新缓冲，以最新播放时钟为准。
             val dueNs = minOf(first.decodeDeadlineNs, sync.decodeTimeNs(first.ptsUs, now, decodeAvgNs))
-            first.decodeReadyNs = dueNs
             val waitNs = dueNs - now
             if (waitNs > 1_000_000) {
                 handler.postDelayed(feedTask, (waitNs / 1_000_000).coerceAtMost(20))
@@ -226,11 +189,10 @@ class VideoDecoder(
                     throw IllegalStateException("frame of ${p.length} bytes doesn't fit the ${buf.capacity()} byte input buffer")
                 }
                 buf.put(p.data, p.offset, p.length)
-                decoding[p.ptsUs] = Decoding(p.seq, p.context, System.nanoTime())
+                decoding[p.ptsUs] = System.nanoTime()
                 mc.queueInputBuffer(idx, 0, p.length, p.ptsUs, if (p.key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
             } catch (e: Exception) {
                 Log.w(TAG, "can't queue a frame: $e")
-                if (!decoding.containsKey(p.ptsUs) && p.context == feedbackContext) telemetry.dropped()
                 p.ack()
                 fail("queue: $e")
                 return
@@ -240,16 +202,17 @@ class VideoDecoder(
     }
 
     private fun fail(why: String) {
-        telemetry.error()
-        discardPending()
         releaseCodec()
+        pending.forEach { it.ack() }
+        pending.clear()
         needKey = true
         onError(why)
         askKeyframe(force = true)
     }
 
     private fun configure(p: VideoPacket): Boolean {
-        discardPending()
+        pending.forEach { it.ack() }
+        pending.clear()
         releaseCodec()
         val s = surface ?: return false
         // MediaFormat(MediaFormat) is API 29+. Build both variants from the
@@ -299,16 +262,9 @@ class VideoDecoder(
         return false
     }
 
-    private fun discardPending() {
-        telemetry.dropped(pending.count { it.context == feedbackContext })
-        pending.forEach { it.ack() }
-        pending.clear()
-    }
-
     private fun releaseCodec() {
         handler.removeCallbacks(feedTask)
         pendingBytes = 0
-        telemetry.dropped(decoding.values.count { it.context == feedbackContext })
         decoding.clear()
         decodeAvgNs = 0
         val mc = codec ?: return
@@ -330,16 +286,13 @@ class VideoDecoder(
             if (codec !== this@VideoDecoder.codec) return
             try {
                 val now = System.nanoTime()
-                val output = decoding.remove(info.presentationTimeUs)
-                output?.let { sent ->
-                    val elapsed = (now - sent.at).coerceIn(0, 500_000_000)
+                decoding.remove(info.presentationTimeUs)?.let { sent ->
+                    val elapsed = (now - sent).coerceIn(0, 500_000_000)
                     decodeAvgNs = if (decodeAvgNs == 0L) elapsed else decodeAvgNs + (elapsed - decodeAvgNs) / 10
-                    telemetry.decoded(sent.seq, sent.context, elapsed / 1000)
                 }
                 val render = info.size > 0 || (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0
                 if (render && sync.enabled) codec.releaseOutputBuffer(index, sync.renderTimeNs(info.presentationTimeUs, now))
                 else codec.releaseOutputBuffer(index, render)
-                if (render && output != null) telemetry.presented(output.seq, output.context)
                 feed()
             } catch (e: Exception) {
                 Log.w(TAG, "releaseOutputBuffer: $e")
@@ -401,13 +354,6 @@ class VideoDecoder(
                 all.firstOrNull { isHardware(it.first) } ?: all.firstOrNull()
             }
         }
-
-        fun receiverCapabilities(): ReceiverCapabilities = ReceiverCapabilities(decodable.map { c ->
-            val caps = decoders[c]?.let { (info, type) -> runCatching { info.getCapabilitiesForType(type).videoCapabilities }.getOrNull() }
-            DecodeCapability(c, caps?.supportedWidths?.upper?.coerceAtMost(65535)?.takeIf { it >= 64 },
-                caps?.supportedHeights?.upper?.coerceAtMost(65535)?.takeIf { it >= 64 },
-                caps?.supportedFrameRates?.upper?.toInt()?.coerceIn(1, 120))
-        })
 
         fun decoderInfo(c: Codec): MediaCodecInfo? = decoders[c]?.first
 

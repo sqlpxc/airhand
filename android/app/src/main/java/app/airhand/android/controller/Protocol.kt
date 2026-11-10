@@ -28,7 +28,7 @@ object Media {
     const val CURSOR = 2
     const val AUDIO = 3
 
-    data class Video(val seq: Int, val key: Boolean, val codec: Codec, val width: Int, val height: Int, val captureUs: Long, val context: VideoContext? = null)
+    data class Video(val seq: Int, val key: Boolean, val codec: Codec, val width: Int, val height: Int, val captureUs: Long)
     data class Audio(val seq: Int, val start: Boolean, val captureUs: Long)
     data class Shape(val width: Int, val height: Int, val hotX: Int, val hotY: Int)
 
@@ -67,10 +67,6 @@ object Media {
             width = bb.u16(8),
             height = bb.u16(10),
             captureUs = bb.getLong(16),
-            context = if (b[1].toInt() and 2 != 0 && headerLen(b) >= 36) VideoContext(
-                bb.getInt(24).toLong() and 0xffffffffL,
-                MediaInstance(bb.getInt(28).toLong() and 0xffffffffL, bb.getInt(32).toLong() and 0xffffffffL),
-            ) else null,
         )
     }
 
@@ -107,18 +103,16 @@ object Commands {
         hostKey: String? = null,
         pairing: String? = null,
         audio: Boolean = false,
-        receiver: ReceiverCapabilities? = null,
-    ): JSONObject = options(resume, settings, hostKey, pairing, audio, receiver).put("cmd", "connect").put("code", code)
+    ): JSONObject = options(resume, settings, hostKey, pairing, audio).put("cmd", "connect").put("code", code)
 
     /** 连接选项（`ConnectOptions`） */
-    fun options(resume: String?, settings: Quality, hostKey: String?, pairing: String?, audio: Boolean, receiver: ReceiverCapabilities? = null): JSONObject =
+    fun options(resume: String?, settings: Quality, hostKey: String?, pairing: String?, audio: Boolean): JSONObject =
         JSONObject()
             .put("resume", Resume.toJson(resume))
             .put("hostKey", hostKey ?: JSONObject.NULL)
             .put("pairing", pairing ?: JSONObject.NULL)
             .put("settings", settings.toJson())
             .put("audio", audio)
-            .apply { if (receiver != null) put("receiver", receiver.toJson()) }
 
     fun input(sid: Int, events: JSONArray): JSONObject = cmd("input", sid).put("events", events)
     fun settings(sid: Int, q: Quality): JSONObject = cmd("settings", sid).put("settings", q.toJson())
@@ -126,7 +120,6 @@ object Commands {
     fun display(sid: Int, index: Int): JSONObject = cmd("display", sid).put("index", index)
     fun audio(sid: Int, enabled: Boolean): JSONObject = cmd("audio", sid).put("enabled", enabled)
     fun clipboard(sid: Int, text: String): JSONObject = cmd("clipboard", sid).put("text", text)
-    fun videoFeedback(sid: Int, feedback: JSONObject): JSONObject = cmd("videoFeedback", sid).put("feedback", feedback)
     fun disconnect(sid: Int): JSONObject = cmd("disconnect", sid)
 }
 

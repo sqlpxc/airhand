@@ -12,7 +12,8 @@
 //! 不解码、不拷贝，原样交给界面；
 //! 界面按同一个格式解析（`client/src/lib/media.ts`、`android/.../controller/Protocol.kt` 里的 `Media`，
 //! 三边都用 `crates/airhand-link/tests/protocol.json` 里的样例检查）。
-//! 光标形状走大块通道（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor)），控制端把它转成同样格式的光标包。
+//! 光标（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor) / [`HostMsg::CursorImage`](crate::session::HostMsg::CursorImage)）
+//! 由控制端合并成同样格式的光标包（[`cursor_packet`]）交给界面。
 //!
 //! 声音包平时不走声音流，而是一包一个 QUIC 数据报（[`crate::datagram`]，不带长度前缀）：丢了的不重传，
 //! 后面的包也不用等它。放不进一个数据报的（很少见）才走声音流。数据报可能乱序，控制端按采集时刻（相同时按序号）丢掉迟到的包。
@@ -34,7 +35,10 @@
 //! # 以后加字段
 //!
 //! 头的长度在第 3 个字节里（[`header_len`]）：以后要加字段（色彩空间、显示器编号……）就加在第 24 字节之后，
-//! 把头变长，负载照样从"头的长度"处开始，旧的界面不认识新字段、跳过它们就行。所以读的一方必须：
+//! 把头变长，负载照样从"头的长度"处开始，旧的界面不认识新字段、跳过它们就行。
+//!
+//! 24 字节之后是一串扩展，每个是 `类型 u8 | 长度 u8 | 值`（TLV）：每个扩展自己说明有多长，
+//! 新的扩展不依赖别的扩展在不在、排在第几，读的一方只取认识的类型。现在还没有扩展。所以读的一方必须：
 //!
 //! * 从第 3 个字节读头的长度、从那里开始取负载，**不能**写死 24；
 //! * 忽略不认识的标志位、为 0 的保留字节（以后可能有值）、24 字节之后不认识的部分；
@@ -50,13 +54,10 @@
 //!
 //! 编码格式不认识的画面包（[`VideoHeader::decode`] 返回 `None`）三边都丢掉，不猜成某种格式送进解码器。
 
-use crate::session::{Codec, CursorState};
+use crate::session::{Codec, CursorShape};
 
 /// 本版本写的媒体包头的长度，也是头最短的长度（读的时候按第 3 个字节，见 [`header_len`]）
 pub const HEADER_LEN: usize = 24;
-/// VIDEO_MODEL extension: config ID, stream ID and transport generation (u32 LE each).
-pub const VIDEO_CONTEXT_LEN: usize = HEADER_LEN + 12;
-const FLAG_VIDEO_CONTEXT: u8 = 2;
 /// 画面包上限（一个 4K 关键帧也远小于这个值）
 pub const MAX_VIDEO_PACKET: usize = 32 * 1024 * 1024;
 /// 声音包上限
@@ -140,35 +141,6 @@ pub struct VideoHeader {
 }
 
 impl VideoHeader {
-    /// The legacy prefix remains byte-for-byte identical. Only negotiated VIDEO_MODEL senders use this.
-    pub fn encode_with_context(&self, context: Option<crate::video::VideoContext>) -> Vec<u8> {
-        let mut header = self.encode().to_vec();
-        if let Some(c) = context {
-            header[1] |= FLAG_VIDEO_CONTEXT;
-            header[3] = VIDEO_CONTEXT_LEN as u8;
-            header.extend_from_slice(&c.config_id.to_le_bytes());
-            header.extend_from_slice(&c.instance.stream_id.to_le_bytes());
-            header.extend_from_slice(&c.instance.generation.to_le_bytes());
-        }
-        header
-    }
-
-    pub fn context(packet: &[u8]) -> Option<crate::video::VideoContext> {
-        if Kind::of(packet)? != Kind::Video
-            || packet[1] & FLAG_VIDEO_CONTEXT == 0
-            || header_len(packet)? < VIDEO_CONTEXT_LEN
-        {
-            return None;
-        }
-        Some(crate::video::VideoContext {
-            config_id: u32_at(packet, 24),
-            instance: crate::video::MediaInstance {
-                stream_id: u32_at(packet, 28),
-                generation: u32_at(packet, 32),
-            },
-        })
-    }
-
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         debug_assert!(self.codec.is_known(), "encoding with an unknown codec");
         let mut h = new_header(Kind::Video);
@@ -236,6 +208,22 @@ impl AudioHeader {
     }
 }
 
+/// 交给界面的光标（[`cursor_packet`]）。由控制端合并线上的光标消息得到，不在线上传
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorState {
+    pub visible: bool,
+    /// 换成了哪个形状；`None` 表示形状没变
+    pub shape: Option<CursorSlot>,
+}
+
+/// 光标换成了界面槽位 `slot` 里的形状（见 [`CURSOR_SLOTS`](crate::session::CURSOR_SLOTS)）
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorSlot {
+    pub slot: u8,
+    /// 新的形状：存进这个槽位（替换掉原来的）。`None` 表示槽位里已经是它了
+    pub image: Option<CursorShape>,
+}
+
 /// 光标包（控制端交给界面，不在线上传）
 pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
     let image = c.shape.as_ref().and_then(|s| s.image.as_ref());
@@ -264,10 +252,10 @@ pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
 }
 
 /// 线上的一个媒体包（加密之前）：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
-/// 多留了认证标签的容量：原地加密时不用重新分配（画面包可能有几 MiB）
-pub fn frame(header: &[u8], payload: &[&[u8]]) -> Vec<u8> {
-    let len = header.len() + payload.iter().map(|p| p.len()).sum::<usize>();
-    let mut buf = Vec::with_capacity(4 + len + crate::handshake::TAG_LEN);
+/// 多留了加密开销（标签和计数）的容量：原地加密时不用重新分配（画面包可能有几 MiB）
+pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
+    let len = HEADER_LEN + payload.iter().map(|p| p.len()).sum::<usize>();
+    let mut buf = Vec::with_capacity(4 + len + crate::handshake::SEAL_OVERHEAD);
     buf.extend_from_slice(&(len as u32).to_le_bytes());
     buf.extend_from_slice(header);
     for p in payload {
@@ -279,7 +267,6 @@ pub fn frame(header: &[u8], payload: &[&[u8]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{CursorShape, CursorSlot};
 
     #[test]
     fn unknown_video_codec_preserves_the_header_and_ack_sequence() {

@@ -3,22 +3,23 @@
 //! * [`Identity`]：一台设备的长期 X25519 密钥（Noise 的静态密钥），由各端自己保存；
 //! * [`initiate`] / [`respond`]：控制端 / 被控端在控制通道上握手（最后是控制端的确认），得到 [`Secured`]
 //!   和双方协商好的 [`Negotiated`]；
-//! * [`Secured`]：握手一次性派生的通道密钥集合：[`FrameSealer`] / [`FrameOpener`]（流上的帧）、
-//!   [`DatagramSealer`] / [`DatagramOpener`]（声音数据报）。
+//! * [`Secured`]：握手一次性派生的通道密钥：每条通道每个方向一个 [`Sealer`] / [`Opener`]，
+//!   声音的数据报和声音流共用一个。
 //!
-//! 加解密都是原地做的：发送的帧预留了认证标签的位置（`airhand_proto::framing::encode_with_spare`、
-//! `airhand_proto::media::frame`），收到的帧解密之后截掉标签，画面包照样原样交给界面，不多拷贝。
+//! 加解密都是原地做的：发送的帧预留了标签和计数的位置（`airhand_proto::framing::encode_with_spare`、
+//! `airhand_proto::media::frame`），收到的帧解密之后截掉尾巴，画面包照样原样交给界面，不多拷贝。
 
 use std::time::Duration;
 
 use crate::wire::{read_frame, write_frame};
-use airhand_proto::framing;
+use airhand_proto::framing::{self, PREFIX};
 use airhand_proto::handshake::{
     self, Confirm, ControllerIntro, HandshakeError, HandshakeFinish, HandshakeInit, HandshakeReply,
-    HostVerdict, PAKE_CONTROLLER, PAKE_HOST, Pattern, PublicKey, Refusal, TAG_LEN,
+    HostVerdict, NONCE_LEN, PAKE_CONTROLLER, PAKE_HOST, Pattern, PublicKey, Refusal, SEAL_OVERHEAD,
+    TAG_LEN,
 };
 use airhand_proto::session::QualitySettings;
-use airhand_proto::{Role, SESSION_MIN, SESSION_VERSION, SessionLane};
+use airhand_proto::{Role, SESSION_MIN, SESSION_VERSION, SessionLane, datagram};
 use anyhow::{Context, Result, anyhow, bail};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf;
@@ -108,118 +109,98 @@ fn aead_key(raw: &[u8; 32]) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, raw).expect("32-byte key"))
 }
 
-/// 一条通道一个方向的发送端：每一帧用下一个计数做 nonce（计数不上线，收的一方按顺序数）
-pub struct FrameSealer {
+/// 一条通道一个方向的发送端。每个密封单元是 `密文 | 标签 | 计数`，计数就是 nonce，从 0 开始递增
+/// （见 `airhand_proto::handshake` 的"之后的每一帧"）
+pub struct Sealer {
     key: LessSafeKey,
     counter: u64,
 }
 
-impl FrameSealer {
-    /// 把一帧（`u32 长度 | 明文`，`framing::encode` / `media::frame` 编好的）原地加密成 `u32 长度 | 密文 | 标签`
+impl Sealer {
+    /// 把一帧（`u32 长度 | 明文`，`framing::encode_with_spare` / `media::frame` 编好的，留了 [`SEAL_OVERHEAD`]
+    /// 的容量）原地加密成 `u32 长度 | 密文 | 标签 | 计数`
     pub fn seal_frame(&mut self, frame: &mut Vec<u8>) -> Result<()> {
-        anyhow::ensure!(frame.len() >= 4, "not a frame");
-        let n = self.next()?;
-        let tag = self
-            .key
-            .seal_in_place_separate_tag(n, Aad::empty(), &mut frame[4..])
-            .map_err(|_| anyhow!("encryption failed"))?;
-        frame.extend_from_slice(tag.as_ref());
-        let len = (frame.len() - 4) as u32;
-        frame[..4].copy_from_slice(&len.to_le_bytes());
+        anyhow::ensure!(frame.len() >= PREFIX, "not a frame");
+        self.seal_at(frame, PREFIX)?;
+        let len = (frame.len() - PREFIX) as u32;
+        frame[..PREFIX].copy_from_slice(&len.to_le_bytes());
         Ok(())
     }
 
-    /// 加密一段负载（不带长度前缀），返回 `密文 | 标签`
+    /// 加密一段负载（不带长度前缀），返回密封单元 `密文 | 标签 | 计数`
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
+        let mut out = Vec::with_capacity(plaintext.len() + SEAL_OVERHEAD);
         out.extend_from_slice(plaintext);
-        let n = self.next()?;
-        self.key
-            .seal_in_place_append_tag(n, Aad::empty(), &mut out)
-            .map_err(|_| anyhow!("encryption failed"))?;
+        self.seal_at(&mut out, 0)?;
         Ok(out)
     }
 
-    fn next(&mut self) -> Result<Nonce> {
+    /// 数据报：`会话 ID | 密文 | 标签 | 计数`（见 `airhand_proto::datagram`）
+    pub fn seal_datagram(&mut self, session_id: u64, packet: &[u8]) -> Result<Vec<u8>> {
+        let mut d = Vec::with_capacity(datagram::HEADER + packet.len() + SEAL_OVERHEAD);
+        d.extend_from_slice(&session_id.to_le_bytes());
+        d.extend_from_slice(packet);
+        self.seal_at(&mut d, datagram::HEADER)?;
+        Ok(d)
+    }
+
+    /// 把 `buf[start..]` 原地加密，后面追加标签和计数
+    fn seal_at(&mut self, buf: &mut Vec<u8>, start: usize) -> Result<()> {
         let c = self.counter;
         self.counter = c.checked_add(1).context("nonce counter exhausted")?;
-        Ok(nonce(c))
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce(c), Aad::empty(), &mut buf[start..])
+            .map_err(|_| anyhow!("encryption failed"))?;
+        buf.extend_from_slice(tag.as_ref());
+        buf.extend_from_slice(&c.to_le_bytes());
+        Ok(())
     }
 }
 
 /// 一条通道一个方向的接收端
-pub struct FrameOpener {
+pub struct Opener {
     key: LessSafeKey,
-    counter: u64,
+    order: Order,
 }
 
-impl FrameOpener {
-    /// 原地解密一帧的负载（`密文 | 标签`，不带长度前缀），之后 `payload` 就是明文。
-    /// 解不开（被改过、丢了一帧、顺序不对、不是这条通道的）是错误：会话不能再继续
-    pub fn open(&mut self, payload: &mut Vec<u8>) -> Result<()> {
-        let c = self.counter;
-        self.counter = c.checked_add(1).context("nonce counter exhausted")?;
+/// 接收端认哪些计数（见 `airhand_proto::handshake` 的"之后的每一帧"）
+enum Order {
+    /// 控制、大块通道：必须是下一个，丢掉、重排、重放的消息都不认
+    Next(u64),
+    /// 画面、声音：没收到过就行（滑动窗口挡掉重放）。声音的数据报本来就会丢、会乱序，以后画面也可能分几条流发
+    Window(ReplayWindow),
+}
+
+impl Opener {
+    /// 原地解开一个密封单元（`密文 | 标签 | 计数`，流上一帧去掉长度前缀的部分），之后 `buf` 就是明文。
+    /// 解不开（被改过、不是这条通道的、计数不对）是错误：控制、大块、画面通道上会话不能再继续；
+    /// 声音包丢掉就是了
+    pub fn open(&mut self, buf: &mut Vec<u8>) -> Result<()> {
+        let at = buf
+            .len()
+            .checked_sub(NONCE_LEN + TAG_LEN)
+            .context("a session frame is too short")?
+            + TAG_LEN;
+        let c = u64::from_le_bytes(buf[at..].try_into().expect("8 bytes"));
+        let fresh = match &self.order {
+            Order::Next(next) => c == *next,
+            Order::Window(w) => w.fresh(c),
+        };
+        anyhow::ensure!(fresh, "a session frame was dropped, reordered or replayed");
+        buf.truncate(at);
         let len = self
             .key
-            .open_in_place(nonce(c), Aad::empty(), payload)
+            .open_in_place(nonce(c), Aad::empty(), buf)
             .map_err(|_| anyhow!("a session frame failed authentication"))?
             .len();
-        payload.truncate(len);
-        Ok(())
-    }
-}
-
-/// 声音数据报的发送端：`会话 ID | u64 计数 | 密文 | 标签`
-pub struct DatagramSealer {
-    key: LessSafeKey,
-    counter: u64,
-}
-
-/// 数据报在会话 ID 之后的开销：计数 + 标签
-pub const DATAGRAM_OVERHEAD: usize = 8 + TAG_LEN;
-
-impl DatagramSealer {
-    pub fn seal(&mut self, session_id: u64, packet: &[u8]) -> Result<Vec<u8>> {
-        let c = self.counter;
-        self.counter = c.checked_add(1).context("nonce counter exhausted")?;
-        let mut d =
-            Vec::with_capacity(airhand_proto::datagram::HEADER + DATAGRAM_OVERHEAD + packet.len());
-        d.extend_from_slice(&session_id.to_le_bytes());
-        d.extend_from_slice(&c.to_le_bytes());
-        let body = d.len();
-        d.extend_from_slice(packet);
-        let tag = self
-            .key
-            .seal_in_place_separate_tag(nonce(c), Aad::empty(), &mut d[body..])
-            .map_err(|_| anyhow!("encryption failed"))?;
-        d.extend_from_slice(tag.as_ref());
-        Ok(d)
-    }
-}
-
-/// 声音数据报的接收端：数据报可能丢、可能乱序，计数是明文；用滑动窗口挡掉重放的
-pub struct DatagramOpener {
-    key: LessSafeKey,
-    window: ReplayWindow,
-}
-
-impl DatagramOpener {
-    /// `body`：会话 ID 后面的部分。解不开、重放的返回 `None`（丢掉，数据报本来就可能丢）
-    pub fn open(&mut self, body: &[u8]) -> Option<Vec<u8>> {
-        let counter = u64::from_le_bytes(body.get(..8)?.try_into().ok()?);
-        if !self.window.fresh(counter) {
-            return None;
-        }
-        let mut buf = body[8..].to_vec();
-        let len = self
-            .key
-            .open_in_place(nonce(counter), Aad::empty(), &mut buf)
-            .ok()?
-            .len();
         buf.truncate(len);
-        // 认证通过之后才记下：伪造的数据报不能把窗口推走
-        self.window.accept(counter);
-        Some(buf)
+        // 认证通过之后才记下：伪造的单元不能把计数推走
+        match &mut self.order {
+            Order::Next(next) => *next = c.saturating_add(1),
+            Order::Window(w) => w.accept(c),
+        }
+        Ok(())
     }
 }
 
@@ -243,10 +224,10 @@ impl ReplayWindow {
 
     fn accept(&mut self, c: u64) {
         if c >= self.top {
-            let shift = c + 1 - self.top;
+            let shift = c - self.top + 1;
             self.seen = if shift >= 128 { 0 } else { self.seen << shift };
             self.seen |= 1;
-            self.top = c + 1;
+            self.top = c.saturating_add(1);
         } else {
             self.seen |= 1 << (self.top - 1 - c);
         }
@@ -255,21 +236,20 @@ impl ReplayWindow {
 
 // ───────────────────────────── 会话的密钥 ─────────────────────────────
 
-/// 每条通道的密钥只能移交一次。没有 Clone，也没有重新从计数器 0 创建加密端的公开接口。
+/// 每条通道的密钥只能移交一次。没有 Clone，也没有重新从计数 0 创建加密端的公开接口。
 pub struct LaneKeys {
-    pub sealer: FrameSealer,
-    pub opener: FrameOpener,
+    pub sealer: Sealer,
+    pub opener: Opener,
 }
 
-/// 握手之后可移交给媒体和大块通道的密钥；控制通道已经在握手中消耗了第一帧。
+/// 握手之后移交给画面、声音（流和数据报共用）、大块通道的密钥；控制通道的在 [`Initiated`] / [`Responded`] 里
+/// （握手已经用掉了它的第一个计数）。
 pub struct Secured {
     pub peer: PublicKey,
     pub safety: String,
     pub video: LaneKeys,
     pub audio: LaneKeys,
     pub bulk: LaneKeys,
-    pub datagram_sealer: DatagramSealer,
-    pub datagram_opener: DatagramOpener,
 }
 
 /// 仅握手内部持有的原始材料，消费后派生一次全部通道密钥。
@@ -296,21 +276,15 @@ impl Drop for KeyMaterial {
 
 impl KeyMaterial {
     fn split(self) -> (Secured, LaneKeys) {
-        let lane = |lane| LaneKeys {
-            sealer: self.sealer(lane),
-            opener: self.opener(lane),
-        };
         (
             Secured {
                 peer: self.peer,
                 safety: self.safety.clone(),
-                video: lane(SessionLane::Video),
-                audio: lane(SessionLane::Audio),
-                bulk: lane(SessionLane::Bulk),
-                datagram_sealer: self.datagram_sealer(),
-                datagram_opener: self.datagram_opener(),
+                video: self.lane(SessionLane::Video),
+                audio: self.lane(SessionLane::Audio),
+                bulk: self.lane(SessionLane::Bulk),
             },
-            lane(SessionLane::Control),
+            self.lane(SessionLane::Control),
         )
     }
 
@@ -337,40 +311,29 @@ impl KeyMaterial {
         })
     }
 
-    fn key(&self, sending: bool, label: &[u8]) -> LessSafeKey {
+    fn key(&self, sending: bool, lane: SessionLane) -> LessSafeKey {
         // 控制端发送 = 发起方 → 响应方
         let i2r = sending == (self.role == Role::Controller);
         let ikm = if i2r { &self.i2r } else { &self.r2i };
         let mut out = [0u8; 32];
-        derive(&self.h, ikm, label, &mut out);
+        derive(&self.h, ikm, &lane_label(lane), &mut out);
         aead_key(&out)
     }
 
-    fn sealer(&self, lane: SessionLane) -> FrameSealer {
-        FrameSealer {
-            key: self.key(true, &lane_label(lane)),
-            counter: 0,
-        }
-    }
-
-    fn opener(&self, lane: SessionLane) -> FrameOpener {
-        FrameOpener {
-            key: self.key(false, &lane_label(lane)),
-            counter: 0,
-        }
-    }
-
-    fn datagram_sealer(&self) -> DatagramSealer {
-        DatagramSealer {
-            key: self.key(true, b"airhand datagram"),
-            counter: 0,
-        }
-    }
-
-    fn datagram_opener(&self) -> DatagramOpener {
-        DatagramOpener {
-            key: self.key(false, b"airhand datagram"),
-            window: ReplayWindow::default(),
+    fn lane(&self, lane: SessionLane) -> LaneKeys {
+        let order = match lane {
+            SessionLane::Control | SessionLane::Bulk => Order::Next(0),
+            SessionLane::Video | SessionLane::Audio => Order::Window(ReplayWindow::default()),
+        };
+        LaneKeys {
+            sealer: Sealer {
+                key: self.key(true, lane),
+                counter: 0,
+            },
+            opener: Opener {
+                key: self.key(false, lane),
+                order,
+            },
         }
     }
 }
@@ -422,9 +385,9 @@ async fn send_step<W: AsyncWrite + Unpin, T: airhand_proto::minicbor::Encode<()>
 pub struct Initiated {
     pub secured: Secured,
     /// 控制通道上被控端 → 控制端的接收端（已经解开了被控端的决定，计数接着往下数）
-    pub opener: FrameOpener,
+    pub opener: Opener,
     /// 控制通道上控制端 → 被控端的发送端（已经发出了确认，计数接着往下数）
-    pub sealer: FrameSealer,
+    pub sealer: Sealer,
     /// 选定的会话版本、双方都支持的能力位（和被控端算出来的一样）
     pub negotiated: Negotiated,
 }
@@ -437,7 +400,8 @@ pub struct InitiatorParams<'a> {
     pub me: &'a Identity,
     /// 之前记下的被控端公钥（"我的设备"）：只认它
     pub host_key: Option<PublicKey>,
-    /// 配对码（被控端要求配对时用户输入的）
+    /// 配对码（被控端要求配对、或者对方的身份变了时用户输入的）。带着它就用配对码认对方，
+    /// 对方的公钥可以和 `host_key` 不一样（重新配对之后记下新的，见 `airhand_proto::handshake` 的"身份"）
     pub pairing: Option<&'a str>,
     pub intro: &'a ControllerIntro,
 }
@@ -522,14 +486,7 @@ where
     let verdict = if pattern == Pattern::Known {
         reply.verdict
     } else {
-        // 已经知道被控端的公钥了：配对时如果之前记着它，要一样
-        let theirs: PublicKey = hs
-            .get_remote_static()
-            .context("the host sent no static key")?
-            .try_into()?;
-        if p.host_key.is_some_and(|k| k != theirs) {
-            return Err(Problem::HostKeyChanged.into());
-        }
+        // First：之前不认识它；Pairing：配对码认的是它，换过身份也没关系
         let n = hs.write_message(&intro, &mut msg)?;
         send_step(
             send,
@@ -573,7 +530,7 @@ where
     let mut negotiated = Negotiated::new(version, verdict.features);
     negotiated.features = negotiated.features.common(p.intro.features);
     // 确认（见 airhand_proto::handshake 的"确认"）：被控端解开它才算本机进来了，重放的握手消息走不到这一步
-    let mut confirm = framing::encode_with_spare(&Confirm::default(), TAG_LEN);
+    let mut confirm = framing::encode_with_spare(&Confirm::default(), SEAL_OVERHEAD);
     sealer.seal_frame(&mut confirm)?;
     tokio::time::timeout(STEP_TIMEOUT, send.write_all(&confirm))
         .await
@@ -679,9 +636,9 @@ pub enum Admission {
 pub struct Responded {
     pub secured: Secured,
     /// 控制通道上被控端 → 控制端的发送端（已经发出了决定，计数接着往下数）
-    pub sealer: FrameSealer,
+    pub sealer: Sealer,
     /// 控制通道上控制端 → 被控端的接收端（已经解开了确认，计数接着往下数）
-    pub opener: FrameOpener,
+    pub opener: Opener,
     pub intro: ControllerIntro,
     pub admission: Admission,
     /// 选定的会话版本、双方都支持的能力位（和控制端算出来的一样）
@@ -700,19 +657,6 @@ pub struct ResponderParams<'a> {
 ///
 /// 收到控制端的确认才返回：在那之前不能显示"谁在连"、不能开始采集（`Noise_IK` 的第 1 条消息可以被重放）
 pub async fn respond<R, W>(recv: &mut R, send: &mut W, p: ResponderParams<'_>) -> Result<Responded>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    respond_with_features(recv, send, p, airhand_proto::features::session::SUPPORTED).await
-}
-
-async fn respond_with_features<R, W>(
-    recv: &mut R,
-    send: &mut W,
-    p: ResponderParams<'_>,
-    features: airhand_proto::Features,
-) -> Result<Responded>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -813,21 +757,13 @@ where
         }
     };
     anyhow::ensure!(hs.is_handshake_finished(), "the handshake didn't finish");
-    let intro: ControllerIntro = framing::decode_known(&intro_bytes)?;
-    if features.has(airhand_proto::features::session::VIDEO_MODEL)
-        && intro
-            .features
-            .has(airhand_proto::features::session::VIDEO_MODEL)
-    {
-        let video = intro
-            .video
-            .as_ref()
-            .context("VIDEO_MODEL requires a video offer")?;
-        anyhow::ensure!(
-            video.receiver.valid() && video.view.request_id == 0,
-            "invalid initial video offer"
-        );
-    }
+    let intro: ControllerIntro = match framing::decode_known(&intro_bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            fail(send, HandshakeError::Malformed).await;
+            return Err(e.into());
+        }
+    };
     let (
         secured,
         LaneKeys {
@@ -839,8 +775,7 @@ where
     // 决定：版本，然后是让不让进来
     let version = intro.max.min(SESSION_VERSION);
     let compatible = version >= intro.min.max(SESSION_MIN);
-    let mut negotiated = Negotiated::new(version, intro.features);
-    negotiated.features = negotiated.features.common(features);
+    let negotiated = Negotiated::new(version, intro.features);
     let admission = if pattern == Pattern::Pairing {
         Some(Admission::Paired)
     } else if p.gate.is_known(&secured.peer) {
@@ -852,6 +787,7 @@ where
             Access::Pairing => None,
         }
     };
+    let features = airhand_proto::features::session::SUPPORTED;
     let refused = if !compatible {
         Some(Refusal::Incompatible)
     } else if admission.is_none() {
@@ -922,15 +858,11 @@ pub fn controller_intro(
     ControllerIntro {
         min: SESSION_MIN,
         max: SESSION_VERSION,
-        features: airhand_proto::Features::from_bits(
-            airhand_proto::features::session::SUPPORTED.bits()
-                & !airhand_proto::features::session::VIDEO_MODEL.bits(),
-        ),
+        features: airhand_proto::features::session::SUPPORTED,
         name: name.to_string(),
         os: os.to_string(),
         settings: settings.sanitized(),
         audio,
-        video: None,
     }
 }
 
@@ -1111,128 +1043,20 @@ mod tests {
         assert_eq!(h.secured.peer, *me.public());
     }
 
+    /// 被控端的公钥和记着的不一样：不连，也不能不验证地换成新的；输对配对码才认新的身份
     #[tokio::test]
-    async fn old_peer_without_cursor_feature_negotiates_the_legacy_session() {
-        let gate = TestGate::new(Access::Open, None);
-        let me = Identity::generate();
-        let ((mut cr, mut cw), (mut hr, mut hw)) = pipes();
-        let mut intro = test_intro();
-        intro.features = airhand_proto::Features::NONE;
-        let (c, h) = tokio::join!(
-            initiate(
-                &mut cr,
-                &mut cw,
-                InitiatorParams {
-                    session_id: 42,
-                    code: 123456,
-                    me: &me,
-                    host_key: None,
-                    pairing: None,
-                    intro: &intro
-                }
-            ),
-            respond(
-                &mut hr,
-                &mut hw,
-                ResponderParams {
-                    session_id: 42,
-                    code: 123456,
-                    gate: &gate
-                }
-            ),
-        );
-        let (c, h) = (c.unwrap(), h.unwrap());
-        assert_eq!(c.negotiated, h.negotiated);
-        assert!(
-            !c.negotiated
-                .has(airhand_proto::features::session::CURSOR_UPDATES)
-        );
-        let mut tx = h.sealer;
-        let mut rx = c.opener;
-        let mut msg = framing::encode(&airhand_proto::session::HostMsg::Cursor(
-            airhand_proto::session::CursorState {
-                visible: false,
-                shape: None,
-            },
-        ));
-        tx.seal_frame(&mut msg).unwrap();
-        let mut payload = msg[4..].to_vec();
-        rx.open(&mut payload).unwrap();
-        assert!(matches!(
-            framing::decode_known::<airhand_proto::session::HostMsg>(&payload).unwrap(),
-            airhand_proto::session::HostMsg::Cursor(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn video_offer_falls_back_when_the_host_does_not_support_the_extension() {
-        use airhand_proto::video::*;
-        let gate = TestGate::new(Access::Open, None);
-        let me = Identity::generate();
-        let ((mut cr, mut cw), (mut hr, mut hw)) = pipes();
-        let mut intro = test_intro();
-        let legacy = intro.features;
-        intro.features = intro
-            .features
-            .with(airhand_proto::features::session::VIDEO_MODEL);
-        intro.video = Some(VideoOffer {
-            receiver: ReceiverCapabilities {
-                codecs: vec![DecodeCapability {
-                    codec: airhand_proto::session::Codec::H264,
-                    max_width: None,
-                    max_height: None,
-                    max_fps: Some(30),
-                }],
-            },
-            view: ViewRequest {
-                request_id: 0,
-                preference: intro.settings,
-            },
-        });
-        let (c, h) = tokio::join!(
-            initiate(
-                &mut cr,
-                &mut cw,
-                InitiatorParams {
-                    session_id: 42,
-                    code: 123456,
-                    me: &me,
-                    host_key: None,
-                    pairing: None,
-                    intro: &intro
-                }
-            ),
-            respond_with_features(
-                &mut hr,
-                &mut hw,
-                ResponderParams {
-                    session_id: 42,
-                    code: 123456,
-                    gate: &gate
-                },
-                legacy
-            ),
-        );
-        let (c, h) = (c.unwrap(), h.unwrap());
-        assert_eq!(c.negotiated, h.negotiated);
-        assert!(
-            !c.negotiated
-                .has(airhand_proto::features::session::VIDEO_MODEL)
-        );
-        assert_eq!(h.intro.settings, intro.settings);
-    }
-
-    #[tokio::test]
-    async fn a_different_host_key_is_refused() {
+    async fn a_different_host_key_needs_pairing_again() {
         let gate = TestGate::new(Access::Open, Some("123456"));
         let me = Identity::generate();
         let stale = *Identity::generate().public();
         let (c, h) = run(&gate, &me, Some(stale), None).await;
         assert_eq!(problem(c), Problem::HostKeyChanged);
         assert!(h.is_err());
-        // 配对时也一样：被控端的公钥和记着的不一样就不连
-        let (c, _) = run(&gate, &me, Some(stale), Some("123456")).await;
-        assert_eq!(problem(c), Problem::HostKeyChanged);
+        let (c, _) = run(&gate, &me, Some(stale), Some("000000")).await;
+        assert_eq!(problem(c), Problem::PairingFailed);
+        let (c, h) = run(&gate, &me, Some(stale), Some("123456")).await;
+        assert_eq!(c.unwrap().secured.peer, *gate.me.public());
+        assert_eq!(h.unwrap().admission, Admission::Paired);
     }
 
     #[tokio::test]
@@ -1471,48 +1295,70 @@ mod tests {
         let host = KeyMaterial::new(Role::Host, &mut r).unwrap();
 
         let frames: Vec<Vec<u8>> = {
-            let mut s = ctl.sealer(SessionLane::Control);
+            let mut s = ctl.lane(SessionLane::Control).sealer;
             (0..3u8)
                 .map(|k| {
-                    let mut f = framing::encode(&airhand_proto::session::ControllerMsg::Ack {
-                        seq: k as u32,
-                    });
+                    let mut f = framing::encode_with_spare(
+                        &airhand_proto::session::ControllerMsg::Ack {
+                            seq: k as u32,
+                            arrived: None,
+                        },
+                        SEAL_OVERHEAD,
+                    );
+                    let cap = f.capacity();
                     s.seal_frame(&mut f).unwrap();
+                    assert_eq!(f.capacity(), cap, "sealing reallocated");
+                    // 长度前缀之后：密文 | 标签 | 计数
+                    assert_eq!(f[f.len() - NONCE_LEN..], u64::from(k).to_le_bytes());
                     f[4..].to_vec()
                 })
                 .collect()
         };
         // 按顺序：都解得开
-        let mut o = host.opener(SessionLane::Control);
+        let mut o = host.lane(SessionLane::Control).opener;
         for f in &frames {
             o.open(&mut f.clone()).unwrap();
         }
-        // 丢了一帧
-        let mut o = host.opener(SessionLane::Control);
+        // 丢了一帧、重放
+        let mut o = host.lane(SessionLane::Control).opener;
         o.open(&mut frames[0].clone()).unwrap();
         assert!(o.open(&mut frames[2].clone()).is_err());
+        assert!(o.open(&mut frames[0].clone()).is_err());
+        // 改了计数（nonce 不对，解不开）
+        let mut forged = frames[2].clone();
+        let at = forged.len() - NONCE_LEN;
+        forged[at] = 1;
+        assert!(o.open(&mut forged).is_err());
+        o.open(&mut frames[1].clone()).unwrap();
         // 换到别的通道
-        let mut o = host.opener(SessionLane::Video);
+        let mut o = host.lane(SessionLane::Bulk).opener;
         assert!(o.open(&mut frames[0].clone()).is_err());
         // 方向反了（被控端自己发的不能当成收到的）
-        let mut s = host.sealer(SessionLane::Control);
-        let back = s.seal(b"x").unwrap();
-        let mut o = host.opener(SessionLane::Control);
+        let back = host.lane(SessionLane::Control).sealer.seal(b"x").unwrap();
+        let mut o = host.lane(SessionLane::Control).opener;
         assert!(o.open(&mut back.clone()).is_err());
+        assert!(o.open(&mut vec![0; SEAL_OVERHEAD - 1]).is_err());
 
-        // 数据报：乱序可以，重放、篡改不行
-        let mut ds = host.datagram_sealer();
-        let mut dopen = ctl.datagram_opener();
-        let d: Vec<Vec<u8>> = (0..4u8).map(|k| ds.seal(7, &[k; 10]).unwrap()).collect();
+        // 声音：数据报和流共用一个计数，乱序可以，重放、篡改不行
+        let mut s = host.lane(SessionLane::Audio).sealer;
+        let mut o = ctl.lane(SessionLane::Audio).opener;
+        let d: Vec<Vec<u8>> = (0..4u8)
+            .map(|k| s.seal_datagram(7, &[k; 10]).unwrap())
+            .collect();
+        assert_eq!(airhand_proto::datagram::session(&d[0]), Some(7));
         let body = |d: &Vec<u8>| d[airhand_proto::datagram::HEADER..].to_vec();
-        assert_eq!(dopen.open(&body(&d[1])).unwrap(), [1; 10]);
-        assert_eq!(dopen.open(&body(&d[0])).unwrap(), [0; 10]);
-        assert!(dopen.open(&body(&d[1])).is_none());
+        let open = |o: &mut Opener, mut b: Vec<u8>| o.open(&mut b).map(|()| b);
+        assert_eq!(open(&mut o, body(&d[1])).unwrap(), [1; 10]);
+        assert_eq!(open(&mut o, body(&d[0])).unwrap(), [0; 10]);
+        assert!(open(&mut o, body(&d[1])).is_err());
         let mut bad = body(&d[3]);
-        bad[12] ^= 1;
-        assert!(dopen.open(&bad).is_none());
-        assert_eq!(dopen.open(&body(&d[3])).unwrap(), [3; 10]);
-        assert_eq!(dopen.open(&body(&d[2])).unwrap(), [2; 10]);
+        bad[2] ^= 1;
+        assert!(open(&mut o, bad).is_err());
+        assert_eq!(open(&mut o, body(&d[3])).unwrap(), [3; 10]);
+        let mut f = airhand_proto::media::frame(&[3; 24], &[b"opus"]);
+        s.seal_frame(&mut f).unwrap();
+        assert_eq!(&open(&mut o, f[4..].to_vec()).unwrap()[24..], b"opus");
+        assert_eq!(open(&mut o, body(&d[2])).unwrap(), [2; 10]);
     }
 
     #[test]

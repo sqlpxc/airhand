@@ -10,10 +10,12 @@ export { fmtCode } from "./devices";
 /** 新建连接标签里正在连的会话（关掉这个标签就放弃） */
 let pending: RemoteSession | null = null;
 
-/** 怎么连：配对码（对方要求配对时）、信任对方的新身份（对方的身份变了，用户确认了是重装） */
+/**
+ * 怎么连：配对码（对方要求配对时；对方的身份变了、用户确认是重装之后也是重新配对，
+ * 配对码认的就是对方，记着的旧公钥不作数，见 airhand_proto::handshake 的"身份"）
+ */
 export interface OpenOptions {
   pairing?: string | null;
-  trustNew?: boolean;
 }
 
 /**
@@ -27,8 +29,7 @@ export async function openSession(code: string, settings: QualitySettings, opts:
     if (st.view === "new") store.closeDraft();
     store.setView(dup.id);
     if (dup.state === "closed") {
-      if (opts.trustNew) dup.trustNewIdentity();
-      else if (opts.pairing) dup.pairWith(opts.pairing);
+      if (opts.pairing) dup.pairWith(opts.pairing);
       else dup.reconnect();
     }
     return;
@@ -37,9 +38,8 @@ export async function openSession(code: string, settings: QualitySettings, opts:
   if (store.get().draft?.busy) return;
   store.patchDraft({ digits: code.split(""), busy: true, error: null });
   // 我的设备里有：带着上次的重连凭证连（对方不在线时等它上线，而不是报错），连上之前就显示它的名字；
-  // 只认记着的对方公钥（用户确认过对方重装了的话不带它，连上之后记下新的）
-  const found = st.devices.find((d) => d.code === code);
-  const saved = found && opts.trustNew ? { ...found, hostKey: null } : found;
+  // 只认记着的对方公钥（带着配对码时认配对码，连上之后记下对方现在的公钥）
+  const saved = st.devices.find((d) => d.code === code);
   const s = new RemoteSession(code, settings, saved, opts.pairing);
   pending = s;
   try {

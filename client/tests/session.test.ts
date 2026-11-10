@@ -6,7 +6,6 @@ import { stripTypeScriptTypes } from "node:module";
 import { ConnectionAttempt } from "../src/lib/connection-attempt.ts";
 import { fitSize, stricter, viewMaxShort } from "../src/lib/fit.ts";
 import * as media from "../src/lib/media.ts";
-import { receiverCapabilities } from "../src/lib/video-model.ts";
 
 // Load the actual session class with browser/backend dependencies replaced by
 // small fakes. This tests delivery ordering without a WebView or network.
@@ -19,8 +18,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   const calls: any[] = [];
   const timers: (() => void)[] = [];
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
-    fitSize, stricter, viewMaxShort, media, receiverCapabilities,
-    store: { get: () => ({ decoders: ["h264", "h265", "av1"] }) },
+    fitSize, stricter, viewMaxShort, media,
     toProblem: (e: any) => e,
     api: {
       connect: (c: any, o: any, output: any) => {
@@ -166,16 +164,17 @@ test("端到端：记下对方的公钥、之后只认它；要配对码时不�
   await h.session.connect();
   assert.deepEqual(tried.at(-1), { hostKey: granted.hostKey, pairing: null });
 
-  // 对方的身份变了：不自动重连；用户信任新的身份之后不带公钥再连，记下新的
+  // 对方的身份变了：不自动重连，也不能不验证就换成新的；用户输入配对码重新配对，配对码认的是对方，记下新的
   answer = async () => { throw { kind: "hostKeyChanged" }; };
   h.session.sid = null;
   await h.session.connect().catch((e: any) => h.session.scheduleRetry(e));
   assert.equal(h.session.state, "closed");
+  assert.equal("trustNewIdentity" in h.session, false);
   const changed = { ...granted, hostKey: "cd".repeat(32) };
   answer = async () => changed;
-  h.session.trustNewIdentity();
+  h.session.pairWith("135 790");
   await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(tried.at(-1), { hostKey: null, pairing: null });
+  assert.deepEqual(tried.at(-1), { hostKey: granted.hostKey, pairing: "135790" });
   assert.equal(h.session.hostKey, changed.hostKey);
 });
 

@@ -28,6 +28,7 @@ import org.json.JSONObject
 import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * 屏幕采集 + 硬件编码。
@@ -109,8 +110,7 @@ class ScreenCapture(
     private var encoder: Encoder? = null
     private var settings = Tick(fps = 30, maxShort = 1080, codec = Codec.H264, kbps = 4000)
 
-    private data class Tick(val fps: Int, val maxShort: Int, val codec: Codec, val kbps: Int, val version: Long = 0)
-    private data class OutputParameters(val version: Long, val kbps: Int)
+    private data class Tick(val fps: Int, val maxShort: Int, val codec: Codec, val kbps: Int)
 
     private fun loop() {
         try {
@@ -188,13 +188,12 @@ class ScreenCapture(
                     maxShort = o.optInt("maxShort", 1080),
                     codec = Codec.fromWire(o.optString("codec")) ?: Codec.H264,
                     kbps = o.optInt("kbps", 4000),
-                    version = o.getLong("version"),
                 )
                 if (next.maxShort != settings.maxShort || next.codec != settings.codec || next.fps != settings.fps) {
                     encoder?.release()
                     encoder = null
                 }
-                encoder?.setParameters(next.version, next.kbps)
+                if (next.kbps != settings.kbps) encoder?.setBitrate(next.kbps)
                 settings = next
                 if (o.optBoolean("key")) {
                     encoder?.requestKeyframe()
@@ -291,7 +290,7 @@ class ScreenCapture(
             virtualDisplay?.surface = textureSurface
         }
         return try {
-            val e = Encoder(info, c, w, h, settings.fps, settings.kbps, settings.version)
+            val e = Encoder(info, c, w, h, settings.fps, settings.kbps)
             call(
                 JSONObject().put("op", "encoder").put(
                     "info",
@@ -299,7 +298,6 @@ class ScreenCapture(
                         .put("width", w).put("height", h),
                 ),
             )
-            e.startOutput()
             call(JSONObject().put("op", "capture").put("failure", JSONObject.NULL))
             e
         } catch (ex: Exception) {
@@ -310,15 +308,14 @@ class ScreenCapture(
     }
 
     /** 一个编码器及其输出线程 */
-    private inner class Encoder(info: MediaCodecInfo, val codec: Codec, val width: Int, val height: Int, val fps: Int, kbps: Int, version: Long) {
+    private inner class Encoder(info: MediaCodecInfo, val codec: Codec, val width: Int, val height: Int, fps: Int, kbps: Int) {
         private val mc: MediaCodec = MediaCodec.createByCodecName(info.name)
         private val inputSurface: Surface
         val eglSurface: EGLSurface
 
         @Volatile
         private var draining = true
-        private var drain: Thread? = null
-        @Volatile private var outputParameters = OutputParameters(version, kbps)
+        private val drain: Thread
 
         init {
             fun basic() = MediaFormat.createVideoFormat(codec.mime, width, height).apply {
@@ -348,20 +345,12 @@ class ScreenCapture(
             inputSurface = mc.createInputSurface()
             mc.start()
             eglSurface = egl.windowSurface(inputSurface)
+            drain = Thread({ drainLoop() }, "airhand-encode-out").apply { start() }
             Log.i(TAG, "encoder ${info.name} started: ${codec.label} ${width}x$height ${fps}fps ${kbps}kbps")
         }
 
-        fun startOutput() {
-            // Rust resets its configuration before the first codec-config buffer can arrive.
-            drain = Thread({ drainLoop() }, "airhand-encode-out").apply { start() }
-        }
-
-        fun setParameters(version: Long, kbps: Int) {
-            val old = outputParameters
-            val applied = if (kbps == old.kbps || runCatching {
-                mc.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, kbps * 1000) })
-            }.isSuccess) kbps else old.kbps
-            outputParameters = OutputParameters(version, applied)
+        fun setBitrate(kbps: Int) = runCatching {
+            mc.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, kbps * 1000) })
         }
 
         fun requestKeyframe() = runCatching {
@@ -384,8 +373,7 @@ class ScreenCapture(
                             var flags = 0
                             if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) flags = flags or 1
                             if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) flags = flags or 2
-                            val parameters = outputParameters
-                            Native.hostVideo(h, buf, info.offset, info.size, flags, info.presentationTimeUs, codec.id, width, height, fps, parameters.kbps, parameters.version)
+                            Native.hostVideo(h, buf, info.offset, info.size, flags, info.presentationTimeUs, codec.id, width, height)
                         }
                         runCatching { mc.releaseOutputBuffer(idx, false) }
                     }
@@ -398,8 +386,7 @@ class ScreenCapture(
                             val total = parts.sumOf { it.remaining() }
                             val direct = ByteBuffer.allocateDirect(total)
                             parts.forEach { direct.put(it.duplicate()) }
-                            val parameters = outputParameters
-                            Native.hostVideo(h, direct, 0, total, 2, 0, codec.id, width, height, fps, parameters.kbps, parameters.version)
+                            Native.hostVideo(h, direct, 0, total, 2, 0, codec.id, width, height)
                         }
                     }
                 }
@@ -408,7 +395,7 @@ class ScreenCapture(
 
         fun release() {
             draining = false
-            drain?.join(500)
+            drain.join(500)
             runCatching { egl.makeIdle() }
             runCatching { egl.destroy(eglSurface) }
             runCatching { mc.stop() }
@@ -454,7 +441,7 @@ class ScreenCapture(
         fun encodeSize(w: Int, h: Int, maxShort: Int, caps: MediaCodecInfo.VideoCapabilities?): Pair<Int, Int> {
             val short = min(w, h)
             var scale = if (maxShort in 1 until short) maxShort.toDouble() / short else 1.0
-            fun align(v: Double) = max(16, (v / 16).toInt() * 16)
+            fun align(v: Double) = max(16, (v / 16).roundToInt() * 16)
             repeat(30) {
                 val (ew, eh) = align(w * scale) to align(h * scale)
                 if (caps == null || runCatching { caps.isSizeSupported(ew, eh) }.getOrDefault(false)) return ew to eh

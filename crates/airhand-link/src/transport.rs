@@ -9,10 +9,10 @@
 //! * 控制端：[`HostReceiver`] 从四条流和数据报读被控端发来的东西，解密。
 //!
 //! 声音走 QUIC 数据报（`airhand_proto::datagram`）：不重传，也不排在丢了的包后面等重传，
-//! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流。
+//! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流，和数据报用同一把密钥、同一串计数。
 use crate::wire::{read_frame, read_packet};
 use airhand_proto::framing::{self, Decoded};
-use airhand_proto::handshake::TAG_LEN;
+use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, Kind};
 use airhand_proto::session::HostMsg;
 use airhand_proto::{Role, SessionHeader, SessionLane, datagram};
@@ -20,20 +20,21 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::debug;
 
-use crate::secure::{DATAGRAM_OVERHEAD, DatagramOpener, DatagramSealer, FrameOpener, FrameSealer};
+use crate::secure::{Opener, Sealer};
 
 pub type Stream = (SendStream, RecvStream);
 
-/// 加密一帧（`u32 长度 | 明文`）。编码时多留了标签的位置，通常不用重新分配（[`framing::encode_with_spare`]、
+/// 加密一帧（`u32 长度 | 明文`）。编码时多留了加密开销的位置，通常不用重新分配（[`framing::encode_with_spare`]、
 /// [`media::frame`]）；同一份数据发给几个会话时（例如 Android 的广播）这里拷贝一次，每个会话的密钥不一样
-pub fn seal(frame: Bytes, sealer: &mut FrameSealer) -> Result<Bytes> {
+pub fn seal(frame: Bytes, sealer: &mut Sealer) -> Result<Bytes> {
     let mut v = Vec::from(frame);
-    v.reserve(TAG_LEN);
+    v.reserve(SEAL_OVERHEAD);
     sealer.seal_frame(&mut v)?;
     Ok(Bytes::from(v))
 }
@@ -51,18 +52,24 @@ impl Frames for mpsc::Receiver<Bytes> {
     }
 }
 
-/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 发完后正常结束这条流。
 /// 十秒钟写不进去一帧算对方失联
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn write_sealed(send: &mut SendStream, sealed: Bytes) -> Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, send.write_chunk(sealed))
+        .await
+        .context("session writer stalled")??;
+    Ok(())
+}
+
+/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 发完后正常结束这条流
 pub async fn write_lane(
     mut send: SendStream,
     mut rx: impl Frames,
-    mut sealer: FrameSealer,
+    mut sealer: Sealer,
 ) -> Result<()> {
     while let Some(bytes) = rx.next().await {
-        let sealed = seal(bytes, &mut sealer)?;
-        tokio::time::timeout(Duration::from_secs(10), send.write_chunk(sealed))
-            .await
-            .context("session writer stalled")??;
+        write_sealed(&mut send, seal(bytes, &mut sealer)?).await?;
     }
     send.finish()?;
     Ok(())
@@ -75,28 +82,24 @@ pub async fn write_audio(
     session_id: u64,
     mut send: SendStream,
     mut rx: mpsc::Receiver<Bytes>,
-    mut sealer: FrameSealer,
-    mut datagrams: DatagramSealer,
+    mut sealer: Sealer,
 ) -> Result<()> {
     while let Some(framed) = rx.recv().await {
-        let packet = framed.get(4..).unwrap_or_default();
-        let size = datagram::HEADER + DATAGRAM_OVERHEAD + packet.len();
+        let packet = framed.get(framing::PREFIX..).unwrap_or_default();
+        let size = datagram::HEADER + packet.len() + SEAL_OVERHEAD;
         let fits = conn
             .max_datagram_size()
             .is_some_and(|max| size <= max.min(datagram::MAX));
         if fits {
-            let d = datagrams.seal(session_id, packet)?;
+            let d = sealer.seal_datagram(session_id, packet)?;
             match conn.send_datagram(Bytes::from(d)) {
                 Ok(()) => continue,
                 Err(SendDatagramError::ConnectionLost(e)) => return Err(e.into()),
-                // 对方不收数据报、太大了：走声音流
+                // 对方不收数据报、太大了：走声音流（这个计数没用上，接收端本来就容许跳过）
                 Err(_) => {}
             }
         }
-        let sealed = seal(framed, &mut sealer)?;
-        tokio::time::timeout(Duration::from_secs(10), send.write_chunk(sealed))
-            .await
-            .context("session writer stalled")??;
+        write_sealed(&mut send, seal(framed, &mut sealer)?).await?;
     }
     send.finish()?;
     Ok(())
@@ -124,7 +127,7 @@ pub struct SessionStreams {
     pub control: Stream,
     pub video: Stream,
     pub audio: Stream,
-    /// 大块通道（剪贴板、光标），双向
+    /// 大块通道（剪贴板、光标图像），双向
     pub bulk: Stream,
 }
 
@@ -166,20 +169,20 @@ pub async fn open_session(
 pub enum FromHost {
     /// 控制流、大块通道上的消息
     Control(HostMsg),
-    /// 画面包（[`media`] 格式：头 + 码流），原样交给界面
-    Video(Vec<u8>),
+    /// 画面包（[`media`] 格式：头 + 码流），原样交给界面。`arrived`：从网络上读完的时刻
+    /// （控制端的时钟，微秒），确认时带给被控端（见 `ControllerMsg::Ack`）
+    Video { packet: Vec<u8>, arrived: u64 },
     /// 声音包（[`media`] 格式：头 + Opus 包），原样交给界面
     Audio(Vec<u8>),
 }
 
 /// 控制端读被控端的四条流和声音数据报的解密端
 pub struct Openers {
-    pub features: airhand_proto::Features,
-    pub control: FrameOpener,
-    pub bulk: FrameOpener,
-    pub video: FrameOpener,
-    pub audio: FrameOpener,
-    pub datagrams: DatagramOpener,
+    pub control: Opener,
+    pub bulk: Opener,
+    pub video: Opener,
+    /// 声音流和声音数据报共用
+    pub audio: Opener,
 }
 
 /// 控制端读被控端的四条流和声音数据报。
@@ -213,27 +216,16 @@ impl HostReceiver {
     ) -> Self {
         let mut tasks = JoinSet::new();
         let (audio_tx, audio_rx) = mpsc::channel(16);
+        let audio_opener = Arc::new(Mutex::new(openers.audio));
         if let Some(d) = datagrams {
-            datagram_reader(&mut tasks, d, openers.datagrams, audio_tx.clone());
+            datagram_reader(&mut tasks, d, audio_opener.clone(), audio_tx.clone());
         }
-        media_reader(&mut tasks, audio.1, Kind::Audio, openers.audio, audio_tx);
+        audio_reader(&mut tasks, audio.1, audio_opener, audio_tx);
         let (video_tx, video_rx) = mpsc::channel(2);
-        media_reader(&mut tasks, video.1, Kind::Video, openers.video, video_tx);
+        video_reader(&mut tasks, video.1, openers.video, video_tx);
         Self {
-            control: message_reader(
-                &mut tasks,
-                control,
-                openers.control,
-                SessionLane::Control,
-                openers.features,
-            ),
-            bulk: message_reader(
-                &mut tasks,
-                bulk,
-                openers.bulk,
-                SessionLane::Bulk,
-                openers.features,
-            ),
+            control: message_reader(&mut tasks, control, openers.control, SessionLane::Control),
+            bulk: message_reader(&mut tasks, bulk, openers.bulk, SessionLane::Bulk),
             video: video_rx,
             audio: audio_rx,
             bulk_open: true,
@@ -310,25 +302,18 @@ async fn forward(tx: &mpsc::Sender<Result<FromHost>>, r: Result<Option<FromHost>
 /// 读一条被控端的控制消息（解密、解码）；对方版本新增的消息跳过。流在消息边界处结束时为 `None`
 async fn next_host_msg(
     recv: &mut RecvStream,
-    opener: &mut FrameOpener,
+    opener: &mut Opener,
     buf: &mut Vec<u8>,
     lane: SessionLane,
-    features: airhand_proto::Features,
 ) -> Result<Option<HostMsg>> {
     loop {
-        if !read_frame(recv, lane.receive_frame_size(features), buf).await? {
+        if !read_frame(recv, lane.max_frame_size(), buf).await? {
             return Ok(None);
         }
         opener.open(buf)?;
         match framing::decode::<HostMsg>(buf)? {
             Decoded::Msg(m) => {
                 anyhow::ensure!(m.lane() == lane, "host message on the wrong lane");
-                if matches!(m, HostMsg::VideoConfig(_)) {
-                    anyhow::ensure!(
-                        features.has(airhand_proto::features::session::VIDEO_MODEL),
-                        "video model was not negotiated"
-                    );
-                }
                 return Ok(Some(m));
             }
             Decoded::Unknown(variant) => debug!(variant, "skipping a message from a newer host"),
@@ -340,16 +325,15 @@ async fn next_host_msg(
 fn message_reader(
     tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
-    mut opener: FrameOpener,
+    mut opener: Opener,
     lane: SessionLane,
-    features: airhand_proto::Features,
 ) -> mpsc::Receiver<Result<FromHost>> {
-    let capacity = (4 * 1024 * 1024 / lane.receive_frame_size(features)).min(16);
+    let capacity = (4 * 1024 * 1024 / lane.max_frame_size()).min(16);
     let (tx, rx) = mpsc::channel(capacity);
     tasks.spawn(async move {
         let mut buf = Vec::new();
         loop {
-            let r = next_host_msg(&mut recv, &mut opener, &mut buf, lane, features)
+            let r = next_host_msg(&mut recv, &mut opener, &mut buf, lane)
                 .await
                 .map(|m| m.map(FromHost::Control));
             if !forward(&tx, r).await {
@@ -360,22 +344,27 @@ fn message_reader(
     rx
 }
 
-/// 声音数据报放进声音的信箱。数据报本来就可能丢：解不开的（被篡改、重放的）、信箱满了（界面跟不上）都丢掉这一包，不等
+/// 解开一个声音包（数据报或者声音流上的一帧）。数据报本来就可能丢：解不开的（被篡改、重放的）丢掉这一包
+fn open_audio(opener: &Mutex<Opener>, mut p: Vec<u8>) -> Option<Vec<u8>> {
+    if let Err(e) = opener.lock().unwrap().open(&mut p) {
+        debug!("dropped an audio packet: {e:#}");
+        return None;
+    }
+    (Kind::of(&p) == Some(Kind::Audio) && p.len() <= media::MAX_AUDIO_PACKET).then_some(p)
+}
+
+/// 声音数据报放进声音的信箱。信箱满了（界面跟不上）也丢掉这一包，不等
 fn datagram_reader(
     tasks: &mut JoinSet<()>,
     mut rx: mpsc::Receiver<Bytes>,
-    mut opener: DatagramOpener,
+    opener: Arc<Mutex<Opener>>,
     tx: mpsc::Sender<Result<FromHost>>,
 ) {
     tasks.spawn(async move {
         while let Some(d) = rx.recv().await {
-            let Some(p) = opener.open(&d) else {
-                debug!("dropped an audio datagram that failed authentication");
+            let Some(p) = open_audio(&opener, d.to_vec()) else {
                 continue;
             };
-            if Kind::of(&p) != Some(Kind::Audio) || p.len() > media::MAX_AUDIO_PACKET {
-                continue;
-            }
             if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(Ok(FromHost::Audio(p))) {
                 break;
             }
@@ -383,27 +372,48 @@ fn datagram_reader(
     });
 }
 
-fn media_reader(
+/// 声音流（放不进数据报的声音包）
+fn audio_reader(
     tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
-    kind: Kind,
-    mut opener: FrameOpener,
+    opener: Arc<Mutex<Opener>>,
     tx: mpsc::Sender<Result<FromHost>>,
 ) {
-    let max = TAG_LEN
-        + match kind {
-            Kind::Audio => media::MAX_AUDIO_PACKET,
-            _ => media::MAX_VIDEO_PACKET,
-        };
+    let max = SessionLane::Audio.max_frame_size();
     tasks.spawn(async move {
         loop {
             let r = match read_packet(&mut recv, max).await {
-                Ok(Some(mut p)) => match opener.open(&mut p) {
-                    Ok(()) if Kind::of(&p) == Some(kind) => Ok(Some(match kind {
-                        Kind::Audio => FromHost::Audio(p),
-                        _ => FromHost::Video(p),
+                Ok(Some(p)) => match open_audio(&opener, p) {
+                    Some(p) => Ok(Some(FromHost::Audio(p))),
+                    None => continue,
+                },
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.into()),
+            };
+            if !forward(&tx, r).await {
+                break;
+            }
+        }
+    });
+}
+
+/// 画面流：解不开、不是画面包都是错误（流是可靠的，丢不了帧）
+fn video_reader(
+    tasks: &mut JoinSet<()>,
+    mut recv: RecvStream,
+    mut opener: Opener,
+    tx: mpsc::Sender<Result<FromHost>>,
+) {
+    let max = SessionLane::Video.max_frame_size();
+    tasks.spawn(async move {
+        loop {
+            let r = match read_packet(&mut recv, max).await {
+                Ok(Some(mut packet)) => match opener.open(&mut packet) {
+                    Ok(()) if Kind::of(&packet) == Some(Kind::Video) => Ok(Some(FromHost::Video {
+                        packet,
+                        arrived: crate::controller::now_us(),
                     })),
-                    Ok(()) => Err(anyhow!("unexpected packet on the {kind:?} stream")),
+                    Ok(()) => Err(anyhow!("unexpected packet on the video stream")),
                     Err(e) => Err(e),
                 },
                 Ok(None) => Ok(None),
@@ -444,7 +454,7 @@ mod tests {
         assert!(!o.accept(&audio(1, true, 980_000)));
         assert!(!o.accept(&audio(5, false, 100_000)));
         assert!(o.accept(&audio(3, false, 1_020_000)));
-        // 相同采集时刻（旧端缺少精度）仍能按序号丢重复、识别绕回。
+        // 相同采集时刻（时钟精度不够）仍能按序号丢重复、识别绕回。
         let mut o = AudioOrder::default();
         assert!(o.accept(&audio(u32::MAX, true, 0)));
         assert!(o.accept(&audio(0, false, 0)));

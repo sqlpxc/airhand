@@ -13,7 +13,6 @@ import { isTauri } from "@tauri-apps/api/core";
 import { tauriBackend } from "./backend/tauri";
 import { webBackend } from "./backend/web";
 import type { Lang } from "./i18n";
-import type { ReceiverCapabilities, VideoConfig, VideoFeedback } from "./video-model";
 
 export type Codec = "h264" | "h265" | "av1";
 
@@ -65,7 +64,7 @@ export type Problem =
   /** 重连时对方不在线（服务器确认过是之前连上的那台）：对方重新上线时会收到 onHostOnline */
   | { kind: "hostOffline" }
   // 端到端加密（见 Rust 的 airhand_proto::handshake）
-  /** 对方的身份（公钥）和记下的不一样：不自动重连，用户确认后不带公钥再连（trustNew） */
+  /** 对方的身份（公钥）和记下的不一样：不自动重连，用户确认是对方重装之后输入配对码重新配对 */
   | { kind: "hostKeyChanged" }
   /** 对方要求配对码（第一次连这台电脑） */
   | { kind: "pairingRequired" }
@@ -173,8 +172,6 @@ export interface ConnectOptions {
   settings: QualitySettings;
   /** 开始时要不要声音（同上） */
   audio: boolean;
-  /** Decoder hard limits; omitted by older frontends. */
-  receiver?: ReceiverCapabilities | null;
 }
 
 /** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
@@ -221,7 +218,6 @@ export type SessionEvent =
       frames: number;
     }
   | { type: "encoder"; codec: Codec; name: string; hardware: boolean; width: number; height: number }
-  | { type: "videoConfig"; config: VideoConfig }
   | { type: "notice"; notice: RemoteNotice }
   /** 被控端复制的文本（只有网页版会收到，由 backend/web.ts 处理） */
   | { type: "clipboard"; text: string }
@@ -262,7 +258,6 @@ export type Command =
   | { cmd: "clipboardSync"; sid: number; enabled: boolean }
   /** 收到了第 seq 帧画面（累积确认；由 Backend 自己发） */
   | { cmd: "ack"; sid: number; seq: number }
-  | { cmd: "videoFeedback"; sid: number; feedback: VideoFeedback }
   | { cmd: "disconnect"; sid: number };
 
 /** 会话的输出 */

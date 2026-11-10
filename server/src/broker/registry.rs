@@ -374,13 +374,12 @@ impl Broker {
     /// 被控端的用户断开了所有控制端：换一个密钥，之前发出的重连凭证随之作废。
     /// 被控端手里的旧密钥继续认，直到它带着新密钥回来（它可能没来得及保存新的）。
     /// 返回新的密钥，以及固定的控制码要等它落盘的屏障
-    /// 被控端明确证明持有新密钥后才淘汰上一把；重复请求不会继续轮换。
-    /// 旧端第二次请求没有确认信息时，要求它重新注册，以证明保存了哪把密钥。
+    /// 被控端明确证明持有新密钥后才淘汰上一把（`known`：它已经保存的密钥）；重复请求不会继续轮换。
     fn rekey(
         &self,
         conn_id: u64,
         code: u32,
-        known: Option<[u8; 16]>,
+        known: [u8; 16],
     ) -> Result<Option<([u8; 16], Option<Barrier>)>> {
         let mut hosts = self.hosts.lock();
         let Some(h) = hosts
@@ -389,16 +388,7 @@ impl Broker {
         else {
             return Ok(None);
         };
-        let owner = match known {
-            Some(secret) => h.secrets.owner(&secret),
-            None => {
-                anyhow::ensure!(
-                    h.secrets.prev.is_none(),
-                    "re-register to confirm the saved host secret before rekeying again"
-                );
-                Owner::Current
-            }
-        };
+        let owner = h.secrets.owner(&known);
         anyhow::ensure!(
             matches!(owner, Owner::Current | Owner::Previous),
             "rekey used an unknown host secret"

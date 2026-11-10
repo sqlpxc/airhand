@@ -52,7 +52,6 @@ pub(crate) struct Phone {
     out: Outbox,
     video: mpsc::Sender<Bytes>,
     audio: mpsc::Sender<Bytes>,
-    video_model: Arc<airhand_link::video::VideoSession>,
     /// 发给所有会话的消息：会话开始之后才订阅（同意之前不转发，Hello 里带着那时的状态）
     broadcasts: Option<broadcast::Receiver<Encoded>>,
 }
@@ -66,7 +65,6 @@ impl Phone {
             out: senders.out,
             video: senders.video,
             audio: senders.audio,
-            video_model: senders.video_model,
             broadcasts: None,
         }
     }
@@ -111,11 +109,6 @@ impl Platform for Phone {
         });
         {
             let info = sh.info.lock().unwrap();
-            let (w, h) = info
-                .displays
-                .first()
-                .map_or((0, 0), |d| (d.width, d.height));
-            sh.video.source(w, h, info.codecs.clone());
             self.out.send(&HostMsg::Hello(HostHello {
                 hostname: info.hostname.clone(),
                 os: info.os.clone(),
@@ -143,12 +136,8 @@ impl Platform for Phone {
                 })))?;
             }
         }
-        sh.video.subscribe_video(
-            self.id,
-            self.video.clone(),
-            start.settings,
-            self.video_model.clone(),
-        )?;
+        sh.video
+            .subscribe(self.id, self.video.clone(), start.settings);
         if start.audio {
             sh.audio
                 .subscribe(self.id, self.audio.clone(), self.out.clone());
@@ -161,7 +150,7 @@ impl Platform for Phone {
         match req {
             // 晚到太久的输入已经换成了"释放所有按键"
             Request::Input(events) => sh.event(json!({ "type": "input", "events": events })),
-            Request::Ack(seq) => sh.video.ack(self.id, seq),
+            Request::Ack { seq, arrived } => sh.video.ack(self.id, seq, arrived),
             Request::Settings(s) => sh.video.set_settings(self.id, s),
             Request::Keyframe => sh.video.request_keyframe(),
             // 手机只有一块屏幕
@@ -241,10 +230,6 @@ mod tests {
                 7,
                 [0; 32],
                 Senders {
-                    video_model: Arc::new(airhand_link::video::VideoSession::new(
-                        None,
-                        out.clone(),
-                    )),
                     out,
                     video: video_tx,
                     audio: audio_tx,
@@ -262,7 +247,6 @@ mod tests {
                 },
                 settings: Default::default(),
                 audio: true,
-                video: None,
             };
             answer_tx.send(phone.ask(&admitted)).unwrap();
             phone

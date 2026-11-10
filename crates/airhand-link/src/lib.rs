@@ -31,8 +31,6 @@ pub mod secure;
 pub mod tasks;
 #[cfg(feature = "client")]
 pub mod transport;
-#[cfg(feature = "client")]
-pub mod video;
 pub mod wire;
 
 #[cfg(feature = "client")]

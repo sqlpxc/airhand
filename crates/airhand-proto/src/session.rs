@@ -7,12 +7,13 @@
 //! 消息走两条通道（[`crate::SessionLane`]），编码一样、各自有序：
 //!
 //! * **控制**：输入、确认、Ping / Pong、设置、提示……都很小，要快；
-//! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标（[`HostMsg::Cursor`]，
-//!   带着几十 KB 的图像）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板会把后面的
-//!   消息挡住大约 1.7 秒：确认迟到，被控端的在途帧窗口停住、测到的往返时延变大，自适应码率误判为拥塞；
+//! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标图像
+//!   （[`HostMsg::CursorImage`]，几十 KB）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
+//!   会把后面的消息挡住大约 1.7 秒：确认迟到，被控端的在途帧窗口停住、测到的往返时延变大，自适应码率误判为拥塞；
 //!   输入晚到超过 [`INPUT_MAX_AGE`] 还会被当成过时的丢掉。
-//! * 双方支持 [`crate::features::session::CURSOR_UPDATES`] 时，光标可见性和完整形状引用走控制流，
-//!   图像走大块流。引用包含槽位和代际，跨流乱序不会让旧图像改变最新可见性；否则使用原来的 [`HostMsg::Cursor`]。
+//!
+//! 光标拆成两半：可见性和用哪个形状（[`HostMsg::Cursor`]，很小）走控制通道，形状的图像走大块通道。
+//! 形状按槽位和代际引用（[`CursorRef`]），两条通道之间乱序也不会让晚到的旧图像盖掉新的选择。
 //!
 //! 大块通道的优先级和画面一样（QUIC 轮流发，谁也不独占），比控制、声音低。
 //!
@@ -33,7 +34,7 @@
 //! # 鼠标
 //!
 //! 平时鼠标用绝对坐标（[`InputEvent::MouseMove`]）：控制端的指针在哪里，被控端的光标就在哪里。
-//! 被控端的光标隐藏了（[`CursorState::visible`] 为 false，例如游戏里按住右键转视角、第一人称游戏）时，
+//! 被控端的光标隐藏了（[`HostMsg::Cursor`] 的 `visible` 为 false，例如游戏里按住右键转视角、第一人称游戏）时，
 //! 控制端改发相对移动（[`InputEvent::MouseDelta`]）：游戏这时自己把光标拉回原位、只看移动了多少，
 //! 绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动了）。
 //!
@@ -82,10 +83,16 @@ pub enum HostMsg {
     /// 编码器（重新）创建后通知控制端当前实际使用的编码参数。
     #[n(6)]
     Encoder(#[n(0)] EncoderInfo),
-    /// 远端光标形状/可见性变化。控制端用本地光标显示该形状（移动零延迟），
-    /// 光标隐藏时改用相对移动（见模块说明）。走大块通道
+    /// 光标的最新状态：可见性，用哪个形状（`None`：还没有形状）。控制端用本地光标显示该形状（移动零延迟），
+    /// 光标隐藏时改用相对移动（见模块说明）。走控制通道，只留最新值。
+    /// 形状的图像还没到时先应用可见性，等那一代图像到了再换形状（见 [`HostMsg::CursorImage`]）
     #[n(7)]
-    Cursor(#[n(0)] CursorState),
+    Cursor {
+        #[n(0)]
+        visible: bool,
+        #[n(1)]
+        shape: Option<CursorRef>,
+    },
     /// 被控端剪贴板文本变化。走大块通道
     #[n(8)]
     Clipboard {
@@ -96,43 +103,28 @@ pub enum HostMsg {
     /// 原因不认识（[`ByeReason::Unknown`]，对方版本新增的）时会话照样结束
     #[n(9)]
     Bye(#[n(0)] ByeReason),
-    /// 完整的最新光标状态，走控制流。只在协商了 CURSOR_UPDATES 时发送。
-    /// 图像尚未到达时先应用 visible，保持旧图像，等指定代际的图像到达。
+    /// 一个槽位的新图像（之前没发过的形状）。走大块通道；不带可见性，也不选择形状（那是 [`HostMsg::Cursor`] 的事）
     #[n(10)]
-    CursorUpdate {
-        #[n(0)]
-        visible: bool,
-        #[n(1)]
-        shape: Option<CursorRef>,
-    },
-    /// 一个槽位的新图像，走大块流，不携带可见性，也不自行选择光标形状。
-    #[n(11)]
     CursorImage {
         #[n(0)]
         reference: CursorRef,
         #[n(1)]
         image: CursorShape,
     },
-    /// Actual video output, correlated with extended packets; requires VIDEO_MODEL.
-    #[n(12)]
-    VideoConfig(#[n(0)] crate::video::VideoConfig),
 }
 
 impl HostMsg {
     /// 这条消息走哪条通道（见模块说明的"走哪条通道"）
     pub fn lane(&self) -> SessionLane {
         match self {
-            HostMsg::Cursor(_) | HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => {
-                SessionLane::Bulk
-            }
+            HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => SessionLane::Bulk,
             HostMsg::Hello(_)
             | HostMsg::AwaitingApproval
             | HostMsg::Pong { .. }
             | HostMsg::Displays { .. }
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
-            | HostMsg::CursorUpdate { .. }
-            | HostMsg::VideoConfig(_)
+            | HostMsg::Cursor { .. }
             | HostMsg::Bye(_) => SessionLane::Control,
         }
     }
@@ -203,38 +195,19 @@ open_enum! {
     }
 }
 
-/// 光标槽位里的某一代图像，防止槽位复用和跨通道乱序造成旧图像覆盖新图像。
+/// 控制端按槽位缓存光标形状，最多这么多个。动画光标（例如忙碌时的转圈）反复用到同几个形状，
+/// 被控端只在控制端还没有它时发图像，之后只发引用。哪个槽位放什么由被控端决定（控制端照做），
+/// 两边不会对不上。槽位只在一个会话里有效
+pub const CURSOR_SLOTS: u8 = 32;
+
+/// 槽位 `slot`（`< CURSOR_SLOTS`）里的第 `generation` 代图像。槽位复用时代际变大：
+/// 跨通道晚到的旧图像认得出来，不会盖掉新的
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorRef {
     #[n(0)]
     pub slot: u8,
     #[n(1)]
     pub generation: u64,
-}
-
-#[derive(Encode, Decode, Debug, Clone, PartialEq)]
-pub struct CursorState {
-    #[n(0)]
-    pub visible: bool,
-    /// 换成了哪个形状；`None` 表示形状未变化
-    #[n(1)]
-    pub shape: Option<CursorSlot>,
-}
-
-/// 控制端按槽位缓存光标形状，最多这么多个。动画光标（例如忙碌时的转圈）反复用到同几个形状，
-/// 被控端只在控制端还没有它时发图像，之后只发槽位：不然优先级最高的控制流上一秒要发几十次几十 KB 的图像。
-/// 哪个槽位放什么由被控端决定（控制端照做），两边不会对不上。槽位只在一个会话里有效
-pub const CURSOR_SLOTS: u8 = 32;
-
-/// 光标换成了控制端槽位 `slot` 里的形状（见 [`CURSOR_SLOTS`]）
-#[derive(Encode, Decode, Debug, Clone, PartialEq)]
-pub struct CursorSlot {
-    /// `< CURSOR_SLOTS`
-    #[n(0)]
-    pub slot: u8,
-    /// 新的形状：存进这个槽位（替换掉原来的）。`None` 表示槽位里已经是它了
-    #[n(1)]
-    pub image: Option<CursorShape>,
 }
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Hash)]
@@ -387,11 +360,17 @@ pub enum ControllerMsg {
         #[cbor(n(1), with = "crate::cbor::open_vec")]
         events: Vec<InputEvent>,
     },
-    /// 确认收到某一帧，用于被控端的在途帧控制（防止延迟堆积）。
+    /// 界面收到了第 `seq` 帧（累积确认），用于被控端的在途帧控制（防止延迟堆积）。
+    ///
+    /// `arrived`：这一帧从网络上读完的时刻（控制端的时钟，微秒，和 [`ControllerMsg::Ping::t`] 同一个时钟；
+    /// 控制端不知道时为 `None`）。确认要等界面收到才发，往返时延里混着界面那一段；到达时刻只算网络：
+    /// 被控端拿它减去自己的发送时刻，两边时钟之差是常数，变化的部分就是网络上的排队
     #[n(2)]
     Ack {
         #[n(0)]
         seq: u32,
+        #[n(1)]
+        arrived: Option<u64>,
     },
     /// 画质设置变了（开始时的设置在握手里，见 [`crate::handshake::ControllerIntro`]）
     #[n(3)]
@@ -421,12 +400,6 @@ pub enum ControllerMsg {
         #[n(0)]
         enabled: bool,
     },
-    /// Updated preference, separate from receiver hard limits; requires VIDEO_MODEL.
-    #[n(9)]
-    View(#[n(0)] crate::video::ViewRequest),
-    /// Cumulative decoder/renderer telemetry, independent of Ack; requires VIDEO_MODEL.
-    #[n(10)]
-    VideoFeedback(#[n(0)] crate::video::VideoFeedback),
 }
 
 impl ControllerMsg {
@@ -439,9 +412,7 @@ impl ControllerMsg {
             | Self::RequestKeyframe
             | Self::SelectDisplay { .. }
             | Self::Ping { .. }
-            | Self::Audio { .. }
-            | Self::View(_)
-            | Self::VideoFeedback(_) => SessionLane::Control,
+            | Self::Audio { .. } => SessionLane::Control,
         }
     }
 }

@@ -412,7 +412,6 @@ class WebConsole implements Backend {
       case "clipboardSync":
         return this.clipboardSync(c.sid, c.enabled);
       case "input":
-      case "videoFeedback":
       case "ack":
         return this.notify(c.cmd, c);
       case "disconnect":

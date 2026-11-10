@@ -98,11 +98,6 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
             // 桌面被控端不请本机用户同意（无人值守），gate 不会要求它
             debug_assert_ne!(admitted.admission, Admission::NeedsApproval);
             let mut desktop = Desktop::new(session_id, senders);
-            desktop.cursors = Arc::new(Mutex::new(CursorCache::with_fast_updates(
-                admitted
-                    .negotiated
-                    .has(airhand_proto::features::session::CURSOR_UPDATES),
-            )));
             desktop.identity = Some((gate.clone(), ip, admitted.clone()));
             desktop
         },
@@ -127,7 +122,6 @@ struct Desktop {
     current: u8,
     settings: QualitySettings,
     flow: Arc<Flow>,
-    video_model: Arc<airhand_link::video::VideoSession>,
     /// 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
     cursors: Arc<Mutex<CursorCache>>,
     pipeline: Option<Pipeline>,
@@ -163,7 +157,6 @@ impl Desktop {
             current: 0,
             settings: QualitySettings::default(),
             flow: Arc::new(Flow::default()),
-            video_model: senders.video_model,
             cursors: Arc::default(),
             pipeline: None,
             injector: InjectorThread::new(),
@@ -189,7 +182,6 @@ impl Desktop {
             self.out.clone(),
             self.flow.clone(),
             self.cursors.clone(),
-            self.video_model.clone(),
         ));
     }
 
@@ -273,7 +265,7 @@ impl Platform for Desktop {
                     .unwrap_or(&fallback);
                 self.injector.handle(events, d);
             }
-            Request::Ack(seq) => self.flow.ack(seq),
+            Request::Ack { seq, arrived } => self.flow.ack(seq, arrived),
             Request::Settings(s) => {
                 self.settings = s;
                 if let Some(p) = &self.pipeline {

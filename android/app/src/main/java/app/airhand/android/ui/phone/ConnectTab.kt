@@ -114,7 +114,7 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
         if (phase is RemoteSession.Phase.Failed) {
             error = Messages.problem(ctx, phase.reason)
             errorCode = s.code
-            if (phase.reason.needsPairing || phase.reason.kind == "hostKeyChanged") askUser = s.code to phase.reason
+            if (phase.reason.needsPairing) askUser = s.code to phase.reason
             app.endSession(s)
         }
         // 连上了：这台已经在“我的设备”里，输入框清空
@@ -286,37 +286,25 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
         }
     }
 
-    // 对方要配对码：输入对方托盘菜单里的配对码再连；对方的身份变了：用户确认是重装了才信任新的身份
+    // 对方要配对码、或者对方的身份变了（用户确认是重装了之后重新配对）：输入对方托盘菜单里的配对码再连
     askUser?.let { (c, p) ->
-        val retry = { pairing: String?, trustNew: Boolean ->
-            askUser = null
-            error = null
-            errorCode = null
-            app.startSession(c, viewOnly = false, pairing = pairing, trustNew = trustNew)
-        }
-        if (p.needsPairing) {
-            val hint = stringResource(R.string.pairing_hint)
-            EditTextDialog(
-                title = stringResource(R.string.pairing_title),
-                initial = "",
-                label = stringResource(R.string.pairing_label),
-                supporting = Messages.problem(ctx, p),
-                placeholder = "000000",
-                keyboardType = KeyboardType.Number,
-                validate = { if (it.count(Char::isDigit) == 6) null else hint },
-                onDismiss = { askUser = null },
-                onSave = { retry(it.filter(Char::isDigit), false) },
-            )
-        } else {
-            ConfirmDialog(
-                title = stringResource(R.string.trust_new_title),
-                text = Messages.problem(ctx, p),
-                confirm = stringResource(R.string.trust_new_confirm),
-                destructive = true,
-                onDismiss = { askUser = null },
-                onConfirm = { retry(null, true) },
-            )
-        }
+        val hint = stringResource(R.string.pairing_hint)
+        EditTextDialog(
+            title = stringResource(R.string.pairing_title),
+            initial = "",
+            label = stringResource(R.string.pairing_label),
+            supporting = Messages.problem(ctx, p),
+            placeholder = "000000",
+            keyboardType = KeyboardType.Number,
+            validate = { if (it.count(Char::isDigit) == 6) null else hint },
+            onDismiss = { askUser = null },
+            onSave = {
+                askUser = null
+                error = null
+                errorCode = null
+                app.startSession(c, viewOnly = false, pairing = it.filter(Char::isDigit))
+            },
+        )
     }
     renaming?.let { d ->
         EditTextDialog(

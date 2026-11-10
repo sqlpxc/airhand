@@ -9,68 +9,11 @@
 //! 改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边跟上。
 
 use airhand_link::controller::{Command, ConnectOptions};
-use airhand_proto::media::{self, AudioHeader, VideoHeader};
+use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
-    Codec, CursorShape, CursorSlot, CursorState, InputEvent, MouseButton, QualitySettings,
-    SystemAction, TouchPhase,
+    Codec, CursorShape, InputEvent, MouseButton, QualitySettings, SystemAction, TouchPhase,
 };
-use airhand_proto::video::*;
 use serde_json::{Value, json};
-
-fn receiver() -> ReceiverCapabilities {
-    ReceiverCapabilities {
-        codecs: vec![
-            DecodeCapability {
-                codec: Codec::H264,
-                max_width: Some(1920),
-                max_height: Some(1080),
-                max_fps: Some(60),
-            },
-            DecodeCapability {
-                codec: Codec::H265,
-                max_width: None,
-                max_height: None,
-                max_fps: None,
-            },
-            DecodeCapability {
-                codec: Codec::AV1,
-                max_width: Some(3840),
-                max_height: Some(2160),
-                max_fps: Some(120),
-            },
-        ],
-    }
-}
-
-fn video_config() -> VideoConfig {
-    VideoConfig {
-        context: VideoContext {
-            config_id: 7,
-            instance: MediaInstance::default(),
-        },
-        request_id: 3,
-        codec: Codec::AV1,
-        width: 1920,
-        height: 1080,
-        fps: 60,
-        bitrate_kbps: 8000,
-    }
-}
-
-fn feedback() -> VideoFeedback {
-    VideoFeedback {
-        context: video_config().context,
-        sample_id: 2,
-        received_seq: 9,
-        decoded_seq: Some(8),
-        presented_seq: Some(8),
-        pending_frames: 1,
-        oldest_pending_ms: 12,
-        decode_time_us: 7000,
-        dropped_frames: 0,
-        decoder_errors: 0,
-    }
-}
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
@@ -171,13 +114,6 @@ fn commands() -> Vec<(Value, Command)> {
             Command::Ack { sid: 3, seq: 99 },
         ),
         (
-            json!({ "cmd": "videoFeedback", "sid": 3, "feedback": feedback() }),
-            Command::VideoFeedback {
-                sid: 3,
-                feedback: feedback(),
-            },
-        ),
-        (
             json!({ "cmd": "disconnect", "sid": 3 }),
             Command::Disconnect { sid: 3 },
         ),
@@ -192,8 +128,7 @@ fn connect_options() -> (Value, ConnectOptions) {
             "hostKey": "ab".repeat(32),
             "pairing": "482913",
             "settings": { "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "h265" },
-            "audio": true,
-            "receiver": receiver()
+            "audio": true
         }),
         ConnectOptions {
             resume: Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
@@ -201,7 +136,6 @@ fn connect_options() -> (Value, ConnectOptions) {
             pairing: Some("482913".into()),
             settings: settings(),
             audio: true,
-            receiver: Some(receiver()),
         },
     )
 }
@@ -254,7 +188,8 @@ fn fixture() -> Value {
         visible: false,
         shape: None,
     });
-    // 以后的版本在头里加了 8 个字节的字段（头的长度是 32）：负载照样从头的长度处开始，不认识的字段跳过
+    // 以后的版本在头里加了一个 8 字节的扩展（类型 0xee、长度 6，头的长度是 32）：
+    // 负载照样从头的长度处开始，不认识的扩展跳过
     let longer = {
         let mut p = AudioHeader {
             seq: 4,
@@ -264,7 +199,7 @@ fn fixture() -> Value {
         .encode()
         .to_vec();
         p[3] = 32;
-        p.extend_from_slice(&[0xee; 8]);
+        p.extend_from_slice(&[0xee, 6, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee]);
         p.extend_from_slice(&[0xab, 0xcd]);
         p
     };
@@ -300,22 +235,11 @@ fn fixture() -> Value {
             {
                 "name": "audio with a longer header from a newer version", "hex": hex(&longer),
                 "kind": 3, "seq": 4, "start": false, "captureUs": capture_us + 40_000, "payload": "abcd"
-            },
-            {
-                "name": "video with negotiated context", "hex": hex(&media::frame(&video.encode_with_context(Some(video_config().context)), &[&[7, 8, 9]])[4..]),
-                "kind": 1, "seq": 9, "key": true, "codec": "av1", "width": 1920, "height": 1080,
-                "captureUs": capture_us, "context": video_config().context, "payload": "070809"
             }
         ],
         "input": serde_json::to_value(inputs()).unwrap(),
         "commands": commands().into_iter().map(|(v, _)| v).collect::<Vec<_>>(),
         "connectOptions": connect_options().0,
-        "videoModel": {
-            "receiver": receiver(),
-            "view": ViewRequest { request_id: 3, preference: settings() },
-            "config": video_config(),
-            "feedback": feedback(),
-        },
     })
 }
 
@@ -332,21 +256,22 @@ fn fixture_matches_the_implementation() {
     // 字面量由 Rust 生成并由 tsc 检查，不能把 JSON.parse 的 any 当作类型契约。
     let contract_data = json!({
         "input": want["input"], "commands": want["commands"], "connectOptions": want["connectOptions"],
-        "videoModel": want["videoModel"],
     });
     let contract = format!(
         "// Generated by airhand-link/tests/protocol.rs; update with AIRHAND_UPDATE_FIXTURES=1.\n\
          import type {{ InputEvent, Command, ConnectOptions }} from \"../src/lib/api\";\n\
-         import type {{ ReceiverCapabilities, ViewRequest, VideoConfig, VideoFeedback }} from \"../src/lib/video-model\";\n\
-         export const contract = {} satisfies {{ input: InputEvent[]; commands: Command[]; connectOptions: ConnectOptions; videoModel: {{ receiver: ReceiverCapabilities; view: ViewRequest; config: VideoConfig; feedback: VideoFeedback }} }};\n",
+         export const contract = {} satisfies {{ input: InputEvent[]; commands: Command[]; connectOptions: ConnectOptions }};\n",
         serde_json::to_string_pretty(&contract_data).unwrap(),
     );
     if std::env::var_os("AIRHAND_UPDATE_FIXTURES").is_some() {
         std::fs::write(path(), &text).unwrap();
         std::fs::write(&contract_path, &contract).unwrap();
     }
+    // Windows 上检出的文件可能是 CRLF
     assert_eq!(
-        std::fs::read_to_string(contract_path).unwrap(),
+        std::fs::read_to_string(contract_path)
+            .unwrap()
+            .replace("\r\n", "\n"),
         contract,
         "the TypeScript contract fixture is out of date: AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol"
     );

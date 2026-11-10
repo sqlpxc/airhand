@@ -43,7 +43,6 @@ struct Ctrl {
     force_key: AtomicBool,
     stop: AtomicBool,
     flow: Arc<Flow>,
-    video_model: Arc<airhand_link::video::VideoSession>,
     /// 控制端缓存了哪些光标形状（整个会话一份）
     cursors: Arc<Mutex<CursorCache>>,
 }
@@ -58,7 +57,6 @@ impl Pipeline {
         out: Outbox,
         flow: Arc<Flow>,
         cursors: Arc<Mutex<CursorCache>>,
-        video_model: Arc<airhand_link::video::VideoSession>,
     ) -> Self {
         let ctrl = Arc::new(Ctrl {
             settings: Mutex::new(settings),
@@ -66,7 +64,6 @@ impl Pipeline {
             force_key: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             flow,
-            video_model,
             cursors,
         });
         let c = ctrl.clone();
@@ -167,24 +164,9 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
 
     while !ctrl.stop.load(Ordering::Acquire) {
         let v = ctrl.settings_ver.load(Ordering::Acquire);
-        let preference = *ctrl.settings.lock().unwrap();
-        let (w, h) = last_frame.as_ref().map_or((0, 0), |f| (f.width, f.height));
-        let mut selected =
-            match ctrl
-                .video_model
-                .select(preference, &super::encoder::available_codecs(), w, h)
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    notice(Notice::CaptureFailed {
-                        detail: e.to_string(),
-                    });
-                    break;
-                }
-            };
-        if v != ver || settings != selected.settings {
+        if v != ver {
             ver = v;
-            settings = selected.settings;
+            settings = *ctrl.settings.lock().unwrap();
             sub.set_fps(settings.fps);
             abr.reset(settings.bitrate_kbps);
             if let Some(e) = &mut enc {
@@ -209,9 +191,8 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         };
         let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
 
-        // 光标变化：只发送可见性 +（如有变化）形状。控制端已经有的形状（动画光标循环到的帧）只发槽位。
-        // 图像走大块通道，和剪贴板共用：队列满了不等，下一轮再发最新形状。
-        // 新端的可见性和完整形状引用独立走控制通道；旧端仍使用同一条有序的光标消息。
+        // 光标变化：可见性和形状引用走控制通道（只留最新值）；控制端还没有的形状（动画光标第一次转到的帧）
+        // 先把图像排进大块通道，和剪贴板共用：队列满了不等，下一轮再发最新形状（见 CursorCache）。
         if cs > cursor_seq {
             cursor_seq = cs;
             cursor_pending = true;
@@ -290,22 +271,6 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 None => continue,
             },
         };
-        selected = match ctrl.video_model.select(
-            preference,
-            &super::encoder::available_codecs(),
-            frame.width,
-            frame.height,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                notice(Notice::CaptureFailed {
-                    detail: e.to_string(),
-                });
-                break;
-            }
-        };
-        settings = selected.settings;
-        sub.set_fps(settings.fps);
         let started = Instant::now();
         next_due = started + Duration::from_secs_f64(1.0 / settings.fps.max(1) as f64);
 
@@ -326,7 +291,6 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     if !send(&HostMsg::Encoder(e.info().clone())) {
                         break;
                     }
-                    ctrl.video_model.restart();
                     enc = Some(e);
                     force = true;
                 }
@@ -357,11 +321,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 if ctrl.stop.load(Ordering::Acquire) {
                     break;
                 }
-                let size = if ctrl.video_model.enabled() {
-                    media::VIDEO_CONTEXT_LEN
-                } else {
-                    media::HEADER_LEN
-                } + ef.data.len();
+                let size = media::HEADER_LEN + ef.data.len();
                 if size > media::MAX_VIDEO_PACKET {
                     notice(Notice::CaptureFailed {
                         detail: "encoded frame exceeds the video budget".into(),
@@ -395,17 +355,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     // 控制端按采集时间做音画同步，用旧的时间会以为这一帧严重滞后，让声音跟着多等
                     capture_us: super::clock::us(if fresh { frame.captured } else { started }),
                 };
-                let header = match ctrl.video_model.header(&header, selected, abr.current) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        ctrl.flow.discard(seq);
-                        notice(Notice::CaptureFailed {
-                            detail: e.to_string(),
-                        });
-                        break;
-                    }
-                };
-                let packet = Bytes::from(media::frame(&header, &[&ef.data]));
+                let packet = Bytes::from(media::frame(&header.encode(), &[&ef.data]));
                 if !send_cancellable(&video, &ctrl.stop, packet) {
                     ctrl.flow.discard(seq);
                     break;

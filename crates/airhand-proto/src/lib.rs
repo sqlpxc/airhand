@@ -42,8 +42,8 @@
 //! | 声音 | 被控端 → 控制端     | 放不进数据报的声音包（很少见）                    | 媒体包（[`media`]） |
 //! | 大块 | 双向                | 大的消息：剪贴板、光标（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //!
-//! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密文（见 `airhand_link::secure`）。
-//! 媒体包是定长头 + 原始数据，控制端解密后原样交给界面，不重新编码。
+//! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
+//! "之后的每一帧"）。媒体包是定长头 + 原始数据，控制端解密后原样交给界面，不重新编码。
 //!
 //! 声音包平时走 QUIC 数据报（[`datagram`]）：丢了就丢了，不重传，也不用排在丢了的包后面等重传。
 //! 服务器按数据报开头的会话 ID 在这个会话的两端之间原样转发。
@@ -57,7 +57,6 @@ pub mod handshake;
 pub mod media;
 pub mod session;
 pub mod signal;
-pub mod video;
 
 /// 信令协议版本（客户端 ⇄ 服务器，包括 [`SessionHeader`] 和数据报的会话 ID）。
 ///
@@ -85,9 +84,9 @@ pub const PAIRING_DIGITS: usize = 6;
 
 /// 信令流单条消息上限。
 pub const MAX_SIGNAL_MSG: usize = 64 * 1024;
-/// 会话控制通道单条消息上限，含加密标签。长输入分批，大消息走 Bulk。
+/// 会话控制通道单条消息上限，含加密开销（[`handshake::SEAL_OVERHEAD`]）。长输入分批，大消息走 Bulk。
 pub const MAX_CONTROL_MSG: usize = 64 * 1024;
-/// 大块通道单条消息上限（1 MiB 的剪贴板文本、光标图像），含加密标签。
+/// 大块通道单条消息上限（1 MiB 的剪贴板文本、光标图像），含加密开销。
 pub const MAX_BULK_MSG: usize = 2 * 1024 * 1024;
 
 /// 会话流头部魔数（"AHS1" 是 v9 之前的格式：固定三条通道）。
@@ -119,21 +118,13 @@ pub enum SessionLane {
 impl SessionLane {
     pub const ALL: [Self; 4] = [Self::Control, Self::Video, Self::Audio, Self::Bulk];
 
-    /// 一帧负载的资源上限（含 AEAD 标签，不含长度前缀），发送和接收共用。
+    /// 一帧负载的资源上限（含加密开销，不含长度前缀），发送和接收共用。
     pub const fn max_frame_size(self) -> usize {
         match self {
             Self::Control => MAX_CONTROL_MSG,
             Self::Bulk => MAX_BULK_MSG,
-            Self::Video => media::MAX_VIDEO_PACKET + handshake::TAG_LEN,
-            Self::Audio => media::MAX_AUDIO_PACKET + handshake::TAG_LEN,
-        }
-    }
-
-    /// 旧端允许 2 MiB 的控制帧；只有协商后才能收紧，避免旧端长文本被误判为损坏。
-    pub const fn receive_frame_size(self, features: Features) -> usize {
-        match self {
-            Self::Control if !features.has(features::session::SMALL_CONTROL) => MAX_BULK_MSG,
-            _ => self.max_frame_size(),
+            Self::Video => media::MAX_VIDEO_PACKET + handshake::SEAL_OVERHEAD,
+            Self::Audio => media::MAX_AUDIO_PACKET + handshake::SEAL_OVERHEAD,
         }
     }
 
@@ -211,24 +202,17 @@ impl SessionHeader {
     }
 }
 
-/// QUIC 数据报：`会话 ID（u64 LE）| 密文`（没有长度前缀，一个数据报就是一个包）。
+/// QUIC 数据报：`会话 ID（u64 LE）| 密封单元`（没有长度前缀，一个数据报就是一个包）。
 ///
 /// 服务器只看开头的会话 ID：发送方是这个会话的一端，就原样转给另一端，否则丢掉。
-/// 后面是端到端加密的媒体包（`airhand_link::secure` 的数据报格式：计数器 + 密文 + 认证标签）。
-/// 目前只有被控端的声音包走数据报（见 [`media`]）。
+/// 后面是端到端加密的媒体包，和流上的一帧一样是 `密文 | 标签 | 计数`（见 [`handshake`] 的"之后的每一帧"）。
+/// 目前只有被控端的声音包走数据报（见 [`media`]），和声音流用同一把密钥、同一串计数。
 pub mod datagram {
     /// 开头的会话 ID
     pub const HEADER: usize = 8;
     /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
     /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
     pub const MAX: usize = 1000;
-
-    pub fn encode(session_id: u64, packet: &[u8]) -> Vec<u8> {
-        let mut d = Vec::with_capacity(HEADER + packet.len());
-        d.extend_from_slice(&session_id.to_le_bytes());
-        d.extend_from_slice(packet);
-        d
-    }
 
     /// 数据报属于哪个会话；不到一个会话 ID 长时为 `None`
     pub fn session(d: &[u8]) -> Option<u64> {
@@ -298,8 +282,6 @@ pub mod features {
     pub mod signal {
         use crate::Features;
 
-        /// Reserved: replaceable media transport instances. Not supported by the fixed-lane relay.
-        pub const MEDIA_INSTANCES: Features = Features::from_bits(1 << 0);
         /// 本端支持的
         pub const SUPPORTED: Features = Features::NONE;
     }
@@ -308,16 +290,8 @@ pub mod features {
     pub mod session {
         use crate::Features;
 
-        /// 光标可见性和形状引用走控制流，图像走大块流，用代际引用处理乱序。
-        pub const CURSOR_UPDATES: Features = Features::from_bits(1 << 0);
-        /// 控制帧限制为 64 KiB；长输入按字符边界分批。旧端仍按原来的 2 MiB 接收。
-        pub const SMALL_CONTROL: Features = Features::from_bits(1 << 1);
-        /// Receiver capabilities, view requests, selected configurations and decoder feedback.
-        pub const VIDEO_MODEL: Features = Features::from_bits(1 << 2);
-        /// Reserved; requires signal::MEDIA_INSTANCES as well. Never advertised until implemented.
-        pub const MEDIA_INSTANCES: Features = Features::from_bits(1 << 3);
         /// 本端支持的
-        pub const SUPPORTED: Features = CURSOR_UPDATES.with(SMALL_CONTROL).with(VIDEO_MODEL);
+        pub const SUPPORTED: Features = Features::NONE;
     }
 }
 
@@ -379,25 +353,9 @@ mod tests {
 
     #[test]
     fn datagram_layout() {
-        let d = datagram::encode(0x0102_0304_0506_0708, &[9, 9]);
-        assert_eq!(d, [8, 7, 6, 5, 4, 3, 2, 1, 9, 9]);
+        let d = [8, 7, 6, 5, 4, 3, 2, 1, 9, 9];
         assert_eq!(datagram::session(&d), Some(0x0102_0304_0506_0708));
         assert_eq!(datagram::session(&d[..7]), None);
-    }
-
-    #[test]
-    fn control_budget_is_negotiated_without_changing_bulk() {
-        let small = features::session::SMALL_CONTROL;
-        assert_eq!(
-            SessionLane::Control.receive_frame_size(Features::NONE),
-            2 << 20
-        );
-        assert_eq!(SessionLane::Control.receive_frame_size(small), 64 << 10);
-        assert_eq!(SessionLane::Bulk.receive_frame_size(small), 2 << 20);
-        assert_eq!(
-            SessionLane::Bulk.receive_frame_size(Features::NONE),
-            2 << 20
-        );
     }
 
     #[test]

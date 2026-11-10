@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::secure::{FrameSealer, Negotiated};
+use crate::secure::{Negotiated, Sealer};
 use crate::transport::{self, FromHost, HostReceiver};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
@@ -67,9 +67,6 @@ pub enum SessionEvent {
         hardware: bool,
         width: u32,
         height: u32,
-    },
-    VideoConfig {
-        config: airhand_proto::video::VideoConfig,
     },
     Displays {
         displays: Vec<DisplayInfo>,
@@ -159,12 +156,34 @@ impl Default for Stats {
     }
 }
 
+/// 最近收到的画面帧是什么时候从网络上读完的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
+/// （`ControllerMsg::Ack::arrived`）。在途的帧不超过 `flow::MAX_WINDOW` 个，记最近 64 个就够了
+pub(super) struct Arrivals([Option<(u32, u64)>; 64]);
+
+impl Default for Arrivals {
+    fn default() -> Self {
+        Self([None; 64])
+    }
+}
+
+impl Arrivals {
+    fn record(&mut self, seq: u32, at: u64) {
+        self.0[seq as usize % self.0.len()] = Some((seq, at));
+    }
+
+    pub(super) fn get(&self, seq: u32) -> Option<u64> {
+        self.0[seq as usize % self.0.len()]
+            .filter(|&(s, _)| s == seq)
+            .map(|(_, at)| at)
+    }
+}
+
 pub(super) struct SessionIo {
     pub send: SendStream,
     /// 控制流上控制端 → 被控端的加密（已经发过确认，计数接着往下数）
-    pub sealer: FrameSealer,
+    pub sealer: Sealer,
     /// 大块通道（剪贴板）：发送的一半、排着队的消息（编码好的）、加密
-    pub bulk: (SendStream, mpsc::Receiver<Bytes>, FrameSealer),
+    pub bulk: (SendStream, mpsc::Receiver<Bytes>, Sealer),
     /// 往大块通道排消息（桌面版自己同步剪贴板时用）
     pub bulk_tx: mpsc::Sender<Bytes>,
     pub recv: HostReceiver,
@@ -172,6 +191,7 @@ pub(super) struct SessionIo {
     pub mode: Mode,
     /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
     pub negotiated: Negotiated,
+    pub arrivals: Arc<std::sync::Mutex<Arrivals>>,
 }
 
 /// 见 [`super::Frontend`]
@@ -200,6 +220,7 @@ pub(super) async fn run(
         ui,
         mode,
         negotiated,
+        arrivals,
     } = io;
     info!(sid, ?negotiated, "session started");
     let local_clip = match mode {
@@ -234,18 +255,11 @@ pub(super) async fn run(
         loop {
             let msg = match recv.recv().await? {
                 // 画面、声音：只看一眼头做统计，原样交给界面
-                FromHost::Video(p) => {
+                FromHost::Video { packet: p, arrived } => {
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
-                    if negotiated.has(airhand_proto::features::session::VIDEO_MODEL) {
-                        let c = VideoHeader::context(&p)
-                            .ok_or_else(|| anyhow::anyhow!("video context missing"))?;
-                        anyhow::ensure!(
-                            c.config_id != 0 && c.instance == Default::default(),
-                            "unsupported media instance"
-                        );
-                    }
+                    arrivals.lock().unwrap().record(h.seq, arrived);
                     {
                         let mut s = st.lock().unwrap();
                         s.last_msg = Instant::now();
@@ -324,11 +338,7 @@ pub(super) async fn run(
                     }
                     return Err(Problem::from(reason).into());
                 }
-                HostMsg::Cursor(c) => {
-                    out.packet(media::cursor_packet(&c))
-                        .map_err(|_| ui_closed())?;
-                }
-                HostMsg::CursorUpdate { visible, shape } => {
+                HostMsg::Cursor { visible, shape } => {
                     let state = cursor.update(visible, shape);
                     out.packet(media::cursor_packet(&state))
                         .map_err(|_| ui_closed())?;
@@ -338,14 +348,6 @@ pub(super) async fn run(
                         out.packet(media::cursor_packet(&state))
                             .map_err(|_| ui_closed())?;
                     }
-                }
-                HostMsg::VideoConfig(config) => {
-                    anyhow::ensure!(
-                        config.valid() && config.context.instance == Default::default(),
-                        "unsupported video configuration"
-                    );
-                    out.event(SessionEvent::VideoConfig { config })
-                        .map_err(|_| ui_closed())?;
                 }
                 HostMsg::Encoder(e) => {
                     let _ = out.event(SessionEvent::Encoder {

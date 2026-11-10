@@ -2,27 +2,22 @@
 //!
 //! * **走哪条通道由消息决定**（[`HostMsg::lane`]）：发的一方只管 [`Outbox::send`]，不用自己挑控制流还是大块通道。
 //!   大的消息（剪贴板、光标形状）在大块通道上排队，挡不住控制消息；
-//! * **只关心最新值的状态不排队**，各占一个槽位、只留最新的一个，写任务先发它们，再按顺序发排着队的：
-//!   Pong、显示器列表和新的 CursorUpdate（控制通道），旧端的光标可见性在大块通道。网络慢时不会越积越多、占满队列，
+//! * **只关心最新值的状态不排队**：Pong、显示器列表、光标状态（控制通道）各占一个槽位、只留最新的一个，
+//!   写任务先发它们，再按顺序发排着队的。网络慢时不会越积越多、占满队列，
 //!   Pong 也不会排在一串提示后面、把控制端测到的往返时延拉长；
 //! * 其它消息按顺序排队，有上限。满了怎么办由发的一方决定（[`SendError::Full`]）：控制消息排满了说明对方早就不收了，
-//!   会话结束；剪贴板丢掉这一次；光标形状下一轮再发那时最新的。
+//!   会话结束；剪贴板丢掉这一次；光标图像下一轮再发那时最新的。
 //!
-//! 槽位里的状态不能越过还排着队、带着同一个状态的消息，不然新的会被旧的盖掉：
-//!
-//! * 显示器列表不越过 [`HostMsg::Hello`]（它带着开始时的显示器列表）；
-//! * 旧端的光标可见性不越过带着形状的 [`HostMsg::Cursor`]（它也带着可见性）。新端的图像没有可见性，
-//!   [`HostMsg::CursorUpdate`] 使用完整的带代际引用，不需要等大块通道。
-//!
-//! 反过来，这样的消息排进队列时，槽位里更早的那个值就作废了（它带着的更新）。
+//! 显示器列表不能越过还排着队的 [`HostMsg::Hello`]（它带着开始时的显示器列表），不然新的会被旧的盖掉；
+//! 反过来，Hello 排进队列时，槽位里更早的显示器列表就作废了。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use airhand_proto::SessionLane;
 use airhand_proto::framing;
-use airhand_proto::handshake::TAG_LEN;
-use airhand_proto::session::{CursorState, HostMsg};
+use airhand_proto::handshake::SEAL_OVERHEAD;
+use airhand_proto::session::HostMsg;
 use bytes::Bytes;
 use tokio::sync::Notify;
 
@@ -38,40 +33,19 @@ const BULK_BYTES: usize = 4 * 1024 * 1024;
 /// 队列里的两条通道
 const CONTROL: usize = 0;
 const BULK: usize = 1;
-/// 每条通道最多这么多个槽位
-const SLOTS: usize = 4;
-
-/// 只留最新值的槽位：在哪条通道上、第几个（写任务按这个先后发）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Slot {
-    lane: usize,
-    index: usize,
-}
-
-const PONG: Slot = Slot {
-    lane: CONTROL,
-    index: 0,
-};
-const DISPLAYS: Slot = Slot {
-    lane: CONTROL,
-    index: 1,
-};
-const CURSOR_UPDATE: Slot = Slot {
-    lane: CONTROL,
-    index: 2,
-};
-const CURSOR_VISIBLE: Slot = Slot {
-    lane: BULK,
-    index: 0,
-};
+/// 控制通道上只留最新值的槽位（写任务按这个先后发）
+const PONG: usize = 0;
+const DISPLAYS: usize = 1;
+const CURSOR: usize = 2;
+const SLOTS: usize = 3;
 
 /// 一条消息在队列里怎么放
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
-    /// 只留最新的一个
-    Latest(Slot),
+    /// 控制通道上的一个槽位：只留最新的一个
+    Latest(usize),
     /// 按顺序排队。`before`：这个槽位里的状态它也带着，槽位要等它发出去之后才轮到（见模块说明）
-    Queued { lane: usize, before: Option<Slot> },
+    Queued { lane: usize, before: Option<usize> },
 }
 
 impl Place {
@@ -84,17 +58,11 @@ impl Place {
             HostMsg::Pong { .. } => Place::Latest(PONG),
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
             HostMsg::Hello(_) => queued(Some(DISPLAYS)),
-            HostMsg::CursorUpdate { .. } => Place::Latest(CURSOR_UPDATE),
-            HostMsg::VideoConfig(_) => Place::Latest(Slot {
-                lane: CONTROL,
-                index: 3,
-            }),
-            HostMsg::CursorImage { .. } => queued(None),
-            HostMsg::Cursor(CursorState { shape: None, .. }) => Place::Latest(CURSOR_VISIBLE),
-            HostMsg::Cursor(CursorState { shape: Some(_), .. }) => queued(Some(CURSOR_VISIBLE)),
+            HostMsg::Cursor { .. } => Place::Latest(CURSOR),
             HostMsg::AwaitingApproval
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
+            | HostMsg::CursorImage { .. }
             | HostMsg::Clipboard { .. }
             | HostMsg::Bye(_) => queued(None),
         }
@@ -102,7 +70,7 @@ impl Place {
 
     fn lane(self) -> usize {
         match self {
-            Place::Latest(slot) => slot.lane,
+            Place::Latest(_) => CONTROL,
             Place::Queued { lane, .. } => lane,
         }
     }
@@ -175,7 +143,7 @@ impl State {
             return Err(SendError::Closed);
         }
         match msg.place {
-            Place::Latest(slot) => self.slots[slot.index] = Some(msg.bytes),
+            Place::Latest(slot) => self.slots[slot] = Some(msg.bytes),
             Place::Queued { before, .. } => {
                 let len = msg.bytes.len();
                 if self.items.len() >= limit.messages
@@ -183,7 +151,6 @@ impl State {
                 {
                     return Err(SendError::Full);
                 }
-                let before = before.map(|slot| slot.index);
                 if let Some(i) = before {
                     // 这条消息带着更新的值：槽位里的作废，之后的要排在它后面
                     self.slots[i] = None;
@@ -292,8 +259,8 @@ impl Outbox {
     /// 编码一条消息。同一条消息发给多个会话时只编码一次，每个会话 [`Outbox::send_encoded`]
     pub fn encode(msg: &HostMsg) -> Encoded {
         Encoded {
-            // 写任务加密时在后面追加认证标签，这里先留好位置
-            bytes: Bytes::from(framing::encode_with_spare(msg, TAG_LEN)),
+            // 写任务加密时在后面追加标签和计数，这里先留好位置
+            bytes: Bytes::from(framing::encode_with_spare(msg, SEAL_OVERHEAD)),
             place: Place::of(msg),
         }
     }
@@ -304,7 +271,7 @@ impl Outbox {
 
     /// 发送 [`Outbox::encode`] 编好的消息。只留最新值的状态（见模块说明）不会排满
     pub fn send_encoded(&self, msg: Encoded) -> Result<(), SendError> {
-        if msg.bytes.len() - framing::PREFIX + TAG_LEN > msg.lane().max_frame_size() {
+        if msg.bytes.len() - framing::PREFIX + SEAL_OVERHEAD > msg.lane().max_frame_size() {
             return Err(SendError::TooLarge);
         }
         let lane = &self.shared.lanes[msg.place.lane()];
@@ -360,7 +327,7 @@ impl Drop for LaneReceiver {
 mod tests {
     use super::*;
     use airhand_proto::session::{
-        ByeReason, CursorShape, CursorSlot, DisplayInfo, HostHello, Notice, Platform,
+        ByeReason, CursorRef, CursorShape, DisplayInfo, HostHello, Notice, Platform,
     };
     use std::time::Duration;
 
@@ -412,20 +379,30 @@ mod tests {
         HostMsg::Notice(Some(Notice::NoDisplays))
     }
 
-    fn cursor(visible: bool, slot: Option<u8>) -> HostMsg {
-        HostMsg::Cursor(CursorState {
+    fn cursor(visible: bool, slot: u8) -> HostMsg {
+        HostMsg::Cursor {
             visible,
-            shape: slot.map(|slot| CursorSlot {
+            shape: Some(CursorRef {
                 slot,
-                image: Some(CursorShape {
-                    width: 1,
-                    height: 1,
-                    hot_x: 0,
-                    hot_y: 0,
-                    rgba: vec![slot; 4],
-                }),
+                generation: 1,
             }),
-        })
+        }
+    }
+
+    fn image(slot: u8) -> HostMsg {
+        HostMsg::CursorImage {
+            reference: CursorRef {
+                slot,
+                generation: 1,
+            },
+            image: CursorShape {
+                width: 1,
+                height: 1,
+                hot_x: 0,
+                hot_y: 0,
+                rgba: vec![slot; 4],
+            },
+        }
     }
 
     fn clipboard(len: usize) -> HostMsg {
@@ -453,8 +430,8 @@ mod tests {
             (notice(), SessionLane::Control),
             (HostMsg::AwaitingApproval, SessionLane::Control),
             (HostMsg::Bye(ByeReason::Kicked), SessionLane::Control),
-            (cursor(true, None), SessionLane::Bulk),
-            (cursor(true, Some(1)), SessionLane::Bulk),
+            (cursor(true, 1), SessionLane::Control),
+            (image(1), SessionLane::Bulk),
             (clipboard(3), SessionLane::Bulk),
         ] {
             assert_eq!(msg.lane(), lane, "{msg:?}");
@@ -526,66 +503,22 @@ mod tests {
         assert_eq!(shown(&out[0]), "fresh");
     }
 
+    /// 光标状态只留最新的，走控制通道：大块通道排满了（剪贴板、光标图像）也挡不住它
     #[test]
-    fn fast_cursor_state_bypasses_a_full_bulk_lane() {
+    fn cursor_state_bypasses_a_full_bulk_lane() {
         let (tx, mut control, _bulk) = channel();
         while tx.send(&clipboard(1 << 20)).is_ok() {}
-        let reference = airhand_proto::session::CursorRef {
-            slot: 2,
-            generation: 7,
-        };
-        tx.send(&HostMsg::CursorUpdate {
-            visible: true,
-            shape: Some(reference),
-        })
-        .unwrap();
-        tx.send(&HostMsg::CursorUpdate {
-            visible: false,
-            shape: Some(reference),
-        })
-        .unwrap();
+        tx.send(&cursor(true, 2)).unwrap();
+        tx.send(&cursor(false, 2)).unwrap();
         let messages = drain(&mut control);
         assert_eq!(messages.len(), 1);
-        assert!(
-            matches!(messages[0], HostMsg::CursorUpdate { visible: false, shape: Some(r) } if r == reference)
-        );
-    }
-
-    /// 光标的可见性只留最新的，排在剪贴板前面，但不越过带着形状的光标消息
-    #[test]
-    fn cursor_visibility_follows_the_shapes() {
-        let visible = |m: &HostMsg| match m {
-            HostMsg::Cursor(c) => (c.visible, c.shape.as_ref().map(|s| s.slot)),
-            other => panic!("{other:?}"),
-        };
-        let (tx, _control, mut bulk) = channel();
-        tx.send(&clipboard(10)).unwrap();
-        for i in 0..100 {
-            tx.send(&cursor(i % 2 == 0, None)).unwrap();
-        }
-        let out = drain(&mut bulk);
-        assert_eq!(out.len(), 2);
-        assert_eq!(visible(&out[0]), (false, None));
-        assert!(matches!(out[1], HostMsg::Clipboard { .. }));
-
-        // 形状（带着"可见"）排在剪贴板后面，之后光标隐藏了：隐藏要在形状之后到，不然又被形状改回可见
-        tx.send(&clipboard(10)).unwrap();
-        tx.send(&cursor(true, Some(3))).unwrap();
-        tx.send(&cursor(true, Some(4))).unwrap();
-        tx.send(&cursor(false, None)).unwrap();
-        let out = drain(&mut bulk);
-        assert!(matches!(out[0], HostMsg::Clipboard { .. }));
-        assert_eq!(visible(&out[1]), (true, Some(3)));
-        assert_eq!(visible(&out[2]), (true, Some(4)));
-        assert_eq!(visible(&out[3]), (false, None));
-        assert_eq!(out.len(), 4);
-
-        // 形状带着更新的可见性：槽位里更早的作废
-        tx.send(&cursor(false, None)).unwrap();
-        tx.send(&cursor(true, Some(5))).unwrap();
-        let out = drain(&mut bulk);
-        assert_eq!(out.len(), 1);
-        assert_eq!(visible(&out[0]), (true, Some(5)));
+        assert!(matches!(
+            messages[0],
+            HostMsg::Cursor {
+                visible: false,
+                shape: Some(CursorRef { slot: 2, .. })
+            }
+        ));
     }
 
     /// 大块通道按字节数限量：控制通道不受影响，单条消息也不能突破协议上限。
@@ -599,17 +532,17 @@ mod tests {
         }
         assert!((2..=4).contains(&queued), "{queued}");
         assert_eq!(tx.send(&clipboard(1 << 20)), Err(SendError::Full));
-        // 小的（光标形状）字节数还没到上限，照样放得进；可见性是槽位，也放得进；控制消息在另一条通道
-        tx.send(&cursor(true, Some(1))).unwrap();
-        tx.send(&cursor(false, None)).unwrap();
+        // 小的（光标图像）字节数还没到上限，照样放得进；控制消息在另一条通道
+        tx.send(&image(1)).unwrap();
+        tx.send(&image(2)).unwrap();
         tx.send(&notice()).unwrap();
         assert_eq!(drain(&mut control).len(), 1);
         assert_eq!(drain(&mut bulk).len(), queued + 2);
         // 条数也有上限
         for _ in 0..BULK_MESSAGES {
-            let _ = tx.send(&cursor(true, Some(1)));
+            let _ = tx.send(&image(1));
         }
-        assert_eq!(tx.send(&cursor(true, Some(1))), Err(SendError::Full));
+        assert_eq!(tx.send(&image(1)), Err(SendError::Full));
         drain(&mut bulk);
         let huge = Outbox::encode(&clipboard(BULK_BYTES + 1));
         assert_eq!(tx.send_encoded(huge), Err(SendError::TooLarge));

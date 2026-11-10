@@ -251,7 +251,7 @@ where
                     events.registered(got, true).await;
                     id.rekey = std::mem::take(&mut rekey_again);
                     if id.rekey {
-                        write_msg(&mut sig.send, &ClientMsg::Rekey { secret: Some(secret) }).await?;
+                        write_msg(&mut sig.send, &ClientMsg::Rekey { secret }).await?;
                     }
                     info!(code, "the server changed this host's secret, old reconnect tokens are void");
                 }
@@ -276,9 +276,8 @@ where
                         rekey_again = true;
                     } else {
                         id.rekey = true;
-                        write_msg(&mut sig.send, &ClientMsg::Rekey {
-                            secret: reclaim.map(|r| r.secret),
-                        }).await?;
+                        let saved = reclaim.expect("set when registered");
+                        write_msg(&mut sig.send, &ClientMsg::Rekey { secret: saved.secret }).await?;
                     }
                 }
                 events.kicked(cmd);

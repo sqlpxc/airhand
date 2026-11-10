@@ -57,9 +57,9 @@ class RemoteSession(
     resume: String?,
     /** 只看画面（电视）：不发送任何输入 */
     val viewOnly: Boolean,
-    /** 之前记下的对方公钥（我的设备）：只认它，对不上是 hostKeyChanged。null：第一次连，或者用户信任了对方的新身份 */
+    /** 之前记下的对方公钥（我的设备）：只认它，对不上是 hostKeyChanged。null：第一次连 */
     hostKey: String? = null,
-    /** 配对码（对方要求配对时用户输入的），只用于第一次连接 */
+    /** 配对码（对方要求配对、或者对方的身份变了要重新配对时用户输入的），只用于这一次连接 */
     pairing: String? = null,
 ) {
     sealed interface Phase {
@@ -88,7 +88,6 @@ class RemoteSession(
     val displays = MutableStateFlow<List<DisplayInfo>>(emptyList())
     val currentDisplay = MutableStateFlow(0)
     val encoder = MutableStateFlow<EncoderInfo?>(null)
-    val videoConfig = MutableStateFlow<VideoConfig?>(null)
     val stats = MutableStateFlow<Stats?>(null)
 
     /** 被控端的提示，按类别（capture / audio / permissions / other）各保留一条 */
@@ -214,7 +213,7 @@ class RemoteSession(
                 // 开始时的画质和要不要声音在端到端握手里就告诉对方：它一开始就按这个建编码器
                 val withAudio = audioOn.value && !background
                 sentAudio = withAudio
-                val cmd = Commands.connect(code, resume, settings, hostKey, pairing, withAudio, VideoDecoder.receiverCapabilities())
+                val cmd = Commands.connect(code, resume, settings, hostKey, pairing, withAudio)
                 val r = runCatching { JSONObject(Native.ctlCall(h, cmd.toString())) }
                     .getOrElse { JSONObject().put("err", JSONObject().put("kind", "failed").put("detail", it.toString())) }
                 if (closed) {
@@ -310,7 +309,6 @@ class RemoteSession(
         sid = ok.getInt("sid")
         // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
         cursorSlots.clear()
-        videoConfig.value = null
         resume = Resume.fromJson(ok.optJSONArray("resume")) ?: resume
         // 端到端握手确认过的对方公钥：之后重连只认它；配对码用过了
         ok.optString("hostKey").takeIf { it.isNotBlank() }?.let { hostKey = it }
@@ -383,8 +381,6 @@ class RemoteSession(
                         // 负载从头里写的长度处开始（以后的版本可能把头加长）
                         offset = Media.payload(b),
                         length = b.size - Media.payload(b),
-                        context = v.context,
-                        feedback = { f -> Native.ctlCall(h, Commands.videoFeedback(sid, f).toString()) },
                         ack = { Native.ctlAck(h, sid, v.seq) },
                     ),
                 )
@@ -435,10 +431,6 @@ class RemoteSession(
                 if (quality.value.codec != best) setQuality(quality.value.copy(codec = best)) else refreshSettings()
             }
             "awaitingApproval" -> _phase.value = Phase.Approving
-            "videoConfig" -> {
-                val config = VideoConfig.parse(e.getJSONObject("config"))
-                if (config.context.configId > (videoConfig.value?.context?.configId ?: 0)) videoConfig.value = config
-            }
             "encoder" -> encoder.value = EncoderInfo(
                 Codec.fromWire(e.optString("codec")) ?: Codec.H264,
                 e.optString("name"),

@@ -50,7 +50,6 @@ class ProtocolTest {
                     Media.Video(
                         m.getInt("seq"), m.getBoolean("key"), Codec.fromWire(m.getString("codec"))!!,
                         m.getInt("width"), m.getInt("height"), m.getLong("captureUs"),
-                        m.optJSONObject("context")?.let(VideoContext::parse),
                     ),
                     Media.video(b),
                 )
@@ -109,10 +108,9 @@ class ProtocolTest {
         assertSame(want["display"], Commands.display(3, 1))
         assertSame(want["audio"], Commands.audio(3, true))
         assertSame(want["clipboard"], Commands.clipboard(3, "hi"))
-        assertSame(want["videoFeedback"], Commands.videoFeedback(3, fixture.getJSONObject("videoModel").getJSONObject("feedback")))
         assertSame(want["disconnect"], Commands.disconnect(3))
         // Android 不用的：画面确认走 Native.ctlAck，剪贴板由自己同步
-        assertEquals(setOf("ack", "clipboardSync"), want.keys - setOf("input", "settings", "keyframe", "display", "audio", "clipboard", "disconnect", "videoFeedback"))
+        assertEquals(setOf("ack", "clipboardSync"), want.keys - setOf("input", "settings", "keyframe", "display", "audio", "clipboard", "disconnect"))
     }
 
     /** connect：控制码加上连接选项（和桌面版、网页版一样的 ConnectOptions） */
@@ -120,44 +118,12 @@ class ProtocolTest {
     fun connectOptionsMatchRust() {
         val want = fixture.getJSONObject("connectOptions")
         val resume = Resume.fromJson(want.getJSONArray("resume"))
-        val have = Commands.options(resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", true, receiver())
+        val have = Commands.options(resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", true)
         assertSame(want, have)
-        val cmd = Commands.connect("123 456", resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", true, receiver())
+        val cmd = Commands.connect("123 456", resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", true)
         assertEquals("connect", cmd.getString("cmd"))
         assertEquals("123 456", cmd.getString("code"))
         assertSame(want, JSONObject(cmd.toString()).apply { remove("cmd"); remove("code") })
-    }
-
-    private fun receiver() = ReceiverCapabilities(listOf(
-        DecodeCapability(Codec.H264, 1920, 1080, 60),
-        DecodeCapability(Codec.H265),
-        DecodeCapability(Codec.AV1, 3840, 2160, 120),
-    ))
-
-    @Test
-    fun videoModelMatchesRust() {
-        val model = fixture.getJSONObject("videoModel")
-        assertSame(model.getJSONObject("receiver"), receiver().toJson())
-        assertSame(model.getJSONObject("view"), ViewRequest(3, Quality(60, 8000, 1080, true, Codec.H265)).toJson())
-        val config = VideoConfig.parse(model.getJSONObject("config"))
-        assertEquals(VideoContext(7), config.context)
-        assertEquals(3L, config.requestId)
-        assertEquals(Codec.AV1, config.codec)
-        val telemetry = VideoFeedbackCollector()
-        telemetry.received(8, config.context)
-        telemetry.decoded(8, config.context, 7000)
-        telemetry.presented(8, config.context)
-        telemetry.sample(0, 0)
-        telemetry.received(9, config.context)
-        assertSame(model.getJSONObject("feedback"), telemetry.sample(1, 12))
-        // A late decoder callback cannot change progress in the new configuration.
-        telemetry.received(10, VideoContext(8))
-        telemetry.decoded(9, config.context, 10000)
-        telemetry.presented(9, config.context)
-        val fresh = telemetry.sample(0, 0)!!
-        assertTrue(fresh.isNull("decodedSeq"))
-        assertTrue(fresh.isNull("presentedSeq"))
-        assertEquals(1L, fresh.getLong("sampleId"))
     }
 
     @Test

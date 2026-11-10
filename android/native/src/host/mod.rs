@@ -321,8 +321,6 @@ impl Host {
                 let mut info = sh.info.lock().unwrap();
                 if info.displays != displays {
                     info.displays = displays.clone();
-                    let (w, h) = displays.first().map_or((0, 0), |d| (d.width, d.height));
-                    sh.video.source(w, h, info.codecs.clone());
                     drop(info);
                     sh.broadcast(&HostMsg::Displays {
                         displays,

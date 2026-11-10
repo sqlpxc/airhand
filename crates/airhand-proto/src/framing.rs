@@ -54,7 +54,7 @@ pub fn encode<T: Encode<()>>(msg: &T) -> Vec<u8> {
     encode_with_spare(msg, 0)
 }
 
-/// 同 [`encode`]，多留 `spare` 字节的容量：加密时在后面追加认证标签不用重新分配
+/// 同 [`encode`]，多留 `spare` 字节的容量：加密时在后面追加标签和计数（[`crate::handshake::SEAL_OVERHEAD`]）不用重新分配
 pub fn encode_with_spare<T: Encode<()>>(msg: &T, spare: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64 + spare);
     buf.extend_from_slice(&[0u8; 4]);
@@ -174,17 +174,17 @@ mod tests {
             })),
             HostMsg::Notice(Some(Notice::AudioRecovered)),
             HostMsg::Bye(ByeReason::CodeChanged),
-            HostMsg::Cursor(CursorState {
+            HostMsg::Cursor {
                 visible: false,
                 shape: None,
-            }),
-            HostMsg::Cursor(CursorState {
+            },
+            HostMsg::Cursor {
                 visible: true,
-                shape: Some(CursorSlot {
+                shape: Some(CursorRef {
                     slot: 3,
-                    image: None,
+                    generation: 9,
                 }),
-            }),
+            },
         ];
         let mut wire = Vec::new();
         for m in &msgs {
@@ -351,7 +351,7 @@ mod tests {
                 code: 654_321,
                 resume: None,
             },
-            ClientMsg::Rekey { secret: None },
+            ClientMsg::Rekey { secret: [6; 16] },
             ClientMsg::Release,
             ClientMsg::Register {
                 reclaim: Some(reclaim),
@@ -539,9 +539,7 @@ mod tests {
                 code: 123_456,
                 resume: Some([7; 16]),
             },
-            ClientMsg::Rekey {
-                secret: Some([5; 16]),
-            },
+            ClientMsg::Rekey { secret: [5; 16] },
             ClientMsg::Release,
         ] {
             signal.extend(encode(&m));

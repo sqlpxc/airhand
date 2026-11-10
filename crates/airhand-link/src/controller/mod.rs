@@ -55,7 +55,7 @@ use crate::secure::{self, Identity, InitiatorParams};
 use crate::transport::{HostReceiver, Openers, open_session};
 use crate::wire::{read_msg, write_msg};
 use airhand_proto::framing;
-use airhand_proto::handshake::TAG_LEN;
+use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
 use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram};
@@ -80,8 +80,8 @@ const DATAGRAM_QUEUE: usize = 16;
 /// 大块通道（剪贴板）最多排着这么多条：网络慢的时候再复制，丢掉的是这一次（之前排着的发完了就轮到下一次）
 const BULK_QUEUE: usize = 4;
 
-/// 控制端的时钟（微秒）：Ping 和输入里的 `t` 都是它
-fn now_us() -> u64 {
+/// 控制端的时钟（微秒）：Ping 和输入里的 `t`、确认里画面的到达时刻都是它
+pub(crate) fn now_us() -> u64 {
     static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
     EPOCH.elapsed().as_micros() as u64
 }
@@ -157,10 +157,6 @@ pub enum Command {
         sid: u32,
         seq: u32,
     },
-    VideoFeedback {
-        sid: u32,
-        feedback: airhand_proto::video::VideoFeedback,
-    },
     /// 断开会话（先松开所有按着的键）
     Disconnect {
         sid: u32,
@@ -179,7 +175,6 @@ impl Command {
             | Command::Clipboard { sid, .. }
             | Command::ClipboardSync { sid, .. }
             | Command::Ack { sid, .. }
-            | Command::VideoFeedback { sid, .. }
             | Command::Disconnect { sid } => *sid,
         }
     }
@@ -208,9 +203,6 @@ pub struct ConnectOptions {
     /// 开始时要不要声音（同上）
     #[serde(default)]
     pub audio: bool,
-    /// Actual decoder capabilities, separate from user-selected settings. Absent means legacy mode.
-    #[serde(default)]
-    pub receiver: Option<airhand_proto::video::ReceiverCapabilities>,
 }
 
 /// 会话 ID → 交给这个会话的声音数据报
@@ -246,8 +238,8 @@ struct SessionHandle {
     task: AbortHandle,
     /// 桌面版：是否同步剪贴板
     clipboard: Option<Arc<AtomicBool>>,
-    video_model: bool,
-    next_view: u32,
+    /// 画面帧什么时候到的：确认时带上（见 [`session::Arrivals`]）
+    arrivals: Arc<Mutex<session::Arrivals>>,
 }
 
 struct Inner {
@@ -320,9 +312,6 @@ impl ControllerService {
         frontend: Frontend,
     ) -> Result<SessionInfo, Problem> {
         let code = airhand_proto::parse_code(code).ok_or(Problem::InvalidCode)?;
-        if opts.receiver.as_ref().is_some_and(|r| !r.valid()) {
-            return Err(Problem::failed("invalid receiver capabilities"));
-        }
         let pairing = match opts.pairing.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(p) => Some(airhand_proto::parse_pairing(p).ok_or(Problem::PairingFailed)?),
@@ -392,24 +381,12 @@ impl ControllerService {
         let (mut send, mut recv) = streams.control;
         // 端到端握手：确认对方的身份、让对方确认本机（见模块说明的"端到端加密"）。
         // 开始时的画质和声音在介绍里：被控端一开始就按它建编码器，不用先按默认设置建一个再重建
-        let mut intro = secure::controller_intro(
+        let intro = secure::controller_intro(
             &self.inner.cfg.name,
             &self.inner.cfg.os,
             opts.settings,
             opts.audio,
         );
-        if let Some(receiver) = opts.receiver {
-            intro.video = Some(airhand_proto::video::VideoOffer {
-                receiver,
-                view: airhand_proto::video::ViewRequest {
-                    request_id: 0,
-                    preference: opts.settings.sanitized(),
-                },
-            });
-            intro.features = intro
-                .features
-                .with(airhand_proto::features::session::VIDEO_MODEL);
-        }
         let init = secure::initiate(
             &mut recv,
             &mut send,
@@ -433,14 +410,13 @@ impl ControllerService {
             streams.audio,
             Some(dgram_rx),
             Openers {
-                features: init.negotiated.features,
                 control: init.opener,
                 bulk: secured.bulk.opener,
                 video: secured.video.opener,
                 audio: secured.audio.opener,
-                datagrams: secured.datagram_opener,
             },
         );
+        let arrivals = Arc::new(Mutex::new(session::Arrivals::default()));
 
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
@@ -465,6 +441,7 @@ impl ControllerService {
             ui,
             mode,
             negotiated: init.negotiated,
+            arrivals: arrivals.clone(),
         };
         let inner = self.inner.clone();
         let tx2 = tx.clone();
@@ -484,10 +461,7 @@ impl ControllerService {
                 bulk: bulk_tx,
                 task: handle.abort_handle(),
                 clipboard,
-                video_model: init
-                    .negotiated
-                    .has(airhand_proto::features::session::VIDEO_MODEL),
-                next_view: 1,
+                arrivals,
             },
         );
         info!(sid, code, host = %grant.host_name, safety = %secured.safety, "session established");
@@ -507,32 +481,7 @@ impl ControllerService {
         let msg = match cmd {
             Command::Input { sid, events } => (sid, queue::input(events)),
             Command::Settings { sid, settings } => {
-                let mut sessions = self.inner.sessions.lock().unwrap();
-                let s = sessions.get_mut(&sid).ok_or(Problem::NoSession)?;
-                let msg = if s.video_model {
-                    let request_id = s.next_view;
-                    s.next_view = request_id
-                        .checked_add(1)
-                        .ok_or_else(|| Problem::failed("view request IDs exhausted"))?;
-                    ControllerMsg::View(airhand_proto::video::ViewRequest {
-                        request_id,
-                        preference: settings.sanitized(),
-                    })
-                } else {
-                    ControllerMsg::Settings(settings.sanitized())
-                };
-                return s.tx.send(msg);
-            }
-            Command::VideoFeedback { sid, feedback } => {
-                let sessions = self.inner.sessions.lock().unwrap();
-                let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-                if !s.video_model {
-                    return Ok(());
-                }
-                if !feedback.valid() {
-                    return Err(Problem::failed("invalid video feedback"));
-                }
-                return s.tx.send(ControllerMsg::VideoFeedback(feedback));
+                (sid, ControllerMsg::Settings(settings.sanitized()))
             }
             Command::Keyframe { sid } => (sid, ControllerMsg::RequestKeyframe),
             Command::Display { sid, index } => (sid, ControllerMsg::SelectDisplay { index }),
@@ -567,9 +516,13 @@ impl ControllerService {
         s.tx.send(msg)
     }
 
-    /// 界面收到了这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的
+    /// 界面收到了这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的，
+    /// 带着这一帧从网络上读完的时刻（见 `ControllerMsg::Ack`）
     pub fn ack(&self, sid: u32, seq: u32) -> Result<(), Problem> {
-        self.send(sid, ControllerMsg::Ack { seq })
+        let sessions = self.inner.sessions.lock().unwrap();
+        let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+        let arrived = s.arrivals.lock().unwrap().get(seq);
+        s.tx.send(ControllerMsg::Ack { seq, arrived })
     }
 
     /// 断开会话（[`Command::Disconnect`]）
@@ -591,7 +544,7 @@ fn send_clipboard(bulk: &mpsc::Sender<Bytes>, text: String) {
     if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT {
         return;
     }
-    let msg = framing::encode_with_spare(&ControllerMsg::Clipboard { text }, TAG_LEN);
+    let msg = framing::encode_with_spare(&ControllerMsg::Clipboard { text }, SEAL_OVERHEAD);
     if let Err(mpsc::error::TrySendError::Full(_)) = bulk.try_send(Bytes::from(msg)) {
         warn!("the clipboard lane is busy (slow network), dropped this clipboard update");
     }

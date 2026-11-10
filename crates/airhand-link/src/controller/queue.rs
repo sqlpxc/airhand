@@ -64,12 +64,11 @@ enum Slot {
     Ack = 0,
     Ping = 1,
     Settings = 2,
-    Feedback = 3,
 }
 
 #[derive(Default)]
 struct State {
-    slots: [Option<Bytes>; 4],
+    slots: [Option<Bytes>; 3],
     items: VecDeque<Item>,
     bytes: usize,
     failed: bool,
@@ -121,9 +120,9 @@ pub(super) fn channel() -> (Sender, Receiver) {
 
 /// 编码（明文，带长度前缀）；写任务加密时在后面追加认证标签，这里先留好位置
 fn encode(msg: &ControllerMsg) -> Result<Bytes, Problem> {
-    let bytes = framing::encode_with_spare(msg, airhand_proto::handshake::TAG_LEN);
+    let bytes = framing::encode_with_spare(msg, airhand_proto::handshake::SEAL_OVERHEAD);
     if msg.lane() != airhand_proto::SessionLane::Control
-        || bytes.len() - framing::PREFIX + airhand_proto::handshake::TAG_LEN
+        || bytes.len() - framing::PREFIX + airhand_proto::handshake::SEAL_OVERHEAD
             > airhand_proto::MAX_CONTROL_MSG
     {
         return Err(Problem::failed(
@@ -225,8 +224,7 @@ impl Sender {
         let slot = match &msg {
             ControllerMsg::Ack { .. } => Some(Slot::Ack),
             ControllerMsg::Ping { .. } => Some(Slot::Ping),
-            ControllerMsg::Settings(_) | ControllerMsg::View(_) => Some(Slot::Settings),
-            ControllerMsg::VideoFeedback(_) => Some(Slot::Feedback),
+            ControllerMsg::Settings(_) => Some(Slot::Settings),
             _ => None,
         };
         let (kind, delta, t) = match &msg {
@@ -394,7 +392,7 @@ mod tests {
         for m in messages {
             let wire = encode(&m).unwrap();
             assert!(
-                wire.len() - 4 + airhand_proto::handshake::TAG_LEN
+                wire.len() - 4 + airhand_proto::handshake::SEAL_OVERHEAD
                     <= airhand_proto::MAX_CONTROL_MSG
             );
             let ControllerMsg::Input { t, events } = m else {
@@ -441,7 +439,7 @@ mod tests {
         for seq in 0..50 {
             tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
                 .unwrap();
-            tx.send(ControllerMsg::Ack { seq }).unwrap();
+            tx.send(ControllerMsg::Ack { seq, arrived: None }).unwrap();
             tx.send(ControllerMsg::Ping { t: seq as u64 }).unwrap();
             tx.send(input(vec![InputEvent::MouseDelta { dx: 1, dy: 0 }]))
                 .unwrap();
@@ -452,7 +450,7 @@ mod tests {
         for seq in 0..50 {
             tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
                 .unwrap();
-            tx.send(ControllerMsg::Ack { seq }).unwrap();
+            tx.send(ControllerMsg::Ack { seq, arrived: None }).unwrap();
         }
         assert_eq!(queued(&tx).len(), 1);
     }
@@ -467,16 +465,30 @@ mod tests {
         };
         tx.send(input(vec![click.clone()])).unwrap();
         tx.send(ControllerMsg::RequestKeyframe).unwrap();
-        tx.send(ControllerMsg::Ack { seq: 1 }).unwrap();
+        tx.send(ControllerMsg::Ack {
+            seq: 1,
+            arrived: None,
+        })
+        .unwrap();
         tx.send(ControllerMsg::Settings(QualitySettings::default()))
             .unwrap();
         tx.send(ControllerMsg::Ping { t: 7 }).unwrap();
-        tx.send(ControllerMsg::Ack { seq: 9 }).unwrap();
+        tx.send(ControllerMsg::Ack {
+            seq: 9,
+            arrived: None,
+        })
+        .unwrap();
         let mut out = Vec::new();
         for _ in 0..5 {
             out.push(decode(&rx.recv().await.unwrap()));
         }
-        assert!(matches!(out[0], ControllerMsg::Ack { seq: 9 }));
+        assert!(matches!(
+            out[0],
+            ControllerMsg::Ack {
+                seq: 9,
+                arrived: None
+            }
+        ));
         assert!(matches!(out[1], ControllerMsg::Ping { t: 7 }));
         assert!(matches!(out[2], ControllerMsg::Settings(_)));
         assert_eq!(events(&out[3]), [click]);
@@ -599,6 +611,12 @@ mod tests {
         }
         assert!(tx.send(ControllerMsg::RequestKeyframe).is_err());
         assert!(rx.recv().await.is_err());
-        assert!(tx.send(ControllerMsg::Ack { seq: 1 }).is_err());
+        assert!(
+            tx.send(ControllerMsg::Ack {
+                seq: 1,
+                arrived: None
+            })
+            .is_err()
+        );
     }
 }

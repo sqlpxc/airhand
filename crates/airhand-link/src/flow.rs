@@ -1,9 +1,13 @@
-//! Shared video flow control and adaptive bitrate. Sequence numbers belong to a
-//! session, not an encoder/display; rebuilding a pipeline must retain its Flow.
+//! 被控端的在途帧控制和自适应码率（桌面版和 Android 共用）。帧序号属于会话，不属于某个编码器或显示器：
+//! 重建编码管线时接着用同一个 [`Flow`]。
 //!
 //! 在途帧窗口 ≈ 基础 RTT × 帧率 + 2（即带宽时延积换算成帧数），最多 [`MAX_WINDOW`] 帧：
 //! RTT 300 ms、60 fps 时是 20 帧，窗口太小的话长距离链路上帧率上不去。
 //! 基础 RTT 是最近 [`MIN_RTT_WINDOW`] 里的最小样本（单调队列实现的滑动窗口最小值）。
+//!
+//! 确认里还带着这一帧到达控制端的时刻（控制端的时钟）：减去本端的发送时刻，就是单向时延加上两边时钟之差，
+//! 减去它最近的最小值，就是这一帧在网络上多排了多久的队（[`FlowState::queue_delay`]）。
+//! 和往返时延不同，它不含界面那一段（IPC、解码前的排队），也不含确认回来的路。
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -18,6 +22,32 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// 基础 RTT 取这么长时间里的最小样本
 pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 
+/// 最近 [`MIN_RTT_WINDOW`] 里的最小值：样本按时间排列、值严格递增，队头就是窗口里的最小值。
+/// 窗口里只有一个样本时即使过了期也留着（画面静止时不发帧，没有新样本）
+#[derive(Debug, Default)]
+struct WindowMin(VecDeque<(f64, Instant)>);
+
+impl WindowMin {
+    fn push(&mut self, v: f64, now: Instant) {
+        while self.0.back().is_some_and(|&(x, _)| x >= v) {
+            self.0.pop_back();
+        }
+        self.0.push_back((v, now));
+        while self.0.len() > 1
+            && self
+                .0
+                .front()
+                .is_some_and(|&(_, t)| now.duration_since(t) > MIN_RTT_WINDOW)
+        {
+            self.0.pop_front();
+        }
+    }
+
+    fn get(&self) -> Option<f64> {
+        self.0.front().map(|&(v, _)| v)
+    }
+}
+
 #[derive(Debug)]
 pub struct FlowState {
     sent: u32,
@@ -25,8 +55,13 @@ pub struct FlowState {
     pending: VecDeque<(u32, Instant, usize)>,
     pending_bytes: usize,
     srtt_ms: f64,
-    /// 滑动窗口最小值：样本按时间排列、RTT 严格递增，队头就是窗口里的最小值
-    min_rtt: VecDeque<(f64, Instant)>,
+    min_rtt: WindowMin,
+    /// 把发送时刻换成微秒的起点（和控制端的到达时刻相减）
+    epoch: Instant,
+    /// 单向时延（到达时刻 − 发送时刻，含两边时钟之差，毫秒）的最小值
+    min_owd: WindowMin,
+    /// 最近一帧比最快的时候在网络上多排了多久（毫秒）
+    queue_ms: Option<f64>,
 }
 
 impl Default for FlowState {
@@ -37,7 +72,10 @@ impl Default for FlowState {
             pending: VecDeque::new(),
             pending_bytes: 0,
             srtt_ms: 0.0,
-            min_rtt: VecDeque::new(),
+            min_rtt: WindowMin::default(),
+            epoch: Instant::now(),
+            min_owd: WindowMin::default(),
+            queue_ms: None,
         }
     }
 }
@@ -54,7 +92,8 @@ impl FlowState {
         self.pending_bytes += bytes;
     }
 
-    pub fn on_ack(&mut self, seq: u32) {
+    /// 控制端确认到了第 `seq` 帧（累积）。`arrived`：这一帧到达控制端的时刻（控制端的时钟，微秒）
+    pub fn on_ack(&mut self, seq: u32, arrived: Option<u64>) {
         if seq.wrapping_sub(self.acked) as i32 <= 0 || seq.wrapping_sub(self.sent) as i32 > 0 {
             return;
         }
@@ -66,36 +105,32 @@ impl FlowState {
             }
             self.pending.pop_front();
             self.pending_bytes -= bytes;
-            if s == seq {
-                let rtt = now.duration_since(t).as_secs_f64() * 1000.0;
-                self.srtt_ms = if self.srtt_ms == 0.0 {
-                    rtt
-                } else {
-                    self.srtt_ms * 0.875 + rtt * 0.125
-                };
-                self.sample_min_rtt(rtt, now);
+            if s != seq {
+                continue;
+            }
+            let rtt = now.duration_since(t).as_secs_f64() * 1000.0;
+            self.srtt_ms = if self.srtt_ms == 0.0 {
+                rtt
+            } else {
+                self.srtt_ms * 0.875 + rtt * 0.125
+            };
+            self.min_rtt.push(rtt, now);
+            if let Some(arrived) = arrived {
+                let sent = t.duration_since(self.epoch).as_secs_f64() * 1000.0;
+                let owd = arrived as f64 / 1000.0 - sent;
+                self.min_owd.push(owd, now);
+                self.queue_ms = self.min_owd.get().map(|min| owd - min);
             }
         }
     }
 
-    /// 记一个 RTT 样本。窗口里只有一个样本时即使过了期也留着（画面静止时不发帧，没有新样本）
-    fn sample_min_rtt(&mut self, rtt: f64, now: Instant) {
-        while self.min_rtt.back().is_some_and(|&(r, _)| r >= rtt) {
-            self.min_rtt.pop_back();
-        }
-        self.min_rtt.push_back((rtt, now));
-        while self.min_rtt.len() > 1
-            && self
-                .min_rtt
-                .front()
-                .is_some_and(|&(_, t)| now.duration_since(t) > MIN_RTT_WINDOW)
-        {
-            self.min_rtt.pop_front();
-        }
+    fn min_rtt_ms(&self) -> Option<f64> {
+        self.min_rtt.get()
     }
 
-    fn min_rtt_ms(&self) -> Option<f64> {
-        self.min_rtt.front().map(|&(r, _)| r)
+    /// 最近确认的一帧在网络上比最快的时候多排了多久（毫秒，见模块说明）；控制端没报到达时刻时为 `None`
+    pub fn queue_delay(&self) -> Option<f64> {
+        self.queue_ms
     }
 
     pub fn inflight(&self) -> u32 {
@@ -147,8 +182,8 @@ impl Flow {
         drop(state);
         self.cv.notify_all();
     }
-    pub fn ack(&self, seq: u32) {
-        self.state.lock().unwrap().on_ack(seq);
+    pub fn ack(&self, seq: u32, arrived: Option<u64>) {
+        self.state.lock().unwrap().on_ack(seq, arrived);
         self.cv.notify_all();
     }
     pub fn wake(&self) {
@@ -222,17 +257,17 @@ mod tests {
     #[test]
     fn rejects_future_and_stale_ack_and_counts_only_sent_frames() {
         let mut f = FlowState::default();
-        f.on_ack(100);
+        f.on_ack(100, None);
         assert_eq!(f.inflight(), 0);
         f.on_sent(1, 100);
-        f.on_ack(100);
+        f.on_ack(100, None);
         assert_eq!(f.inflight(), 1);
-        f.on_ack(1);
+        f.on_ack(1, None);
         f.on_sent(1000, 100);
         assert_eq!(f.inflight(), 1);
-        f.on_ack(1);
+        f.on_ack(1, None);
         assert_eq!(f.inflight(), 1);
-        f.on_ack(1000);
+        f.on_ack(1000, None);
         assert_eq!(f.inflight(), 0);
     }
     #[test]
@@ -241,12 +276,12 @@ mod tests {
         assert_eq!(f.sent(100), 1);
         // A replacement pipeline uses the same session flow, including late ACKs.
         assert_eq!(f.sent(100), 2);
-        f.ack(1);
+        f.ack(1, None);
         assert!(f.wait_window(60, &AtomicBool::new(false), Duration::ZERO));
         let mut state = FlowState::default();
         state.on_sent(u32::MAX, 100);
         state.on_sent(0, 100);
-        state.on_ack(0);
+        state.on_ack(0, None);
         assert_eq!(state.inflight(), 0);
     }
     #[test]
@@ -255,7 +290,7 @@ mod tests {
         flow.on_sent(1, 100);
         flow.pending.front_mut().unwrap().1 = Instant::now() - ACK_TIMEOUT - Duration::from_secs(1);
         assert!(flow.ack_stalled());
-        flow.on_ack(1);
+        flow.on_ack(1, None);
         assert!(!flow.ack_stalled());
     }
 
@@ -266,7 +301,7 @@ mod tests {
         let seq = f.sent(MAX_INFLIGHT_BYTES - 100);
         assert!(f.wait_room(60, 100, &stop, Duration::ZERO));
         assert!(!f.wait_room(60, 101, &stop, Duration::ZERO));
-        f.ack(seq);
+        f.ack(seq, None);
         assert!(f.wait_room(60, MAX_INFLIGHT_BYTES, &stop, Duration::ZERO));
         let seq = f.sent(MAX_INFLIGHT_BYTES);
         assert!(!f.wait_window(60, &stop, Duration::ZERO));
@@ -286,29 +321,52 @@ mod tests {
         assert_eq!(f.window(60), 3);
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
-        f.sample_min_rtt(50.0, at(0));
-        f.sample_min_rtt(120.0, at(1));
-        f.sample_min_rtt(80.0, at(2));
+        f.min_rtt.push(50.0, at(0));
+        f.min_rtt.push(120.0, at(1));
+        f.min_rtt.push(80.0, at(2));
         assert_eq!(f.min_rtt_ms(), Some(50.0));
         // 50 过了窗口：最小值是窗口里剩下的 80，而不是刚来的那个样本
-        f.sample_min_rtt(200.0, at(11));
+        f.min_rtt.push(200.0, at(11));
         assert_eq!(f.min_rtt_ms(), Some(80.0));
-        f.sample_min_rtt(300.0, at(13));
+        f.min_rtt.push(300.0, at(13));
         assert_eq!(f.min_rtt_ms(), Some(200.0));
         // 很久没有样本（画面静止）也保留最后的值，下一个样本来了再替换
-        f.sample_min_rtt(250.0, at(100));
+        f.min_rtt.push(250.0, at(100));
         assert_eq!(f.min_rtt_ms(), Some(250.0));
+    }
+
+    /// 到达时刻和发送时刻不在同一个时钟上：只看比最快的时候慢了多少
+    #[test]
+    fn queue_delay_is_relative_to_the_fastest_frame() {
+        let mut f = FlowState::default();
+        assert_eq!(f.queue_delay(), None);
+        // 控制端的时钟比这边早了一小时；第 1 帧网络上用了 20 ms，第 2 帧 70 ms
+        let skew = 3_600_000_000u64;
+        let sent = |f: &mut FlowState, seq: u32, at_ms: u64| {
+            f.on_sent(seq, 100);
+            f.pending.back_mut().unwrap().1 = f.epoch + Duration::from_millis(at_ms);
+        };
+        sent(&mut f, 1, 0);
+        f.on_ack(1, Some(skew + 20_000));
+        assert_eq!(f.queue_delay(), Some(0.0));
+        sent(&mut f, 2, 100);
+        f.on_ack(2, Some(skew + 170_000));
+        assert!((f.queue_delay().unwrap() - 50.0).abs() < 1e-6);
+        // 没报到达时刻的确认不动它
+        sent(&mut f, 3, 200);
+        f.on_ack(3, None);
+        assert!((f.queue_delay().unwrap() - 50.0).abs() < 1e-6);
     }
 
     #[test]
     fn window_covers_long_round_trips() {
         let mut f = FlowState::default();
-        f.sample_min_rtt(300.0, Instant::now());
+        f.min_rtt.push(300.0, Instant::now());
         // 300 ms × 60 fps = 18 帧在路上，再加 2
         assert_eq!(f.window(60), 20);
         assert_eq!(f.window(120), MAX_WINDOW);
         let mut near = FlowState::default();
-        near.sample_min_rtt(5.0, Instant::now());
+        near.min_rtt.push(5.0, Instant::now());
         assert_eq!(near.window(30), 3);
     }
 }

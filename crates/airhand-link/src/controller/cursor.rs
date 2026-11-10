@@ -1,5 +1,7 @@
-//! 合并跨通道的光标状态与图像。界面仍收到原来的媒体包，三端不需要各写一份乱序处理。
-use airhand_proto::session::{CURSOR_SLOTS, CursorRef, CursorShape, CursorSlot, CursorState};
+//! 合并跨通道的光标状态（控制通道）与图像（大块通道），换成交给界面的光标包（`airhand_proto::media::cursor_packet`）：
+//! 三种界面不需要各写一份乱序处理。
+use airhand_proto::media::{CursorSlot, CursorState};
+use airhand_proto::session::{CURSOR_SLOTS, CursorRef, CursorShape};
 
 struct Image {
     generation: u64,

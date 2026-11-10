@@ -8,10 +8,10 @@
 
 use std::time::{Duration, Instant};
 
-use airhand_link::secure::{self, FrameSealer, Identity, InitiatorParams};
+use airhand_link::secure::{self, Identity, InitiatorParams, Sealer};
 use airhand_link::transport::{FromHost, HostReceiver, Openers, open_session, session_datagrams};
 use airhand_link::wire::{read_msg, write_msg};
-use airhand_proto::handshake::TAG_LEN;
+use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerMsg, HostMsg, InputEvent, Notice, QualitySettings,
@@ -27,12 +27,12 @@ use crate::status;
 /// 控制流（或者大块通道）的发送端：加密之后写进去
 struct Ctl {
     send: quinn::SendStream,
-    sealer: FrameSealer,
+    sealer: Sealer,
 }
 
 impl Ctl {
     async fn send(&mut self, msg: &ControllerMsg) {
-        let mut f = airhand_proto::framing::encode_with_spare(msg, TAG_LEN);
+        let mut f = airhand_proto::framing::encode_with_spare(msg, SEAL_OVERHEAD);
         self.sealer.seal_frame(&mut f).unwrap();
         self.send.write_all(&f).await.unwrap();
     }
@@ -206,11 +206,9 @@ async fn e2e_roundtrip() {
         streams.audio,
         Some(datagrams),
         Openers {
-            features: init.negotiated.features,
             bulk: init.secured.bulk.opener,
             video: init.secured.video.opener,
             audio: init.secured.audio.opener,
-            datagrams: init.secured.datagram_opener,
             control: init.opener,
         },
     );
@@ -303,7 +301,7 @@ async fn e2e_roundtrip() {
             Err(_) => continue, // 画面静止时不会有帧
         };
         let msg = match msg {
-            FromHost::Video(p) => {
+            FromHost::Video { packet: p, arrived } => {
                 let v = VideoHeader::decode(&p).expect("画面包的头");
                 let data = media::payload(&p).expect("画面包的负载");
                 let age = age_ms(v.capture_us);
@@ -318,7 +316,11 @@ async fn e2e_roundtrip() {
                 if v.codec == Codec::H264 && matches!(decoder.decode(data), Ok(Some(_))) {
                     rep.decoded += 1;
                 }
-                ctl.send(&ControllerMsg::Ack { seq: v.seq }).await;
+                ctl.send(&ControllerMsg::Ack {
+                    seq: v.seq,
+                    arrived: Some(arrived),
+                })
+                .await;
                 continue;
             }
             FromHost::Audio(p) => {
@@ -367,11 +369,8 @@ async fn e2e_roundtrip() {
                 );
                 rep.encoders.push((e.codec, e.name, e.hardware));
             }
-            HostMsg::VideoConfig(_) => {
-                panic!("video model was not negotiated by this legacy probe")
-            }
             HostMsg::Pong { .. } => rep.pongs += 1,
-            HostMsg::Cursor(_) | HostMsg::CursorUpdate { .. } => rep.cursor += 1,
+            HostMsg::Cursor { .. } => rep.cursor += 1,
             HostMsg::CursorImage { .. } => {}
             HostMsg::Clipboard { text } => {
                 if text == to_host {

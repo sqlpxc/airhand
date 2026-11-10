@@ -1,4 +1,4 @@
-//! v9 的固定线上字节。不要随协议实现重新生成：兼容改动必须继续读写旧消息，新增消息另加样例。
+//! v9 的固定线上字节。发布之后不要随协议实现重新生成：兼容改动必须继续读写这些消息，新增消息另加样例。
 use airhand_proto::{
     Features, framing,
     handshake::*,
@@ -24,7 +24,7 @@ fn golden<T: Encode<()> + for<'b> Decode<'b, ()>>(value: T, hex: &str) {
 }
 
 #[test]
-fn v9_existing_messages_keep_their_wire_encoding() {
+fn signal_messages_keep_their_wire_encoding() {
     golden(
         ClientMsg::Register {
             reclaim: None,
@@ -41,17 +41,50 @@ fn v9_existing_messages_keep_their_wire_encoding() {
         },
         "820282071a0001e240",
     );
-    golden(ClientMsg::Rekey { secret: None }, "820480");
+    golden(
+        ClientMsg::Rekey { secret: [7; 16] },
+        "8204815007070707070707070707070707070707",
+    );
+}
+
+#[test]
+fn session_messages_keep_their_wire_encoding() {
     golden(HostMsg::Pong { t: 99 }, "8203811863");
     golden(HostMsg::Bye(ByeReason::Kicked), "82098100");
+    golden(HostMsg::Clipboard { text: "hi".into() }, "820881626869");
     golden(
-        HostMsg::Cursor(CursorState {
+        HostMsg::Cursor {
             visible: false,
             shape: None,
-        }),
-        "82078181f4",
+        },
+        "820781f4",
     );
-    golden(HostMsg::Clipboard { text: "hi".into() }, "820881626869");
+    golden(
+        HostMsg::Cursor {
+            visible: false,
+            shape: Some(CursorRef {
+                slot: 2,
+                generation: 7,
+            }),
+        },
+        "820782f4820207",
+    );
+    golden(
+        HostMsg::CursorImage {
+            reference: CursorRef {
+                slot: 2,
+                generation: 7,
+            },
+            image: CursorShape {
+                width: 1,
+                height: 1,
+                hot_x: 0,
+                hot_y: 0,
+                rgba: vec![1, 2, 3, 4],
+            },
+        },
+        "820a8282020785010100004401020304",
+    );
     golden(
         ControllerMsg::Input {
             t: 5,
@@ -60,9 +93,27 @@ fn v9_existing_messages_keep_their_wire_encoding() {
         "8201820581820680",
     );
     golden(
+        ControllerMsg::Ack {
+            seq: 99,
+            arrived: Some(1000),
+        },
+        "82028218631903e8",
+    );
+    golden(
+        ControllerMsg::Ack {
+            seq: 5,
+            arrived: None,
+        },
+        "82028105",
+    );
+    golden(
         ControllerMsg::Settings(QualitySettings::default()),
         "82038185181e190fa0190438f500",
     );
+}
+
+#[test]
+fn handshake_messages_keep_their_wire_encoding() {
     golden(
         HandshakeInit {
             pattern: Pattern::Known,
@@ -82,104 +133,4 @@ fn v9_existing_messages_keep_their_wire_encoding() {
         "a40001010003010401",
     );
     golden(Confirm::default(), "a0");
-}
-
-#[test]
-fn video_contract_extension_has_stable_numbers() {
-    use airhand_proto::video::*;
-    let context = VideoContext {
-        config_id: 1,
-        instance: MediaInstance::default(),
-    };
-    golden(
-        ControllerMsg::View(ViewRequest {
-            request_id: 1,
-            preference: QualitySettings::default(),
-        }),
-        "820981a200010185181e190fa0190438f500",
-    );
-    golden(
-        HostMsg::VideoConfig(VideoConfig {
-            context,
-            request_id: 0,
-            codec: Codec::H264,
-            width: 64,
-            height: 64,
-            fps: 30,
-            bitrate_kbps: 1000,
-        }),
-        "820c81a700a2000101a2000001000100020003184004184005181e061903e8",
-    );
-    golden(
-        ControllerMsg::VideoFeedback(VideoFeedback {
-            context,
-            sample_id: 1,
-            received_seq: 1,
-            decoded_seq: None,
-            presented_seq: None,
-            pending_frames: 1,
-            oldest_pending_ms: 5,
-            decode_time_us: 0,
-            dropped_frames: 0,
-            decoder_errors: 0,
-        }),
-        "820a81a800a2000101a2000001000101020105010605070008000900",
-    );
-    assert_eq!(airhand_proto::features::session::VIDEO_MODEL.bits(), 1 << 2);
-}
-
-#[test]
-fn rekey_confirmation_is_an_optional_field() {
-    #[derive(Encode, Decode)]
-    enum Old {
-        #[n(4)]
-        Rekey,
-    }
-    let old = framing::to_vec(&Old::Rekey);
-    assert!(matches!(
-        framing::decode_known::<ClientMsg>(&old).unwrap(),
-        ClientMsg::Rekey { secret: None }
-    ));
-    let new = ClientMsg::Rekey {
-        secret: Some([7; 16]),
-    };
-    assert!(matches!(
-        framing::decode_known::<Old>(&framing::to_vec(&new)).unwrap(),
-        Old::Rekey
-    ));
-    golden(new, "8204815007070707070707070707070707070707");
-}
-
-#[test]
-fn cursor_extension_uses_new_numbers() {
-    golden(
-        HostMsg::CursorUpdate {
-            visible: false,
-            shape: Some(CursorRef {
-                slot: 2,
-                generation: 7,
-            }),
-        },
-        "820a82f4820207",
-    );
-    golden(
-        HostMsg::CursorImage {
-            reference: CursorRef {
-                slot: 2,
-                generation: 7,
-            },
-            image: CursorShape {
-                width: 1,
-                height: 1,
-                hot_x: 0,
-                hot_y: 0,
-                rgba: vec![1, 2, 3, 4],
-            },
-        },
-        "820b8282020785010100004401020304",
-    );
-    assert_eq!(
-        airhand_proto::features::session::CURSOR_UPDATES,
-        Features::from_bits(1)
-    );
 }

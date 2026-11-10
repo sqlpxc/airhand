@@ -149,13 +149,14 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const title = useSessionTitle(s);
   const [menu, setMenu] = useState<Menu>(null);
   const [toast, setToast] = useState<string | null>(null);
-  // 对方要求配对码时输入的配对码
+  // 对方要求配对码、或者对方的身份变了（要重新配对）时输入的配对码
   const [pairing, setPairing] = useState("");
   const needsPairing =
     s.state === "closed" &&
     (s.closedReason?.kind === "pairingRequired" ||
       s.closedReason?.kind === "pairingFailed" ||
-      s.closedReason?.kind === "pairingUnavailable");
+      s.closedReason?.kind === "pairingUnavailable" ||
+      s.closedReason?.kind === "hostKeyChanged");
   const toolbarRef = useRef<HTMLElement>(null);
   const revealed = useToolbarReveal(immersive, toolbarRef);
   // 菜单关掉后键盘回到远程画面（例如按 Esc 关掉画质面板后接着打字）
@@ -486,12 +487,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
                   />
                 )}
                 <div className="overlay-actions">
-                  {s.closedReason?.kind === "hostKeyChanged" ? (
-                    <button className="primary-btn small" onClick={() => s.trustNewIdentity()}>
-                      <IconRefresh size={16} />
-                      {t("session.trustNew")}
-                    </button>
-                  ) : needsPairing ? (
+                  {needsPairing ? (
                     <button className="primary-btn small" disabled={pairing.length !== 6} onClick={() => s.pairWith(pairing)}>
                       <IconRefresh size={16} />
                       {t("session.pairAndReconnect")}

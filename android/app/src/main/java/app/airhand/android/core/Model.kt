@@ -69,8 +69,12 @@ data class Problem(
     /** 对方有意结束，或者要用户来决定（对方的身份变了、要配对码、版本不兼容），不应该自动重连 */
     val isFinal get() = kind in FINAL
 
-    /** 端到端握手的问题：要用户输入配对码 */
-    val needsPairing get() = kind == "pairingRequired" || kind == "pairingFailed" || kind == "pairingUnavailable"
+    /**
+     * 端到端握手的问题：要用户输入配对码。对方的身份变了也是：用户确认是对方重装了之后重新配对，
+     * 不能不验证就换成新的身份（见 airhand_proto::handshake 的"身份"）
+     */
+    val needsPairing get() =
+        kind == "pairingRequired" || kind == "pairingFailed" || kind == "pairingUnavailable" || kind == "hostKeyChanged"
 
     companion object {
         private val FINAL = setOf(

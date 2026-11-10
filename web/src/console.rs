@@ -235,7 +235,7 @@ struct WebUi {
 
 impl SessionUi for WebUi {
     fn packet(&self, mut packet: Vec<u8>) -> Result<(), UiClosed> {
-        // 解密后原缓冲还留着 16 字节认证标签的容量，直接用它放通道号，避免再分配整包。
+        // 解密后原缓冲还留着标签和计数（24 字节）的容量，直接用它放通道号，避免再分配整包。
         let len = packet.len();
         packet.resize(len + 4, 0);
         packet.copy_within(..len, 4);
@@ -453,7 +453,7 @@ mod tests {
                 budget: Arc::new(Semaphore::new(1024)),
             },
         };
-        let mut packet = Vec::with_capacity(3 + airhand_proto::handshake::TAG_LEN);
+        let mut packet = Vec::with_capacity(3 + airhand_proto::handshake::SEAL_OVERHEAD);
         packet.extend_from_slice(&[1, 2, 3]);
         let ptr = packet.as_ptr();
         ui.packet(packet).unwrap();

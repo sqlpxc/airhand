@@ -25,9 +25,6 @@ use super::registry::MAX_WAITING;
 use super::tokens::{ct_eq, hmac_sha256};
 use super::*;
 
-#[path = "tests_video.rs"]
-mod video_contract;
-
 /// 谁都让进来的被控端（测试用）
 struct OpenGate(Identity);
 
@@ -375,12 +372,10 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
         c.audio,
         None,
         Openers {
-            features: init.negotiated.features,
             control: init.opener,
             bulk: init.secured.bulk.opener,
             video: init.secured.video.opener,
             audio: init.secured.audio.opener,
-            datagrams: init.secured.datagram_opener,
         },
     );
     assert!(
@@ -392,7 +387,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     let (mut video, _r3) = h.video;
     let mut bye = airhand_proto::framing::encode_with_spare(
         &HostMsg::Bye(ByeReason::Kicked),
-        airhand_proto::handshake::TAG_LEN,
+        airhand_proto::handshake::SEAL_OVERHEAD,
     );
     resp.sealer.seal_frame(&mut bye).unwrap();
     ctl.write_all(&bye).await.unwrap();
@@ -604,7 +599,11 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
                 .unwrap()
                 .unwrap()
             {
-                ControllerMsg::Ack { seq: 2 } => break,
+                // 确认带着画面到达控制端的时刻
+                ControllerMsg::Ack { seq: 2, arrived } => {
+                    assert!(arrived.is_some());
+                    break;
+                }
                 ControllerMsg::Ping { t } => io.out.send(&HostMsg::Pong { t }).unwrap(),
                 _ => {}
             }
@@ -726,16 +725,13 @@ async fn registration_does_not_reveal_whether_a_code_is_taken() {
     assert_eq!(again, own);
 }
 
-/// 用真实 QUIC 和端到端握手检查通道预算；旧端的大输入仍可读取，新端严格限制。
+/// 用真实 QUIC 和端到端握手检查通道预算：大剪贴板在大块通道上可以，控制通道上的大消息、发错通道的消息都结束会话
 #[tokio::test]
-async fn session_lane_limits_preserve_legacy_input_and_reject_wrong_lanes() {
+async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
     use airhand_link::{secure, transport};
     use airhand_proto::session::{ControllerMsg, InputEvent};
-    use airhand_proto::{Features, Role, SessionLane, features, framing};
-    for features in [
-        Features::NONE,
-        features::session::CURSOR_UPDATES.with(features::session::SMALL_CONTROL),
-    ] {
+    use airhand_proto::{Role, SessionLane, framing};
+    for wrong_lane in [false, true] {
         let (_broker, cfg) = start().await;
         let (mut host, id) = register(&cfg, None).await;
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
@@ -754,8 +750,7 @@ async fn session_lane_limits_preserve_legacy_input_and_reject_wrong_lanes() {
         };
         let gate = OpenGate(Identity::generate());
         let me = Identity::generate();
-        let mut intro = secure::controller_intro("ctl", "test", QualitySettings::default(), false);
-        intro.features = features;
+        let intro = secure::controller_intro("ctl", "test", QualitySettings::default(), false);
         let controller = async {
             let mut streams = transport::open_session(&ctrl.conn, session_id, Role::Controller)
                 .await
@@ -778,8 +773,7 @@ async fn session_lane_limits_preserve_legacy_input_and_reject_wrong_lanes() {
         };
         let (host_io, (mut streams, mut init)) =
             tokio::join!(HostStreams::open(&inc, 2, 16, &gate), controller);
-        let (mut host_io, admitted) = host_io.unwrap();
-        assert_eq!(admitted.negotiated.features, features);
+        let (mut host_io, _) = host_io.unwrap();
         let text = "x".repeat(100_000);
         // 大剪贴板在 Bulk 上有效。
         let mut frame = framing::encode(&ControllerMsg::Clipboard { text: text.clone() });
@@ -790,35 +784,28 @@ async fn session_lane_limits_preserve_legacy_input_and_reject_wrong_lanes() {
             .unwrap()
             .unwrap();
         assert!(matches!(msg, ControllerMsg::Clipboard { text: t } if t == text));
-        // 同样大小的输入，只允许未协商小控制帧的旧端。
-        let mut frame = framing::encode(&ControllerMsg::Input {
-            t: 0,
-            events: vec![InputEvent::Text { text: text.clone() }],
-        });
-        init.sealer.seal_frame(&mut frame).unwrap();
-        streams.control.0.write_all(&frame).await.unwrap();
-        let msg = timeout(Duration::from_secs(5), host_io.incoming.recv())
-            .await
-            .unwrap();
-        if features.has(features::session::SMALL_CONTROL) {
-            assert!(msg.is_none());
-        } else {
-            assert!(
-                matches!(msg, Some(ControllerMsg::Input { events, .. }) if events == [InputEvent::Text { text }])
-            );
+        if wrong_lane {
             // 已知消息发到错误通道，即使密文认证成功也应拒绝。
             let ping = ControllerMsg::Ping { t: 1 };
             assert_eq!(ping.lane(), SessionLane::Control);
             let mut frame = framing::encode(&ping);
             init.secured.bulk.sealer.seal_frame(&mut frame).unwrap();
             streams.bulk.0.write_all(&frame).await.unwrap();
-            assert!(
-                timeout(Duration::from_secs(5), host_io.incoming.recv())
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+        } else {
+            // 同样大小的输入超出了控制通道的上限（控制端会分批发）
+            let mut frame = framing::encode(&ControllerMsg::Input {
+                t: 0,
+                events: vec![InputEvent::Text { text }],
+            });
+            init.sealer.seal_frame(&mut frame).unwrap();
+            streams.control.0.write_all(&frame).await.unwrap();
         }
+        assert!(
+            timeout(Duration::from_secs(5), host_io.incoming.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(host_io.close(session_id, Ok(())).await.is_err());
         drop(grant);
     }
@@ -835,7 +822,7 @@ async fn rekey_voids_tokens_and_keeps_the_code() {
     let old_token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
 
-    write_msg(&mut host.send, &ClientMsg::Rekey { secret: None })
+    write_msg(&mut host.send, &ClientMsg::Rekey { secret: id.secret })
         .await
         .unwrap();
     let ServerMsg::Rekeyed { secret } = next(&mut host).await else {
@@ -884,7 +871,7 @@ async fn repeated_rekey_preserves_the_last_confirmed_secret() {
     let (broker, cfg) = start_with(Some(file.clone())).await;
     let (mut host, saved) = register_with(&cfg, None, true).await;
     let request = ClientMsg::Rekey {
-        secret: Some(saved.secret),
+        secret: saved.secret,
     };
     write_msg(&mut host.send, &request).await.unwrap();
     write_msg(&mut host.send, &request).await.unwrap();
@@ -910,7 +897,7 @@ async fn repeated_rekey_preserves_the_last_confirmed_secret() {
     write_msg(
         &mut host.send,
         &ClientMsg::Rekey {
-            secret: Some(recovered.secret),
+            secret: recovered.secret,
         },
     )
     .await
@@ -931,23 +918,6 @@ async fn repeated_rekey_preserves_the_last_confirmed_secret() {
         crate::codes::Owner::Other
     );
     let _ = std::fs::remove_dir_all(dir);
-}
-
-#[tokio::test]
-async fn repeated_legacy_rekey_requires_reclaim_instead_of_losing_ownership() {
-    let (broker, cfg) = start().await;
-    let (mut host, saved) = register_with(&cfg, None, true).await;
-    for _ in 0..2 {
-        write_msg(&mut host.send, &ClientMsg::Rekey { secret: None })
-            .await
-            .unwrap();
-    }
-    tokio::time::timeout(Duration::from_secs(5), host.conn.closed())
-        .await
-        .unwrap();
-    wait_until("the host disconnected", || broker.stats().0 == 0).await;
-    let (_host, restored) = register_full(&cfg, Some(saved), true, true).await;
-    assert_eq!(restored.code, saved.code);
 }
 
 /// 被控端服务（airhand-link）：本机用户断开所有控制端时请服务器换密钥，并保存新密钥；被断开的控制端拿着旧凭证连不回来
@@ -1102,7 +1072,7 @@ async fn host_service_retries_an_unanswered_rekey() {
         }
     });
     let rekey = received.recv().await.unwrap();
-    assert!(matches!(rekey, ClientMsg::Rekey { secret: Some(s) } if s == id.secret));
+    assert!(matches!(rekey, ClientMsg::Rekey { secret: s } if s == id.secret));
     assert!(
         timeout(Duration::from_millis(100), received.recv())
             .await
@@ -1116,7 +1086,7 @@ async fn host_service_retries_an_unanswered_rekey() {
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(rekey, ClientMsg::Rekey { secret: Some(s) } if s == [8; 16]));
+    assert!(matches!(rekey, ClientMsg::Rekey { secret: s } if s == [8; 16]));
     // 第二次换钥的回答还没收到就断了：重连使用已经保存的第一把新密钥。
     conn.close(VarInt::from_u32(0), b"gone");
     let (_conn, _send, _recv, reg) = accept().await;
@@ -1172,14 +1142,9 @@ async fn stale_tokens_are_revoked_and_never_count_as_guesses() {
     let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
     let stale = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
-    write_msg(
-        &mut host.send,
-        &ClientMsg::Rekey {
-            secret: Some(id.secret),
-        },
-    )
-    .await
-    .unwrap();
+    write_msg(&mut host.send, &ClientMsg::Rekey { secret: id.secret })
+        .await
+        .unwrap();
     let ServerMsg::Rekeyed { secret } = next(&mut host).await else {
         panic!("expected Rekeyed");
     };
@@ -1312,7 +1277,7 @@ async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
         broker.routes.lock().contains_key(&sid)
     })
     .await;
-    let dgram = |sid: u64, body: &[u8]| datagram::encode(sid, body).into();
+    let dgram = |sid: u64, body: &[u8]| [&sid.to_le_bytes()[..], body].concat().into();
     let recv = async |conn: &quinn::Connection| {
         let d = timeout(Duration::from_secs(2), conn.read_datagram())
             .await
@@ -1512,7 +1477,7 @@ async fn sessions_are_limited_per_source_and_code() {
     assert_eq!(broker.stats().1, 3);
     assert_eq!(broker.failure_count(ip), 0);
     // 被控端没有再收到请求：下一条消息是它自己换密钥的回答
-    write_msg(&mut host.send, &ClientMsg::Rekey { secret: None })
+    write_msg(&mut host.send, &ClientMsg::Rekey { secret: id.secret })
         .await
         .unwrap();
     assert!(matches!(next(&mut host).await, ServerMsg::Rekeyed { .. }));

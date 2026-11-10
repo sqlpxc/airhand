@@ -102,8 +102,6 @@
     <string name="pairing_title">Enter the pairing code</string>
     <string name="pairing_label">Pairing code</string>
     <string name="pairing_hint">The 6-digit pairing code in the other computer\'s Airhand tray menu. It remembers this phone once paired</string>
-    <string name="trust_new_title">Trust the new identity?</string>
-    <string name="trust_new_confirm">Trust and connect</string>
     <string name="require_approval">Ask before someone connects</string>
     <string name="require_approval_desc">When someone enters this phone\'s code, you allow or decline first. A device you allowed reconnects without asking until sharing stops</string>
     <string name="perm_battery">Run in background</string>
@@ -313,7 +311,7 @@
     <string name="problem_host_busy">The other device has too many connections</string>
     <string name="problem_server_timeout">The server didn\'t answer in time</string>
     <string name="problem_host_offline">The device is offline</string>
-    <string name="problem_host_key_changed">The other device\'s identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Only trust the new identity once you\'ve confirmed it was reinstalled</string>
+    <string name="problem_host_key_changed">The other device\'s identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Once you\'ve confirmed it was reinstalled, enter its current pairing code to pair again (a phone has no pairing code: remove it from My devices and connect again)</string>
     <string name="problem_pairing_required">First connection to this device: enter its pairing code, shown in the Airhand tray menu on that computer</string>
     <string name="problem_pairing_failed">Wrong pairing code, check the one in the other computer\'s tray menu</string>
     <string name="problem_pairing_unavailable">The other computer paused pairing after too many wrong codes: ask its user to pick a new pairing code in the tray menu</string>
