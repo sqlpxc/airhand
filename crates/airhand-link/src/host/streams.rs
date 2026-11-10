@@ -106,6 +106,7 @@ pub struct Admitted {
     pub settings: QualitySettings,
     /// 开始时要不要声音
     pub audio: bool,
+    pub video: Option<airhand_proto::video::VideoOffer>,
 }
 
 /// 读一条控制端的消息（解密、解码）；对方版本新增的消息跳过。流在消息边界处结束时为 `None`
@@ -124,6 +125,12 @@ async fn next_controller_msg(
         match framing::decode::<ControllerMsg>(buf)? {
             Decoded::Msg(m) => {
                 anyhow::ensure!(m.lane() == lane, "controller message on the wrong lane");
+                if matches!(m, ControllerMsg::View(_) | ControllerMsg::VideoFeedback(_)) {
+                    anyhow::ensure!(
+                        features.has(airhand_proto::features::session::VIDEO_MODEL),
+                        "video model was not negotiated"
+                    );
+                }
                 return Ok(Some(m));
             }
             Decoded::Unknown(variant) => {
@@ -169,6 +176,11 @@ impl HostStreams {
             negotiated: r.negotiated,
             settings: r.intro.settings.sanitized(),
             audio: r.intro.audio,
+            video: r
+                .negotiated
+                .has(airhand_proto::features::session::VIDEO_MODEL)
+                .then_some(r.intro.video)
+                .flatten(),
         };
         info!(
             session_id,

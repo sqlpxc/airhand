@@ -323,6 +323,12 @@ async fn next_host_msg(
         match framing::decode::<HostMsg>(buf)? {
             Decoded::Msg(m) => {
                 anyhow::ensure!(m.lane() == lane, "host message on the wrong lane");
+                if matches!(m, HostMsg::VideoConfig(_)) {
+                    anyhow::ensure!(
+                        features.has(airhand_proto::features::session::VIDEO_MODEL),
+                        "video model was not negotiated"
+                    );
+                }
                 return Ok(Some(m));
             }
             Decoded::Unknown(variant) => debug!(variant, "skipping a message from a newer host"),

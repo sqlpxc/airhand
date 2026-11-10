@@ -25,6 +25,9 @@ use super::registry::MAX_WAITING;
 use super::tokens::{ct_eq, hmac_sha256};
 use super::*;
 
+#[path = "tests_video.rs"]
+mod video_contract;
+
 /// 谁都让进来的被控端（测试用）
 struct OpenGate(Identity);
 
@@ -729,7 +732,10 @@ async fn session_lane_limits_preserve_legacy_input_and_reject_wrong_lanes() {
     use airhand_link::{secure, transport};
     use airhand_proto::session::{ControllerMsg, InputEvent};
     use airhand_proto::{Features, Role, SessionLane, features, framing};
-    for features in [Features::NONE, features::session::SUPPORTED] {
+    for features in [
+        Features::NONE,
+        features::session::CURSOR_UPDATES.with(features::session::SMALL_CONTROL),
+    ] {
         let (_broker, cfg) = start().await;
         let (mut host, id) = register(&cfg, None).await;
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();

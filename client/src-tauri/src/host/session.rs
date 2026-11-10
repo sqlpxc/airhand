@@ -127,6 +127,7 @@ struct Desktop {
     current: u8,
     settings: QualitySettings,
     flow: Arc<Flow>,
+    video_model: Arc<airhand_link::video::VideoSession>,
     /// 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
     cursors: Arc<Mutex<CursorCache>>,
     pipeline: Option<Pipeline>,
@@ -162,6 +163,7 @@ impl Desktop {
             current: 0,
             settings: QualitySettings::default(),
             flow: Arc::new(Flow::default()),
+            video_model: senders.video_model,
             cursors: Arc::default(),
             pipeline: None,
             injector: InjectorThread::new(),
@@ -187,6 +189,7 @@ impl Desktop {
             self.out.clone(),
             self.flow.clone(),
             self.cursors.clone(),
+            self.video_model.clone(),
         ));
     }
 

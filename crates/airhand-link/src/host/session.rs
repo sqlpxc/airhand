@@ -102,6 +102,7 @@ pub struct Senders {
     pub video: mpsc::Sender<Bytes>,
     /// 声音包
     pub audio: mpsc::Sender<Bytes>,
+    pub video_model: Arc<crate::video::VideoSession>,
 }
 
 /// 一个会话里各平台不同的事。方法都在会话的任务里依次调用，不会同时进来两个。
@@ -180,12 +181,17 @@ where
         info!(session_id, "a known controller connected");
     }
     let out = io.out.clone();
+    let video_model = Arc::new(crate::video::VideoSession::new(
+        admitted.video.clone(),
+        out.clone(),
+    ));
     let mut platform = platform(
         &admitted,
         Senders {
             out: io.out.clone(),
             video: io.video.clone(),
             audio: io.audio.clone(),
+            video_model: video_model.clone(),
         },
     );
     let result = drive(
@@ -197,10 +203,12 @@ where
         &mut kick,
         &mut io.writer,
         &inc.approvals,
+        &video_model,
     )
     .await;
     // 先停掉还拿着发送端的东西，写任务才能把排着的（例如 Bye）发完
     platform.stop().await;
+    drop(video_model);
     drop(out);
     io.close(session_id, result).await
 }
@@ -249,6 +257,7 @@ async fn drive<P: Platform>(
     kick: &mut watch::Receiver<ByeReason>,
     writer: &mut Writer,
     approvals: &ApprovalSlots,
+    video_model: &crate::video::VideoSession,
 ) -> Result<()> {
     // 本机用户可能在端到端握手期间已经点了断开，不能先开始采集再处理这个通知。
     if kick.has_changed().unwrap_or(false) {
@@ -308,6 +317,14 @@ async fn drive<P: Platform>(
                     ControllerMsg::Input { events, .. } => Request::Input(events),
                     ControllerMsg::Ack { seq } => Request::Ack(seq),
                     ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
+                    ControllerMsg::View(view) => {
+                        if !video_model.view(view) { continue; }
+                        Request::Settings(view.preference.sanitized())
+                    }
+                    ControllerMsg::VideoFeedback(feedback) => {
+                        if open { video_model.feedback(feedback); }
+                        continue;
+                    }
                     ControllerMsg::RequestKeyframe => Request::Keyframe,
                     ControllerMsg::SelectDisplay { index } => Request::SelectDisplay(index),
                     ControllerMsg::Clipboard { text } if text.len() > MAX_CLIPBOARD_TEXT => {
@@ -466,6 +483,7 @@ mod tests {
             },
             settings: QualitySettings::default(),
             audio: true,
+            video: None,
         }
     }
 
@@ -499,6 +517,7 @@ mod tests {
                 &mut kick_rx,
                 &mut writer,
                 &approvals,
+                &crate::video::VideoSession::new(None, out.clone()),
             )
             .await
         });

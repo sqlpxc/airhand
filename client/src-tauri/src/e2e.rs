@@ -367,6 +367,9 @@ async fn e2e_roundtrip() {
                 );
                 rep.encoders.push((e.codec, e.name, e.hardware));
             }
+            HostMsg::VideoConfig(_) => {
+                panic!("video model was not negotiated by this legacy probe")
+            }
             HostMsg::Pong { .. } => rep.pongs += 1,
             HostMsg::Cursor(_) | HostMsg::CursorUpdate { .. } => rep.cursor += 1,
             HostMsg::CursorImage { .. } => {}

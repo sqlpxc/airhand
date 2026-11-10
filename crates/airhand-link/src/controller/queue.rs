@@ -64,11 +64,12 @@ enum Slot {
     Ack = 0,
     Ping = 1,
     Settings = 2,
+    Feedback = 3,
 }
 
 #[derive(Default)]
 struct State {
-    slots: [Option<Bytes>; 3],
+    slots: [Option<Bytes>; 4],
     items: VecDeque<Item>,
     bytes: usize,
     failed: bool,
@@ -224,7 +225,8 @@ impl Sender {
         let slot = match &msg {
             ControllerMsg::Ack { .. } => Some(Slot::Ack),
             ControllerMsg::Ping { .. } => Some(Slot::Ping),
-            ControllerMsg::Settings(_) => Some(Slot::Settings),
+            ControllerMsg::Settings(_) | ControllerMsg::View(_) => Some(Slot::Settings),
+            ControllerMsg::VideoFeedback(_) => Some(Slot::Feedback),
             _ => None,
         };
         let (kind, delta, t) = match &msg {

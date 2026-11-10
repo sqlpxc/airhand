@@ -39,7 +39,7 @@ const BULK_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL: usize = 0;
 const BULK: usize = 1;
 /// 每条通道最多这么多个槽位
-const SLOTS: usize = 3;
+const SLOTS: usize = 4;
 
 /// 只留最新值的槽位：在哪条通道上、第几个（写任务按这个先后发）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +85,10 @@ impl Place {
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
             HostMsg::Hello(_) => queued(Some(DISPLAYS)),
             HostMsg::CursorUpdate { .. } => Place::Latest(CURSOR_UPDATE),
+            HostMsg::VideoConfig(_) => Place::Latest(Slot {
+                lane: CONTROL,
+                index: 3,
+            }),
             HostMsg::CursorImage { .. } => queued(None),
             HostMsg::Cursor(CursorState { shape: None, .. }) => Place::Latest(CURSOR_VISIBLE),
             HostMsg::Cursor(CursorState { shape: Some(_), .. }) => queued(Some(CURSOR_VISIBLE)),

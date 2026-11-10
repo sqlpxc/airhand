@@ -31,6 +31,7 @@ import { RemoteInput } from "./input";
 import { AvSync, type AvSyncStats } from "./avsync";
 import { bestCodec, codecUsable } from "./codec";
 import { VideoPlayer } from "./video";
+import { receiverCapabilities, type VideoConfig, type VideoFeedback } from "./video-model";
 import { t } from "./i18n";
 import { RECOVERS, type SessionNotice } from "./messages";
 import { CODEC_LABEL } from "./presets";
@@ -101,6 +102,8 @@ export class RemoteSession {
   /** 对方支持的系统操作（手机的返回、主页……）；电脑为空 */
   hostActions: SystemAction[] = [];
   encoder: EncoderState | null = null;
+  videoConfig: VideoConfig | null = null;
+  private pendingVideoFeedback: VideoFeedback | null = null;
   stats: Stats = { fps: 0, kbps: 0, rttMs: null, width: 0, height: 0, decodeMs: 0 };
   /** 画面上方的提示（显示时才变成文字，见 messages.ts） */
   notice: SessionNotice | null = null;
@@ -210,6 +213,10 @@ export class RemoteSession {
     if (!ctx) throw new Error(t("error.canvas"));
     this.video = new VideoPlayer({
       canvas: this.canvas, ctx, sync: this.sync,
+      feedback: (feedback) => {
+        if (this.sid === null) this.pendingVideoFeedback = feedback;
+        else this.command({ cmd: "videoFeedback", sid: this.sid, feedback });
+      },
       requestKeyframe: () => this.requestKeyframe(),
       unsupported: (codec) => this.onUndecodable(codec),
       resized: () => this.layout(),
@@ -264,6 +271,8 @@ export class RemoteSession {
       },
     };
     this.video.reset();
+    this.videoConfig = null;
+    this.pendingVideoFeedback = null;
     this.audio.reset();
     this.sync.reset();
     // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
@@ -279,7 +288,8 @@ export class RemoteSession {
     try {
       info = await api.connect(
         this.code,
-        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing, settings: sent, audio },
+        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing, settings: sent, audio,
+          receiver: receiverCapabilities(store.get().decoders) },
         sink,
         this.clipboardSync,
       );
@@ -302,6 +312,10 @@ export class RemoteSession {
     this.pairing = null;
     this.connectedOnce = true;
     this.sid = info.sid;
+    if (this.pendingVideoFeedback) {
+      this.command({ cmd: "videoFeedback", sid: info.sid, feedback: this.pendingVideoFeedback });
+      this.pendingVideoFeedback = null;
+    }
     this.hostName = info.hostName;
     this.hostOs = info.hostOs;
     // 收到对方的 hello 才算开始（对方可能要先问它的用户，见 onEvent 的 awaitingApproval）；
@@ -490,6 +504,9 @@ export class RemoteSession {
           decodeMs: this.video.decodeAvg,
         };
         this.syncStats = this.sync.stats();
+        break;
+      case "videoConfig":
+        if (!this.videoConfig || ev.config.context.configId > this.videoConfig.context.configId) this.videoConfig = ev.config;
         break;
       case "encoder":
         this.encoder = { codec: ev.codec, name: ev.name, hardware: ev.hardware, width: ev.width, height: ev.height };

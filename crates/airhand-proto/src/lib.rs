@@ -57,6 +57,7 @@ pub mod handshake;
 pub mod media;
 pub mod session;
 pub mod signal;
+pub mod video;
 
 /// 信令协议版本（客户端 ⇄ 服务器，包括 [`SessionHeader`] 和数据报的会话 ID）。
 ///
@@ -297,6 +298,8 @@ pub mod features {
     pub mod signal {
         use crate::Features;
 
+        /// Reserved: replaceable media transport instances. Not supported by the fixed-lane relay.
+        pub const MEDIA_INSTANCES: Features = Features::from_bits(1 << 0);
         /// 本端支持的
         pub const SUPPORTED: Features = Features::NONE;
     }
@@ -309,8 +312,12 @@ pub mod features {
         pub const CURSOR_UPDATES: Features = Features::from_bits(1 << 0);
         /// 控制帧限制为 64 KiB；长输入按字符边界分批。旧端仍按原来的 2 MiB 接收。
         pub const SMALL_CONTROL: Features = Features::from_bits(1 << 1);
+        /// Receiver capabilities, view requests, selected configurations and decoder feedback.
+        pub const VIDEO_MODEL: Features = Features::from_bits(1 << 2);
+        /// Reserved; requires signal::MEDIA_INSTANCES as well. Never advertised until implemented.
+        pub const MEDIA_INSTANCES: Features = Features::from_bits(1 << 3);
         /// 本端支持的
-        pub const SUPPORTED: Features = CURSOR_UPDATES.with(SMALL_CONTROL);
+        pub const SUPPORTED: Features = CURSOR_UPDATES.with(SMALL_CONTROL).with(VIDEO_MODEL);
     }
 }
 

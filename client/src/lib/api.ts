@@ -13,6 +13,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { tauriBackend } from "./backend/tauri";
 import { webBackend } from "./backend/web";
 import type { Lang } from "./i18n";
+import type { ReceiverCapabilities, VideoConfig, VideoFeedback } from "./video-model";
 
 export type Codec = "h264" | "h265" | "av1";
 
@@ -172,6 +173,8 @@ export interface ConnectOptions {
   settings: QualitySettings;
   /** 开始时要不要声音（同上） */
   audio: boolean;
+  /** Decoder hard limits; omitted by older frontends. */
+  receiver?: ReceiverCapabilities | null;
 }
 
 /** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
@@ -218,6 +221,7 @@ export type SessionEvent =
       frames: number;
     }
   | { type: "encoder"; codec: Codec; name: string; hardware: boolean; width: number; height: number }
+  | { type: "videoConfig"; config: VideoConfig }
   | { type: "notice"; notice: RemoteNotice }
   /** 被控端复制的文本（只有网页版会收到，由 backend/web.ts 处理） */
   | { type: "clipboard"; text: string }
@@ -258,6 +262,7 @@ export type Command =
   | { cmd: "clipboardSync"; sid: number; enabled: boolean }
   /** 收到了第 seq 帧画面（累积确认；由 Backend 自己发） */
   | { cmd: "ack"; sid: number; seq: number }
+  | { cmd: "videoFeedback"; sid: number; feedback: VideoFeedback }
   | { cmd: "disconnect"; sid: number };
 
 /** 会话的输出 */

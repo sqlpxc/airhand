@@ -39,7 +39,7 @@ object Native {
     /** `flags`：bit0 关键帧，bit1 参数集；`codec`：[Codec.id] */
     @JvmStatic external fun hostVideo(
         handle: Long, buf: ByteBuffer, offset: Int, len: Int, flags: Int,
-        captureUs: Long, codec: Int, width: Int, height: Int,
+        captureUs: Long, codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int, selectionVersion: Long,
     )
 
     @JvmStatic external fun hostAudio(handle: Long, buf: ByteBuffer, offset: Int, len: Int, captureUs: Long)

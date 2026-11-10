@@ -113,6 +113,9 @@ pub enum HostMsg {
         #[n(1)]
         image: CursorShape,
     },
+    /// Actual video output, correlated with extended packets; requires VIDEO_MODEL.
+    #[n(12)]
+    VideoConfig(#[n(0)] crate::video::VideoConfig),
 }
 
 impl HostMsg {
@@ -129,6 +132,7 @@ impl HostMsg {
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
             | HostMsg::CursorUpdate { .. }
+            | HostMsg::VideoConfig(_)
             | HostMsg::Bye(_) => SessionLane::Control,
         }
     }
@@ -417,6 +421,12 @@ pub enum ControllerMsg {
         #[n(0)]
         enabled: bool,
     },
+    /// Updated preference, separate from receiver hard limits; requires VIDEO_MODEL.
+    #[n(9)]
+    View(#[n(0)] crate::video::ViewRequest),
+    /// Cumulative decoder/renderer telemetry, independent of Ack; requires VIDEO_MODEL.
+    #[n(10)]
+    VideoFeedback(#[n(0)] crate::video::VideoFeedback),
 }
 
 impl ControllerMsg {
@@ -429,7 +439,9 @@ impl ControllerMsg {
             | Self::RequestKeyframe
             | Self::SelectDisplay { .. }
             | Self::Ping { .. }
-            | Self::Audio { .. } => SessionLane::Control,
+            | Self::Audio { .. }
+            | Self::View(_)
+            | Self::VideoFeedback(_) => SessionLane::Control,
         }
     }
 }

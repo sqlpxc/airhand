@@ -362,6 +362,9 @@ pub extern "system" fn Java_app_airhand_android_core_Native_hostVideo(
     codec: jint,
     width: jint,
     height: jint,
+    fps: jint,
+    bitrate_kbps: jint,
+    selection_version: jlong,
 ) {
     let Some(host) = host(h) else { return };
     let Some(data) = direct_slice(&env, &buf, offset, len) else {
@@ -374,7 +377,7 @@ pub extern "system" fn Java_app_airhand_android_core_Native_hostVideo(
         _ => Codec::H264,
     };
     guard((), || {
-        host.video_hub().push(
+        host.video_hub().push_with_parameters(
             data,
             flags & 1 != 0,
             flags & 2 != 0,
@@ -382,6 +385,9 @@ pub extern "system" fn Java_app_airhand_android_core_Native_hostVideo(
             codec,
             width.clamp(0, u16::MAX as i32) as u16,
             height.clamp(0, u16::MAX as i32) as u16,
+            fps.clamp(1, 120) as u8,
+            bitrate_kbps.clamp(100, 100_000) as u32,
+            selection_version as u32,
         )
     });
 }

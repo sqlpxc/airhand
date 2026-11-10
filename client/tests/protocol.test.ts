@@ -24,7 +24,7 @@ test("媒体包：头和数据按 media.ts 解析，负载从头里写的长度�
     assert.equal(hex(media.payload(pkt, dv)), m.payload, m.name);
     if (m.kind === media.VIDEO) {
       const h = media.videoHeader(dv);
-      assert.deepEqual(h, { seq: m.seq, key: m.key, codec: m.codec, width: m.width, height: m.height, captureUs: m.captureUs }, m.name);
+      assert.deepEqual(h, { seq: m.seq, key: m.key, codec: m.codec, width: m.width, height: m.height, captureUs: m.captureUs, ...(m.context ? { context: m.context } : {}) }, m.name);
       assert.equal(media.videoSeq(dv), m.seq);
     } else if (m.kind === media.AUDIO) {
       assert.deepEqual(media.audioHeader(dv), { seq: m.seq, start: m.start, captureUs: m.captureUs }, m.name);
@@ -61,7 +61,7 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
   const button = { type: "mouseButton", button: "right", down: true };
   assert.deepEqual(events[2], button);
   const cmds = commands.map((c) => c.cmd).sort();
-  assert.deepEqual(cmds, ["ack", "audio", "clipboard", "clipboardSync", "disconnect", "display", "input", "keyframe", "settings"]);
+  assert.deepEqual(cmds, ["ack", "audio", "clipboard", "clipboardSync", "disconnect", "display", "input", "keyframe", "settings", "videoFeedback"]);
   const settings = commands.find((c) => c.cmd === "settings");
   assert.deepEqual(settings, {
     cmd: "settings",
@@ -71,6 +71,6 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
   // 连接选项：字段和 ConnectOptions 一样
   const opts = contract.connectOptions;
   assert.deepEqual(opts, fixture.connectOptions);
-  assert.deepEqual(Object.keys(opts).sort(), ["audio", "hostKey", "pairing", "resume", "settings"]);
+  assert.deepEqual(Object.keys(opts).sort(), ["audio", "hostKey", "pairing", "receiver", "resume", "settings"]);
   assert.equal(opts.settings.codec, "h265");
 });

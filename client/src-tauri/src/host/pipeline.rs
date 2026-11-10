@@ -43,6 +43,7 @@ struct Ctrl {
     force_key: AtomicBool,
     stop: AtomicBool,
     flow: Arc<Flow>,
+    video_model: Arc<airhand_link::video::VideoSession>,
     /// 控制端缓存了哪些光标形状（整个会话一份）
     cursors: Arc<Mutex<CursorCache>>,
 }
@@ -57,6 +58,7 @@ impl Pipeline {
         out: Outbox,
         flow: Arc<Flow>,
         cursors: Arc<Mutex<CursorCache>>,
+        video_model: Arc<airhand_link::video::VideoSession>,
     ) -> Self {
         let ctrl = Arc::new(Ctrl {
             settings: Mutex::new(settings),
@@ -64,6 +66,7 @@ impl Pipeline {
             force_key: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             flow,
+            video_model,
             cursors,
         });
         let c = ctrl.clone();
@@ -164,9 +167,24 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
 
     while !ctrl.stop.load(Ordering::Acquire) {
         let v = ctrl.settings_ver.load(Ordering::Acquire);
-        if v != ver {
+        let preference = *ctrl.settings.lock().unwrap();
+        let (w, h) = last_frame.as_ref().map_or((0, 0), |f| (f.width, f.height));
+        let mut selected =
+            match ctrl
+                .video_model
+                .select(preference, &super::encoder::available_codecs(), w, h)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    notice(Notice::CaptureFailed {
+                        detail: e.to_string(),
+                    });
+                    break;
+                }
+            };
+        if v != ver || settings != selected.settings {
             ver = v;
-            settings = *ctrl.settings.lock().unwrap();
+            settings = selected.settings;
             sub.set_fps(settings.fps);
             abr.reset(settings.bitrate_kbps);
             if let Some(e) = &mut enc {
@@ -272,6 +290,22 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 None => continue,
             },
         };
+        selected = match ctrl.video_model.select(
+            preference,
+            &super::encoder::available_codecs(),
+            frame.width,
+            frame.height,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                notice(Notice::CaptureFailed {
+                    detail: e.to_string(),
+                });
+                break;
+            }
+        };
+        settings = selected.settings;
+        sub.set_fps(settings.fps);
         let started = Instant::now();
         next_due = started + Duration::from_secs_f64(1.0 / settings.fps.max(1) as f64);
 
@@ -292,6 +326,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     if !send(&HostMsg::Encoder(e.info().clone())) {
                         break;
                     }
+                    ctrl.video_model.restart();
                     enc = Some(e);
                     force = true;
                 }
@@ -322,7 +357,11 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 if ctrl.stop.load(Ordering::Acquire) {
                     break;
                 }
-                let size = media::HEADER_LEN + ef.data.len();
+                let size = if ctrl.video_model.enabled() {
+                    media::VIDEO_CONTEXT_LEN
+                } else {
+                    media::HEADER_LEN
+                } + ef.data.len();
                 if size > media::MAX_VIDEO_PACKET {
                     notice(Notice::CaptureFailed {
                         detail: "encoded frame exceeds the video budget".into(),
@@ -356,7 +395,17 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     // 控制端按采集时间做音画同步，用旧的时间会以为这一帧严重滞后，让声音跟着多等
                     capture_us: super::clock::us(if fresh { frame.captured } else { started }),
                 };
-                let packet = Bytes::from(media::frame(&header.encode(), &[&ef.data]));
+                let header = match ctrl.video_model.header(&header, selected, abr.current) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        ctrl.flow.discard(seq);
+                        notice(Notice::CaptureFailed {
+                            detail: e.to_string(),
+                        });
+                        break;
+                    }
+                };
+                let packet = Bytes::from(media::frame(&header, &[&ef.data]));
                 if !send_cancellable(&video, &ctrl.stop, packet) {
                     ctrl.flow.discard(seq);
                     break;

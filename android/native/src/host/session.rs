@@ -52,6 +52,7 @@ pub(crate) struct Phone {
     out: Outbox,
     video: mpsc::Sender<Bytes>,
     audio: mpsc::Sender<Bytes>,
+    video_model: Arc<airhand_link::video::VideoSession>,
     /// 发给所有会话的消息：会话开始之后才订阅（同意之前不转发，Hello 里带着那时的状态）
     broadcasts: Option<broadcast::Receiver<Encoded>>,
 }
@@ -65,6 +66,7 @@ impl Phone {
             out: senders.out,
             video: senders.video,
             audio: senders.audio,
+            video_model: senders.video_model,
             broadcasts: None,
         }
     }
@@ -109,6 +111,11 @@ impl Platform for Phone {
         });
         {
             let info = sh.info.lock().unwrap();
+            let (w, h) = info
+                .displays
+                .first()
+                .map_or((0, 0), |d| (d.width, d.height));
+            sh.video.source(w, h, info.codecs.clone());
             self.out.send(&HostMsg::Hello(HostHello {
                 hostname: info.hostname.clone(),
                 os: info.os.clone(),
@@ -136,8 +143,12 @@ impl Platform for Phone {
                 })))?;
             }
         }
-        sh.video
-            .subscribe(self.id, self.video.clone(), start.settings);
+        sh.video.subscribe_video(
+            self.id,
+            self.video.clone(),
+            start.settings,
+            self.video_model.clone(),
+        )?;
         if start.audio {
             sh.audio
                 .subscribe(self.id, self.audio.clone(), self.out.clone());
@@ -230,6 +241,10 @@ mod tests {
                 7,
                 [0; 32],
                 Senders {
+                    video_model: Arc::new(airhand_link::video::VideoSession::new(
+                        None,
+                        out.clone(),
+                    )),
                     out,
                     video: video_tx,
                     audio: audio_tx,
@@ -247,6 +262,7 @@ mod tests {
                 },
                 settings: Default::default(),
                 audio: true,
+                video: None,
             };
             answer_tx.send(phone.ask(&admitted)).unwrap();
             phone

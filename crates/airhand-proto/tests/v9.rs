@@ -85,6 +85,50 @@ fn v9_existing_messages_keep_their_wire_encoding() {
 }
 
 #[test]
+fn video_contract_extension_has_stable_numbers() {
+    use airhand_proto::video::*;
+    let context = VideoContext {
+        config_id: 1,
+        instance: MediaInstance::default(),
+    };
+    golden(
+        ControllerMsg::View(ViewRequest {
+            request_id: 1,
+            preference: QualitySettings::default(),
+        }),
+        "820981a200010185181e190fa0190438f500",
+    );
+    golden(
+        HostMsg::VideoConfig(VideoConfig {
+            context,
+            request_id: 0,
+            codec: Codec::H264,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 1000,
+        }),
+        "820c81a700a2000101a2000001000100020003184004184005181e061903e8",
+    );
+    golden(
+        ControllerMsg::VideoFeedback(VideoFeedback {
+            context,
+            sample_id: 1,
+            received_seq: 1,
+            decoded_seq: None,
+            presented_seq: None,
+            pending_frames: 1,
+            oldest_pending_ms: 5,
+            decode_time_us: 0,
+            dropped_frames: 0,
+            decoder_errors: 0,
+        }),
+        "820a81a800a2000101a2000001000101020105010605070008000900",
+    );
+    assert_eq!(airhand_proto::features::session::VIDEO_MODEL.bits(), 1 << 2);
+}
+
+#[test]
 fn rekey_confirmation_is_an_optional_field() {
     #[derive(Encode, Decode)]
     enum Old {

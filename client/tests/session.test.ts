@@ -6,6 +6,7 @@ import { stripTypeScriptTypes } from "node:module";
 import { ConnectionAttempt } from "../src/lib/connection-attempt.ts";
 import { fitSize, stricter, viewMaxShort } from "../src/lib/fit.ts";
 import * as media from "../src/lib/media.ts";
+import { receiverCapabilities } from "../src/lib/video-model.ts";
 
 // Load the actual session class with browser/backend dependencies replaced by
 // small fakes. This tests delivery ordering without a WebView or network.
@@ -18,7 +19,8 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   const calls: any[] = [];
   const timers: (() => void)[] = [];
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
-    fitSize, stricter, viewMaxShort, media,
+    fitSize, stricter, viewMaxShort, media, receiverCapabilities,
+    store: { get: () => ({ decoders: ["h264", "h265", "av1"] }) },
     toProblem: (e: any) => e,
     api: {
       connect: (c: any, o: any, output: any) => {

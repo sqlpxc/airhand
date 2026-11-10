@@ -68,6 +68,9 @@ pub enum SessionEvent {
         width: u32,
         height: u32,
     },
+    VideoConfig {
+        config: airhand_proto::video::VideoConfig,
+    },
     Displays {
         displays: Vec<DisplayInfo>,
         current: u8,
@@ -235,6 +238,14 @@ pub(super) async fn run(
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
+                    if negotiated.has(airhand_proto::features::session::VIDEO_MODEL) {
+                        let c = VideoHeader::context(&p)
+                            .ok_or_else(|| anyhow::anyhow!("video context missing"))?;
+                        anyhow::ensure!(
+                            c.config_id != 0 && c.instance == Default::default(),
+                            "unsupported media instance"
+                        );
+                    }
                     {
                         let mut s = st.lock().unwrap();
                         s.last_msg = Instant::now();
@@ -327,6 +338,14 @@ pub(super) async fn run(
                         out.packet(media::cursor_packet(&state))
                             .map_err(|_| ui_closed())?;
                     }
+                }
+                HostMsg::VideoConfig(config) => {
+                    anyhow::ensure!(
+                        config.valid() && config.context.instance == Default::default(),
+                        "unsupported video configuration"
+                    );
+                    out.event(SessionEvent::VideoConfig { config })
+                        .map_err(|_| ui_closed())?;
                 }
                 HostMsg::Encoder(e) => {
                     let _ = out.event(SessionEvent::Encoder {

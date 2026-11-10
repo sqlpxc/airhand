@@ -10,7 +10,7 @@
 //! 或者需要关键帧时返回一个 JSON，见 [`Tick`]。
 
 use airhand_link::flow::{Abr, FlowState as Flow};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -47,14 +47,20 @@ struct State {
     abr: Abr,
     /// H.264 / HEVC 的参数集（MediaCodec 单独给出的 codec config），拼在每个关键帧前面
     config: Vec<u8>,
+    host_codecs: Vec<Codec>,
+    source: (u32, u32),
+    selections: VecDeque<(u32, HashMap<u64, airhand_link::video::SelectedVideo>)>,
 }
 
 struct Out {
     tx: mpsc::Sender<Bytes>,
     flow: Flow,
     settings: QualitySettings,
+    request_id: u32,
     /// 还没收到过关键帧（刚加入，或者队列满了丢过帧）：非关键帧不发给它
     need_key: bool,
+    model: Option<Arc<airhand_link::video::VideoSession>>,
+    failed: bool,
 }
 
 /// [`VideoHub::tick`] 的结果
@@ -85,6 +91,9 @@ impl VideoHub {
                 seq: 0,
                 abr: Abr::new(settings.bitrate_kbps),
                 config: Vec::new(),
+                host_codecs: vec![Codec::H264, Codec::H265, Codec::AV1],
+                source: (0, 0),
+                selections: VecDeque::new(),
             }),
             cv: Condvar::new(),
             events,
@@ -98,15 +107,42 @@ impl VideoHub {
     }
 
     /// 会话开始看画面
+    #[cfg(test)]
     pub fn subscribe(&self, id: u64, tx: mpsc::Sender<Bytes>, settings: QualitySettings) {
+        self.subscribe_model(id, tx, settings, None).unwrap();
+    }
+
+    fn subscribe_model(
+        &self,
+        id: u64,
+        tx: mpsc::Sender<Bytes>,
+        settings: QualitySettings,
+        model: Option<Arc<airhand_link::video::VideoSession>>,
+    ) -> anyhow::Result<()> {
         let mut st = self.st.lock().unwrap();
+        let allowed = model.as_ref().and_then(|m| m.receiver());
+        anyhow::ensure!(
+            st.host_codecs.iter().any(|c| {
+                allowed.as_ref().is_none_or(|r| r.capability(*c).is_some())
+                    && st.sessions.values().all(|o| {
+                        o.model
+                            .as_ref()
+                            .and_then(|m| m.receiver())
+                            .is_none_or(|r| r.capability(*c).is_some())
+                    })
+            }),
+            "no common codec for the shared Android encoder"
+        );
         st.sessions.insert(
             id,
             Out {
                 tx,
                 flow: Flow::default(),
                 settings: settings.sanitized(),
+                request_id: 0,
                 need_key: true,
+                model,
+                failed: false,
             },
         );
         st.merge_settings();
@@ -117,6 +153,24 @@ impl VideoHub {
             self.report_active(true);
         }
         self.cv.notify_all();
+        Ok(())
+    }
+
+    pub fn source(&self, width: u32, height: u32, codecs: Vec<Codec>) {
+        let mut st = self.st.lock().unwrap();
+        st.source = (width, height);
+        st.host_codecs = codecs;
+        st.merge_settings();
+    }
+
+    pub fn subscribe_video(
+        &self,
+        id: u64,
+        tx: mpsc::Sender<Bytes>,
+        settings: QualitySettings,
+        model: Arc<airhand_link::video::VideoSession>,
+    ) -> anyhow::Result<()> {
+        self.subscribe_model(id, tx, settings, Some(model))
     }
 
     #[cfg(test)]
@@ -155,7 +209,7 @@ impl VideoHub {
             .unwrap()
             .sessions
             .get(&id)
-            .is_some_and(|o| o.flow.ack_stalled())
+            .is_some_and(|o| o.failed || o.flow.ack_stalled())
     }
 
     /// 只修改该会话的需求；共享编码参数按所有观看者合并，不由最后一次修改覆盖。
@@ -187,6 +241,7 @@ impl VideoHub {
             return None;
         }
         st.told_version = st.version;
+        st.remember_selection();
         st.told_kbps = kbps;
         let key = std::mem::take(&mut st.force_key);
         Some(Tick {
@@ -225,6 +280,7 @@ impl VideoHub {
     }
 
     /// 编码器的输出。`config`：参数集（不是画面），存起来拼到之后的关键帧前面
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn push(
         &self,
@@ -235,6 +291,31 @@ impl VideoHub {
         codec: Codec,
         width: u16,
         height: u16,
+    ) {
+        let (fps, kbps, version) = {
+            let mut st = self.st.lock().unwrap();
+            st.remember_selection();
+            (st.settings.fps, st.abr.current, st.version)
+        };
+        self.push_with_parameters(
+            data, key, config, capture_us, codec, width, height, fps, kbps, version,
+        );
+    }
+
+    /// Parameters describe the encoder that produced this packet, not a pending request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_with_parameters(
+        &self,
+        data: &[u8],
+        key: bool,
+        config: bool,
+        capture_us: u64,
+        codec: Codec,
+        width: u16,
+        height: u16,
+        encoder_fps: u8,
+        encoder_kbps: u32,
+        selection_version: u32,
     ) {
         let mut st = self.st.lock().unwrap();
         if config {
@@ -261,11 +342,30 @@ impl VideoHub {
         } else {
             &[]
         };
-        let bytes = Bytes::from(media::frame(&header.encode(), &[config, data]));
+        let config = config.to_vec();
+        let base_size = media::HEADER_LEN + config.len() + data.len();
+        if base_size + media::VIDEO_CONTEXT_LEN - media::HEADER_LEN > media::MAX_VIDEO_PACKET {
+            return;
+        }
         let mut want_key = false;
         let fps = st.settings.fps;
-        for (id, o) in st.sessions.iter_mut() {
-            if !o.flow.can_send(fps, bytes.len() - 4) {
+        let state = &mut *st;
+        let selections = state
+            .selections
+            .iter()
+            .find(|(v, _)| *v == selection_version)
+            .map(|(_, s)| s);
+        for (id, o) in state.sessions.iter_mut() {
+            if o.failed {
+                continue;
+            }
+            let size = base_size
+                + if o.model.as_ref().is_some_and(|m| m.enabled()) {
+                    media::VIDEO_CONTEXT_LEN - media::HEADER_LEN
+                } else {
+                    0
+                };
+            if !o.flow.can_send(fps, size) {
                 o.need_key = true;
                 continue;
             }
@@ -273,10 +373,31 @@ impl VideoHub {
                 want_key = true;
                 continue;
             }
-            match o.tx.try_send(bytes.clone()) {
+            let encoded_header = match &o.model {
+                Some(model) => {
+                    let Some(mut selected) = selections.as_ref().and_then(|s| s.get(id)).copied()
+                    else {
+                        o.need_key = true;
+                        want_key = true;
+                        continue;
+                    };
+                    selected.settings.fps = encoder_fps;
+                    match model.header(&header, selected, encoder_kbps) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!(session = id, "video contract rejected output: {e:#}");
+                            o.failed = true;
+                            continue;
+                        }
+                    }
+                }
+                None => header.encode().to_vec(),
+            };
+            let bytes = Bytes::from(media::frame(&encoded_header, &[&config, data]));
+            match o.tx.try_send(bytes) {
                 Ok(()) => {
                     o.need_key = false;
-                    o.flow.on_sent(seq, bytes.len() - 4);
+                    o.flow.on_sent(seq, size);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // 丢了一帧，之后的帧解不出来：从下一个关键帧重新开始
@@ -294,7 +415,13 @@ impl VideoHub {
 
     /// 编码器重建了（格式 / 分辨率变了）：旧的参数集作废
     pub fn reset_config(&self) {
-        self.st.lock().unwrap().config.clear();
+        let mut st = self.st.lock().unwrap();
+        st.config.clear();
+        for o in st.sessions.values() {
+            if let Some(m) = &o.model {
+                m.restart();
+            }
+        }
     }
 }
 
@@ -319,8 +446,45 @@ fn starts_with_parameter_set(data: &[u8], codec: Codec) -> bool {
 }
 
 impl State {
+    fn remember_selection(&mut self) {
+        if self
+            .selections
+            .back()
+            .is_some_and(|(v, _)| *v == self.version)
+        {
+            return;
+        }
+        let selected = self
+            .sessions
+            .iter()
+            .map(|(&id, o)| {
+                let s = airhand_link::video::SelectedVideo {
+                    request_id: o.request_id,
+                    settings: o.settings,
+                };
+                (id, s)
+            })
+            .collect();
+        self.selections.push_back((self.version, selected));
+        while self.selections.len() > 4 {
+            self.selections.pop_front();
+        }
+    }
+
     /// 单编码器：帧率和码率满足前台需求，尺寸服从最严格上限；编码偏好不一致时用共同基线 H.264。
     fn merge_settings(&mut self) {
+        // A view can change without changing the merged encoder parameters. Kotlin must still
+        // observe that revision before output is associated with the new request.
+        self.version = self.version.wrapping_add(1);
+        for o in self.sessions.values_mut() {
+            if let Some(m) = &o.model
+                && let Ok(selected) =
+                    m.select(o.settings, &self.host_codecs, self.source.0, self.source.1)
+            {
+                o.settings = selected.settings;
+                o.request_id = selected.request_id;
+            }
+        }
         let mut all = self.sessions.values().map(|o| o.settings);
         let Some(mut s) = all.next() else { return };
         for other in all {
@@ -335,9 +499,36 @@ impl State {
                 s.codec = Codec::H264;
             }
         }
+        let common: Vec<Codec> = self
+            .host_codecs
+            .iter()
+            .copied()
+            .filter(|c| {
+                self.sessions.values().all(|o| {
+                    o.model
+                        .as_ref()
+                        .and_then(|m| m.receiver())
+                        .is_none_or(|r| r.capability(*c).is_some())
+                })
+            })
+            .collect();
+        if !common.contains(&s.codec) {
+            if let Some(codec) = [Codec::AV1, Codec::H265, Codec::H264]
+                .into_iter()
+                .find(|c| common.contains(c))
+            {
+                s.codec = codec;
+            }
+        }
+        for o in self.sessions.values() {
+            if let Some(receiver) = o.model.as_ref().and_then(|m| m.receiver())
+                && let Some(limited) = receiver.select(s, &common, self.source.0, self.source.1)
+            {
+                s = limited;
+            }
+        }
         if self.settings != s {
             self.settings = s;
-            self.version = self.version.wrapping_add(1);
             self.abr.reset(s.bitrate_kbps);
             info!(?s, "shared quality settings updated");
         }
@@ -366,6 +557,140 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airhand_proto::session::HostMsg;
+
+    #[test]
+    fn shared_encoder_honors_receiver_limits_and_output_keeps_its_applied_request() {
+        use airhand_link::host::queue;
+        use airhand_link::video::VideoSession;
+        use airhand_proto::video::*;
+        let (hub, _) = hub();
+        hub.source(1920, 1080, vec![Codec::H264, Codec::AV1]);
+        let (out, mut control, _bulk) = queue::channel();
+        let model = Arc::new(VideoSession::new(
+            Some(VideoOffer {
+                receiver: ReceiverCapabilities {
+                    codecs: vec![DecodeCapability {
+                        codec: Codec::H264,
+                        max_width: Some(1280),
+                        max_height: Some(720),
+                        max_fps: Some(30),
+                    }],
+                },
+                view: ViewRequest {
+                    request_id: 0,
+                    preference: QualitySettings {
+                        fps: 60,
+                        codec: Codec::AV1,
+                        max_short: 0,
+                        ..Default::default()
+                    },
+                },
+            }),
+            out,
+        ));
+        let (tx, mut rx) = mpsc::channel(QUEUE);
+        hub.subscribe_video(1, tx, QualitySettings::default(), model.clone())
+            .unwrap();
+        let first = hub.tick().unwrap();
+        assert_eq!(
+            (first.codec, first.max_short, first.fps),
+            (Codec::H264, 720, 30)
+        );
+        hub.push_with_parameters(
+            &[1],
+            true,
+            false,
+            0,
+            Codec::H264,
+            1280,
+            720,
+            30,
+            4000,
+            first.version,
+        );
+        let packet = rx.try_recv().unwrap();
+        let initial = VideoHeader::context(&packet[4..]).unwrap();
+        let msg: HostMsg =
+            airhand_proto::framing::decode_known(&control.try_recv().unwrap()[4..]).unwrap();
+        assert!(
+            matches!(msg, HostMsg::VideoConfig(c) if c.request_id == 0 && c.context == initial)
+        );
+        let request = ViewRequest {
+            request_id: 1,
+            preference: QualitySettings {
+                fps: 15,
+                ..Default::default()
+            },
+        };
+        assert!(model.view(request));
+        hub.set_settings(1, request.preference);
+        // Old encoder output arriving before Kotlin consumes its next tick still belongs to view 0.
+        hub.push_with_parameters(
+            &[1],
+            false,
+            false,
+            1,
+            Codec::H264,
+            1280,
+            720,
+            30,
+            4000,
+            first.version,
+        );
+        let packet = rx.try_recv().unwrap();
+        assert_eq!(VideoHeader::context(&packet[4..]), Some(initial));
+        assert!(control.try_recv().is_none());
+        let second = hub.tick().unwrap();
+        assert_eq!(second.fps, 15);
+        hub.reset_config();
+        hub.push_with_parameters(
+            &[1],
+            true,
+            false,
+            2,
+            Codec::H264,
+            1280,
+            720,
+            15,
+            4000,
+            second.version,
+        );
+        let packet = rx.try_recv().unwrap();
+        let next = VideoHeader::context(&packet[4..]).unwrap();
+        assert!(next.config_id > initial.config_id);
+        let msg: HostMsg =
+            airhand_proto::framing::decode_known(&control.try_recv().unwrap()[4..]).unwrap();
+        assert!(
+            matches!(msg, HostMsg::VideoConfig(c) if c.request_id == 1 && c.fps == 15 && c.context == next)
+        );
+
+        // Adding a viewer with no common codec cannot make existing viewers receive undecodable output.
+        let (out, _c, _b) = queue::channel();
+        let other = Arc::new(VideoSession::new(
+            Some(VideoOffer {
+                receiver: ReceiverCapabilities {
+                    codecs: vec![DecodeCapability {
+                        codec: Codec::AV1,
+                        max_width: None,
+                        max_height: None,
+                        max_fps: None,
+                    }],
+                },
+                view: ViewRequest {
+                    request_id: 0,
+                    preference: Default::default(),
+                },
+            }),
+            out,
+        ));
+        let (tx, _rx) = mpsc::channel(QUEUE);
+        assert!(
+            hub.subscribe_video(2, tx, Default::default(), other)
+                .is_err()
+        );
+        assert_eq!(hub.st.lock().unwrap().sessions.len(), 1);
+    }
 
     fn hub() -> (VideoHub, Arc<Queue<String>>) {
         let events = Arc::new(Queue::new(64));

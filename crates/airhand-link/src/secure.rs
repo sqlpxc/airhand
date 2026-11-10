@@ -704,6 +704,19 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    respond_with_features(recv, send, p, airhand_proto::features::session::SUPPORTED).await
+}
+
+async fn respond_with_features<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    p: ResponderParams<'_>,
+    features: airhand_proto::Features,
+) -> Result<Responded>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = Vec::new();
     read_step(recv, &mut buf).await?;
     let init: HandshakeInit = match framing::decode_known(&buf) {
@@ -801,6 +814,20 @@ where
     };
     anyhow::ensure!(hs.is_handshake_finished(), "the handshake didn't finish");
     let intro: ControllerIntro = framing::decode_known(&intro_bytes)?;
+    if features.has(airhand_proto::features::session::VIDEO_MODEL)
+        && intro
+            .features
+            .has(airhand_proto::features::session::VIDEO_MODEL)
+    {
+        let video = intro
+            .video
+            .as_ref()
+            .context("VIDEO_MODEL requires a video offer")?;
+        anyhow::ensure!(
+            video.receiver.valid() && video.view.request_id == 0,
+            "invalid initial video offer"
+        );
+    }
     let (
         secured,
         LaneKeys {
@@ -812,7 +839,8 @@ where
     // 决定：版本，然后是让不让进来
     let version = intro.max.min(SESSION_VERSION);
     let compatible = version >= intro.min.max(SESSION_MIN);
-    let negotiated = Negotiated::new(version, intro.features);
+    let mut negotiated = Negotiated::new(version, intro.features);
+    negotiated.features = negotiated.features.common(features);
     let admission = if pattern == Pattern::Pairing {
         Some(Admission::Paired)
     } else if p.gate.is_known(&secured.peer) {
@@ -824,7 +852,6 @@ where
             Access::Pairing => None,
         }
     };
-    let features = airhand_proto::features::session::SUPPORTED;
     let refused = if !compatible {
         Some(Refusal::Incompatible)
     } else if admission.is_none() {
@@ -895,11 +922,15 @@ pub fn controller_intro(
     ControllerIntro {
         min: SESSION_MIN,
         max: SESSION_VERSION,
-        features: airhand_proto::features::session::SUPPORTED,
+        features: airhand_proto::Features::from_bits(
+            airhand_proto::features::session::SUPPORTED.bits()
+                & !airhand_proto::features::session::VIDEO_MODEL.bits(),
+        ),
         name: name.to_string(),
         os: os.to_string(),
         settings: settings.sanitized(),
         audio,
+        video: None,
     }
 }
 
@@ -1131,6 +1162,64 @@ mod tests {
             framing::decode_known::<airhand_proto::session::HostMsg>(&payload).unwrap(),
             airhand_proto::session::HostMsg::Cursor(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn video_offer_falls_back_when_the_host_does_not_support_the_extension() {
+        use airhand_proto::video::*;
+        let gate = TestGate::new(Access::Open, None);
+        let me = Identity::generate();
+        let ((mut cr, mut cw), (mut hr, mut hw)) = pipes();
+        let mut intro = test_intro();
+        let legacy = intro.features;
+        intro.features = intro
+            .features
+            .with(airhand_proto::features::session::VIDEO_MODEL);
+        intro.video = Some(VideoOffer {
+            receiver: ReceiverCapabilities {
+                codecs: vec![DecodeCapability {
+                    codec: airhand_proto::session::Codec::H264,
+                    max_width: None,
+                    max_height: None,
+                    max_fps: Some(30),
+                }],
+            },
+            view: ViewRequest {
+                request_id: 0,
+                preference: intro.settings,
+            },
+        });
+        let (c, h) = tokio::join!(
+            initiate(
+                &mut cr,
+                &mut cw,
+                InitiatorParams {
+                    session_id: 42,
+                    code: 123456,
+                    me: &me,
+                    host_key: None,
+                    pairing: None,
+                    intro: &intro
+                }
+            ),
+            respond_with_features(
+                &mut hr,
+                &mut hw,
+                ResponderParams {
+                    session_id: 42,
+                    code: 123456,
+                    gate: &gate
+                },
+                legacy
+            ),
+        );
+        let (c, h) = (c.unwrap(), h.unwrap());
+        assert_eq!(c.negotiated, h.negotiated);
+        assert!(
+            !c.negotiated
+                .has(airhand_proto::features::session::VIDEO_MODEL)
+        );
+        assert_eq!(h.intro.settings, intro.settings);
     }
 
     #[tokio::test]

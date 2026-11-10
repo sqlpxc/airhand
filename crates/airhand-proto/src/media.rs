@@ -54,6 +54,9 @@ use crate::session::{Codec, CursorState};
 
 /// 本版本写的媒体包头的长度，也是头最短的长度（读的时候按第 3 个字节，见 [`header_len`]）
 pub const HEADER_LEN: usize = 24;
+/// VIDEO_MODEL extension: config ID, stream ID and transport generation (u32 LE each).
+pub const VIDEO_CONTEXT_LEN: usize = HEADER_LEN + 12;
+const FLAG_VIDEO_CONTEXT: u8 = 2;
 /// 画面包上限（一个 4K 关键帧也远小于这个值）
 pub const MAX_VIDEO_PACKET: usize = 32 * 1024 * 1024;
 /// 声音包上限
@@ -137,6 +140,35 @@ pub struct VideoHeader {
 }
 
 impl VideoHeader {
+    /// The legacy prefix remains byte-for-byte identical. Only negotiated VIDEO_MODEL senders use this.
+    pub fn encode_with_context(&self, context: Option<crate::video::VideoContext>) -> Vec<u8> {
+        let mut header = self.encode().to_vec();
+        if let Some(c) = context {
+            header[1] |= FLAG_VIDEO_CONTEXT;
+            header[3] = VIDEO_CONTEXT_LEN as u8;
+            header.extend_from_slice(&c.config_id.to_le_bytes());
+            header.extend_from_slice(&c.instance.stream_id.to_le_bytes());
+            header.extend_from_slice(&c.instance.generation.to_le_bytes());
+        }
+        header
+    }
+
+    pub fn context(packet: &[u8]) -> Option<crate::video::VideoContext> {
+        if Kind::of(packet)? != Kind::Video
+            || packet[1] & FLAG_VIDEO_CONTEXT == 0
+            || header_len(packet)? < VIDEO_CONTEXT_LEN
+        {
+            return None;
+        }
+        Some(crate::video::VideoContext {
+            config_id: u32_at(packet, 24),
+            instance: crate::video::MediaInstance {
+                stream_id: u32_at(packet, 28),
+                generation: u32_at(packet, 32),
+            },
+        })
+    }
+
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         debug_assert!(self.codec.is_known(), "encoding with an unknown codec");
         let mut h = new_header(Kind::Video);
@@ -233,8 +265,8 @@ pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
 
 /// 线上的一个媒体包（加密之前）：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
 /// 多留了认证标签的容量：原地加密时不用重新分配（画面包可能有几 MiB）
-pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
-    let len = HEADER_LEN + payload.iter().map(|p| p.len()).sum::<usize>();
+pub fn frame(header: &[u8], payload: &[&[u8]]) -> Vec<u8> {
+    let len = header.len() + payload.iter().map(|p| p.len()).sum::<usize>();
     let mut buf = Vec::with_capacity(4 + len + crate::handshake::TAG_LEN);
     buf.extend_from_slice(&(len as u32).to_le_bytes());
     buf.extend_from_slice(header);

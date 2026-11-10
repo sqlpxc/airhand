@@ -157,6 +157,10 @@ pub enum Command {
         sid: u32,
         seq: u32,
     },
+    VideoFeedback {
+        sid: u32,
+        feedback: airhand_proto::video::VideoFeedback,
+    },
     /// 断开会话（先松开所有按着的键）
     Disconnect {
         sid: u32,
@@ -175,6 +179,7 @@ impl Command {
             | Command::Clipboard { sid, .. }
             | Command::ClipboardSync { sid, .. }
             | Command::Ack { sid, .. }
+            | Command::VideoFeedback { sid, .. }
             | Command::Disconnect { sid } => *sid,
         }
     }
@@ -203,6 +208,9 @@ pub struct ConnectOptions {
     /// 开始时要不要声音（同上）
     #[serde(default)]
     pub audio: bool,
+    /// Actual decoder capabilities, separate from user-selected settings. Absent means legacy mode.
+    #[serde(default)]
+    pub receiver: Option<airhand_proto::video::ReceiverCapabilities>,
 }
 
 /// 会话 ID → 交给这个会话的声音数据报
@@ -238,6 +246,8 @@ struct SessionHandle {
     task: AbortHandle,
     /// 桌面版：是否同步剪贴板
     clipboard: Option<Arc<AtomicBool>>,
+    video_model: bool,
+    next_view: u32,
 }
 
 struct Inner {
@@ -310,6 +320,9 @@ impl ControllerService {
         frontend: Frontend,
     ) -> Result<SessionInfo, Problem> {
         let code = airhand_proto::parse_code(code).ok_or(Problem::InvalidCode)?;
+        if opts.receiver.as_ref().is_some_and(|r| !r.valid()) {
+            return Err(Problem::failed("invalid receiver capabilities"));
+        }
         let pairing = match opts.pairing.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(p) => Some(airhand_proto::parse_pairing(p).ok_or(Problem::PairingFailed)?),
@@ -379,12 +392,24 @@ impl ControllerService {
         let (mut send, mut recv) = streams.control;
         // 端到端握手：确认对方的身份、让对方确认本机（见模块说明的"端到端加密"）。
         // 开始时的画质和声音在介绍里：被控端一开始就按它建编码器，不用先按默认设置建一个再重建
-        let intro = secure::controller_intro(
+        let mut intro = secure::controller_intro(
             &self.inner.cfg.name,
             &self.inner.cfg.os,
             opts.settings,
             opts.audio,
         );
+        if let Some(receiver) = opts.receiver {
+            intro.video = Some(airhand_proto::video::VideoOffer {
+                receiver,
+                view: airhand_proto::video::ViewRequest {
+                    request_id: 0,
+                    preference: opts.settings.sanitized(),
+                },
+            });
+            intro.features = intro
+                .features
+                .with(airhand_proto::features::session::VIDEO_MODEL);
+        }
         let init = secure::initiate(
             &mut recv,
             &mut send,
@@ -459,6 +484,10 @@ impl ControllerService {
                 bulk: bulk_tx,
                 task: handle.abort_handle(),
                 clipboard,
+                video_model: init
+                    .negotiated
+                    .has(airhand_proto::features::session::VIDEO_MODEL),
+                next_view: 1,
             },
         );
         info!(sid, code, host = %grant.host_name, safety = %secured.safety, "session established");
@@ -478,7 +507,32 @@ impl ControllerService {
         let msg = match cmd {
             Command::Input { sid, events } => (sid, queue::input(events)),
             Command::Settings { sid, settings } => {
-                (sid, ControllerMsg::Settings(settings.sanitized()))
+                let mut sessions = self.inner.sessions.lock().unwrap();
+                let s = sessions.get_mut(&sid).ok_or(Problem::NoSession)?;
+                let msg = if s.video_model {
+                    let request_id = s.next_view;
+                    s.next_view = request_id
+                        .checked_add(1)
+                        .ok_or_else(|| Problem::failed("view request IDs exhausted"))?;
+                    ControllerMsg::View(airhand_proto::video::ViewRequest {
+                        request_id,
+                        preference: settings.sanitized(),
+                    })
+                } else {
+                    ControllerMsg::Settings(settings.sanitized())
+                };
+                return s.tx.send(msg);
+            }
+            Command::VideoFeedback { sid, feedback } => {
+                let sessions = self.inner.sessions.lock().unwrap();
+                let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+                if !s.video_model {
+                    return Ok(());
+                }
+                if !feedback.valid() {
+                    return Err(Problem::failed("invalid video feedback"));
+                }
+                return s.tx.send(ControllerMsg::VideoFeedback(feedback));
             }
             Command::Keyframe { sid } => (sid, ControllerMsg::RequestKeyframe),
             Command::Display { sid, index } => (sid, ControllerMsg::SelectDisplay { index }),

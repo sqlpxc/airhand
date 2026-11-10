@@ -11,6 +11,7 @@
 // 光标形状按槽位缓存（动画光标反复用到的那几帧只传一次）：标志 bit1 = 新形状（RGBA 在头后面），存进槽位并换成它；
 // bit2 = 换成槽位里已有的形状；都没有 = 形状没变。槽位只在一个会话里有效。
 import type { Codec } from "./api";
+import type { VideoContext } from "./video-model";
 
 /** 头最短的长度（本版本写的长度） */
 export const HEADER_LEN = 24;
@@ -29,6 +30,8 @@ export interface VideoHeader {
   height: number;
   /** 采集时间（被控端时钟，微秒）；在 2^53 以内，转成 number 不丢精度 */
   captureUs: number;
+  /** VIDEO_MODEL identity; absent for legacy video packets. */
+  context?: VideoContext;
 }
 
 export interface AudioHeader {
@@ -76,6 +79,10 @@ export function videoHeader(dv: DataView): VideoHeader | null {
     width: dv.getUint16(8, true),
     height: dv.getUint16(10, true),
     captureUs: Number(dv.getBigUint64(16, true)),
+    ...((dv.getUint8(1) & 2) !== 0 && headerLen(dv) >= 36 ? { context: {
+      configId: dv.getUint32(24, true),
+      instance: { streamId: dv.getUint32(28, true), generation: dv.getUint32(32, true) },
+    } } : {}),
   };
 }
 

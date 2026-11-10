@@ -220,6 +220,9 @@ pub struct ControllerIntro {
     /// 开始时要不要声音（之后的变化是 `ControllerMsg::Audio`）
     #[n(6)]
     pub audio: bool,
+    /// Optional video contract. Legacy settings remain the fallback for peers without VIDEO_MODEL.
+    #[n(7)]
+    pub video: Option<crate::video::VideoOffer>,
 }
 
 /// 被控端的决定（加密，见 [`HandshakeReply::verdict`]）
