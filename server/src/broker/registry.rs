@@ -43,6 +43,8 @@ pub(super) struct HostEntry {
     tx: SignalTx,
     conn: quinn::Connection,
     sessions: Arc<AtomicUsize>,
+    /// 会话开始时告诉它自己的公网地址（它支持 `OBSERVED_ADDR`）
+    observe: bool,
 }
 
 pub(super) struct Reserved {
@@ -66,6 +68,15 @@ struct Ctrl<'a> {
     peer: SocketAddr,
     name: &'a str,
     tx: &'a SignalTx,
+    /// 会话开始时告诉它自己的公网地址（它支持 `OBSERVED_ADDR`）
+    observe: bool,
+}
+
+/// 服务器看到的这条连接的来源地址（IPv4 映射的 IPv6 地址写成 IPv4）。会话开始时才取：
+/// 客户端换了网络、QUIC 连接迁移了的话是新的地址
+fn observed(conn: &quinn::Connection) -> SocketAddr {
+    let a = conn.remote_address();
+    SocketAddr::new(a.ip().to_canonical(), a.port())
 }
 
 /// 连接请求被拒绝的原因（发给控制端的是 [`Denied::error`]）
@@ -136,6 +147,8 @@ pub(super) struct HostConn<'a> {
     pub(super) name: &'a str,
     pub(super) os: &'a str,
     pub(super) tx: &'a SignalTx,
+    /// 它支持 `OBSERVED_ADDR`（见 [`HostEntry::observe`]）
+    pub(super) observe: bool,
 }
 
 impl Broker {
@@ -296,6 +309,7 @@ impl Broker {
                 tx: host.tx.clone(),
                 conn: host.conn.clone(),
                 sessions: Arc::new(AtomicUsize::new(0)),
+                observe: host.observe,
             },
         );
         Ok((code, barrier))
@@ -410,12 +424,14 @@ impl Broker {
         Ok(Some((secrets.cur, barrier)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn controller_loop(
         self: &Arc<Self>,
         conn_id: u64,
         peer: SocketAddr,
         name: String,
         tx: SignalTx,
+        observe: bool,
         mut recv: RecvStream,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
@@ -425,6 +441,7 @@ impl Broker {
             peer,
             name: &name,
             tx: &tx,
+            observe,
         };
         // 这条连接在等哪些被控端上线（最早的在前面）
         let mut waiting: Vec<u32> = Vec::new();
@@ -529,6 +546,7 @@ impl Broker {
                 name: ctrl.name.to_string(),
                 ip: ctrl.peer.ip(),
             },
+            observed: host.observe.then(|| observed(&host.conn)),
         };
         if host.tx.send(incoming).is_err() {
             // 被控端正在断开（槽位随着会话的登记一起归还）
@@ -548,6 +566,7 @@ impl Broker {
             host_name: host.name.clone(),
             host_os: host.os.clone(),
             resume: self.resume_token(code, &host.secrets.cur),
+            observed: ctrl.observe.then(|| observed(&ctrl.tx.conn)),
         })
     }
 

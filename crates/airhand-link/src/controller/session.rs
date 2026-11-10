@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::direct::Mirrors;
 use crate::secure::{Negotiated, Sealer};
 use crate::transport::{self, FromHost, HostReceiver};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
-    ByeReason, Codec, ControllerMsg, DisplayInfo, HostMsg, Notice, Platform, SystemAction,
+    ByeReason, Codec, ControllerMsg, DirectOffer, DisplayInfo, HostMsg, Notice, Platform,
+    SystemAction,
 };
 use anyhow::Result;
 use bytes::Bytes;
@@ -79,6 +81,8 @@ pub enum SessionEvent {
         width: u16,
         height: u16,
         frames: u64,
+        /// 画面是从直连来的（不经过中转，见 [`crate::direct`]）
+        direct: bool,
     },
     /// 被控端发来的提示，由控制台按自己的界面语言显示
     Notice { notice: NoticeView },
@@ -140,6 +144,8 @@ struct Stats {
     h: u16,
     rtt: Option<f32>,
     last_msg: Instant,
+    /// 最近一帧画面是从直连来的
+    direct: bool,
 }
 
 impl Default for Stats {
@@ -152,6 +158,7 @@ impl Default for Stats {
             h: 0,
             rtt: None,
             last_msg: Instant::now(),
+            direct: false,
         }
     }
 }
@@ -192,6 +199,16 @@ pub(super) struct SessionIo {
     /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
     pub negotiated: Negotiated,
     pub arrivals: Arc<std::sync::Mutex<Arrivals>>,
+    /// 控制、大块通道在直连上的那一份（直连没通时什么也不做）
+    pub mirrors: Mirrors,
+    /// 直连任务（两端都支持直连时才有）
+    pub direct: Option<Direct>,
+}
+
+/// 会话的直连任务（[`crate::direct::controller`]）：被控端发来的候选地址交给它
+pub(super) struct Direct {
+    pub offers: mpsc::Sender<DirectOffer>,
+    pub task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 }
 
 /// 见 [`super::Frontend`]
@@ -221,16 +238,25 @@ pub(super) async fn run(
         mode,
         negotiated,
         arrivals,
+        mirrors,
+        direct,
     } = io;
     info!(sid, ?negotiated, "session started");
+    let (offers, direct_task) = match direct {
+        Some(d) => (Some(d.offers), Some(d.task)),
+        None => (None, None),
+    };
     let local_clip = match mode {
         Mode::Desktop { clip, enabled } => Some((clip, enabled)),
         Mode::Browser => None,
     };
     // Every frontend acknowledges after its last IPC/network hop, not here.
+    // 每一帧写进中转（完整的一份），直连通着的话也从直连发一份（见 crate::direct）
+    let control_mirror = mirrors.control;
     let writer = async move {
         loop {
             let bytes = transport::seal(rx.recv().await?, &mut sealer)?;
+            control_mirror.offer(&bytes);
             tokio::time::timeout(HOST_TIMEOUT, send.write_chunk(bytes)).await??;
         }
         #[allow(unreachable_code)]
@@ -238,7 +264,7 @@ pub(super) async fn run(
     };
     // 大块通道（剪贴板）：和画面一样的优先级，慢了不挡控制消息
     let bulk_writer = async move {
-        transport::write_lane(bulk_send, bulk_rx, bulk_sealer).await?;
+        transport::write_lane(bulk_send, bulk_rx, bulk_sealer, mirrors.bulk).await?;
         // 只有会话结束时才会关闭（发送端在会话手里）
         std::future::pending::<()>().await;
         anyhow::Ok(())
@@ -250,12 +276,22 @@ pub(super) async fn run(
     let out = ui.clone();
     let st = stats.clone();
     let clip_in = local_clip.clone();
+    let keyframe_tx = tx.clone();
     let reader = async move {
         let mut cursor = super::cursor::CursorReceiver::default();
         loop {
             let msg = match recv.recv().await? {
                 // 画面、声音：只看一眼头做统计，原样交给界面
-                FromHost::Video { packet: p, arrived } => {
+                FromHost::Video {
+                    packet: p,
+                    arrived,
+                    direct,
+                    gap,
+                } => {
+                    // 前面有帧断在了直连上：解码器要从关键帧重新开始
+                    if gap {
+                        keyframe_tx.send(ControllerMsg::RequestKeyframe)?;
+                    }
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
@@ -268,6 +304,7 @@ pub(super) async fn run(
                         s.bytes += p.len();
                         s.w = h.width;
                         s.h = h.height;
+                        s.direct = direct;
                     }
                     out.packet(p).map_err(|_| ui_closed())?;
                     continue;
@@ -358,6 +395,12 @@ pub(super) async fn run(
                         height: e.height,
                     });
                 }
+                // 直连的候选地址：交给直连任务（不支持直连时被控端不会发）
+                HostMsg::Direct(offer) => {
+                    if let Some(o) = &offers {
+                        let _ = o.try_send(offer);
+                    }
+                }
             }
         }
         #[allow(unreachable_code)]
@@ -386,6 +429,7 @@ pub(super) async fn run(
                     width: s.w,
                     height: s.h,
                     frames: s.total,
+                    direct: s.direct,
                 };
                 s.frames = 0;
                 s.bytes = 0;
@@ -418,10 +462,18 @@ pub(super) async fn run(
         }
     };
 
+    // 直连任务一直跑到会话结束（不支持直连、或者它不再试了：一直等着）
+    let direct = async move {
+        if let Some(task) = direct_task {
+            task.await;
+        }
+        std::future::pending::<()>().await
+    };
     let result: Result<()> = tokio::select! {
         r = reader => r,
         r = ticker => r,
         () = clipper => Ok(()),
+        () = direct => Ok(()),
         r = writer => r.and(Err(Problem::SessionEnded.into())),
         r = bulk_writer => r.and(Err(Problem::SessionEnded.into())),
     };
@@ -536,8 +588,10 @@ mod tests {
             width: 1,
             height: 1,
             frames: 2,
+            direct: true,
         };
         assert_eq!(serde_json::to_value(&s).unwrap()["rttMs"], json!(null));
+        assert_eq!(serde_json::to_value(&s).unwrap()["direct"], json!(true));
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::Declined),
             retry: false,

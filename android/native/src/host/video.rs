@@ -148,6 +148,21 @@ impl VideoHub {
         self.cv.notify_all();
     }
 
+    /// 这个会话的画面换了一条路（中转 ⇄ 直连，见 `airhand_link::direct`）。`lost`：直连断了，在途的帧不会确认了，
+    /// 也解不出来了：不再等它们，从下一个关键帧重新加入
+    pub fn path_changed(&self, id: u64, lost: bool) {
+        let mut st = self.st.lock().unwrap();
+        if let Some(o) = st.sessions.get_mut(&id) {
+            o.flow.path_changed(lost);
+            if lost {
+                o.need_key = true;
+                st.force_key = true;
+            }
+        }
+        drop(st);
+        self.cv.notify_all();
+    }
+
     pub fn ack_stalled(&self, id: u64) -> bool {
         self.st
             .lock()
@@ -470,6 +485,28 @@ mod tests {
         hub.ack(7, seqs[1], None);
         assert_eq!(inflight(), 0);
         assert!(hub.wait_window(Duration::ZERO));
+    }
+
+    /// 直连断了：断在上面的帧不再占着这个会话的窗口，它从关键帧重新加入
+    #[test]
+    fn a_lost_path_restarts_the_viewer_from_a_keyframe() {
+        let (hub, _) = hub();
+        let (tx, mut rx) = mpsc::channel(QUEUE);
+        hub.add(1, tx);
+        let _ = hub.tick();
+        hub.push(&big(), true, false, 0, Codec::AV1, 8, 8);
+        hub.push(&big(), false, false, 0, Codec::AV1, 8, 8);
+        assert!(!hub.wait_window(Duration::ZERO));
+        for _ in 0..2 {
+            rx.try_recv().unwrap();
+        }
+        hub.path_changed(1, true);
+        assert!(hub.wait_window(Duration::ZERO));
+        assert!(hub.tick().unwrap().key);
+        hub.push(&[1], false, false, 0, Codec::AV1, 8, 8);
+        assert!(rx.try_recv().is_err(), "delta frames after a lost path");
+        hub.push(&[2], true, false, 0, Codec::AV1, 8, 8);
+        assert!(decode(&rx.try_recv().unwrap()).key);
     }
 
     #[test]

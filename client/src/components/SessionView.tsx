@@ -234,6 +234,11 @@ export function SessionView({ s }: { s: RemoteSession }) {
                 <span>{Math.round(st.fps)} fps</span>
                 <span>{fmtKbps(st.kbps)}</span>
                 <span className={`rtt ${rttClass}`}>{rtt != null ? `${rtt} ms` : "— ms"}</span>
+                {st.width > 0 && (
+                  <span className="muted" title={t("session.pathTitle")}>
+                    {st.direct ? t("session.direct") : t("session.relayed")}
+                  </span>
+                )}
                 {s.syncActive && s.syncStats.videoDelayMs >= 5 && (
                   <span className="muted" title={t("session.syncTitle")}>
                     {t("session.sync", { ms: Math.round(s.syncStats.videoDelayMs) })}

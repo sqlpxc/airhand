@@ -40,7 +40,12 @@
 //! # 声音
 //!
 //! 被控端的声音包走 QUIC 数据报（见 `airhand_proto::datagram`）。一条连接上可能有好几个会话，
-//! 连接的读任务按数据报开头的会话 ID 交给对应会话的 [`HostReceiver`]。
+//! 连接的读任务按数据报开头的会话 ID 交给对应会话的 [`HostReceiver`]（探测数据报交给会话的直连任务）。
+//!
+//! # 直连
+//!
+//! 两端都支持时，会话开始之后被控端发来候选地址，控制端从连服务器的那个 endpoint 连过去（见 [`crate::direct`]）。
+//! 连上了对界面没有什么不同，只是更快；画面从直连来的时候 [`SessionEvent::Stats`] 的 `direct` 是 true。
 
 mod cursor;
 mod queue;
@@ -51,6 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::direct::{self, Mirrors, Via};
 use crate::secure::{self, Identity, InitiatorParams};
 use crate::transport::{HostReceiver, Openers, open_session};
 use crate::wire::{read_msg, write_msg};
@@ -58,10 +64,10 @@ use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram, features};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use quinn::Connection;
+use quinn::{Connection, Endpoint};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
@@ -205,8 +211,14 @@ pub struct ConnectOptions {
     pub audio: bool,
 }
 
-/// 会话 ID → 交给这个会话的声音数据报
-type Datagrams = Mutex<HashMap<u64, mpsc::Sender<Bytes>>>;
+/// 一个会话的数据报交给谁：声音交给接收端，探测交给直连任务（见 [`crate::direct`]）
+struct SessionDatagrams {
+    audio: mpsc::Sender<Bytes>,
+    probes: mpsc::Sender<(Via, Bytes)>,
+}
+
+/// 会话 ID → 交给这个会话的数据报
+type Datagrams = Mutex<HashMap<u64, SessionDatagrams>>;
 
 /// 会话收数据报的登记，丢掉时注销（会话结束、被中止，或者还没开始就失败了）
 struct DatagramRoute {
@@ -227,6 +239,8 @@ impl Drop for DatagramRoute {
 #[derive(Clone)]
 struct Live {
     conn: Connection,
+    /// 连服务器的 endpoint：直连也从它发起（同一个 socket，见 [`crate::direct`]）
+    endpoint: Endpoint,
     tx: mpsc::Sender<ClientMsg>,
     pending: Pending,
 }
@@ -366,11 +380,14 @@ impl ControllerService {
 
         // 先登记再开流：被控端一开始发声音，数据报就有地方去
         let (dgram_tx, dgram_rx) = mpsc::channel(DATAGRAM_QUEUE);
-        self.inner
-            .datagrams
-            .lock()
-            .unwrap()
-            .insert(grant.session_id, dgram_tx);
+        let (probe_tx, probe_rx) = mpsc::channel(DATAGRAM_QUEUE);
+        self.inner.datagrams.lock().unwrap().insert(
+            grant.session_id,
+            SessionDatagrams {
+                audio: dgram_tx.clone(),
+                probes: probe_tx.clone(),
+            },
+        );
         let route = DatagramRoute {
             inner: self.inner.clone(),
             session_id: grant.session_id,
@@ -402,6 +419,7 @@ impl ControllerService {
         .await
         .map_err(|e| Problem::from_error(e, Problem::failed))?;
         let secured = init.secured;
+        let negotiated = init.negotiated;
         let (bulk_send, bulk_recv) = streams.bulk;
         let recv = HostReceiver::new(
             recv,
@@ -421,6 +439,33 @@ impl ControllerService {
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
         let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
+        // 直连（两端都支持时）：等被控端发来候选地址
+        let mirrors = Mirrors::default();
+        let direct = negotiated.has(features::session::DIRECT).then(|| {
+            let (offers_tx, offers) = mpsc::channel(4);
+            let answer = tx.clone();
+            let task = direct::controller::run(direct::controller::Session {
+                endpoint: live.endpoint.clone(),
+                relay: live.conn.clone(),
+                session_id: grant.session_id,
+                observed: grant.observed,
+                key: secured.direct,
+                probe: secured.probe,
+                offers,
+                answer: Box::new(move |offer| {
+                    let _ = answer.send(ControllerMsg::Direct(offer));
+                }),
+                attach: recv.attach(),
+                mirrors: mirrors.clone(),
+                audio: dgram_tx,
+                probes: probe_rx,
+                probe_tx,
+            });
+            session::Direct {
+                offers: offers_tx,
+                task: Box::pin(task),
+            }
+        });
         let (mode, clipboard) = match frontend {
             Frontend::Desktop { clipboard, sync } => {
                 let enabled = Arc::new(AtomicBool::new(sync));
@@ -440,8 +485,10 @@ impl ControllerService {
             recv,
             ui,
             mode,
-            negotiated: init.negotiated,
+            negotiated,
             arrivals: arrivals.clone(),
+            mirrors,
+            direct,
         };
         let inner = self.inner.clone();
         let tx2 = tx.clone();
@@ -589,6 +636,7 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     let pending: Pending = Arc::default();
     *inner.live.lock().unwrap() = Some(Live {
         conn: sig.conn.clone(),
+        endpoint: sig.endpoint.clone(),
         tx,
         pending: pending.clone(),
     });
@@ -598,7 +646,7 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     let mut send = sig.send;
     let mut recv = sig.recv;
     let inner = inner.clone();
-    // 声音数据报：按会话 ID 交给会话（见模块说明的"声音"）
+    // 数据报：按会话 ID 交给会话（见模块说明的"声音"）。会话跟不上（或者已经结束了）就丢掉这一包
     let dgram_conn = sig.conn.clone();
     let dgram_inner = inner.clone();
     let datagrams = async move {
@@ -607,15 +655,18 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
             let Some(session_id) = datagram::session(&d) else {
                 continue;
             };
-            let to = dgram_inner
-                .datagrams
-                .lock()
-                .unwrap()
-                .get(&session_id)
-                .cloned();
-            // 会话跟不上（或者已经结束了）就丢掉这一包
-            if let Some(to) = to {
-                let _ = to.try_send(d.slice(datagram::HEADER..));
+            let routes = dgram_inner.datagrams.lock().unwrap();
+            let Some(to) = routes.get(&session_id) else {
+                continue;
+            };
+            match datagram::kind(&d) {
+                Some(datagram::AUDIO) => {
+                    let _ = to.audio.try_send(d);
+                }
+                Some(datagram::PROBE) => {
+                    let _ = to.probes.try_send((Via::Relay, d));
+                }
+                _ => {}
             }
         }
         #[allow(unreachable_code)]

@@ -64,7 +64,8 @@ impl Place {
             | HostMsg::Encoder(_)
             | HostMsg::CursorImage { .. }
             | HostMsg::Clipboard { .. }
-            | HostMsg::Bye(_) => queued(None),
+            | HostMsg::Bye(_)
+            | HostMsg::Direct(_) => queued(None),
         }
     }
 

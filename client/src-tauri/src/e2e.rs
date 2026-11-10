@@ -301,7 +301,9 @@ async fn e2e_roundtrip() {
             Err(_) => continue, // 画面静止时不会有帧
         };
         let msg = match msg {
-            FromHost::Video { packet: p, arrived } => {
+            FromHost::Video {
+                packet: p, arrived, ..
+            } => {
                 let v = VideoHeader::decode(&p).expect("画面包的头");
                 let data = media::payload(&p).expect("画面包的负载");
                 let age = age_ms(v.capture_us);
@@ -380,6 +382,8 @@ async fn e2e_roundtrip() {
                 }
             }
             HostMsg::Bye(reason) => panic!("意外的 Bye: {reason:?}"),
+            // 这个协议级的控制端不建直连（不回答，被控端就一直走中转）
+            HostMsg::Direct(_) => {}
             HostMsg::Displays { .. } => {}
             HostMsg::AwaitingApproval => panic!("桌面被控端不会请本机用户同意"),
             HostMsg::Notice(notice) => {

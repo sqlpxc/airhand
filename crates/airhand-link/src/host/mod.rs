@@ -13,7 +13,9 @@
 //!   Ping 也在读任务里回 Pong，画面确认在读任务里交给平台的 [`Acks`]，不等会话的主循环；
 //! * [`Outbox`]（[`queue`]）：发给控制端的消息。按消息挑通道（大的走大块通道），只关心最新值的状态
 //!   （Pong、显示器列表、光标可见性）只留最新的一个、排在前面；
-//! * [`CursorCache`]：控制端缓存了哪些光标形状。
+//! * [`CursorCache`]：控制端缓存了哪些光标形状；
+//! * 直连（[`crate::direct`]）：每条服务器连接一个 [`DirectHub`]（接受控制端连过来的直连），每个会话一个直连任务
+//!   （在 [`HostStreams`] 里）。
 
 mod clock;
 mod cursor;
@@ -36,6 +38,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::ServerState;
+pub use crate::direct::{DirectHub, HostLink};
 use crate::net::{self, LinkConfig, Reconnect, Report};
 use crate::tasks::OwnedTask;
 use crate::wire::{read_msg, write_msg};
@@ -98,6 +101,8 @@ pub struct Incoming {
     pub kick: watch::Receiver<ByeReason>,
     /// 在等本机用户回答的连接请求的名额，这个被控端服务的所有会话共用（见 [`MAX_PENDING_APPROVALS`]）
     pub approvals: ApprovalSlots,
+    /// 直连（见 [`crate::direct`]）：这条服务器连接上的 [`DirectHub`] 和服务器看到的本机地址；`None`：不建直连
+    pub direct: Option<HostLink>,
 }
 
 /// 被控端服务：一直连着服务器，直到 future 被丢掉（丢掉时依次释放会话、QUIC 连接）。
@@ -221,6 +226,9 @@ where
     events.registered(got, changed).await;
     info!(code, "host connected to the server");
     events.server(ServerState::Connected);
+    // 控制端连过来的直连、中转转来的探测数据报（见 crate::direct）。服务器不告诉本机公网地址的话，
+    // 局域网里照样连得上
+    let (hub, _hub_tasks) = DirectHub::start(&sig.endpoint, &sig.punch, &sig.conn);
 
     let mut sessions: JoinSet<u64> = JoinSet::new();
     // 每次发送都会让所有会话向控制端发送 Bye（带上这个原因）并结束
@@ -230,7 +238,7 @@ where
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Some(ServerMsg::Incoming { session_id, peer }) => {
+                Some(ServerMsg::Incoming { session_id, peer, observed }) => {
                     info!(session_id, name = %peer.name, ip = %peer.ip, "controller wants to connect");
                     let run = session(Incoming {
                         conn: sig.conn.clone(),
@@ -239,6 +247,10 @@ where
                         peer,
                         kick: kick_tx.subscribe(),
                         approvals: approvals.clone(),
+                        direct: Some(HostLink {
+                            hub: hub.clone(),
+                            observed,
+                        }),
                     });
                     sessions.spawn(async move {
                         run.await;

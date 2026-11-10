@@ -31,6 +31,11 @@
 //! 网络里最多也只积压这么久的数据；编码器等着，等到了就编最新的画面。没有在途的帧时总能发一帧，关键帧再大也不会卡住。
 //! 另外最多 [`MAX_WINDOW`] 帧、[`MAX_INFLIGHT_BYTES`] 字节：中转往控制端的连接上所有会话共用一个发送窗口，
 //! 画面占满了它，同一连接上的 Pong、Bye 也写不进去。
+//!
+//! **换路**（中转 ⇄ 直连，见 `crate::direct`，[`FlowState::path_changed`]）：新的路时延不一样，基础 RTT、
+//! 最小单向时延从头量（不然换到慢一点的路会被当成排队、白白降码率），换路之前发出的帧确认回来时不算样本
+//! （它们走的是旧路）；码率的估计接着用。
+//! 直连断了换回中转时，断在直连上的帧永远不会确认了：不再算在途，编码器马上能发下一帧（关键帧）。
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -136,6 +141,8 @@ pub struct FlowState {
     adaptive: bool,
     /// 上次调码率以来，在途字节挡住过要发的帧（[`FlowState::note_blocked`]）
     blocked: bool,
+    /// 换了路（[`FlowState::path_changed`]）：这一帧和之前发的走的是旧路，确认时不算时延样本
+    old_path: Option<u32>,
 }
 
 impl Default for FlowState {
@@ -154,6 +161,7 @@ impl Default for FlowState {
             rate: Rate::new(QualitySettings::default().bitrate_kbps),
             adaptive: true,
             blocked: false,
+            old_path: None,
         }
     }
 }
@@ -202,6 +210,13 @@ impl FlowState {
             }
         }
         let Some(f) = acked else { return };
+        // 旧路上发的帧：时延是旧路的，不能拿来当新路的基准
+        if let Some(last) = self.old_path {
+            if f.seq.wrapping_sub(last) as i32 <= 0 {
+                return;
+            }
+            self.old_path = None;
+        }
         let rtt = now.saturating_duration_since(f.at).as_secs_f64() * 1000.0;
         self.srtt_ms = if self.srtt_ms == 0.0 {
             rtt
@@ -344,6 +359,20 @@ impl FlowState {
     /// (平滑的 RTT, 基础 RTT)，毫秒；还没有样本时是 0
     pub fn rtt(&self) -> (f64, f64) {
         (self.srtt_ms, self.min_rtt.get().unwrap_or(0.0))
+    }
+
+    /// 画面换了一条路（见模块说明的"换路"）。`lost`：旧路断了，在途的帧不会确认了
+    pub fn path_changed(&mut self, lost: bool) {
+        self.min_rtt = WindowMin::default();
+        self.min_owd = WindowMin::default();
+        self.samples.clear();
+        // 还在旧路上的帧确认回来时不算时延样本（旧路快的话，新路会被当成一直在排队）
+        self.old_path = Some(self.sent);
+        if lost {
+            self.pending.clear();
+            self.pending_bytes = 0;
+            self.acked = self.sent;
+        }
     }
 }
 
@@ -538,6 +567,11 @@ impl Flow {
     pub fn ack_stalled(&self) -> bool {
         self.state.lock().unwrap().ack_stalled()
     }
+    /// 见 [`FlowState::path_changed`]
+    pub fn path_changed(&self, lost: bool) {
+        self.state.lock().unwrap().path_changed(lost);
+        self.cv.notify_all();
+    }
     /// 见 [`FlowState::set_target`]
     pub fn set_target(&self, kbps: u32, adaptive: bool) {
         self.state.lock().unwrap().set_target(kbps, adaptive);
@@ -583,6 +617,45 @@ mod tests {
         state.on_sent(0, 100);
         state.on_ack(0, None);
         assert_eq!(state.inflight(), 0);
+    }
+
+    /// 直连断了：断在上面的帧不再占着窗口，之后（新路上）的确认照常；迟到的旧确认不算。
+    /// 只是换了路（两条都通）：在途的照样等确认，时延的基准从头量
+    #[test]
+    fn a_lost_path_frees_the_window() {
+        let f = Flow::default();
+        let stop = AtomicBool::new(false);
+        let window = f.state.lock().unwrap().window_bytes();
+        let lost = f.sent(window);
+        assert!(!f.wait_room(1, &stop, Duration::ZERO));
+        f.path_changed(false);
+        assert!(!f.wait_room(1, &stop, Duration::ZERO));
+        f.path_changed(true);
+        assert!(f.wait_room(window, &stop, Duration::ZERO));
+        let next = f.sent(100);
+        f.ack(lost, Some(1));
+        assert_eq!(f.state.lock().unwrap().inflight(), 1);
+        f.ack(next, Some(2));
+        assert_eq!(f.state.lock().unwrap().inflight(), 0);
+        {
+            let s = f.state.lock().unwrap();
+            assert!(s.min_owd.get().is_some() && s.min_rtt.get().is_some());
+        }
+        // 换到一条慢一些的路：旧路上的帧确认回来时不算样本，新路上的才算
+        let old = f.sent(100);
+        f.path_changed(false);
+        {
+            let s = f.state.lock().unwrap();
+            assert!(s.min_owd.get().is_none() && s.min_rtt.get().is_none());
+        }
+        let new = f.sent(100);
+        f.ack(old, Some(10_000));
+        assert!(f.state.lock().unwrap().min_owd.get().is_none());
+        assert_eq!(f.state.lock().unwrap().inflight(), 1);
+        f.ack(new, Some(90_000));
+        let s = f.state.lock().unwrap();
+        assert!(s.min_owd.get().is_some() && s.min_rtt.get().is_some());
+        assert_eq!(s.queue_delay(), Some(0.0));
     }
 
     #[test]

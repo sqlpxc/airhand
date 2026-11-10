@@ -3,6 +3,7 @@
 //! * [`net`]：QUIC 连接、证书固定、版本握手、断线重连；
 //! * [`wire`]：从流里读写长度前缀帧（帧的格式和消息的编解码在 `airhand_proto::framing`，那边不碰 IO）；
 //! * [`transport`]：会话的四条流（控制、画面、声音、大块）；
+//! * [`direct`]：中转之外两端之间的直连（打洞、证明对面是谁、画面走哪条路），[`merge`]：几条路上的帧按计数排好；
 //! * [`secure`]：端到端加密：设备的身份密钥、控制通道上的握手、每一帧的加解密；
 //! * [`controller`]：控制端服务与会话。与界面无关：界面的命令是 [`controller::Command`]，
 //!   画面和事件交给 [`controller::SessionUi`]；
@@ -18,9 +19,13 @@
 #[cfg(feature = "client")]
 pub mod controller;
 #[cfg(feature = "client")]
+pub mod direct;
+#[cfg(feature = "client")]
 pub mod flow;
 #[cfg(feature = "client")]
 pub mod host;
+#[cfg(feature = "client")]
+pub mod merge;
 #[cfg(feature = "client")]
 pub mod net;
 #[cfg(feature = "client")]

@@ -45,7 +45,15 @@
 //! 收到它的时刻（[`ControllerMsg::Input::t`]，和 [`ControllerMsg::Ping`] 是同一个时钟），比平时晚到超过
 //! [`INPUT_MAX_AGE`] 的输入被控端不执行，改成释放所有按键（丢掉的里面可能有松开按键）。
 //! 两边的时钟不需要同步，见 `airhand_link::host` 的 `InputClock`。
+//!
+//! # 直连
+//!
+//! 两端都支持 [`crate::features::session::DIRECT`] 时，会话开始之后（被控端发了 [`HostMsg::Hello`] 之后）
+//! 被控端发 [`HostMsg::Direct`]（本端的候选地址），控制端回 [`ControllerMsg::Direct`]（它的候选地址），
+//! 然后两端打洞、建直连（见 crate 说明的"直连"）。地址在加密的控制通道上，中转看不到局域网地址。
+//! 直连断了被控端可以再发一轮（`round` 加 1），控制端按最新的一轮回答。
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use minicbor::{Decode, Encode};
@@ -111,7 +119,24 @@ pub enum HostMsg {
         #[n(1)]
         image: CursorShape,
     },
+    /// 被控端的直连候选地址：开始（第 `round` 轮）打洞（见模块说明的"直连"）
+    #[n(11)]
+    Direct(#[n(0)] DirectOffer),
 }
+
+/// 一端的直连候选地址（见模块说明的"直连"）
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+pub struct DirectOffer {
+    /// 第几轮（被控端发起，从 1 开始；控制端回答时照抄）
+    #[n(0)]
+    pub round: u32,
+    /// 本端的地址：服务器看到的公网地址、局域网地址……（最多 [`MAX_DIRECT_ADDRS`] 个）
+    #[n(1)]
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// [`DirectOffer`] 里最多这么多个地址（多出来的不用）
+pub const MAX_DIRECT_ADDRS: usize = 8;
 
 impl HostMsg {
     /// 这条消息走哪条通道（见模块说明的"走哪条通道"）
@@ -125,7 +150,8 @@ impl HostMsg {
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
             | HostMsg::Cursor { .. }
-            | HostMsg::Bye(_) => SessionLane::Control,
+            | HostMsg::Bye(_)
+            | HostMsg::Direct(_) => SessionLane::Control,
         }
     }
 }
@@ -401,6 +427,9 @@ pub enum ControllerMsg {
         #[n(0)]
         enabled: bool,
     },
+    /// 控制端的直连候选地址，回答 [`HostMsg::Direct`]（见模块说明的"直连"）
+    #[n(9)]
+    Direct(#[n(0)] DirectOffer),
 }
 
 impl ControllerMsg {
@@ -413,7 +442,8 @@ impl ControllerMsg {
             | Self::RequestKeyframe
             | Self::SelectDisplay { .. }
             | Self::Ping { .. }
-            | Self::Audio { .. } => SessionLane::Control,
+            | Self::Audio { .. }
+            | Self::Direct(_) => SessionLane::Control,
         }
     }
 }

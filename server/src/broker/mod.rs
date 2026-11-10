@@ -295,7 +295,12 @@ impl Broker {
             tokio::time::sleep(Duration::from_millis(500)).await;
             return Ok(());
         };
-        info!(%peer, conn_id, ?role, %name, %os, version, "client connected");
+        // 客户端支持的话，会话开始时告诉它自己的公网地址（直连打洞用，见 airhand_proto::signal 的"公网地址"）
+        let observe = hello
+            .features
+            .common(features::signal::SUPPORTED)
+            .has(features::signal::OBSERVED_ADDR);
+        info!(%peer, conn_id, ?role, %name, %os, version, observe, "client connected");
 
         let (tx, rx) = mpsc::channel::<ServerMsg>(64);
         let tx = SignalTx {
@@ -321,11 +326,12 @@ impl Broker {
                     name: &name,
                     os: &os,
                     tx: &tx,
+                    observe,
                 };
                 self.host_loop(&host, recv, &mut buf, &mut host_code).await
             }
             Role::Controller => {
-                self.controller_loop(conn_id, peer, name, tx, recv, &mut buf)
+                self.controller_loop(conn_id, peer, name, tx, observe, recv, &mut buf)
                     .await
             }
         };

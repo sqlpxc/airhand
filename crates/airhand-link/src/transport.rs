@@ -4,25 +4,29 @@
 //! （整条连接的拥塞控制还是共用的，网络满了声音也会慢）。
 //!
 //! * 双方：[`open_session`] 打开四条流，之后在控制流上握手（[`crate::secure`]）；
-//! * 双方：[`write_lane`] 把排好队的帧加密后写进一条流；被控端的 [`write_audio`] 把声音包加密后发成数据报
+//! * 双方：[`write_lane`] 把排好队的帧加密后写进一条流（直连通着的话也从直连发一份）；
+//!   被控端的 [`write_video`] 把画面写进现在走的那条路，[`write_audio`] 把声音包加密后发成数据报
 //!   （见 [`crate::host::HostStreams`]）；
-//! * 控制端：[`HostReceiver`] 从四条流和数据报读被控端发来的东西，解密。
+//! * 控制端：[`HostReceiver`] 从四条流和数据报读被控端发来的东西，解密。直连上的流通了之后加进来，
+//!   和中转上的按计数合并（[`crate::merge`]）。
 //!
 //! 声音走 QUIC 数据报（`airhand_proto::datagram`）：不重传，也不排在丢了的包后面等重传，
 //! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流，和数据报用同一把密钥、同一串计数。
-use crate::wire::{read_frame, read_packet, read_packet_timed};
+use crate::direct::{Attach, Mirror, Route};
+use crate::merge::{Merge, Policy};
+use crate::wire::read_packet;
 use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, Kind};
 use airhand_proto::session::HostMsg;
 use airhand_proto::{Role, SessionHeader, SessionLane, datagram};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::debug;
 
@@ -62,38 +66,111 @@ async fn write_sealed(send: &mut SendStream, sealed: Bytes) -> Result<()> {
     Ok(())
 }
 
-/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 发完后正常结束这条流
+/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 发完后正常结束这条流。
+/// 控制、大块通道：直连通着的话每一帧也交给 `mirror` 从直连发一份（中转上照样是完整的一份，见 [`crate::direct`]）
 pub async fn write_lane(
     mut send: SendStream,
     mut rx: impl Frames,
     mut sealer: Sealer,
+    mirror: Mirror,
 ) -> Result<()> {
     while let Some(bytes) = rx.next().await {
-        write_sealed(&mut send, seal(bytes, &mut sealer)?).await?;
+        let sealed = seal(bytes, &mut sealer)?;
+        mirror.offer(&sealed);
+        write_sealed(&mut send, sealed).await?;
     }
     send.finish()?;
     Ok(())
 }
 
+/// 直连上一帧画面这么久写不进去，就当它断了（这一帧改从中转发）
+const DIRECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 被控端的画面：`rx` 里排好队的画面包加密后写进现在走的那条路（`route`，由直连任务按两条路的时延决定）。
+/// 往直连上写不进去（断了、堵死了）就放弃直连上的这条流，这一帧改写进中转，并通知 `broken`；
+/// 接收端按计数排好（见 [`crate::merge`]）。中转上写不进去是错误：会话结束
+pub async fn write_video(
+    mut relay: SendStream,
+    mut rx: mpsc::Receiver<Bytes>,
+    mut sealer: Sealer,
+    mut route: watch::Receiver<Route>,
+    broken: Arc<Notify>,
+) -> Result<()> {
+    // 直连上画面的流：哪条连接上的（`stable_id`）
+    let mut direct: Option<(usize, SendStream)> = None;
+    while let Some(frame) = rx.recv().await {
+        let sealed = seal(frame, &mut sealer)?;
+        let media = route.borrow_and_update().media.clone();
+        if let Some(conn) = media {
+            match write_direct(&conn, &mut direct, sealed.clone(), &mut route).await {
+                Ok(()) => continue,
+                Err(e) => {
+                    debug!("writing video to the direct path failed: {e:#}");
+                    if let Some((_, mut s)) = direct.take() {
+                        let _ = s.reset(0u32.into());
+                    }
+                    broken.notify_one();
+                }
+            }
+        }
+        write_sealed(&mut relay, sealed).await?;
+    }
+    relay.finish()?;
+    if let Some((_, mut s)) = direct {
+        let _ = s.finish();
+    }
+    Ok(())
+}
+
+/// 往直连上写一帧画面（这条连接上还没有画面的流就开一条）。写的时候换了路也算失败：这一帧改从中转发
+async fn write_direct(
+    conn: &Connection,
+    direct: &mut Option<(usize, SendStream)>,
+    sealed: Bytes,
+    route: &mut watch::Receiver<Route>,
+) -> Result<()> {
+    if direct
+        .as_ref()
+        .is_none_or(|(id, _)| *id != conn.stable_id())
+    {
+        let s = crate::direct::open_lane(conn, SessionLane::Video).await?;
+        *direct = Some((conn.stable_id(), s));
+    }
+    let (_, s) = direct.as_mut().expect("opened above");
+    tokio::select! {
+        r = tokio::time::timeout(DIRECT_WRITE_TIMEOUT, s.write_chunk(sealed)) => {
+            r.context("the direct path stalled")??;
+            Ok(())
+        }
+        _ = route.changed() => anyhow::bail!("switched paths while writing"),
+    }
+}
+
 /// 被控端的声音：`rx` 里排好队的声音包（[`media::frame`] 编好的，带长度前缀）加密后发成数据报，
-/// 放不进一个数据报的、或者连接不支持数据报的加密后写进声音流 `send`。`rx` 关闭后正常结束声音流
+/// 发在画面走的那条路上（`route`）。放不进一个数据报的、或者连接不支持数据报的加密后写进中转上的声音流 `send`。
+/// `rx` 关闭后正常结束声音流
 pub async fn write_audio(
-    conn: Connection,
+    relay: Connection,
     session_id: u64,
     mut send: SendStream,
     mut rx: mpsc::Receiver<Bytes>,
     mut sealer: Sealer,
+    route: watch::Receiver<Route>,
 ) -> Result<()> {
     while let Some(framed) = rx.recv().await {
         let packet = framed.get(framing::PREFIX..).unwrap_or_default();
         let size = datagram::HEADER + packet.len() + SEAL_OVERHEAD;
+        let direct = route.borrow().media.clone();
+        let conn = direct.as_ref().unwrap_or(&relay);
         let fits = conn
             .max_datagram_size()
             .is_some_and(|max| size <= max.min(datagram::MAX));
         if fits {
-            let d = sealer.seal_datagram(session_id, packet)?;
+            let d = sealer.seal_datagram(session_id, datagram::AUDIO, packet)?;
             match conn.send_datagram(Bytes::from(d)) {
                 Ok(()) => continue,
+                // 直连断了：这一包丢了就丢了（直连任务会把路改回中转）
+                Err(SendDatagramError::ConnectionLost(_)) if direct.is_some() => continue,
                 Err(SendDatagramError::ConnectionLost(e)) => return Err(e.into()),
                 // 对方不收数据报、太大了：走声音流（这个计数没用上，接收端本来就容许跳过）
                 Err(_) => {}
@@ -105,7 +182,7 @@ pub async fn write_audio(
     Ok(())
 }
 
-/// 连接上发给会话 `session_id` 的数据报（去掉会话 ID，还是密文）。连接上只有一个会话的控制端用
+/// 连接上发给会话 `session_id` 的声音数据报（整个数据报，还是密文）。连接上只有一个会话的控制端用
 ///（测试、调试工具）；[`crate::controller::ControllerService`] 自己按会话分发
 pub fn session_datagrams(conn: &Connection, session_id: u64) -> mpsc::Receiver<Bytes> {
     let (tx, rx) = mpsc::channel(16);
@@ -113,8 +190,8 @@ pub fn session_datagrams(conn: &Connection, session_id: u64) -> mpsc::Receiver<B
     tokio::spawn(async move {
         while let Ok(d) = conn.read_datagram().await {
             if datagram::session(&d) == Some(session_id)
-                && let Err(mpsc::error::TrySendError::Closed(_)) =
-                    tx.try_send(d.slice(datagram::HEADER..))
+                && datagram::kind(&d) == Some(datagram::AUDIO)
+                && let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(d)
             {
                 break;
             }
@@ -170,8 +247,14 @@ pub enum FromHost {
     /// 控制流、大块通道上的消息
     Control(HostMsg),
     /// 画面包（[`media`] 格式：头 + 码流），原样交给界面。`arrived`：开始从网络上到达的时刻
-    /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerMsg::Ack`）
-    Video { packet: Vec<u8>, arrived: u64 },
+    /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerMsg::Ack`）。
+    /// `direct`：从直连来的；`gap`：前面有帧没等到（断在了直连上），要一个关键帧（见 [`crate::merge`]）
+    Video {
+        packet: Vec<u8>,
+        arrived: u64,
+        direct: bool,
+        gap: bool,
+    },
     /// 声音包（[`media`] 格式：头 + Opus 包），原样交给界面
     Audio(Vec<u8>),
 }
@@ -189,6 +272,7 @@ pub struct Openers {
 ///
 /// 每条流一个读任务，读任务活到流结束：`select!` / 超时只会取消通道上的接收，不会切断半帧。
 /// 几个有界的信箱互相独立，画面、剪贴板再多也挡不住 Pong 和 Bye。
+/// 直连通了之后，被控端在直连上开的控制、大块、画面通道经 [`HostReceiver::attach`] 加进来。
 pub struct HostReceiver {
     control: mpsc::Receiver<Result<FromHost>>,
     bulk: mpsc::Receiver<Result<FromHost>>,
@@ -198,6 +282,7 @@ pub struct HostReceiver {
     video_open: bool,
     audio_open: bool,
     audio_order: AudioOrder,
+    attach: Attach,
     _tasks: JoinSet<()>,
     // 画面流和声音流反方向的一半用不到，但要留到会话结束
     _reverse: (SendStream, SendStream),
@@ -205,7 +290,7 @@ pub struct HostReceiver {
 
 impl HostReceiver {
     /// `control` / `bulk`：控制流、大块通道收的一半（发的一半由控制端的会话自己用）；
-    /// `datagrams`：发给这个会话的数据报（去掉了会话 ID），里面是加密的声音包
+    /// `datagrams`：发给这个会话的声音数据报（整个数据报，还是密文）
     pub fn new(
         control: RecvStream,
         bulk: RecvStream,
@@ -222,19 +307,40 @@ impl HostReceiver {
         }
         audio_reader(&mut tasks, audio.1, audio_opener, audio_tx);
         let (video_tx, video_rx) = mpsc::channel(2);
-        video_reader(&mut tasks, video.1, openers.video, video_tx);
+        let (video_send, video_recv) = video;
+        let (video_merge, attach_video) =
+            Merge::new(SessionLane::Video, Policy::Video, openers.video, video_recv);
+        video_reader(&mut tasks, video_merge, video_tx);
+        let (control, attach_control) = Merge::new(
+            SessionLane::Control,
+            Policy::Complete,
+            openers.control,
+            control,
+        );
+        let (bulk, attach_bulk) =
+            Merge::new(SessionLane::Bulk, Policy::Complete, openers.bulk, bulk);
         Self {
-            control: message_reader(&mut tasks, control, openers.control, SessionLane::Control),
-            bulk: message_reader(&mut tasks, bulk, openers.bulk, SessionLane::Bulk),
+            control: message_reader(&mut tasks, control, SessionLane::Control),
+            bulk: message_reader(&mut tasks, bulk, SessionLane::Bulk),
             video: video_rx,
             audio: audio_rx,
             bulk_open: true,
             video_open: true,
             audio_open: true,
             audio_order: AudioOrder::default(),
+            attach: Attach {
+                control: Some(attach_control),
+                bulk: Some(attach_bulk),
+                video: Some(attach_video),
+            },
             _tasks: tasks,
-            _reverse: (video.0, audio.0),
+            _reverse: (video_send, audio.0),
         }
+    }
+
+    /// 直连上被控端开的通道交给谁（见 [`crate::direct`]）
+    pub(crate) fn attach(&self) -> Attach {
+        self.attach.clone()
     }
 
     /// 下一样东西。控制消息优先；控制流结束了就是会话结束了（其它流先结束不算）
@@ -299,41 +405,54 @@ async fn forward(tx: &mpsc::Sender<Result<FromHost>>, r: Result<Option<FromHost>
     tx.send(r).await.is_ok() && more
 }
 
-/// 读一条被控端的控制消息（解密、解码）；对方版本新增的消息跳过。流在消息边界处结束时为 `None`
-async fn next_host_msg(
-    recv: &mut RecvStream,
-    opener: &mut Opener,
-    buf: &mut Vec<u8>,
-    lane: SessionLane,
-) -> Result<Option<HostMsg>> {
+/// 一条消息通道（控制、大块）上的消息：解码、检查通道；对方版本新增的消息跳过。通道结束时为 `None`。
+/// 被控端和控制端共用（`M` 是对方发来的消息）
+pub(crate) async fn next_msg<M>(merge: &mut Merge, lane: SessionLane) -> Result<Option<M>>
+where
+    M: for<'b> airhand_proto::minicbor::Decode<'b, ()> + LaneOf,
+{
     loop {
-        if !read_frame(recv, lane.max_frame_size(), buf).await? {
+        let Some(frame) = merge.next().await? else {
             return Ok(None);
-        }
-        opener.open(buf)?;
-        match framing::decode::<HostMsg>(buf)? {
+        };
+        match framing::decode::<M>(&frame.data)? {
             Decoded::Msg(m) => {
-                anyhow::ensure!(m.lane() == lane, "host message on the wrong lane");
+                anyhow::ensure!(m.lane() == lane, "a message on the wrong lane");
                 return Ok(Some(m));
             }
-            Decoded::Unknown(variant) => debug!(variant, "skipping a message from a newer host"),
+            Decoded::Unknown(variant) => debug!(variant, "skipping a message from a newer peer"),
         }
     }
 }
 
-/// 读一条消息流（控制流、大块通道）
+/// 消息走哪条通道（[`next_msg`] 检查用）
+pub(crate) trait LaneOf {
+    fn lane(&self) -> SessionLane;
+}
+
+impl LaneOf for HostMsg {
+    fn lane(&self) -> SessionLane {
+        HostMsg::lane(self)
+    }
+}
+
+impl LaneOf for airhand_proto::session::ControllerMsg {
+    fn lane(&self) -> SessionLane {
+        airhand_proto::session::ControllerMsg::lane(self)
+    }
+}
+
+/// 读一条消息通道（控制、大块）
 fn message_reader(
     tasks: &mut JoinSet<()>,
-    mut recv: RecvStream,
-    mut opener: Opener,
+    mut merge: Merge,
     lane: SessionLane,
 ) -> mpsc::Receiver<Result<FromHost>> {
     let capacity = (4 * 1024 * 1024 / lane.max_frame_size()).min(16);
     let (tx, rx) = mpsc::channel(capacity);
     tasks.spawn(async move {
-        let mut buf = Vec::new();
         loop {
-            let r = next_host_msg(&mut recv, &mut opener, &mut buf, lane)
+            let r = next_msg::<HostMsg>(&mut merge, lane)
                 .await
                 .map(|m| m.map(FromHost::Control));
             if !forward(&tx, r).await {
@@ -362,7 +481,10 @@ fn datagram_reader(
 ) {
     tasks.spawn(async move {
         while let Some(d) = rx.recv().await {
-            let Some(p) = open_audio(&opener, d.to_vec()) else {
+            if datagram::kind(&d) != Some(datagram::AUDIO) {
+                continue;
+            }
+            let Some(p) = open_audio(&opener, d[datagram::HEADER..].to_vec()) else {
                 continue;
             };
             if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(Ok(FromHost::Audio(p))) {
@@ -397,27 +519,18 @@ fn audio_reader(
     });
 }
 
-/// 画面流：解不开、不是画面包都是错误（流是可靠的，丢不了帧）
-fn video_reader(
-    tasks: &mut JoinSet<()>,
-    mut recv: RecvStream,
-    mut opener: Opener,
-    tx: mpsc::Sender<Result<FromHost>>,
-) {
-    let max = SessionLane::Video.max_frame_size();
+/// 画面：解不开、不是画面包都是错误（流是可靠的）。中转和直连上的帧按计数排好（见 [`crate::merge`]）
+fn video_reader(tasks: &mut JoinSet<()>, mut merge: Merge, tx: mpsc::Sender<Result<FromHost>>) {
     tasks.spawn(async move {
         loop {
-            let r = match read_packet_timed(&mut recv, max, crate::controller::now_us).await {
-                Ok(Some((mut packet, arrived))) => match opener.open(&mut packet) {
-                    Ok(()) if Kind::of(&packet) == Some(Kind::Video) => {
-                        Ok(Some(FromHost::Video { packet, arrived }))
-                    }
-                    Ok(()) => Err(anyhow!("unexpected packet on the video stream")),
-                    Err(e) => Err(e),
-                },
-                Ok(None) => Ok(None),
-                Err(e) => Err(e.into()),
-            };
+            let r = merge.next().await.map(|f| {
+                f.map(|f| FromHost::Video {
+                    packet: f.data,
+                    arrived: f.arrived,
+                    direct: f.direct,
+                    gap: f.gap,
+                })
+            });
             if !forward(&tx, r).await {
                 break;
             }

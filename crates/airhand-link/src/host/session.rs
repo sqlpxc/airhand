@@ -41,11 +41,21 @@ use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 pub trait Acks: Send + Sync + 'static {
     /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 [`ControllerMsg::Ack`]
     fn ack(&self, seq: u32, arrived: Option<u64>);
+
+    /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量。
+    /// `lost`：旧路（直连）断了，在途的帧不会确认了，不要再等它们（会话随即要一个关键帧）
+    fn path_changed(&self, lost: bool) {
+        let _ = lost;
+    }
 }
 
 impl Acks for crate::flow::Flow {
     fn ack(&self, seq: u32, arrived: Option<u64>) {
         crate::flow::Flow::ack(self, seq, arrived);
+    }
+
+    fn path_changed(&self, lost: bool) {
+        crate::flow::Flow::path_changed(self, lost);
     }
 }
 use super::{Admission, Gate, Incoming};
@@ -195,6 +205,7 @@ where
         info!(session_id, "a known controller connected");
     }
     let out = io.out.clone();
+    let started = io.started();
     let mut platform = platform(
         &admitted,
         Senders {
@@ -212,6 +223,7 @@ where
         &mut kick,
         &mut io.writer,
         &inc.approvals,
+        &|| started.notify_one(),
     )
     .await;
     // 先停掉还拿着发送端的东西，写任务才能把排着的（例如 Bye）发完
@@ -253,7 +265,9 @@ async fn answer(phase: &mut Phase) -> Answer {
     }
 }
 
-/// 会话的主循环（见模块说明）。正常结束（控制端断开、发了 Bye）时为 `Ok`
+/// 会话的主循环（见模块说明）。正常结束（控制端断开、发了 Bye）时为 `Ok`。
+/// `started`：会话开始了（发了 Hello）之后调用：这时才开始建直连（见 [`crate::direct`]），
+/// 不把本机的地址告诉还没被同意的控制端
 #[allow(clippy::too_many_arguments)]
 async fn drive<P: Platform>(
     session_id: u64,
@@ -264,6 +278,7 @@ async fn drive<P: Platform>(
     kick: &mut watch::Receiver<ByeReason>,
     writer: &mut Writer,
     approvals: &ApprovalSlots,
+    started: &(dyn Fn() + Sync),
 ) -> Result<()> {
     // 本机用户可能在端到端握手期间已经点了断开，不能先开始采集再处理这个通知。
     if kick.has_changed().unwrap_or(false) {
@@ -296,6 +311,7 @@ async fn drive<P: Platform>(
     } else {
         platform.start(start).await?;
         info!(session_id, "session started");
+        started();
         Phase::Open
     };
     let mut watchdog = tokio::time::interval(WATCHDOG);
@@ -313,8 +329,8 @@ async fn drive<P: Platform>(
             msg = incoming.recv() => {
                 let Some(msg) = msg else { return Ok(()) };
                 let req = match msg {
-                    // 读任务已经处理了（见模块说明），不会到这里
-                    ControllerMsg::Ping { .. } | ControllerMsg::Ack { .. } => continue,
+                    // 读任务已经处理了（见模块说明、crate::direct），不会到这里
+                    ControllerMsg::Ping { .. } | ControllerMsg::Ack { .. } | ControllerMsg::Direct(_) => continue,
                     ControllerMsg::Input { events, .. } if events.is_empty() => continue,
                     ControllerMsg::Input { events, .. } => Request::Input(events),
                     ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
@@ -345,6 +361,7 @@ async fn drive<P: Platform>(
                         phase = Phase::Open;
                         platform.start(start).await?;
                         info!(session_id, "session started");
+                        started();
                         continue;
                     }
                     Answer::Declined => {
@@ -523,6 +540,7 @@ mod tests {
                 &mut kick_rx,
                 &mut writer,
                 &approvals,
+                &|| {},
             )
             .await
         });

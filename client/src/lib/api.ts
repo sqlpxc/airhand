@@ -216,6 +216,8 @@ export type SessionEvent =
       width: number;
       height: number;
       frames: number;
+      /** 画面是从直连来的（两台设备之间打通的路，不经过服务器） */
+      direct: boolean;
     }
   | { type: "encoder"; codec: Codec; name: string; hardware: boolean; width: number; height: number }
   | { type: "notice"; notice: RemoteNotice }

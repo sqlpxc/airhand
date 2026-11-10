@@ -4,7 +4,8 @@
 //! * [`initiate`] / [`respond`]：控制端 / 被控端在控制通道上握手（最后是控制端的确认），得到 [`Secured`]
 //!   和双方协商好的 [`Negotiated`]；
 //! * [`Secured`]：握手一次性派生的通道密钥：每条通道每个方向一个 [`Sealer`] / [`Opener`]，
-//!   声音的数据报和声音流共用一个。
+//!   声音的数据报和声音流共用一个；另外还有探测两条路的往返时延用的一对（[`Secured::probe`]），
+//!   和证明直连另一头是谁用的密钥（[`DirectKey`]，见 `crate::direct`）。
 //!
 //! 加解密都是原地做的：发送的帧预留了标签和计数的位置（`airhand_proto::framing::encode_with_spare`、
 //! `airhand_proto::media::frame`），收到的帧解密之后截掉尾巴，画面包照样原样交给界面，不多拷贝。
@@ -135,10 +136,11 @@ impl Sealer {
         Ok(out)
     }
 
-    /// 数据报：`会话 ID | 密文 | 标签 | 计数`（见 `airhand_proto::datagram`）
-    pub fn seal_datagram(&mut self, session_id: u64, packet: &[u8]) -> Result<Vec<u8>> {
+    /// 数据报：`会话 ID | 种类 | 密文 | 标签 | 计数`（见 `airhand_proto::datagram`）
+    pub fn seal_datagram(&mut self, session_id: u64, kind: u8, packet: &[u8]) -> Result<Vec<u8>> {
         let mut d = Vec::with_capacity(datagram::HEADER + packet.len() + SEAL_OVERHEAD);
         d.extend_from_slice(&session_id.to_le_bytes());
+        d.push(kind);
         d.extend_from_slice(packet);
         self.seal_at(&mut d, datagram::HEADER)?;
         Ok(d)
@@ -158,6 +160,13 @@ impl Sealer {
     }
 }
 
+/// 密封单元（`密文 | 标签 | 计数`）末尾的计数，不用解密就看得到：几条路上来的帧按它排好再解密
+/// （见 `crate::merge`）。短得不像一个密封单元时为 `None`
+pub fn counter_of(sealed: &[u8]) -> Option<u64> {
+    let at = sealed.len().checked_sub(NONCE_LEN)?;
+    (sealed.len() >= SEAL_OVERHEAD).then(|| u64::from_le_bytes(sealed[at..].try_into().unwrap()))
+}
+
 /// 一条通道一个方向的接收端
 pub struct Opener {
     key: LessSafeKey,
@@ -173,6 +182,22 @@ enum Order {
 }
 
 impl Opener {
+    /// 下一个要的计数（控制、大块通道）；画面、声音是收到过的最大计数 + 1
+    pub(crate) fn expected(&self) -> u64 {
+        match &self.order {
+            Order::Next(n) => *n,
+            Order::Window(w) => w.top,
+        }
+    }
+
+    /// 这个计数还没收到过（画面、声音的滑动窗口；控制、大块通道必须正好是下一个）
+    pub(crate) fn is_fresh(&self, c: u64) -> bool {
+        match &self.order {
+            Order::Next(n) => c == *n,
+            Order::Window(w) => w.fresh(c),
+        }
+    }
+
     /// 原地解开一个密封单元（`密文 | 标签 | 计数`，流上一帧去掉长度前缀的部分），之后 `buf` 就是明文。
     /// 解不开（被改过、不是这条通道的、计数不对）是错误：控制、大块、画面通道上会话不能再继续；
     /// 声音包丢掉就是了
@@ -250,6 +275,27 @@ pub struct Secured {
     pub video: LaneKeys,
     pub audio: LaneKeys,
     pub bulk: LaneKeys,
+    /// 探测数据报（`airhand_proto::datagram::PROBE`）：量中转、直连两条路的往返时延。乱序可以、重放不行
+    pub probe: LaneKeys,
+    /// 直连的另一头用它证明自己（见 `crate::direct`）
+    pub direct: DirectKey,
+}
+
+/// 证明直连另一头是这个会话的另一端用的密钥：两端一样，从会话的两把密钥派生（不只是握手的哈希：
+/// 握手的哈希中转也算得出来）
+#[derive(Clone)]
+pub struct DirectKey(pub(crate) [u8; 32]);
+
+impl std::fmt::Debug for DirectKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DirectKey(..)")
+    }
+}
+
+impl Drop for DirectKey {
+    fn drop(&mut self) {
+        self.0 = [0; 32];
+    }
 }
 
 /// 仅握手内部持有的原始材料，消费后派生一次全部通道密钥。
@@ -276,6 +322,13 @@ impl Drop for KeyMaterial {
 
 impl KeyMaterial {
     fn split(self) -> (Secured, LaneKeys) {
+        let mut direct = [0u8; 32];
+        derive(
+            &self.h,
+            &[self.i2r, self.r2i].concat(),
+            b"airhand direct",
+            &mut direct,
+        );
         (
             Secured {
                 peer: self.peer,
@@ -283,6 +336,8 @@ impl KeyMaterial {
                 video: self.lane(SessionLane::Video),
                 audio: self.lane(SessionLane::Audio),
                 bulk: self.lane(SessionLane::Bulk),
+                probe: self.keys(b"airhand probe", Order::Window(ReplayWindow::default())),
+                direct: DirectKey(direct),
             },
             self.lane(SessionLane::Control),
         )
@@ -311,12 +366,12 @@ impl KeyMaterial {
         })
     }
 
-    fn key(&self, sending: bool, lane: SessionLane) -> LessSafeKey {
+    fn key(&self, sending: bool, label: &[u8]) -> LessSafeKey {
         // 控制端发送 = 发起方 → 响应方
         let i2r = sending == (self.role == Role::Controller);
         let ikm = if i2r { &self.i2r } else { &self.r2i };
         let mut out = [0u8; 32];
-        derive(&self.h, ikm, &lane_label(lane), &mut out);
+        derive(&self.h, ikm, label, &mut out);
         aead_key(&out)
     }
 
@@ -325,13 +380,17 @@ impl KeyMaterial {
             SessionLane::Control | SessionLane::Bulk => Order::Next(0),
             SessionLane::Video | SessionLane::Audio => Order::Window(ReplayWindow::default()),
         };
+        self.keys(&lane_label(lane), order)
+    }
+
+    fn keys(&self, label: &[u8], order: Order) -> LaneKeys {
         LaneKeys {
             sealer: Sealer {
-                key: self.key(true, lane),
+                key: self.key(true, label),
                 counter: 0,
             },
             opener: Opener {
-                key: self.key(false, lane),
+                key: self.key(false, label),
                 order,
             },
         }
@@ -343,6 +402,27 @@ fn lane_label(lane: SessionLane) -> [u8; 13] {
     let mut l = *b"airhand lane ";
     l[12] = b'0' + lane as u8;
     l
+}
+
+/// 测试用：一条通道一个方向的一对加密端（发送端、接收端），不用握手。`ordered`：控制、大块通道那样必须一个接一个
+#[cfg(test)]
+pub(crate) fn test_lane(ordered: bool) -> (Sealer, Opener) {
+    let raw = [7u8; 32];
+    let order = if ordered {
+        Order::Next(0)
+    } else {
+        Order::Window(ReplayWindow::default())
+    };
+    (
+        Sealer {
+            key: aead_key(&raw),
+            counter: 0,
+        },
+        Opener {
+            key: aead_key(&raw),
+            order,
+        },
+    )
 }
 
 /// HKDF-SHA256：`salt` 提取、`info` 扩展出 32 字节
@@ -1343,10 +1423,20 @@ mod tests {
         let mut s = host.lane(SessionLane::Audio).sealer;
         let mut o = ctl.lane(SessionLane::Audio).opener;
         let d: Vec<Vec<u8>> = (0..4u8)
-            .map(|k| s.seal_datagram(7, &[k; 10]).unwrap())
+            .map(|k| {
+                s.seal_datagram(7, airhand_proto::datagram::AUDIO, &[k; 10])
+                    .unwrap()
+            })
             .collect();
         assert_eq!(airhand_proto::datagram::session(&d[0]), Some(7));
+        assert_eq!(
+            airhand_proto::datagram::kind(&d[0]),
+            Some(airhand_proto::datagram::AUDIO)
+        );
         let body = |d: &Vec<u8>| d[airhand_proto::datagram::HEADER..].to_vec();
+        // 计数在末尾，不用解密就看得到
+        assert_eq!(counter_of(&body(&d[2])), Some(2));
+        assert_eq!(counter_of(&[0; SEAL_OVERHEAD - 1]), None);
         let open = |o: &mut Opener, mut b: Vec<u8>| o.open(&mut b).map(|()| b);
         assert_eq!(open(&mut o, body(&d[1])).unwrap(), [1; 10]);
         assert_eq!(open(&mut o, body(&d[0])).unwrap(), [0; 10]);

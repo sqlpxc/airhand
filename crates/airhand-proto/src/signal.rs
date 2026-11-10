@@ -64,8 +64,16 @@
 //! 被控端离线多久、服务器重启多少次，都不会把它分给别人，被控端上线时总能取回。很久（见服务器的
 //! `BINDING_TTL`）没有上线的绑定才会被清理。被控端更换控制码时先发 [`ClientMsg::Release`] 解除绑定。
 //! 不保存控制码的被控端（`keep = false`）和以前一样：掉线后控制码只保留一小段时间。
+//!
+//! # 公网地址
+//!
+//! 两端都支持 [`crate::features::signal::OBSERVED_ADDR`] 时，服务器在会话开始时告诉每一端**它自己**的公网地址
+//! （服务器看到的这条连接的来源地址，[`ServerMsg::Incoming::observed`]、[`SessionGrant::observed`]）：
+//! 两端打洞直连要用（见 crate 说明的"直连"）。服务器不把一端的地址告诉另一端：两端在会话开始之后
+//! （被控端的用户同意了、端到端握手确认了对方）才在加密的控制通道上交换地址，被控端不会把自己的地址
+//! 交给一个只知道控制码的人。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -344,12 +352,16 @@ pub enum ServerMsg {
         error: Option<ConnectError>,
     },
     /// 通知被控端：有控制端发起会话，请打开会话流。
+    ///
+    /// `observed`：服务器看到的被控端自己的地址（见模块说明的"公网地址"）
     #[n(3)]
     Incoming {
         #[n(0)]
         session_id: u64,
         #[n(1)]
         peer: Peer,
+        #[n(2)]
+        observed: Option<SocketAddr>,
     },
     /// 通知控制端：它在等的被控端（收到过 [`ConnectError::Offline`]）重新上线了，可以重连
     ///（凭证仍然有效的话就连上了，否则回答 [`ConnectError::Revoked`]）。
@@ -413,6 +425,9 @@ pub struct SessionGrant {
     /// 重连凭证，被控端掉线后重连时带上
     #[cbor(n(3), with = "minicbor::bytes")]
     pub resume: ResumeToken,
+    /// 服务器看到的控制端自己的地址（见模块说明的"公网地址"）
+    #[n(4)]
+    pub observed: Option<SocketAddr>,
 }
 
 open_enum! {

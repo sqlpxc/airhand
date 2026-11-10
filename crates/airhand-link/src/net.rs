@@ -10,6 +10,11 @@
 //!
 //! 服务器的域名可能同时有 IPv6 和 IPv4 地址，而本机不一定能用 IPv6：按 RFC 8305（Happy Eyeballs）
 //! 把两种地址交替排好，每隔 250 ms 多试一个，先连上的那个胜出。
+//!
+//! # 直连
+//!
+//! 连中转的 UDP socket 也是打洞、直连用的那一个（服务器看到的就是它在 NAT 上的映射，见 [`crate::direct`]）：
+//! [`Signal`] 带着它的 [`Endpoint`] 和 [`Punch`]。被控端的 endpoint 还能接受控制端连过来的直连。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +26,10 @@ use airhand_proto::signal::{ClientHello, ServerHello};
 use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
+use quinn::{
+    ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig,
+    VarInt,
+};
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -31,6 +39,7 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use crate::direct::Punch;
 use crate::problem::Problem;
 
 /// 连接中转服务器所需的配置：桌面客户端编译进程序，网页控制台从环境变量读取。
@@ -193,8 +202,10 @@ pub struct Signal {
     /// 和服务器商定的信令版本，双方都支持的信令能力位（见 `airhand_proto::signal` 的"版本握手"）
     pub version: u16,
     pub features: Features,
-    /// 保持 Endpoint 存活
-    _endpoint: Endpoint,
+    /// 连服务器的 endpoint：直连也用它（同一个 socket，见模块说明的"直连"）。被控端的还能接受直连
+    pub endpoint: Endpoint,
+    /// 从这个 socket 发打洞包
+    pub punch: Punch,
 }
 
 pub fn transport_config() -> TransportConfig {
@@ -286,20 +297,34 @@ fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     out
 }
 
-/// 连上服务器的一个地址（QUIC + TLS），返回连接和对方证书的指纹
+/// 连上了的一个地址：endpoint、打洞用的句柄、连接、对方证书的指纹
+type Attempt = (Endpoint, Punch, Connection, [u8; 32]);
+
+/// 连上服务器的一个地址（QUIC + TLS）。被控端的 endpoint 同时接受直连（见模块说明的"直连"）
 async fn attempt(
     addr: SocketAddr,
     sni: Arc<str>,
     expected: Option<[u8; 32]>,
     mismatch: Arc<AtomicBool>,
-) -> Result<(Endpoint, Connection, [u8; 32])> {
+    role: Role,
+) -> Result<Attempt> {
     let bind: SocketAddr = if addr.is_ipv6() {
         "[::]:0".parse()?
     } else {
         "0.0.0.0:0".parse()?
     };
     let seen = Arc::new(Seen::default());
-    let mut endpoint = Endpoint::client(bind).context("can't create a UDP socket")?;
+    let (socket, punch, runtime) =
+        crate::direct::bind(bind).context("can't create a UDP socket")?;
+    let server = match role {
+        Role::Host => crate::direct::tls::server_config()
+            .inspect_err(|e| warn!("direct connections are unavailable: {e:#}"))
+            .ok(),
+        Role::Controller => None,
+    };
+    let mut endpoint =
+        Endpoint::new_with_abstract_socket(EndpointConfig::default(), server, socket, runtime)
+            .context("can't create a QUIC endpoint")?;
     endpoint.set_default_client_config(client_config(expected, seen.clone())?);
     let result = endpoint.connect(addr, &sni)?.await;
     if seen.mismatch.load(Ordering::Relaxed) {
@@ -311,7 +336,7 @@ async fn attempt(
         .lock()
         .unwrap()
         .ok_or_else(|| anyhow!("{addr} didn't present a certificate"))?;
-    Ok((endpoint, conn, fp))
+    Ok((endpoint, punch, conn, fp))
 }
 
 /// Happy Eyeballs（RFC 8305）：按顺序每隔 [`STAGGER`] 多试一个地址（前一个失败了马上试下一个），
@@ -322,15 +347,16 @@ async fn connect_any(
     sni: String,
     expected: Option<[u8; 32]>,
     mismatch: Arc<AtomicBool>,
-) -> Result<(Endpoint, Connection, [u8; 32])> {
+    role: Role,
+) -> Result<Attempt> {
     const STAGGER: Duration = Duration::from_millis(250);
-    type Attempts = JoinSet<Result<(Endpoint, Connection, [u8; 32])>>;
+    type Attempts = JoinSet<Result<Attempt>>;
     let sni: Arc<str> = sni.into();
     let mut next = addrs.into_iter();
     let mut tasks: Attempts = JoinSet::new();
     let mut last_err: Option<anyhow::Error> = None;
     let spawn = |tasks: &mut Attempts, addr: SocketAddr| {
-        tasks.spawn(attempt(addr, sni.clone(), expected, mismatch.clone()));
+        tasks.spawn(attempt(addr, sni.clone(), expected, mismatch.clone(), role));
     };
     if let Some(addr) = next.next() {
         spawn(&mut tasks, addr);
@@ -386,7 +412,8 @@ pub async fn connect_signal(cfg: &LinkConfig, role: Role) -> std::result::Result
 async fn handshake(cfg: &LinkConfig, role: Role, mismatch: Arc<AtomicBool>) -> Result<Signal> {
     let (addrs, sni) = resolve(&cfg.server).await?;
     let expected = cfg.expected();
-    let (endpoint, conn, fp) = connect_any(&cfg.server, addrs, sni, expected, mismatch).await?;
+    let (endpoint, punch, conn, fp) =
+        connect_any(&cfg.server, addrs, sni, expected, mismatch, role).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientHello::new(role, cfg.name.clone(), cfg.os.clone());
     write_frame(&mut send, &hello.encode()).await?;
@@ -418,7 +445,8 @@ async fn handshake(cfg: &LinkConfig, role: Role, mismatch: Arc<AtomicBool>) -> R
                 recv,
                 version,
                 features: features.common(hello.features),
-                _endpoint: endpoint,
+                endpoint,
+                punch,
             })
         }
         ServerHello::Incompatible { min, max } => Err(incompatible(min, max).into()),

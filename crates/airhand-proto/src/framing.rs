@@ -376,6 +376,7 @@ mod tests {
                     host_name: "PC".into(),
                     host_os: "Windows".into(),
                     resume: token,
+                    observed: Some("203.0.113.9:50000".parse().unwrap()),
                 }),
             ),
             ServerMsg::connect_result(6, Err(ConnectError::Offline)),
@@ -385,10 +386,12 @@ mod tests {
             ServerMsg::Incoming {
                 session_id: 9,
                 peer: peer("10.0.0.7"),
+                observed: None,
             },
             ServerMsg::Incoming {
                 session_id: 9,
                 peer: peer("2001:db8::1"),
+                observed: Some("[2001:db8::2]:4433".parse().unwrap()),
             },
             ServerMsg::HostOnline { code: 123_456 },
             ServerMsg::Rekeyed { secret: [3; 16] },
@@ -460,6 +463,29 @@ mod tests {
         };
         assert_eq!(t, 1 << 40);
         assert_eq!(got, events);
+    }
+
+    /// 直连的候选地址：两个方向都在控制通道上，IPv4 / IPv6 都行
+    #[test]
+    fn direct_offers_roundtrip() {
+        use crate::SessionLane;
+        use crate::session::DirectOffer;
+        let offer = DirectOffer {
+            round: 3,
+            addrs: vec![
+                "203.0.113.9:50000".parse().unwrap(),
+                "192.168.1.20:50000".parse().unwrap(),
+                "[2001:db8::7]:4433".parse().unwrap(),
+            ],
+        };
+        let h = HostMsg::Direct(offer.clone());
+        assert_eq!(h.lane(), SessionLane::Control);
+        let back: HostMsg = next(&mut &encode(&h)[..]);
+        assert!(matches!(back, HostMsg::Direct(ref o) if *o == offer));
+        let c = ControllerMsg::Direct(offer.clone());
+        assert_eq!(c.lane(), SessionLane::Control);
+        let back: ControllerMsg = next(&mut &encode(&c)[..]);
+        assert!(matches!(back, ControllerMsg::Direct(ref o) if *o == offer));
     }
 
     /// 新版本的控制端发了旧被控端不认识的输入事件：只跳过那一个，同一批里的其它照常执行

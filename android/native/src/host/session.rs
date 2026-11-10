@@ -91,6 +91,11 @@ impl Acks for VideoAcks {
     fn ack(&self, seq: u32, arrived: Option<u64>) {
         self.shared.video.ack(self.id, seq, arrived);
     }
+
+    /// 画面换了路（中转 ⇄ 直连）：这个会话的码率控制从头量时延；直连断了的话从关键帧重新加入
+    fn path_changed(&self, lost: bool) {
+        self.shared.video.path_changed(self.id, lost);
+    }
 }
 
 impl Platform for Phone {

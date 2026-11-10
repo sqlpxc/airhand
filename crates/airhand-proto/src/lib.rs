@@ -47,6 +47,32 @@
 //!
 //! 声音包平时走 QUIC 数据报（[`datagram`]）：丢了就丢了，不重传，也不用排在丢了的包后面等重传。
 //! 服务器按数据报开头的会话 ID 在这个会话的两端之间原样转发。
+//!
+//! # 直连
+//!
+//! 经过中转时每个字节都要两次 QUIC 加解密、两套重传，中转上还要排队；中转离用户远（跨境）时尤其明显。
+//! 会话的加密（[`handshake`]）和传输无关，所以两端可以在中转之外再打通一条**直连**，帧原样（同样的密文、同样的计数）
+//! 从直连发：
+//!
+//! * 服务器告诉每个客户端它看到的这个客户端的公网地址（[`signal::SessionGrant::observed`]、
+//!   [`signal::ServerMsg::Incoming`] 的 `observed`，信令能力位 [`features::signal::OBSERVED_ADDR`]）；
+//! * 会话开始之后（被控端的用户同意了之后），两端在加密的控制通道上交换各自的候选地址（公网地址和局域网地址，
+//!   [`session::DirectOffer`]，会话能力位 [`features::session::DIRECT`]）：中转看不到局域网地址，
+//!   还没被放进来的控制端也拿不到被控端的地址；
+//! * 两端用连中转的那个 UDP socket 打洞：被控端往控制端的地址发几个字节的打洞包（打开自己 NAT 上的映射），
+//!   控制端用同一个 socket 发起 QUIC 连接（ALPN [`DIRECT_ALPN`]），连上之后用会话密钥证明自己（绑定这条 QUIC 连接的
+//!   TLS 导出密钥，中间人转发不了）。打不通（对称 NAT）就一直走中转；
+//! * 直连上每条通道是一条单向流，开头一个字节是通道编号（[`SessionLane`]），之后和中转上一样是一帧一帧的密封单元；
+//!   数据报和中转上的格式一样。
+//!
+//! 两条路怎么分工：
+//!
+//! * **控制、大块通道两条路都发**：每一帧都写进中转（完整的一份），直连通着的话再从直连发一份。接收端按计数合并，
+//!   重复的丢掉：输入、确认、Ping 总是走更快的那条路，直连突然断了也不会丢；
+//! * **画面、声音只走一条路**：被控端每隔一会儿在两条路上各发一个探测数据报，控制端原样（重新加密）弹回来，
+//!   被控端据此量两条路的往返时延，选延迟低的那条（有一点滞后，免得来回切换）。直连可能比中转还慢
+//!   （例如两端的运营商之间绕路），这时就留在中转上。换路时接收端按计数排好再交出去；直连断了，被控端马上改回中转、
+//!   编一个关键帧，接收端不再等断在直连上的帧（关键帧不用等前面的帧）。
 
 pub mod cbor;
 pub mod framing;
@@ -74,6 +100,9 @@ pub const SESSION_MIN: u16 = 1;
 
 /// QUIC ALPN 标识。与版本握手一样永远不变，否则旧客户端连 TLS 握手都过不了，无法得知版本不一致。
 pub const ALPN: &[u8] = b"airhand/1";
+
+/// 两端之间直连（见模块说明的"直连"）的 QUIC ALPN。直连只在会话里协商好之后才建，不用像 [`ALPN`] 那样永远不变
+pub const DIRECT_ALPN: &[u8] = b"airhand-direct/1";
 
 /// 控制码范围：6 位数字，首位不为 0，避免口头报码时产生歧义。
 pub const CODE_MIN: u32 = 100_000;
@@ -202,21 +231,35 @@ impl SessionHeader {
     }
 }
 
-/// QUIC 数据报：`会话 ID（u64 LE）| 密封单元`（没有长度前缀，一个数据报就是一个包）。
+/// QUIC 数据报：`会话 ID（u64 LE）| 种类 u8 | 密封单元`（没有长度前缀，一个数据报就是一个包）。
 ///
 /// 服务器只看开头的会话 ID：发送方是这个会话的一端，就原样转给另一端，否则丢掉。
-/// 后面是端到端加密的媒体包，和流上的一帧一样是 `密文 | 标签 | 计数`（见 [`handshake`] 的"之后的每一帧"）。
-/// 目前只有被控端的声音包走数据报（见 [`media`]），和声音流用同一把密钥、同一串计数。
+/// 后面是端到端加密的内容，和流上的一帧一样是 `密文 | 标签 | 计数`（见 [`handshake`] 的"之后的每一帧"），
+/// 种类决定用哪把密钥：
+///
+/// * [`AUDIO`]：被控端的声音包（见 [`media`]），和声音流用同一把密钥、同一串计数；
+/// * [`PROBE`]：量两条路（中转、直连）的往返时延的探测包（见模块说明的"直连"），两个方向各一把密钥。
+///
+/// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。
 pub mod datagram {
-    /// 开头的会话 ID
-    pub const HEADER: usize = 8;
+    /// 开头的会话 ID 和种类
+    pub const HEADER: usize = 9;
+    /// 声音包（编号和声音通道一样）
+    pub const AUDIO: u8 = crate::SessionLane::Audio as u8;
+    /// 探测包
+    pub const PROBE: u8 = 16;
     /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
     /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
     pub const MAX: usize = 1000;
 
     /// 数据报属于哪个会话；不到一个会话 ID 长时为 `None`
     pub fn session(d: &[u8]) -> Option<u64> {
-        Some(u64::from_le_bytes(d.get(..HEADER)?.try_into().ok()?))
+        Some(u64::from_le_bytes(d.get(..8)?.try_into().ok()?))
+    }
+
+    /// 数据报的种类（[`AUDIO`]、[`PROBE`]……）；不到一个头长时为 `None`
+    pub fn kind(d: &[u8]) -> Option<u8> {
+        d.get(8).copied()
     }
 }
 
@@ -282,16 +325,22 @@ pub mod features {
     pub mod signal {
         use crate::Features;
 
+        /// 服务器在会话开始时告诉客户端它看到的这个客户端的公网地址（直连打洞用，见 crate 说明的"直连"）
+        pub const OBSERVED_ADDR: Features = Features::from_bits(1 << 0);
+
         /// 本端支持的
-        pub const SUPPORTED: Features = Features::NONE;
+        pub const SUPPORTED: Features = OBSERVED_ADDR;
     }
 
     /// 会话层：被控端 ⇄ 控制端
     pub mod session {
         use crate::Features;
 
+        /// 两端交换候选地址、打洞，在中转之外再走一条直连（见 crate 说明的"直连"）
+        pub const DIRECT: Features = Features::from_bits(1 << 0);
+
         /// 本端支持的
-        pub const SUPPORTED: Features = Features::NONE;
+        pub const SUPPORTED: Features = DIRECT;
     }
 }
 
@@ -353,9 +402,12 @@ mod tests {
 
     #[test]
     fn datagram_layout() {
-        let d = [8, 7, 6, 5, 4, 3, 2, 1, 9, 9];
+        let d = [8, 7, 6, 5, 4, 3, 2, 1, datagram::PROBE, 9];
         assert_eq!(datagram::session(&d), Some(0x0102_0304_0506_0708));
+        assert_eq!(datagram::kind(&d), Some(datagram::PROBE));
         assert_eq!(datagram::session(&d[..7]), None);
+        assert_eq!(datagram::kind(&d[..8]), None);
+        assert_eq!(datagram::AUDIO, 2);
     }
 
     #[test]

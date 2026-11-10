@@ -19,6 +19,7 @@ client = [
     "dep:curve25519-dalek",
     "dep:quinn",
     "dep:rand",
+    "dep:rcgen",
     "dep:ring",
     "dep:rustls",
     "dep:serde",
@@ -31,6 +32,8 @@ client = [
     "tokio/time",
     "tokio/net",
 ]
+# 测试用的钩子（服务器的测试打开，见 server/Cargo.toml）：让一端的 socket 只往中转发包，模拟直连突然断了
+test-hooks = ["client"]
 
 [dependencies]
 # wire 用的（总是有）
@@ -45,6 +48,8 @@ bytes = { version = "1", optional = true }
 curve25519-dalek = { version = "4", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rand = { version = "0.9", optional = true }
+# 被控端接受直连时用的自签名证书（每次运行生成一张；对面是谁由会话密钥证明，见 src/direct/tls.rs）
+rcgen = { version = "0.14", default-features = false, features = ["ring"], optional = true }
 ring = { version = "0.17", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

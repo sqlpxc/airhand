@@ -23,6 +23,6 @@ sha2 = "0.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
-# 测试用真实的客户端链路（QUIC + 握手）连进程内的服务器。只在编译测试时打开 client，
+# 测试用真实的客户端链路（QUIC + 握手）连进程内的服务器。只在编译测试时打开 client（和模拟直连断掉的 test-hooks），
 # 不影响服务器本身的构建（resolver 2 起 dev-dependencies 的 feature 不带进正常构建）
-airhand-link = { path = "../crates/airhand-link" }
+airhand-link = { path = "../crates/airhand-link", features = ["test-hooks"] }

@@ -52,7 +52,10 @@ fn answer(sig: Signal, code: u32) -> tokio::task::JoinHandle<()> {
         while let Ok(Some(m)) =
             read_msg::<_, ServerMsg>(&mut sig.recv, MAX_SIGNAL_MSG, &mut buf).await
         {
-            if let ServerMsg::Incoming { session_id, peer } = m {
+            if let ServerMsg::Incoming {
+                session_id, peer, ..
+            } = m
+            {
                 let inc = Incoming {
                     conn: sig.conn.clone(),
                     session_id,
@@ -60,6 +63,7 @@ fn answer(sig: Signal, code: u32) -> tokio::task::JoinHandle<()> {
                     peer,
                     kick: kick.clone(),
                     approvals: Default::default(),
+                    direct: None,
                 };
                 if let Ok(s) = HostStreams::open(&inc, 2, 16, &gate).await {
                     sessions.push(s);
@@ -569,7 +573,10 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
     let (_broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
     let host_task = tokio::spawn(async move {
-        let ServerMsg::Incoming { session_id, peer } = next(&mut host).await else {
+        let ServerMsg::Incoming {
+            session_id, peer, ..
+        } = next(&mut host).await
+        else {
             panic!()
         };
         let (_kick_tx, kick) = watch::channel(ByeReason::Kicked);
@@ -580,6 +587,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
             peer,
             kick,
             approvals: Default::default(),
+            direct: None,
         };
         let gate = OpenGate(Identity::generate());
         let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
@@ -742,7 +750,10 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         let (mut host, id) = register(&cfg, None).await;
         let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
         let grant = ask(&mut ctrl, 1, id.code, None).await.unwrap();
-        let ServerMsg::Incoming { session_id, peer } = next(&mut host).await else {
+        let ServerMsg::Incoming {
+            session_id, peer, ..
+        } = next(&mut host).await
+        else {
             panic!()
         };
         let (_kick, kick) = watch::channel(ByeReason::Kicked);
@@ -753,6 +764,7 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
             peer,
             kick,
             approvals: Default::default(),
+            direct: None,
         };
         let gate = OpenGate(Identity::generate());
         let me = Identity::generate();
@@ -1283,7 +1295,11 @@ async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
         broker.routes.lock().contains_key(&sid)
     })
     .await;
-    let dgram = |sid: u64, body: &[u8]| [&sid.to_le_bytes()[..], body].concat().into();
+    let dgram = |sid: u64, body: &[u8]| {
+        [&sid.to_le_bytes()[..], &[datagram::AUDIO], body]
+            .concat()
+            .into()
+    };
     let recv = async |conn: &quinn::Connection| {
         let d = timeout(Duration::from_secs(2), conn.read_datagram())
             .await
@@ -1366,7 +1382,10 @@ async fn controller_service_gets_audio_over_datagrams() {
     };
     let gate = OpenGate(Identity::generate());
     let accepting = async {
-        let ServerMsg::Incoming { session_id, peer } = next(&mut host).await else {
+        let ServerMsg::Incoming {
+            session_id, peer, ..
+        } = next(&mut host).await
+        else {
             panic!("expected Incoming");
         };
         let (_kick_tx, kick) = watch::channel(ByeReason::Kicked);
@@ -1377,6 +1396,7 @@ async fn controller_service_gets_audio_over_datagrams() {
             peer,
             kick,
             approvals: Default::default(),
+            direct: None,
         };
         let (s, admitted) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
         (session_id, s, admitted)
@@ -1565,4 +1585,241 @@ async fn fixed_codes_are_never_handed_out() {
     broker.flush_bindings().await;
     assert!(!Bindings::open(Some(&file)).unwrap().contains(id.code));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 直连：两端在服务器之外打通一条路，画面换到直连上（控制端的统计里 direct 为 true），控制消息照常；
+/// 直连突然断了（被控端的 socket 只往服务器发）：画面马上改回中转、要一个关键帧，控制端不再等断在直连上的帧，
+/// 画面接着来；直连恢复之后再换回去。整个过程中画面的序号只增不减
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
+    use airhand_link::host::{Acks, DirectHub, HostLink};
+    use airhand_proto::media::{self, VideoHeader};
+    use airhand_proto::session::{Codec, ControllerMsg, HostMsg, Notice};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    struct Ui {
+        packets: mpsc::UnboundedSender<Vec<u8>>,
+        direct: watch::Sender<Option<bool>>,
+        notices: mpsc::UnboundedSender<String>,
+    }
+    impl SessionUi for Ui {
+        fn packet(&self, p: Vec<u8>) -> Result<(), UiClosed> {
+            self.packets.send(p).map_err(|_| UiClosed)
+        }
+        fn event(&self, e: SessionEvent) -> Result<(), UiClosed> {
+            match e {
+                SessionEvent::Stats { direct, frames, .. } if frames > 0 => {
+                    self.direct.send_replace(Some(direct));
+                }
+                SessionEvent::Notice { notice } => {
+                    let _ = self.notices.send(format!("{notice:?}"));
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+    /// 平台的码率控制：记下换路
+    #[derive(Default)]
+    struct Paths {
+        lost: AtomicU32,
+        changed: AtomicU32,
+    }
+    impl Acks for Paths {
+        fn ack(&self, _: u32, _: Option<u64>) {}
+        fn path_changed(&self, lost: bool) {
+            self.changed.fetch_add(1, Ordering::Relaxed);
+            if lost {
+                self.lost.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let (_broker, cfg) = start().await;
+    let relay: SocketAddr = cfg.server.parse().unwrap();
+    let (mut host, id) = register(&cfg, None).await;
+    let (hub, _hub_tasks) = DirectHub::start(&host.endpoint, &host.punch, &host.conn);
+    let svc = ControllerService::start(
+        Arc::new(cfg.clone()),
+        tokio::runtime::Handle::current(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        Identity::generate(),
+    );
+    let (packets, mut received) = mpsc::unbounded_channel();
+    let (direct_tx, mut direct) = watch::channel(None);
+    let (notices, mut notice_rx) = mpsc::unbounded_channel();
+    let ui = Arc::new(Ui {
+        packets,
+        direct: direct_tx,
+        notices,
+    });
+    let code = id.code.to_string();
+    let connecting = async {
+        loop {
+            match svc
+                .connect(
+                    &code,
+                    ConnectOptions::default(),
+                    ui.clone(),
+                    Frontend::Browser,
+                )
+                .await
+            {
+                Err(Problem::NotConnected) => tokio::time::sleep(Duration::from_millis(20)).await,
+                r => break r.unwrap(),
+            }
+        }
+    };
+    let gate = OpenGate(Identity::generate());
+    let host_endpoint = host.endpoint.local_addr().unwrap();
+    let accepting = async {
+        let ServerMsg::Incoming {
+            session_id,
+            peer,
+            observed,
+        } = next(&mut host).await
+        else {
+            panic!("expected Incoming");
+        };
+        // 服务器告诉被控端它自己的公网地址（在这里就是 127.0.0.1 上连服务器的那个端口）
+        assert_eq!(observed.map(|a| a.port()), Some(host_endpoint.port()));
+        let (_kick_tx, kick) = watch::channel(ByeReason::Kicked);
+        let inc = Incoming {
+            conn: host.conn.clone(),
+            session_id,
+            code: id.code,
+            peer,
+            kick,
+            approvals: Default::default(),
+            direct: Some(HostLink {
+                hub: hub.clone(),
+                observed,
+            }),
+        };
+        let (io, _) = HostStreams::open(&inc, 4, 16, &gate).await.unwrap();
+        (session_id, io, _kick_tx)
+    };
+    let (info, (session_id, mut io, _kick)) = tokio::join!(connecting, accepting);
+    let paths = Arc::new(Paths::default());
+    io.incoming.set_acks(paths.clone());
+    // 会话开始了（发了 Hello）：开始建直连
+    io.started().notify_one();
+
+    // 被控端：每 20 ms 一帧，控制端要关键帧时下一帧是关键帧；每 200 ms 发一条提示（控制消息）
+    let keyframes = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let pump = {
+        let (keyframes, stop) = (keyframes.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut seq = 0u32;
+            let mut key = true;
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            while !stop.load(Ordering::Relaxed) {
+                tokio::select! {
+                    m = io.incoming.recv() => match m {
+                        Some(ControllerMsg::RequestKeyframe) => {
+                            keyframes.fetch_add(1, Ordering::Relaxed);
+                            key = true;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = tick.tick() => {
+                        seq += 1;
+                        let header = VideoHeader {
+                            seq,
+                            key: std::mem::take(&mut key),
+                            codec: Codec::H264,
+                            width: 8,
+                            height: 8,
+                            capture_us: 0,
+                        }
+                        .encode();
+                        io.video
+                            .send(media::frame(&header, &[&[0; 600]]).into())
+                            .await
+                            .unwrap();
+                        if seq.is_multiple_of(10) {
+                            io.out
+                                .send(&HostMsg::Notice(Some(Notice::CaptureFailed {
+                                    detail: seq.to_string(),
+                                })))
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+            io.close(session_id, Ok(())).await
+        })
+    };
+    // 控制端：每一帧都确认，序号只增不减
+    let svc = Arc::new(svc);
+    let frames = Arc::new(AtomicU32::new(0));
+    let checker = {
+        let (svc, frames, sid) = (svc.clone(), frames.clone(), info.sid);
+        tokio::spawn(async move {
+            let mut last = 0u32;
+            while let Some(p) = received.recv().await {
+                let Some(h) = VideoHeader::decode(&p) else {
+                    continue;
+                };
+                assert!(h.seq > last, "video went backwards: {} after {last}", h.seq);
+                last = h.seq;
+                frames.fetch_add(1, Ordering::Relaxed);
+                let _ = svc.ack(sid, h.seq);
+            }
+        })
+    };
+    let wait_for = async |direct: &mut watch::Receiver<Option<bool>>, want: bool, secs: u64| {
+        timeout(
+            Duration::from_secs(secs),
+            direct.wait_for(|d| *d == Some(want)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("video didn't switch to direct={want} in {secs} s"))
+        .unwrap();
+    };
+
+    // 本机上直连比中转快：画面换到直连上
+    wait_for(&mut direct, true, 10).await;
+    assert_eq!(paths.lost.load(Ordering::Relaxed), 0);
+    assert!(paths.changed.load(Ordering::Relaxed) >= 1);
+    // 控制消息（经两条路合并）照常到
+    let before = notice_rx.len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(notice_rx.len() > before);
+
+    // 直连断了：被控端只往服务器发包
+    host.punch.only_to(Some(relay));
+    wait_for(&mut direct, false, 6).await;
+    assert_eq!(paths.lost.load(Ordering::Relaxed), 1);
+    assert!(
+        keyframes.load(Ordering::Relaxed) >= 1,
+        "no keyframe after losing the direct path"
+    );
+    // 画面在中转上接着来
+    let at = keyframes.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while notice_rx.try_recv().is_ok() {}
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(notice_rx.try_recv().is_ok(), "control messages stopped");
+    assert_eq!(*direct.borrow(), Some(false));
+
+    // 直连恢复了：过一会儿换回去
+    host.punch.only_to(None);
+    wait_for(&mut direct, true, 15).await;
+    assert!(keyframes.load(Ordering::Relaxed) >= at);
+
+    stop.store(true, Ordering::Relaxed);
+    pump.await.unwrap().unwrap();
+    // 检查的任务只在出错（序号倒退）时才会结束
+    if checker.is_finished() {
+        checker.await.unwrap();
+    } else {
+        checker.abort();
+    }
+    let frames = frames.load(Ordering::Relaxed);
+    assert!(frames > 100, "{frames}");
+    drop(svc);
 }
