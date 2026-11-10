@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::{Negotiated, PublicKey};
 use airhand_proto::session::{ControllerMsg, InputEvent, QualitySettings};
-use airhand_proto::{MAX_CONTROL_MSG, Role};
+use airhand_proto::{Role, SessionLane};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -35,10 +35,43 @@ pub struct HostStreams {
     /// 声音包（同上）
     pub audio: mpsc::Sender<Bytes>,
     /// 控制端发来的消息
-    pub incoming: mpsc::Receiver<ControllerMsg>,
+    pub incoming: ControllerReceiver,
     /// 写任务（四条流一起）：意外结束就是连接出了问题
     pub writer: Writer,
     reader: OwnedTask<Result<()>>,
+}
+
+/// 控制和大块消息使用独立信箱，批量剪贴板不能占满 Ping / ACK 的接收位置。
+pub struct ControllerReceiver {
+    control: mpsc::Receiver<ControllerMsg>,
+    bulk: mpsc::Receiver<ControllerMsg>,
+    bulk_open: bool,
+}
+
+impl ControllerReceiver {
+    pub(crate) fn new(
+        control: mpsc::Receiver<ControllerMsg>,
+        bulk: mpsc::Receiver<ControllerMsg>,
+    ) -> Self {
+        Self {
+            control,
+            bulk,
+            bulk_open: true,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<ControllerMsg> {
+        loop {
+            tokio::select! {
+                biased;
+                m = self.control.recv() => return m,
+                m = self.bulk.recv(), if self.bulk_open => match m {
+                    Some(m) => return Some(m),
+                    None => self.bulk_open = false,
+                }
+            }
+        }
+    }
 }
 
 /// 四条流的写任务
@@ -80,14 +113,19 @@ async fn next_controller_msg(
     recv: &mut quinn::RecvStream,
     opener: &mut secure::FrameOpener,
     buf: &mut Vec<u8>,
+    lane: SessionLane,
+    features: airhand_proto::Features,
 ) -> Result<Option<ControllerMsg>> {
     loop {
-        if !read_frame(recv, MAX_CONTROL_MSG, buf).await? {
+        if !read_frame(recv, lane.receive_frame_size(features), buf).await? {
             return Ok(None);
         }
         opener.open(buf)?;
-        match framing::decode(buf)? {
-            Decoded::Msg(m) => return Ok(Some(m)),
+        match framing::decode::<ControllerMsg>(buf)? {
+            Decoded::Msg(m) => {
+                anyhow::ensure!(m.lane() == lane, "controller message on the wrong lane");
+                return Ok(Some(m));
+            }
             Decoded::Unknown(variant) => {
                 debug!(variant, "skipping a message from a newer controller")
             }
@@ -169,20 +207,24 @@ impl HostStreams {
             )
         }));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话
-        let (in_tx, incoming) = mpsc::channel(64);
-        let bulk_in = in_tx.clone();
+        let features = r.negotiated.features;
+        let capacity = 4 * 1024 * 1024 / SessionLane::Control.receive_frame_size(features);
+        let (in_tx, control_in) = mpsc::channel(capacity);
+        let (bulk_in, bulk_rx) = mpsc::channel(2);
+        let incoming = ControllerReceiver::new(control_in, bulk_rx);
         let reader = OwnedTask(tokio::spawn(async move {
             // 大块通道（剪贴板）：结束了不算会话结束，控制流结束才是
             let bulk = async move {
                 let mut buf = Vec::new();
-                while let Some(m) =
-                    next_controller_msg(&mut bulk_recv, &mut bulk_opener, &mut buf).await?
+                while let Some(m) = next_controller_msg(
+                    &mut bulk_recv,
+                    &mut bulk_opener,
+                    &mut buf,
+                    SessionLane::Bulk,
+                    features,
+                )
+                .await?
                 {
-                    if matches!(m, ControllerMsg::Input { .. }) {
-                        // 输入只走控制流（过时的输入要在那里挡掉）
-                        warn!(session_id, "ignoring input sent on the bulk lane");
-                        continue;
-                    }
                     if bulk_in.send(m).await.is_err() {
                         break;
                     }
@@ -194,7 +236,15 @@ impl HostStreams {
                 let mut clock = InputClock::default();
                 // 这一串过时的输入已经换成了一个"释放所有按键"
                 let mut released = false;
-                while let Some(m) = next_controller_msg(&mut recv, &mut opener, &mut buf).await? {
+                while let Some(m) = next_controller_msg(
+                    &mut recv,
+                    &mut opener,
+                    &mut buf,
+                    SessionLane::Control,
+                    features,
+                )
+                .await?
+                {
                     let m = match m {
                         ControllerMsg::Ping { t } => {
                             clock.stale(t, Instant::now());
@@ -272,5 +322,41 @@ impl HostStreams {
             Err(e) => warn!(session_id, "session failed: {e:#}"),
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bulk_backpressure_cannot_delay_control_or_keep_a_closed_session_alive() {
+        let (control, control_rx) = mpsc::channel(1);
+        let (bulk, bulk_rx) = mpsc::channel(2);
+        let mut incoming = ControllerReceiver::new(control_rx, bulk_rx);
+        for _ in 0..2 {
+            bulk.try_send(ControllerMsg::Clipboard {
+                text: "x".repeat(1 << 20),
+            })
+            .unwrap();
+        }
+        assert!(
+            bulk.try_send(ControllerMsg::Clipboard {
+                text: "more".into()
+            })
+            .is_err()
+        );
+        control.send(ControllerMsg::Ping { t: 7 }).await.unwrap();
+        assert!(matches!(
+            incoming.recv().await,
+            Some(ControllerMsg::Ping { t: 7 })
+        ));
+        control.send(ControllerMsg::Ack { seq: 3 }).await.unwrap();
+        assert!(matches!(
+            incoming.recv().await,
+            Some(ControllerMsg::Ack { seq: 3 })
+        ));
+        drop(control);
+        assert!(incoming.recv().await.is_none());
     }
 }

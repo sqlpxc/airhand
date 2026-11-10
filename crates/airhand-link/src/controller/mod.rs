@@ -47,8 +47,6 @@ mod queue;
 mod session;
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -90,8 +88,8 @@ fn now_us() -> u64 {
 
 /// 本机剪贴板的双向同步（桌面版；实现见客户端的 `clipboard.rs`）。
 pub trait ClipboardSync: Send + 'static {
-    /// 每隔 [`CLIPBOARD_POLL`] 调用一次：本机剪贴板有新文本（且不是对端刚写入的）时返回它
-    fn poll(&mut self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
+    /// 每隔 [`CLIPBOARD_POLL`] 调用一次，只取已完成的读取结果；不得执行或等待系统剪贴板 IO。
+    fn poll(&mut self) -> Option<String>;
     /// 写入被控端复制的文本
     fn apply(&self, text: String);
 }
@@ -410,6 +408,7 @@ impl ControllerService {
             streams.audio,
             Some(dgram_rx),
             Openers {
+                features: init.negotiated.features,
                 control: init.opener,
                 bulk: secured.bulk.opener,
                 video: secured.video.opener,
@@ -425,7 +424,7 @@ impl ControllerService {
             Frontend::Desktop { clipboard, sync } => {
                 let enabled = Arc::new(AtomicBool::new(sync));
                 let mode = session::Mode::Desktop {
-                    clip: Arc::new(tokio::sync::Mutex::new(clipboard)),
+                    clip: Arc::new(Mutex::new(clipboard)),
                     enabled: enabled.clone(),
                 };
                 (mode, Some(enabled))

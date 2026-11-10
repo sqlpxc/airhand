@@ -120,10 +120,16 @@ pub(super) fn channel() -> (Sender, Receiver) {
 
 /// 编码（明文，带长度前缀）；写任务加密时在后面追加认证标签，这里先留好位置
 fn encode(msg: &ControllerMsg) -> Result<Bytes, Problem> {
-    Ok(Bytes::from(framing::encode_with_spare(
-        msg,
-        airhand_proto::handshake::TAG_LEN,
-    )))
+    let bytes = framing::encode_with_spare(msg, airhand_proto::handshake::TAG_LEN);
+    if msg.lane() != airhand_proto::SessionLane::Control
+        || bytes.len() - framing::PREFIX + airhand_proto::handshake::TAG_LEN
+            > airhand_proto::MAX_CONTROL_MSG
+    {
+        return Err(Problem::failed(
+            "controller message exceeds its lane budget",
+        ));
+    }
+    Ok(Bytes::from(bytes))
 }
 
 /// 一批输入，`t` 是现在（界面的输入都从这里进来）
@@ -148,15 +154,73 @@ fn delta_msg(t: u64, (dx, dy): (i32, i32)) -> ControllerMsg {
     }
 }
 
+// CBOR 的固定开销按上限估计，给消息外层和 AEAD 标签留空间。
+const INPUT_BUDGET: usize = airhand_proto::MAX_CONTROL_MSG - 128;
+fn input_cost(event: &InputEvent) -> usize {
+    64 + match event {
+        InputEvent::Text { text } => text.len(),
+        InputEvent::Key { code, .. } => code.len(),
+        _ => 0,
+    }
+}
+
 impl Sender {
     pub fn send(&self, msg: ControllerMsg) -> Result<(), Problem> {
-        let mut msg = msg;
-        if let ControllerMsg::Input { events, .. } = &mut msg {
-            InputEvent::coalesce(events);
-            if events.is_empty() {
-                return Ok(());
+        let ControllerMsg::Input { t, mut events } = msg else {
+            return self.send_one(msg);
+        };
+        InputEvent::coalesce(&mut events);
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.iter().map(input_cost).sum::<usize>() <= INPUT_BUDGET {
+            return self.send_one(ControllerMsg::Input { t, events });
+        }
+        let mut batch = Vec::new();
+        let mut size = 0;
+        let mut push = |event: InputEvent| -> Result<(), Problem> {
+            let cost = input_cost(&event);
+            if cost > INPUT_BUDGET {
+                return Err(Problem::failed(
+                    "input event exceeds the control lane budget",
+                ));
+            }
+            if size + cost > INPUT_BUDGET {
+                self.send_one(ControllerMsg::Input {
+                    t,
+                    events: std::mem::take(&mut batch),
+                })?;
+                size = 0;
+            }
+            size += cost;
+            batch.push(event);
+            Ok(())
+        };
+        for event in events {
+            match event {
+                InputEvent::Text { text } if text.len() + 64 > INPUT_BUDGET => {
+                    let mut rest = text.as_str();
+                    while !rest.is_empty() {
+                        let mut end = rest.len().min(INPUT_BUDGET - 64);
+                        while !rest.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        push(InputEvent::Text {
+                            text: rest[..end].to_owned(),
+                        })?;
+                        rest = &rest[end..];
+                    }
+                }
+                event => push(event)?,
             }
         }
+        if !batch.is_empty() {
+            self.send_one(ControllerMsg::Input { t, events: batch })?;
+        }
+        Ok(())
+    }
+
+    fn send_one(&self, msg: ControllerMsg) -> Result<(), Problem> {
         let slot = match &msg {
             ControllerMsg::Ack { .. } => Some(Slot::Ack),
             ControllerMsg::Ping { .. } => Some(Slot::Ping),
@@ -303,6 +367,56 @@ mod tests {
 
     fn is_release(m: &ControllerMsg) -> bool {
         events(m) == [InputEvent::ReleaseAll]
+    }
+
+    #[test]
+    fn large_text_batches_keep_order_and_fit_the_control_lane() {
+        let (tx, _rx) = channel();
+        let text = "😀汉字".repeat(20_000);
+        tx.send(ControllerMsg::Input {
+            t: 42,
+            events: vec![
+                InputEvent::Key {
+                    code: "ShiftLeft".into(),
+                    down: true,
+                },
+                InputEvent::Text { text: text.clone() },
+                InputEvent::ReleaseAll,
+            ],
+        })
+        .unwrap();
+        let messages = queued(&tx);
+        assert!(messages.len() > 1);
+        let mut joined = String::new();
+        let mut nontext = Vec::new();
+        for m in messages {
+            let wire = encode(&m).unwrap();
+            assert!(
+                wire.len() - 4 + airhand_proto::handshake::TAG_LEN
+                    <= airhand_proto::MAX_CONTROL_MSG
+            );
+            let ControllerMsg::Input { t, events } = m else {
+                panic!()
+            };
+            assert_eq!(t, 42);
+            for e in events {
+                match e {
+                    InputEvent::Text { text } => joined.push_str(&text),
+                    e => nontext.push(e),
+                }
+            }
+        }
+        assert_eq!(joined, text);
+        assert_eq!(
+            nontext,
+            [
+                InputEvent::Key {
+                    code: "ShiftLeft".into(),
+                    down: true
+                },
+                InputEvent::ReleaseAll
+            ]
+        );
     }
 
     #[test]

@@ -319,7 +319,7 @@ impl Platform for Desktop {
         match tick {
             Tick::Clipboard => {
                 // 走大块通道：1 MiB 的剪贴板不挡控制消息。网络慢、前面排满了就丢掉这一次
-                if let Some(text) = self.clip.poll().await
+                if let Some(text) = self.clip.poll()
                     && let Err(e) = self.out.send(&HostMsg::Clipboard { text })
                 {
                     warn!(session_id, "dropped a clipboard update: {e:#}");
@@ -370,6 +370,10 @@ impl Platform for Desktop {
             }
         }
         Ok(())
+    }
+
+    fn video_stalled(&self) -> bool {
+        self.flow.ack_stalled()
     }
 
     async fn stop(mut self) {

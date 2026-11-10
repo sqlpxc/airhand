@@ -234,11 +234,13 @@ struct WebUi {
 }
 
 impl SessionUi for WebUi {
-    fn packet(&self, packet: Vec<u8>) -> Result<(), UiClosed> {
-        let mut framed = Vec::with_capacity(4 + packet.len());
-        framed.extend_from_slice(&self.ch.to_le_bytes());
-        framed.extend_from_slice(&packet);
-        self.out.push(Message::Binary(Bytes::from(framed)))
+    fn packet(&self, mut packet: Vec<u8>) -> Result<(), UiClosed> {
+        // 解密后原缓冲还留着 16 字节认证标签的容量，直接用它放通道号，避免再分配整包。
+        let len = packet.len();
+        packet.resize(len + 4, 0);
+        packet.copy_within(..len, 4);
+        packet[..4].copy_from_slice(&self.ch.to_le_bytes());
+        self.out.push(Message::Binary(Bytes::from(packet)))
     }
 
     fn event(&self, event: SessionEvent) -> Result<(), UiClosed> {
@@ -438,6 +440,29 @@ mod tests {
         assert_eq!(parse_ack(&[2, 3, 0, 0, 0, 0x2a, 1, 0, 0]), None);
         assert_eq!(parse_ack(&[1, 3, 0, 0, 0]), None);
         assert_eq!(parse_ack(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn media_envelope_reuses_the_decrypted_buffer() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let ui = WebUi {
+            ch: 7,
+            out: Outbox {
+                tx,
+                overflow: Arc::new(Notify::new()),
+                budget: Arc::new(Semaphore::new(1024)),
+            },
+        };
+        let mut packet = Vec::with_capacity(3 + airhand_proto::handshake::TAG_LEN);
+        packet.extend_from_slice(&[1, 2, 3]);
+        let ptr = packet.as_ptr();
+        ui.packet(packet).unwrap();
+        let queued = rx.recv().await.unwrap();
+        let Message::Binary(bytes) = queued.message else {
+            panic!()
+        };
+        assert_eq!(bytes.as_ref(), &[7, 0, 0, 0, 1, 2, 3]);
+        assert_eq!(bytes.as_ptr(), ptr);
     }
 
     #[tokio::test]

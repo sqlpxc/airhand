@@ -84,8 +84,10 @@ pub const PAIRING_DIGITS: usize = 6;
 
 /// 信令流单条消息上限。
 pub const MAX_SIGNAL_MSG: usize = 64 * 1024;
-/// 会话控制通道、大块通道单条消息的上限（最大的是大块通道上 1 MiB 的剪贴板文本和光标形状），含加密的开销。
-pub const MAX_CONTROL_MSG: usize = 2 * 1024 * 1024;
+/// 会话控制通道单条消息上限，含加密标签。长输入分批，大消息走 Bulk。
+pub const MAX_CONTROL_MSG: usize = 64 * 1024;
+/// 大块通道单条消息上限（1 MiB 的剪贴板文本、光标图像），含加密标签。
+pub const MAX_BULK_MSG: usize = 2 * 1024 * 1024;
 
 /// 会话流头部魔数（"AHS1" 是 v9 之前的格式：固定三条通道）。
 pub const SESSION_MAGIC: [u8; 4] = *b"AHS2";
@@ -115,6 +117,24 @@ pub enum SessionLane {
 
 impl SessionLane {
     pub const ALL: [Self; 4] = [Self::Control, Self::Video, Self::Audio, Self::Bulk];
+
+    /// 一帧负载的资源上限（含 AEAD 标签，不含长度前缀），发送和接收共用。
+    pub const fn max_frame_size(self) -> usize {
+        match self {
+            Self::Control => MAX_CONTROL_MSG,
+            Self::Bulk => MAX_BULK_MSG,
+            Self::Video => media::MAX_VIDEO_PACKET + handshake::TAG_LEN,
+            Self::Audio => media::MAX_AUDIO_PACKET + handshake::TAG_LEN,
+        }
+    }
+
+    /// 旧端允许 2 MiB 的控制帧；只有协商后才能收紧，避免旧端长文本被误判为损坏。
+    pub const fn receive_frame_size(self, features: Features) -> usize {
+        match self {
+            Self::Control if !features.has(features::session::SMALL_CONTROL) => MAX_BULK_MSG,
+            _ => self.max_frame_size(),
+        }
+    }
 
     /// 服务器往这条通道写数据时的优先级（越大越先发）：控制消息不能排在画面后面。
     /// 大块和画面一样：一样的优先级 QUIC 轮流发，1 MiB 的剪贴板不会把画面完全挡住，光标也不会排在一串画面后面
@@ -287,8 +307,10 @@ pub mod features {
 
         /// 光标可见性和形状引用走控制流，图像走大块流，用代际引用处理乱序。
         pub const CURSOR_UPDATES: Features = Features::from_bits(1 << 0);
+        /// 控制帧限制为 64 KiB；长输入按字符边界分批。旧端仍按原来的 2 MiB 接收。
+        pub const SMALL_CONTROL: Features = Features::from_bits(1 << 1);
         /// 本端支持的
-        pub const SUPPORTED: Features = CURSOR_UPDATES;
+        pub const SUPPORTED: Features = CURSOR_UPDATES.with(SMALL_CONTROL);
     }
 }
 
@@ -354,6 +376,21 @@ mod tests {
         assert_eq!(d, [8, 7, 6, 5, 4, 3, 2, 1, 9, 9]);
         assert_eq!(datagram::session(&d), Some(0x0102_0304_0506_0708));
         assert_eq!(datagram::session(&d[..7]), None);
+    }
+
+    #[test]
+    fn control_budget_is_negotiated_without_changing_bulk() {
+        let small = features::session::SMALL_CONTROL;
+        assert_eq!(
+            SessionLane::Control.receive_frame_size(Features::NONE),
+            2 << 20
+        );
+        assert_eq!(SessionLane::Control.receive_frame_size(small), 64 << 10);
+        assert_eq!(SessionLane::Bulk.receive_frame_size(small), 2 << 20);
+        assert_eq!(
+            SessionLane::Bulk.receive_frame_size(Features::NONE),
+            2 << 20
+        );
     }
 
     #[test]

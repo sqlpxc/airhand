@@ -47,7 +47,7 @@ pub use session::{
     APPROVAL_TIMEOUT, ApprovalSlots, MAX_PENDING_APPROVALS, PEER_TIMEOUT, Platform, Request,
     Senders, Start, serve,
 };
-pub use streams::{Admitted, HostStreams, Writer};
+pub use streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 
 /// 本机用户的命令（托盘菜单、Android 的界面）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +224,8 @@ where
     let mut sessions: JoinSet<u64> = JoinSet::new();
     // 每次发送都会让所有会话向控制端发送 Bye（带上这个原因）并结束
     let (kick_tx, _) = watch::channel(ByeReason::Kicked);
+    // 换钥过程中再次踢人：先保存当前回答，再轮换一次，覆盖两次操作之间发出的凭证。
+    let mut rekey_again = false;
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
@@ -245,9 +247,12 @@ where
                 // 服务器换了取回控制码的密钥（断开所有控制端之后，见 HostCmd::KickAll）：保存下来，下次取回用它
                 Some(ServerMsg::Rekeyed { secret }) => {
                     let got = Reclaim { code, secret };
-                    id.rekey = false;
                     *reclaim = Some(got);
                     events.registered(got, true).await;
+                    id.rekey = std::mem::take(&mut rekey_again);
+                    if id.rekey {
+                        write_msg(&mut sig.send, &ClientMsg::Rekey { secret: Some(secret) }).await?;
+                    }
                     info!(code, "the server changed this host's secret, old reconnect tokens are void");
                 }
                 Some(other) => warn!("ignoring server message: {other:?}"),
@@ -267,8 +272,14 @@ where
                     // 先让服务器换密钥（之前发出的重连凭证随之作废），再让会话发 Bye：
                     // 被断开的控制端不能带着凭证马上连回来。更换控制码时旧码直接作废，不用换。
                     // 收到 Rekeyed 之前一直记着：断线了就在下次注册时换（见 Identity::rekey）
-                    id.rekey = true;
-                    write_msg(&mut sig.send, &ClientMsg::Rekey).await?;
+                    if id.rekey {
+                        rekey_again = true;
+                    } else {
+                        id.rekey = true;
+                        write_msg(&mut sig.send, &ClientMsg::Rekey {
+                            secret: reclaim.map(|r| r.secret),
+                        }).await?;
+                    }
                 }
                 events.kicked(cmd);
                 kick_tx.send_replace(cmd.reason());

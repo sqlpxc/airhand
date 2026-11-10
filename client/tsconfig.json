@@ -16,5 +16,5 @@
     "types": ["vite/client"],
     "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src", "tests/protocol-contract.ts"]
 }

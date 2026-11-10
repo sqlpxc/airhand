@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub const BINDING_TTL: Duration = Duration::from_secs(180 * 24 * 3600);
 const SCHEMA_VERSION: i64 = 2;
@@ -222,46 +222,41 @@ fn writer(mut db: Connection, store: Arc<Store>) {
 }
 
 impl Bindings {
-    pub fn open(path: Option<&Path>) -> Self {
-        let memory = || Self {
-            entries: HashMap::new(),
-            store: None,
-            key: rand::random(),
-        };
+    /// `None` 显式选择内存模式；配置了数据库时，任何初始化错误都必须阻止启动。
+    /// 否则空绑定表会把已有控制码重新分配，新的服务器密钥也会使旧凭证失效。
+    pub fn open(path: Option<&Path>) -> Result<Self> {
         let Some(path) = path else {
-            return memory();
+            return Ok(Self {
+                entries: HashMap::new(),
+                store: None,
+                key: rand::random(),
+            });
         };
-        let loaded = open(path)
+        let (entries, key, db) = open(path)
             .and_then(|db| Ok((load(&db)?, load_key(&db)?, db)))
-            .with_context(|| format!("can't open {}", path.display()));
-        match loaded {
-            Ok((entries, key, db)) => {
-                info!(
-                    "{} fixed control code(s) in {}",
-                    entries.len(),
-                    path.display()
-                );
-                let store = Arc::new(Store {
-                    state: Mutex::default(),
-                    cv: Condvar::new(),
-                    committed: watch::Sender::new(0),
-                });
-                let worker = store.clone();
-                std::thread::Builder::new()
-                    .name("airhand-codes".into())
-                    .spawn(move || writer(db, worker))
-                    .expect("spawn code persistence worker");
-                Self {
-                    entries,
-                    store: Some(store),
-                    key,
-                }
-            }
-            Err(e) => {
-                error!("{e:#}; fixed codes are only kept in memory until restart");
-                memory()
-            }
-        }
+            .with_context(|| {
+                format!("can't load control code ownership from {}", path.display())
+            })?;
+        info!(
+            "{} fixed control code(s) in {}",
+            entries.len(),
+            path.display()
+        );
+        let store = Arc::new(Store {
+            state: Mutex::default(),
+            cv: Condvar::new(),
+            committed: watch::Sender::new(0),
+        });
+        let worker = store.clone();
+        std::thread::Builder::new()
+            .name("airhand-codes".into())
+            .spawn(move || writer(db, worker))
+            .context("can't start the code persistence worker")?;
+        Ok(Self {
+            entries,
+            store: Some(store),
+            key,
+        })
     }
 
     /// 服务器自己的密钥（随数据库保存；没有数据库时每次启动随机生成）
@@ -384,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_and_expiry() {
         let path = temp();
-        let mut b = Bindings::open(Some(&path));
+        let mut b = Bindings::open(Some(&path)).unwrap();
         let key = b.server_key();
         assert!(b.bind(123456, &[1; 16], None));
         assert!(b.bind(654321, &[2; 16], None));
@@ -394,7 +389,7 @@ mod tests {
         b.persist(654321);
         assert!(b.barrier().wait(Duration::from_secs(5)).await);
         drop(b);
-        let mut b = Bindings::open(Some(&path));
+        let mut b = Bindings::open(Some(&path)).unwrap();
         assert_eq!(b.server_key(), key, "the server key survives a restart");
         assert_eq!(b.len(), 2);
         assert_eq!(b.check(123456, &[1; 16]), Owner::Current);
@@ -405,7 +400,7 @@ mod tests {
         b.remove(123456);
         b.bind(123456, &[3; 16], None); // latest write wins, including remove/rebind
         assert!(b.barrier().wait(Duration::from_secs(5)).await);
-        let again = Bindings::open(Some(&path));
+        let again = Bindings::open(Some(&path)).unwrap();
         assert_eq!(again.check(123456, &[3; 16]), Owner::Current);
         assert_eq!(again.len(), 1);
     }
@@ -413,11 +408,11 @@ mod tests {
     #[tokio::test]
     async fn rekey_keeps_the_previous_secret_until_confirmed() {
         let path = temp();
-        let mut b = Bindings::open(Some(&path));
+        let mut b = Bindings::open(Some(&path)).unwrap();
         b.bind(123456, &[1; 16], None);
         assert!(b.bind(123456, &[2; 16], Some(&[1; 16])));
         assert!(b.barrier().wait(Duration::from_secs(5)).await);
-        let mut again = Bindings::open(Some(&path));
+        let mut again = Bindings::open(Some(&path)).unwrap();
         assert_eq!(again.check(123456, &[2; 16]), Owner::Current);
         assert_eq!(again.check(123456, &[1; 16]), Owner::Previous);
         assert_eq!(again.check(123456, &[3; 16]), Owner::Other);
@@ -430,7 +425,7 @@ mod tests {
     #[test]
     fn barrier_does_not_wait_for_later_writes() {
         let path = temp();
-        let mut b = Bindings::open(Some(&path));
+        let mut b = Bindings::open(Some(&path)).unwrap();
         b.bind(100000, &[1; 16], None);
         let barrier = b.barrier();
         let writes = std::thread::scope(|s| {
@@ -458,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn locked_database_does_not_block_broker_or_lose_ownership() {
         let path = temp();
-        let mut b = Bindings::open(Some(&path));
+        let mut b = Bindings::open(Some(&path)).unwrap();
         let db = Connection::open(&path).unwrap();
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
         let start = Instant::now();
@@ -478,14 +473,36 @@ mod tests {
             .unwrap()
             .execute_batch("PRAGMA user_version = 99")
             .unwrap();
-        let mut b = Bindings::open(Some(&path));
-        b.bind(123456, &[1; 16], None);
-        assert!(b.contains(123456));
+        assert!(Bindings::open(Some(&path)).is_err());
         let v: i64 = Connection::open(&path)
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 99);
+    }
+
+    #[test]
+    fn startup_failure_preserves_saved_ownership_and_server_key() {
+        let path = temp();
+        let db = open(&path).unwrap();
+        let key = load_key(&db).unwrap();
+        db.execute(
+            "INSERT INTO fixed_codes (code, secret_hash, last_seen) VALUES (?1, ?2, ?3)",
+            params![123456, secret_hash(&[7; 16]), now()],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA user_version = 99").unwrap();
+        assert!(Bindings::open(Some(&path)).is_err());
+        db.execute_batch("PRAGMA user_version = 2").unwrap();
+        let saved = Bindings::open(Some(&path)).unwrap();
+        assert_eq!(saved.check(123456, &[7; 16]), Owner::Current);
+        assert_eq!(saved.server_key(), key);
+
+        let invalid = path.with_file_name("corrupt.db");
+        std::fs::write(&invalid, b"not a SQLite database").unwrap();
+        assert!(Bindings::open(Some(&invalid)).is_err());
+        assert!(Bindings::open(Some(path.parent().unwrap())).is_err());
+        assert_eq!(Bindings::open(None).unwrap().len(), 0);
     }
 
     /// 版本 1 的数据库（之前的服务器建的）升级到 2，原来的绑定都还在
@@ -504,7 +521,7 @@ mod tests {
         )
         .unwrap();
         drop(db);
-        let b = Bindings::open(Some(&path));
+        let b = Bindings::open(Some(&path)).unwrap();
         assert_eq!(b.check(123456, &[7; 16]), Owner::Current);
         let v: i64 = Connection::open(&path)
             .unwrap()

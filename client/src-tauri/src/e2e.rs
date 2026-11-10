@@ -206,6 +206,7 @@ async fn e2e_roundtrip() {
         streams.audio,
         Some(datagrams),
         Openers {
+            features: init.negotiated.features,
             bulk: init.secured.bulk.opener,
             video: init.secured.video.opener,
             audio: init.secured.audio.opener,

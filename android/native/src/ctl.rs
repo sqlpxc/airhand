@@ -14,10 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use airhand_link::controller::{
-    Command, ConnectOptions, ControllerService, Frontend, HostOnline, SessionEvent, SessionUi,
-    UiClosed,
-};
+use airhand_link::controller::{Command, ConnectOptions, ControllerService, Frontend, HostOnline};
 use airhand_link::net::{MemoryTrust, Report, TrustStore, format_fingerprint, parse_fingerprint};
 use airhand_link::secure::{Identity, hex, unhex32};
 use airhand_link::{LinkConfig, Problem, ServerState};
@@ -27,6 +24,7 @@ use serde_json::json;
 
 use crate::queue::Queue;
 use crate::rt::rt;
+use crate::session_queue::SessionQueue;
 
 /// 连接服务器用的配置（Kotlin 传来的 JSON）
 #[derive(Debug, Deserialize)]
@@ -131,35 +129,10 @@ pub enum Cmd {
     Session(Command),
 }
 
-/// 会话队列：画面一直有在途帧控制，正常情况下远远到不了上限
-const SESSION_QUEUE: usize = 1024;
-
 pub struct Ctl {
     svc: ControllerService,
     events: Arc<Queue<String>>,
-    sessions: Mutex<HashMap<u32, Arc<Queue<Vec<u8>>>>>,
-}
-
-/// 会话的数据交给 Kotlin：放进队列
-struct QueueUi(Arc<Queue<Vec<u8>>>);
-
-impl SessionUi for QueueUi {
-    fn packet(&self, packet: Vec<u8>) -> Result<(), UiClosed> {
-        if self.0.push(packet) {
-            Ok(())
-        } else {
-            Err(UiClosed)
-        }
-    }
-
-    fn event(&self, event: SessionEvent) -> Result<(), UiClosed> {
-        let json = serde_json::to_vec(&event).map_err(|_| UiClosed)?;
-        if self.0.push(json) {
-            Ok(())
-        } else {
-            Err(UiClosed)
-        }
-    }
+    sessions: Mutex<HashMap<u32, Arc<SessionQueue>>>,
 }
 
 impl Ctl {
@@ -221,9 +194,11 @@ impl Ctl {
     }
 
     fn connect(&self, code: &str, opts: ConnectOptions) -> String {
-        let queue = Arc::new(Queue::new(SESSION_QUEUE));
-        let ui = Arc::new(QueueUi(queue.clone()));
-        let result = rt().block_on(self.svc.connect(code, opts, ui, Frontend::Browser));
+        let queue = Arc::new(SessionQueue::default());
+        let result = rt().block_on(
+            self.svc
+                .connect(code, opts, queue.clone(), Frontend::Browser),
+        );
         match result {
             Ok(info) => {
                 self.sessions.lock().unwrap().insert(info.sid, queue);

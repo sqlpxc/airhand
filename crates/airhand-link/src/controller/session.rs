@@ -175,7 +175,7 @@ pub(super) struct SessionIo {
 pub(super) enum Mode {
     Desktop {
         /// 远端→本机 与 本机→远端 共用同一个同步状态，用来抑制回声
-        clip: Arc<tokio::sync::Mutex<Box<dyn ClipboardSync>>>,
+        clip: Arc<std::sync::Mutex<Box<dyn ClipboardSync>>>,
         /// 是否同步剪贴板（界面可随时切换）
         enabled: Arc<AtomicBool>,
     },
@@ -296,7 +296,7 @@ pub(super) async fn run(
                 HostMsg::Clipboard { text } => match &clip_in {
                     Some((clip, enabled)) => {
                         if enabled.load(Ordering::Relaxed) {
-                            clip.lock().await.apply(text);
+                            clip.lock().unwrap().apply(text);
                         }
                     }
                     None => {
@@ -387,9 +387,10 @@ pub(super) async fn run(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let mut c = clip.lock().await;
+            // poll 只取后台读任务已完成的结果，锁内不执行或等待剪贴板 IO。
+            let text = clip.lock().unwrap().poll();
             // 关闭同步时也要消费变化，否则重新打开时会把旧内容发过去
-            let Some(text) = c.poll().await else { continue };
+            let Some(text) = text else { continue };
             if enabled.load(Ordering::Relaxed) {
                 send_clipboard(&bulk_tx, text);
             }

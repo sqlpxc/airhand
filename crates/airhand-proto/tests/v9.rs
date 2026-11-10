@@ -41,7 +41,7 @@ fn v9_existing_messages_keep_their_wire_encoding() {
         },
         "820282071a0001e240",
     );
-    golden(ClientMsg::Rekey, "820480");
+    golden(ClientMsg::Rekey { secret: None }, "820480");
     golden(HostMsg::Pong { t: 99 }, "8203811863");
     golden(HostMsg::Bye(ByeReason::Kicked), "82098100");
     golden(
@@ -82,6 +82,28 @@ fn v9_existing_messages_keep_their_wire_encoding() {
         "a40001010003010401",
     );
     golden(Confirm::default(), "a0");
+}
+
+#[test]
+fn rekey_confirmation_is_an_optional_field() {
+    #[derive(Encode, Decode)]
+    enum Old {
+        #[n(4)]
+        Rekey,
+    }
+    let old = framing::to_vec(&Old::Rekey);
+    assert!(matches!(
+        framing::decode_known::<ClientMsg>(&old).unwrap(),
+        ClientMsg::Rekey { secret: None }
+    ));
+    let new = ClientMsg::Rekey {
+        secret: Some([7; 16]),
+    };
+    assert!(matches!(
+        framing::decode_known::<Old>(&framing::to_vec(&new)).unwrap(),
+        Old::Rekey
+    ));
+    golden(new, "8204815007070707070707070707070707070707");
 }
 
 #[test]

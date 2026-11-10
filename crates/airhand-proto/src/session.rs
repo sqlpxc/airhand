@@ -419,6 +419,21 @@ pub enum ControllerMsg {
     },
 }
 
+impl ControllerMsg {
+    pub fn lane(&self) -> SessionLane {
+        match self {
+            Self::Clipboard { .. } => SessionLane::Bulk,
+            Self::Input { .. }
+            | Self::Ack { .. }
+            | Self::Settings(_)
+            | Self::RequestKeyframe
+            | Self::SelectDisplay { .. }
+            | Self::Ping { .. }
+            | Self::Audio { .. } => SessionLane::Control,
+        }
+    }
+}
+
 /// 剪贴板同步的文本上限
 pub const MAX_CLIPBOARD_TEXT: usize = 1 << 20;
 

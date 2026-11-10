@@ -11,6 +11,7 @@ pub mod ctl;
 pub mod host;
 pub mod queue;
 pub mod rt;
+mod session_queue;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};

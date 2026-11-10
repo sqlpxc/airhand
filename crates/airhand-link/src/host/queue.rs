@@ -31,7 +31,7 @@ use crate::transport::Frames;
 /// 控制通道最多排这么多条。控制消息都很小，排满了说明对方早就不收了
 const CONTROL_MESSAGES: usize = 32;
 /// 大块通道最多排这么多条、这么多字节（一个剪贴板最多 1 MiB，一个光标形状几十 KB）。
-/// 队列空着的时候，再大的一条消息也放得进去
+/// 单条帧仍需满足所属通道的协议上限。
 const BULK_MESSAGES: usize = 32;
 const BULK_BYTES: usize = 4 * 1024 * 1024;
 
@@ -143,6 +143,8 @@ pub enum SendError {
     /// 会话的写任务已经结束了
     #[error("the session's send queue is closed")]
     Closed,
+    #[error("message exceeds its lane's frame budget")]
+    TooLarge,
 }
 
 struct Item {
@@ -298,6 +300,9 @@ impl Outbox {
 
     /// 发送 [`Outbox::encode`] 编好的消息。只留最新值的状态（见模块说明）不会排满
     pub fn send_encoded(&self, msg: Encoded) -> Result<(), SendError> {
+        if msg.bytes.len() - framing::PREFIX + TAG_LEN > msg.lane().max_frame_size() {
+            return Err(SendError::TooLarge);
+        }
         let lane = &self.shared.lanes[msg.place.lane()];
         lane.state.lock().unwrap().push(msg, &lane.limit)?;
         lane.ready.notify_one();
@@ -579,7 +584,7 @@ mod tests {
         assert_eq!(visible(&out[0]), (true, Some(5)));
     }
 
-    /// 大块通道按字节数限量：排满了丢这一次（由发的一方决定），控制通道不受影响；空着的时候多大的都放得进
+    /// 大块通道按字节数限量：控制通道不受影响，单条消息也不能突破协议上限。
     #[test]
     fn bulk_is_bounded_by_bytes_and_does_not_block_control() {
         let (tx, mut control, mut bulk) = channel();
@@ -602,10 +607,14 @@ mod tests {
         }
         assert_eq!(tx.send(&cursor(true, Some(1))), Err(SendError::Full));
         drain(&mut bulk);
-        // 比上限还大的一条：队列空着就放得进（不然它永远发不出去）
         let huge = Outbox::encode(&clipboard(BULK_BYTES + 1));
-        tx.send_encoded(huge.clone()).unwrap();
-        assert_eq!(tx.send_encoded(huge), Err(SendError::Full));
+        assert_eq!(tx.send_encoded(huge), Err(SendError::TooLarge));
+        assert!(bulk.try_recv().is_none());
+        let mut h = hello("large");
+        if let HostMsg::Hello(ref mut h) = h {
+            h.hostname = "x".repeat(airhand_proto::MAX_CONTROL_MSG);
+        }
+        assert_eq!(tx.send(&h), Err(SendError::TooLarge));
     }
 
     /// 发送端都丢掉之后，写任务把排着的发完再结束（Bye 就是这样发出去的）；写任务不在了，发送端马上知道

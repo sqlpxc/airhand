@@ -131,7 +131,7 @@ fn send_msg_cancellable(out: &Outbox, stop: &AtomicBool, msg: &HostMsg) -> bool 
         }
         match out.send_encoded(msg.clone()) {
             Ok(()) => return true,
-            Err(SendError::Closed) => return false,
+            Err(SendError::Closed | SendError::TooLarge) => return false,
             Err(SendError::Full) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
@@ -211,7 +211,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 }
                 Err(e) => {
                     // 没发出去的图像由 CursorCache 忘掉；可见性已经独立发送。
-                    if e == SendError::Closed {
+                    if matches!(e, SendError::Closed | SendError::TooLarge) {
                         break;
                     }
                 }
@@ -322,7 +322,25 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 if ctrl.stop.load(Ordering::Acquire) {
                     break;
                 }
-                let seq = ctrl.flow.sent();
+                let size = media::HEADER_LEN + ef.data.len();
+                if size > media::MAX_VIDEO_PACKET {
+                    notice(Notice::CaptureFailed {
+                        detail: "encoded frame exceeds the video budget".into(),
+                    });
+                    break;
+                }
+                while !ctrl.flow.wait_room(
+                    settings.fps,
+                    size,
+                    &ctrl.stop,
+                    Duration::from_millis(50),
+                ) {
+                    abr.blocked += 1;
+                    if ctrl.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+                let seq = ctrl.flow.sent(size);
                 let info = e.info();
                 let len = ef.data.len();
                 if !fresh && !force && len < REFINE_DONE_BYTES {

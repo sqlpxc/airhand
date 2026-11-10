@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs";
 import * as media from "../src/lib/media.ts";
-import type { Command, ConnectOptions, InputEvent } from "../src/lib/api.ts";
+import { contract } from "./protocol-contract.ts";
 
 const fixture = JSON.parse(
   fs.readFileSync(new URL("../../crates/airhand-link/tests/protocol.json", import.meta.url), "utf8"),
@@ -50,13 +50,15 @@ test("媒体包：头和数据按 media.ts 解析，负载从头里写的长度�
 
 test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () => {
   // 样例里的每一种输入事件、每一个命令 api.ts 都有（新加了 Rust 这边要记得补上类型）
-  const events: InputEvent[] = fixture.input;
-  const commands: Command[] = fixture.commands;
+  assert.deepEqual(contract.input, fixture.input);
+  assert.deepEqual(contract.commands, fixture.commands);
+  const events = contract.input;
+  const commands = contract.commands;
   const kinds = events.map((e) => e.type);
   assert.deepEqual(kinds, ["mouseMove", "mouseDelta", "mouseButton", "wheel", "key", "text", "releaseAll", "touch", "system"]);
-  const delta: InputEvent = { type: "mouseDelta", dx: -3, dy: 7 };
+  const delta = { type: "mouseDelta", dx: -3, dy: 7 };
   assert.deepEqual(events[1], delta);
-  const button: InputEvent = { type: "mouseButton", button: "right", down: true };
+  const button = { type: "mouseButton", button: "right", down: true };
   assert.deepEqual(events[2], button);
   const cmds = commands.map((c) => c.cmd).sort();
   assert.deepEqual(cmds, ["ack", "audio", "clipboard", "clipboardSync", "disconnect", "display", "input", "keyframe", "settings"]);
@@ -67,7 +69,8 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
     settings: { fps: 60, bitrateKbps: 8000, maxShort: 1080, adaptive: true, codec: "h265" },
   });
   // 连接选项：字段和 ConnectOptions 一样
-  const opts: ConnectOptions = fixture.connectOptions;
+  const opts = contract.connectOptions;
+  assert.deepEqual(opts, fixture.connectOptions);
   assert.deepEqual(Object.keys(opts).sort(), ["audio", "hostKey", "pairing", "resume", "settings"]);
   assert.equal(opts.settings.codec, "h265");
 });

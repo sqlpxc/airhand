@@ -33,7 +33,7 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::queue::Outbox;
-use super::streams::{Admitted, HostStreams, Writer};
+use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 use super::{Admission, Gate, Incoming};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
@@ -140,6 +140,11 @@ pub trait Platform: Send {
     /// 处理 [`Platform::next_event`] 等到的事。返回错误时会话结束
     fn event(&mut self, event: Self::Event) -> impl Future<Output = Result<()>> + Send;
 
+    /// 视频确认超过期限，控制心跳仍正常也应结束会话，避免永久冻结画面。
+    fn video_stalled(&self) -> bool {
+        false
+    }
+
     /// 会话正常结束：停掉还拿着发送端的东西（编码线程、声音订阅），写任务才能把排着的（例如 Bye）发完
     fn stop(self) -> impl Future<Output = ()> + Send
     where
@@ -240,7 +245,7 @@ async fn drive<P: Platform>(
     admitted: &Admitted,
     platform: &mut P,
     out: &Outbox,
-    incoming: &mut mpsc::Receiver<ControllerMsg>,
+    incoming: &mut ControllerReceiver,
     kick: &mut watch::Receiver<ByeReason>,
     writer: &mut Writer,
     approvals: &ApprovalSlots,
@@ -358,6 +363,9 @@ async fn drive<P: Platform>(
             event = platform.next_event(), if open => platform.event(event).await?,
             e = writer.failed() => return Err(e),
             _ = watchdog.tick() => {
+                if open && platform.video_stalled() {
+                    bail!("the controller stopped acknowledging video");
+                }
                 if last_msg.elapsed() > PEER_TIMEOUT {
                     bail!("the controller stopped responding");
                 }
@@ -468,7 +476,8 @@ mod tests {
     /// `approvals`：和别的会话共用的名额（同一个被控端服务的会话）
     fn session_with(admission: Admission, approvals: ApprovalSlots) -> Harness {
         let log = Log::default();
-        let (to_host, mut incoming) = mpsc::channel(16);
+        let (to_host, control_in) = mpsc::channel(16);
+        let mut incoming = ControllerReceiver::new(control_in, mpsc::channel(1).1);
         let (events_tx, events) = mpsc::channel(16);
         let (kick, mut kick_rx) = watch::channel(ByeReason::Kicked);
         let (answer_tx, answer) = oneshot::channel();

@@ -351,7 +351,7 @@ mod tests {
                 code: 654_321,
                 resume: None,
             },
-            ClientMsg::Rekey,
+            ClientMsg::Rekey { secret: None },
             ClientMsg::Release,
             ClientMsg::Register {
                 reclaim: Some(reclaim),
@@ -539,7 +539,9 @@ mod tests {
                 code: 123_456,
                 resume: Some([7; 16]),
             },
-            ClientMsg::Rekey,
+            ClientMsg::Rekey {
+                secret: Some([5; 16]),
+            },
             ClientMsg::Release,
         ] {
             signal.extend(encode(&m));

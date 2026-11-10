@@ -87,7 +87,7 @@ fn limiter_key_groups_addresses() {
 
 #[test]
 fn resume_token_binds_code_and_secret() {
-    let broker = Broker::new(test_config(None));
+    let broker = Broker::new(test_config(None)).unwrap();
     let t = broker.resume_token(123_456, &[1; 16]);
     assert!(ct_eq(&t, &broker.resume_token(123_456, &[1; 16])));
     assert!(!ct_eq(&t, &broker.resume_token(123_457, &[1; 16])));
@@ -95,7 +95,7 @@ fn resume_token_binds_code_and_secret() {
     // 前一半只和控制码、服务器有关：换了密钥也认得是自己发的，别的控制码、别的服务器不认
     assert!(broker.vouches(123_456, &broker.resume_token(123_456, &[2; 16])));
     assert!(!broker.vouches(123_457, &t));
-    assert!(!Broker::new(test_config(None)).vouches(123_456, &t));
+    assert!(!Broker::new(test_config(None)).unwrap().vouches(123_456, &t));
     assert!(!broker.vouches(123_456, &[0; 16]));
     assert!(!ct_eq(&t, &t[..15]));
 }
@@ -115,7 +115,7 @@ fn hmac_matches_rfc4231() {
 
 #[test]
 fn secrets_are_signed_for_one_code() {
-    let broker = Broker::new(test_config(None));
+    let broker = Broker::new(test_config(None)).unwrap();
     let s = broker.issue_secret(123_456);
     assert!(broker.issued_here(123_456, &s));
     assert!(!broker.issued_here(123_457, &s));
@@ -123,7 +123,11 @@ fn secrets_are_signed_for_one_code() {
     forged[15] ^= 1;
     assert!(!broker.issued_here(123_456, &forged));
     // 别的服务器（不同的密钥）签发的不认
-    assert!(!Broker::new(test_config(None)).issued_here(123_456, &s));
+    assert!(
+        !Broker::new(test_config(None))
+            .unwrap()
+            .issued_here(123_456, &s)
+    );
 }
 
 fn test_config(db: Option<std::path::PathBuf>) -> Config {
@@ -155,7 +159,7 @@ async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
     )
     .unwrap();
     let server = endpoint.local_addr().unwrap().to_string();
-    let broker = Broker::new(cfg);
+    let broker = Broker::new(cfg).unwrap();
     let b = broker.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -368,6 +372,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
         c.audio,
         None,
         Openers {
+            features: init.negotiated.features,
             control: init.opener,
             bulk: init.secured.bulk.opener,
             video: init.secured.video.opener,
@@ -718,6 +723,101 @@ async fn registration_does_not_reveal_whether_a_code_is_taken() {
     assert_eq!(again, own);
 }
 
+/// 用真实 QUIC 和端到端握手检查通道预算；旧端的大输入仍可读取，新端严格限制。
+#[tokio::test]
+async fn session_lane_limits_preserve_legacy_input_and_reject_wrong_lanes() {
+    use airhand_link::{secure, transport};
+    use airhand_proto::session::{ControllerMsg, InputEvent};
+    use airhand_proto::{Features, Role, SessionLane, features, framing};
+    for features in [Features::NONE, features::session::SUPPORTED] {
+        let (_broker, cfg) = start().await;
+        let (mut host, id) = register(&cfg, None).await;
+        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let grant = ask(&mut ctrl, 1, id.code, None).await.unwrap();
+        let ServerMsg::Incoming { session_id, peer } = next(&mut host).await else {
+            panic!()
+        };
+        let (_kick, kick) = watch::channel(ByeReason::Kicked);
+        let inc = Incoming {
+            conn: host.conn.clone(),
+            session_id,
+            code: id.code,
+            peer,
+            kick,
+            approvals: Default::default(),
+        };
+        let gate = OpenGate(Identity::generate());
+        let me = Identity::generate();
+        let mut intro = secure::controller_intro("ctl", "test", QualitySettings::default(), false);
+        intro.features = features;
+        let controller = async {
+            let mut streams = transport::open_session(&ctrl.conn, session_id, Role::Controller)
+                .await
+                .unwrap();
+            let init = secure::initiate(
+                &mut streams.control.1,
+                &mut streams.control.0,
+                secure::InitiatorParams {
+                    session_id,
+                    code: id.code,
+                    me: &me,
+                    host_key: None,
+                    pairing: None,
+                    intro: &intro,
+                },
+            )
+            .await
+            .unwrap();
+            (streams, init)
+        };
+        let (host_io, (mut streams, mut init)) =
+            tokio::join!(HostStreams::open(&inc, 2, 16, &gate), controller);
+        let (mut host_io, admitted) = host_io.unwrap();
+        assert_eq!(admitted.negotiated.features, features);
+        let text = "x".repeat(100_000);
+        // 大剪贴板在 Bulk 上有效。
+        let mut frame = framing::encode(&ControllerMsg::Clipboard { text: text.clone() });
+        init.secured.bulk.sealer.seal_frame(&mut frame).unwrap();
+        streams.bulk.0.write_all(&frame).await.unwrap();
+        let msg = timeout(Duration::from_secs(5), host_io.incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, ControllerMsg::Clipboard { text: t } if t == text));
+        // 同样大小的输入，只允许未协商小控制帧的旧端。
+        let mut frame = framing::encode(&ControllerMsg::Input {
+            t: 0,
+            events: vec![InputEvent::Text { text: text.clone() }],
+        });
+        init.sealer.seal_frame(&mut frame).unwrap();
+        streams.control.0.write_all(&frame).await.unwrap();
+        let msg = timeout(Duration::from_secs(5), host_io.incoming.recv())
+            .await
+            .unwrap();
+        if features.has(features::session::SMALL_CONTROL) {
+            assert!(msg.is_none());
+        } else {
+            assert!(
+                matches!(msg, Some(ControllerMsg::Input { events, .. }) if events == [InputEvent::Text { text }])
+            );
+            // 已知消息发到错误通道，即使密文认证成功也应拒绝。
+            let ping = ControllerMsg::Ping { t: 1 };
+            assert_eq!(ping.lane(), SessionLane::Control);
+            let mut frame = framing::encode(&ping);
+            init.secured.bulk.sealer.seal_frame(&mut frame).unwrap();
+            streams.bulk.0.write_all(&frame).await.unwrap();
+            assert!(
+                timeout(Duration::from_secs(5), host_io.incoming.recv())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(host_io.close(session_id, Ok(())).await.is_err());
+        drop(grant);
+    }
+}
+
 /// 本机用户断开所有控制端时换密钥：之前的重连凭证作废，控制码不变。
 /// 被控端用新密钥取回控制码；没来得及保存新密钥时，旧密钥也还认（同时再换一个），保存了之后旧的就不认了
 #[tokio::test]
@@ -729,7 +829,9 @@ async fn rekey_voids_tokens_and_keeps_the_code() {
     let old_token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
 
-    write_msg(&mut host.send, &ClientMsg::Rekey).await.unwrap();
+    write_msg(&mut host.send, &ClientMsg::Rekey { secret: None })
+        .await
+        .unwrap();
     let ServerMsg::Rekeyed { secret } = next(&mut host).await else {
         panic!("expected Rekeyed");
     };
@@ -767,6 +869,79 @@ async fn rekey_voids_tokens_and_keeps_the_code() {
     let (_h3, stolen) = register_with(&cfg, Some(id), true).await;
     assert_ne!(stolen.code, id.code);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 同一把已保存密钥的重复换钥是幂等的；断线、服务器重启都不能丢失归属。
+#[tokio::test]
+async fn repeated_rekey_preserves_the_last_confirmed_secret() {
+    let (dir, file) = temp_db();
+    let (broker, cfg) = start_with(Some(file.clone())).await;
+    let (mut host, saved) = register_with(&cfg, None, true).await;
+    let request = ClientMsg::Rekey {
+        secret: Some(saved.secret),
+    };
+    write_msg(&mut host.send, &request).await.unwrap();
+    write_msg(&mut host.send, &request).await.unwrap();
+    let ServerMsg::Rekeyed { secret: first } = next(&mut host).await else {
+        panic!()
+    };
+    let ServerMsg::Rekeyed { secret: duplicate } = next(&mut host).await else {
+        panic!()
+    };
+    assert_eq!(first, duplicate);
+    assert_eq!(
+        broker.bindings.lock().check(saved.code, &saved.secret),
+        crate::codes::Owner::Previous
+    );
+    host.conn.close(VarInt::from_u32(0), b"replies not saved");
+    wait_until("the host disconnected", || broker.stats().0 == 0).await;
+    broker.flush_bindings().await;
+    let (restarted, cfg) = start_with(Some(file)).await;
+    let (mut host, recovered) = register_full(&cfg, Some(saved), true, true).await;
+    assert_eq!(recovered.code, saved.code);
+    assert_ne!(recovered.secret, saved.secret);
+    // 新请求证明已经保存 recovered：只在这时淘汰原来的 saved。
+    write_msg(
+        &mut host.send,
+        &ClientMsg::Rekey {
+            secret: Some(recovered.secret),
+        },
+    )
+    .await
+    .unwrap();
+    let ServerMsg::Rekeyed { secret: next } = next(&mut host).await else {
+        panic!()
+    };
+    assert_ne!(next, recovered.secret);
+    assert_eq!(
+        restarted
+            .bindings
+            .lock()
+            .check(saved.code, &recovered.secret),
+        crate::codes::Owner::Previous
+    );
+    assert_eq!(
+        restarted.bindings.lock().check(saved.code, &saved.secret),
+        crate::codes::Owner::Other
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn repeated_legacy_rekey_requires_reclaim_instead_of_losing_ownership() {
+    let (broker, cfg) = start().await;
+    let (mut host, saved) = register_with(&cfg, None, true).await;
+    for _ in 0..2 {
+        write_msg(&mut host.send, &ClientMsg::Rekey { secret: None })
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), host.conn.closed())
+        .await
+        .unwrap();
+    wait_until("the host disconnected", || broker.stats().0 == 0).await;
+    let (_host, restored) = register_full(&cfg, Some(saved), true, true).await;
+    assert_eq!(restored.code, saved.code);
 }
 
 /// 被控端服务（airhand-link）：本机用户断开所有控制端时请服务器换密钥，并保存新密钥；被断开的控制端拿着旧凭证连不回来
@@ -910,19 +1085,40 @@ async fn host_service_retries_an_unanswered_rekey() {
     .await
     .unwrap();
     cmd_tx.send(HostCmd::KickAll).unwrap();
-    let mut b = Vec::new();
-    let rekey: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut b)
+    cmd_tx.send(HostCmd::KickAll).unwrap();
+    let (requests, mut received) = mpsc::channel(4);
+    let reader = tokio::spawn(async move {
+        let mut b = Vec::new();
+        while let Ok(Some(m)) = read_msg::<_, ClientMsg>(&mut recv, MAX_SIGNAL_MSG, &mut b).await {
+            if requests.send(m).await.is_err() {
+                break;
+            }
+        }
+    });
+    let rekey = received.recv().await.unwrap();
+    assert!(matches!(rekey, ClientMsg::Rekey { secret: Some(s) } if s == id.secret));
+    assert!(
+        timeout(Duration::from_millis(100), received.recv())
+            .await
+            .is_err(),
+        "only one rekey may be outstanding"
+    );
+    write_msg(&mut send, &ServerMsg::Rekeyed { secret: [8; 16] })
+        .await
+        .unwrap();
+    let rekey = timeout(Duration::from_secs(5), received.recv())
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(rekey, ClientMsg::Rekey));
-    // 还没回答就断了
+    assert!(matches!(rekey, ClientMsg::Rekey { secret: Some(s) } if s == [8; 16]));
+    // 第二次换钥的回答还没收到就断了：重连使用已经保存的第一把新密钥。
     conn.close(VarInt::from_u32(0), b"gone");
     let (_conn, _send, _recv, reg) = accept().await;
     assert!(
-        matches!(reg, ClientMsg::Register { reclaim: Some(r), keep: false, rekey: true } if r == id),
+        matches!(reg, ClientMsg::Register { reclaim: Some(r), keep: false, rekey: true } if r == (Reclaim { code: id.code, secret: [8; 16] })),
         "{reg:?}"
     );
+    reader.abort();
     task.abort();
 }
 
@@ -970,7 +1166,14 @@ async fn stale_tokens_are_revoked_and_never_count_as_guesses() {
     let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
     let stale = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
-    write_msg(&mut host.send, &ClientMsg::Rekey).await.unwrap();
+    write_msg(
+        &mut host.send,
+        &ClientMsg::Rekey {
+            secret: Some(id.secret),
+        },
+    )
+    .await
+    .unwrap();
     let ServerMsg::Rekeyed { secret } = next(&mut host).await else {
         panic!("expected Rekeyed");
     };
@@ -1303,7 +1506,9 @@ async fn sessions_are_limited_per_source_and_code() {
     assert_eq!(broker.stats().1, 3);
     assert_eq!(broker.failure_count(ip), 0);
     // 被控端没有再收到请求：下一条消息是它自己换密钥的回答
-    write_msg(&mut host.send, &ClientMsg::Rekey).await.unwrap();
+    write_msg(&mut host.send, &ClientMsg::Rekey { secret: None })
+        .await
+        .unwrap();
     assert!(matches!(next(&mut host).await, ServerMsg::Rekeyed { .. }));
 
     assert!(ask(&mut second, 2, other.code, None).await.is_ok());
@@ -1381,6 +1586,6 @@ async fn fixed_codes_are_never_handed_out() {
     assert!(!broker.reserved.lock().contains_key(&id.code));
     // Persistence is asynchronous; await the disk barrier outside broker locks.
     broker.flush_bindings().await;
-    assert!(!Bindings::open(Some(&file)).contains(id.code));
+    assert!(!Bindings::open(Some(&file)).unwrap().contains(id.code));
     let _ = std::fs::remove_dir_all(dir);
 }

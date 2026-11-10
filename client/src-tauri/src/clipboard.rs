@@ -4,9 +4,7 @@
 //!   选择所有者变化通知，macOS 用 `NSPasteboard.changeCount`（都不需要读取内容，几乎零开销）；
 //! * 记录"双方已一致"的文本哈希，抑制回声（A 写入 B → B 检测到变化 → 又发回 A）。
 
-use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -72,16 +70,17 @@ fn hash(s: &str) -> u64 {
     h.finish() | 1
 }
 
-fn read_text() -> Option<String> {
-    for _ in 0..3 {
+fn read_text() -> Result<Option<String>, arboard::Error> {
+    for attempt in 0..3 {
         match get_text() {
-            Ok(t) => return Some(t),
-            Err(arboard::Error::ContentNotAvailable) => return None,
-            // 其它程序正占用剪贴板，稍后重试
+            Ok(t) => return Ok(Some(t)),
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(e) if attempt == 2 => return Err(e),
+            // 其它程序正占用剪贴板，稍后重试；失败不能被缓存成这个序号没有文本。
             Err(_) => std::thread::sleep(Duration::from_millis(40)),
         }
     }
-    None
+    unreachable!()
 }
 
 fn write_text(t: &str) -> bool {
@@ -155,6 +154,66 @@ fn writer() -> &'static Arc<ClipboardWriter> {
     WRITER.get_or_init(Arc::default)
 }
 
+/// 读取也只允许一个后台任务。所有会话共享按剪贴板序号缓存的结果；
+/// poll 只取已经完成的结果，慢的系统调用不能暂停会话或堆积阻塞任务。
+#[derive(Default)]
+struct ClipboardReader(Mutex<Reads>);
+
+type ReadResult = Result<Option<Arc<str>>, ()>;
+
+#[derive(Default)]
+struct Reads {
+    latest: Option<(u32, Option<Arc<str>>)>,
+    pending: Option<(u32, tokio::sync::oneshot::Receiver<ReadResult>)>,
+}
+
+impl ClipboardReader {
+    fn poll(
+        &self,
+        seq: u32,
+        read: impl FnOnce() -> Result<Option<String>, arboard::Error> + Send + 'static,
+    ) -> Option<Option<Arc<str>>> {
+        let mut state = self.0.lock().unwrap();
+        if let Some((at, rx)) = &mut state.pending {
+            match rx.try_recv() {
+                Ok(Ok(text)) => {
+                    let at = *at;
+                    state.latest = Some((at, text));
+                    state.pending = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Ok(Err(())) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    state.pending = None
+                }
+            }
+        }
+        if let Some((at, text)) = &state.latest
+            && *at == seq
+        {
+            return Some(text.clone());
+        }
+        if state.pending.is_none() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.pending = Some((seq, rx));
+            tokio::task::spawn_blocking(move || {
+                let text = read()
+                    .map(|text| {
+                        text.filter(|t| !t.is_empty() && t.len() <= MAX_CLIPBOARD_TEXT)
+                            .map(Arc::<str>::from)
+                    })
+                    .map_err(|_| ());
+                let _ = tx.send(text);
+            });
+        }
+        None
+    }
+}
+
+fn reader() -> &'static ClipboardReader {
+    static READER: OnceLock<ClipboardReader> = OnceLock::new();
+    READER.get_or_init(ClipboardReader::default)
+}
+
 /// 单个会话的同步状态。
 pub struct ClipSync {
     last_seq: u32,
@@ -171,7 +230,7 @@ impl ClipSync {
     }
 
     /// 本机剪贴板有新文本（且不是对端刚写入的）时返回它。
-    pub async fn poll(&mut self) -> Option<String> {
+    pub fn poll(&mut self) -> Option<String> {
         // 写入过程中不读取中间状态，否则 A、B 连续更新时会把短暂的 A 当成本机变化回传。
         if writer().busy() {
             return None;
@@ -180,22 +239,17 @@ impl ClipSync {
         if seq == self.last_seq {
             return None;
         }
-        let text = tokio::task::spawn_blocking(read_text)
-            .await
-            .ok()
-            .flatten()?;
+        let text = reader().poll(seq, read_text)?;
         if writer().busy() || sequence() != seq {
             return None;
         }
         self.last_seq = seq;
-        if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT {
-            return None;
-        }
+        let text = text?;
         let h = hash(&text);
         if self.synced.swap(h, Ordering::AcqRel) == h {
             return None;
         }
-        Some(text)
+        Some(text.to_string())
     }
 
     /// 串行写入对端的最新文本。只有写入成功才更新同步哈希；写入期间 poll 不回传中间状态。
@@ -216,8 +270,8 @@ impl ClipSync {
 
 /// 控制端会话用它同步本机剪贴板（见 `airhand_link::controller::Frontend::Desktop`）
 impl airhand_link::controller::ClipboardSync for ClipSync {
-    fn poll(&mut self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
-        Box::pin(ClipSync::poll(self))
+    fn poll(&mut self) -> Option<String> {
+        ClipSync::poll(self)
     }
 
     fn apply(&self, text: String) {
@@ -229,6 +283,51 @@ impl airhand_link::controller::ClipboardSync for ClipSync {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[tokio::test]
+    async fn stalled_clipboard_read_is_shared_and_never_blocks_polling() {
+        let reader = ClipboardReader::default();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        assert!(
+            reader
+                .poll(1, move || {
+                    let _ = started.send(());
+                    wait.recv().unwrap();
+                    Ok(Some("old".into()))
+                })
+                .is_none()
+        );
+        ready.await.unwrap();
+        for _ in 0..100 {
+            assert!(
+                reader
+                    .poll(2, || panic!("must not start another blocked read"))
+                    .is_none()
+            );
+        }
+        // 同一线程上的会话仍可处理心跳；序号变化后只发布新读数。
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(text) = reader.poll(2, || Ok(Some("new".into()))) {
+                    break text;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("new"));
+        assert_eq!(
+            reader
+                .poll(2, || panic!("reuse the same sequence"))
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+    }
 
     #[test]
     fn clipboard_writes_are_serial_and_keep_only_the_latest_pending_value() {

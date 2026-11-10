@@ -15,12 +15,12 @@ use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::media::{self, AudioHeader, Kind};
 use airhand_proto::session::HostMsg;
-use airhand_proto::{MAX_CONTROL_MSG, Role, SessionHeader, SessionLane, datagram};
+use airhand_proto::{Role, SessionHeader, SessionLane, datagram};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -174,6 +174,7 @@ pub enum FromHost {
 
 /// 控制端读被控端的四条流和声音数据报的解密端
 pub struct Openers {
+    pub features: airhand_proto::Features,
     pub control: FrameOpener,
     pub bulk: FrameOpener,
     pub video: FrameOpener,
@@ -219,8 +220,20 @@ impl HostReceiver {
         let (video_tx, video_rx) = mpsc::channel(2);
         media_reader(&mut tasks, video.1, Kind::Video, openers.video, video_tx);
         Self {
-            control: message_reader(&mut tasks, control, openers.control),
-            bulk: message_reader(&mut tasks, bulk, openers.bulk),
+            control: message_reader(
+                &mut tasks,
+                control,
+                openers.control,
+                SessionLane::Control,
+                openers.features,
+            ),
+            bulk: message_reader(
+                &mut tasks,
+                bulk,
+                openers.bulk,
+                SessionLane::Bulk,
+                openers.features,
+            ),
             video: video_rx,
             audio: audio_rx,
             bulk_open: true,
@@ -244,7 +257,7 @@ impl HostReceiver {
                 },
                 m = self.audio.recv(), if self.audio_open => match m {
                     Some(Ok(FromHost::Audio(p))) => {
-                        if self.audio_order.accept(&p, Instant::now()) {
+                        if self.audio_order.accept(&p) {
                             return Ok(FromHost::Audio(p));
                         }
                     }
@@ -260,29 +273,25 @@ impl HostReceiver {
     }
 }
 
-/// 数据报可能乱序：比已经交出去的包还早的声音包（迟到的）丢掉，不倒着播放。
-/// 停顿后的第一包（`start`）、隔了一阵子才来的包照收：被控端重新开始发声音时序号会从头算
+/// 数据报和音频流可能乱序：采集时刻在一个会话内不倒退，即使采集器重启、序号从头算也一样。
+/// `start` 只描述静音段边界，不能让迟到的首包重置顺序。相同采集时刻用序号消歧（允许绕回）。
 #[derive(Default)]
 struct AudioOrder {
-    last: Option<(u32, Instant)>,
+    last: Option<AudioHeader>,
 }
 
 impl AudioOrder {
-    /// 这么久以内才算乱序
-    const WINDOW: Duration = Duration::from_millis(500);
-
-    fn accept(&mut self, packet: &[u8], now: Instant) -> bool {
+    fn accept(&mut self, packet: &[u8]) -> bool {
         let Some(h) = AudioHeader::decode(packet) else {
-            return true;
+            return false;
         };
-        if let Some((last, at)) = self.last
-            && !h.start
-            && now.duration_since(at) < Self::WINDOW
-            && h.seq.wrapping_sub(last) as i32 <= 0
+        if let Some(last) = self.last
+            && (h.capture_us < last.capture_us
+                || (h.capture_us == last.capture_us && h.seq.wrapping_sub(last.seq) as i32 <= 0))
         {
             return false;
         }
-        self.last = Some((h.seq, now));
+        self.last = Some(h);
         true
     }
 }
@@ -303,14 +312,19 @@ async fn next_host_msg(
     recv: &mut RecvStream,
     opener: &mut FrameOpener,
     buf: &mut Vec<u8>,
+    lane: SessionLane,
+    features: airhand_proto::Features,
 ) -> Result<Option<HostMsg>> {
     loop {
-        if !read_frame(recv, MAX_CONTROL_MSG, buf).await? {
+        if !read_frame(recv, lane.receive_frame_size(features), buf).await? {
             return Ok(None);
         }
         opener.open(buf)?;
-        match framing::decode(buf)? {
-            Decoded::Msg(m) => return Ok(Some(m)),
+        match framing::decode::<HostMsg>(buf)? {
+            Decoded::Msg(m) => {
+                anyhow::ensure!(m.lane() == lane, "host message on the wrong lane");
+                return Ok(Some(m));
+            }
             Decoded::Unknown(variant) => debug!(variant, "skipping a message from a newer host"),
         }
     }
@@ -321,12 +335,15 @@ fn message_reader(
     tasks: &mut JoinSet<()>,
     mut recv: RecvStream,
     mut opener: FrameOpener,
+    lane: SessionLane,
+    features: airhand_proto::Features,
 ) -> mpsc::Receiver<Result<FromHost>> {
-    let (tx, rx) = mpsc::channel(16);
+    let capacity = (4 * 1024 * 1024 / lane.receive_frame_size(features)).min(16);
+    let (tx, rx) = mpsc::channel(capacity);
     tasks.spawn(async move {
         let mut buf = Vec::new();
         loop {
-            let r = next_host_msg(&mut recv, &mut opener, &mut buf)
+            let r = next_host_msg(&mut recv, &mut opener, &mut buf, lane, features)
                 .await
                 .map(|m| m.map(FromHost::Control));
             if !forward(&tx, r).await {
@@ -397,36 +414,36 @@ fn media_reader(
 mod tests {
     use super::*;
 
-    fn audio(seq: u32, start: bool) -> Vec<u8> {
-        let h = AudioHeader {
+    fn audio(seq: u32, start: bool, capture_us: u64) -> Vec<u8> {
+        AudioHeader {
             seq,
             start,
-            capture_us: 0,
-        };
-        h.encode().to_vec()
+            capture_us,
+        }
+        .encode()
+        .to_vec()
     }
 
     #[test]
-    fn late_audio_datagrams_are_dropped() {
+    fn late_audio_cannot_rewind_playback_even_when_it_starts_a_segment() {
         let mut o = AudioOrder::default();
-        let t = Instant::now();
-        let ms = |n| t + Duration::from_millis(n);
-        assert!(o.accept(&audio(1, true), ms(0)));
-        assert!(o.accept(&audio(3, false), ms(20)));
-        // 迟到的 2、重复的 3
-        assert!(!o.accept(&audio(2, false), ms(25)));
-        assert!(!o.accept(&audio(3, false), ms(26)));
-        assert!(o.accept(&audio(4, false), ms(40)));
-        // 序号从头算：停顿后的第一包
-        assert!(o.accept(&audio(1, true), ms(60)));
-        assert!(o.accept(&audio(2, false), ms(80)));
-        // 停顿后的第一包丢了：隔了一阵子之后照收
-        assert!(o.accept(&audio(7, false), ms(1000)));
-        assert!(o.accept(&audio(2, false), ms(2000)));
-        // 序号绕回
+        // 首包丢了或迟到：先收到了第三包。
+        assert!(o.accept(&audio(3, false, 60_000)));
+        assert!(!o.accept(&audio(1, true, 20_000)));
+        assert!(!o.accept(&audio(2, false, 40_000)));
+        assert!(!o.accept(&audio(3, false, 60_000)));
+        assert!(o.accept(&audio(4, false, 80_000)));
+        // 采集器重启，首包也可能丢失：用采集时钟分辨新流与迟到的旧流。
+        assert!(o.accept(&audio(2, false, 1_000_000)));
+        assert!(!o.accept(&audio(1, true, 980_000)));
+        assert!(!o.accept(&audio(5, false, 100_000)));
+        assert!(o.accept(&audio(3, false, 1_020_000)));
+        // 相同采集时刻（旧端缺少精度）仍能按序号丢重复、识别绕回。
         let mut o = AudioOrder::default();
-        assert!(o.accept(&audio(u32::MAX, false), ms(0)));
-        assert!(o.accept(&audio(0, false), ms(20)));
-        assert!(!o.accept(&audio(u32::MAX, false), ms(30)));
+        assert!(o.accept(&audio(u32::MAX, true, 0)));
+        assert!(o.accept(&audio(0, false, 0)));
+        assert!(!o.accept(&audio(u32::MAX, true, 0)));
+        assert!(!o.accept(&audio(0, true, 0)));
+        assert!(!o.accept(&[]));
     }
 }

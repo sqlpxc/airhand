@@ -72,7 +72,9 @@ class WebConsole implements Backend {
   /** 最近一次读到 / 写入的本机剪贴板文本 */
   private clipSeen: string | null = null;
   /** 页面没有焦点时浏览器不让写剪贴板：先记下，回到页面时再写 */
-  private clipToWrite: string | null = null;
+  private clipToWrite: { text: string; revision: number } | null = null;
+  private clipRevision = 0;
+  private clipWriteTask: Promise<void> | null = null;
   private clipBusy = false;
 
   constructor() {
@@ -289,14 +291,31 @@ class WebConsole implements Backend {
     }
   }
 
-  private async writeClipboard(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      this.clipSeen = text;
-      if (this.clipToWrite === text) this.clipToWrite = null;
-    } catch {
-      this.clipToWrite = text;
-    }
+  private writeClipboard(text: string): Promise<void> {
+    this.clipToWrite = { text, revision: ++this.clipRevision };
+    return this.flushClipboard();
+  }
+
+  /** 串行写入，只保留最新待执行值；旧调用的失败不能恢复已经被替换的重试。 */
+  private flushClipboard(): Promise<void> {
+    if (this.clipWriteTask) return this.clipWriteTask;
+    const drain = async () => {
+      while (this.clipToWrite !== null) {
+        const update = this.clipToWrite;
+        try {
+          await navigator.clipboard.writeText(update.text);
+        } catch {
+          if (this.clipToWrite === update) break; // 等下次获得焦点再试
+          continue; // 已有更新的值，继续写最新的
+        }
+        if (this.clipToWrite === update) {
+          this.clipSeen = update.text;
+          this.clipToWrite = null;
+        }
+      }
+    };
+    this.clipWriteTask = drain().finally(() => { this.clipWriteTask = null; });
+    return this.clipWriteTask;
   }
 
   /** 被控端复制了文本 */
@@ -308,13 +327,16 @@ class WebConsole implements Backend {
 
   /** 本机剪贴板有变化就发给打开了同步的会话 */
   private async syncClipboard(ask: boolean) {
-    if (this.clipToWrite !== null && document.hasFocus()) await this.writeClipboard(this.clipToWrite);
-    const chans = [...this.chans.values()];
-    if (this.clipBusy || !chans.some((c) => c.clipboard && c.sid !== null)) return;
+    if (this.clipBusy) return;
     this.clipBusy = true;
     try {
+      if (document.hasFocus()) await this.flushClipboard();
+      if (this.clipToWrite !== null || this.clipWriteTask !== null) return;
+      if (![...this.chans.values()].some((c) => c.clipboard && c.sid !== null)) return;
+      const revision = this.clipRevision;
       const text = await this.readClipboard(ask);
-      if (text === null || text === "" || text.length > MAX_CLIPBOARD) return;
+      // 读取期间收到远端更新：这个读结果属于更早的状态，不能回传。
+      if (revision !== this.clipRevision || text === null || text === "" || text.length > MAX_CLIPBOARD) return;
       this.clipSeen = text;
       for (const c of this.chans.values()) {
         if (c.synced === null) {
@@ -411,8 +433,9 @@ class WebConsole implements Backend {
     chan.clipboard = enabled;
     if (enabled) {
       // 用户刚打开同步：这时可以请求读剪贴板的权限。现有内容不发送，只同步之后的变化
+      const revision = this.clipRevision;
       const text = await this.readClipboard(true);
-      if (text !== null) {
+      if (revision === this.clipRevision && this.clipToWrite === null && text !== null) {
         chan.synced = text;
         this.clipSeen = text;
       }

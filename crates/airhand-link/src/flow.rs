@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 
 /// 在途帧窗口的上限
 pub const MAX_WINDOW: u32 = 32;
+/// 单会话已发送、未确认的媒体负载预算；关键帧很大时也不能仅靠帧数限量。
+pub const MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
+/// 控制心跳正常也不能永久占着未确认的视频；超过期限由会话关闭并重连。
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// 基础 RTT 取这么长时间里的最小样本
 pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 
@@ -18,7 +22,8 @@ pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 pub struct FlowState {
     sent: u32,
     acked: u32,
-    pending: VecDeque<(u32, Instant)>,
+    pending: VecDeque<(u32, Instant, usize)>,
+    pending_bytes: usize,
     srtt_ms: f64,
     /// 滑动窗口最小值：样本按时间排列、RTT 严格递增，队头就是窗口里的最小值
     min_rtt: VecDeque<(f64, Instant)>,
@@ -30,6 +35,7 @@ impl Default for FlowState {
             sent: 0,
             acked: 0,
             pending: VecDeque::new(),
+            pending_bytes: 0,
             srtt_ms: 0.0,
             min_rtt: VecDeque::new(),
         }
@@ -37,14 +43,15 @@ impl Default for FlowState {
 }
 
 impl FlowState {
-    pub fn on_sent(&mut self, seq: u32) {
+    pub fn on_sent(&mut self, seq: u32, bytes: usize) {
         // Android shares a sequence across subscribers, so skipped numbers are
         // not in-flight frames. Never use sent - acked as the queue length.
         if self.pending.is_empty() {
             self.acked = seq.wrapping_sub(1);
         }
         self.sent = seq;
-        self.pending.push_back((seq, Instant::now()));
+        self.pending.push_back((seq, Instant::now(), bytes));
+        self.pending_bytes += bytes;
     }
 
     pub fn on_ack(&mut self, seq: u32) {
@@ -53,11 +60,12 @@ impl FlowState {
         }
         self.acked = seq;
         let now = Instant::now();
-        while let Some(&(s, t)) = self.pending.front() {
+        while let Some(&(s, t, bytes)) = self.pending.front() {
             if s.wrapping_sub(seq) as i32 > 0 {
                 break;
             }
             self.pending.pop_front();
+            self.pending_bytes -= bytes;
             if s == seq {
                 let rtt = now.duration_since(t).as_secs_f64() * 1000.0;
                 self.srtt_ms = if self.srtt_ms == 0.0 {
@@ -93,6 +101,17 @@ impl FlowState {
     pub fn inflight(&self) -> u32 {
         self.pending.len() as u32
     }
+    pub fn ack_stalled(&self) -> bool {
+        self.pending
+            .front()
+            .is_some_and(|(_, at, _)| at.elapsed() > ACK_TIMEOUT)
+    }
+
+    pub fn can_send(&self, fps: u8, bytes: usize) -> bool {
+        self.inflight() < self.window(fps)
+            && bytes <= MAX_INFLIGHT_BYTES.saturating_sub(self.pending_bytes)
+    }
+
     pub fn window(&self, fps: u8) -> u32 {
         let Some(min_rtt) = self.min_rtt_ms() else {
             return 3;
@@ -112,19 +131,20 @@ pub struct Flow {
 
 impl Flow {
     /// Assign and record the next session-wide frame before exposing it to the receiver.
-    pub fn sent(&self) -> u32 {
+    pub fn sent(&self, bytes: usize) -> u32 {
         let mut state = self.state.lock().unwrap();
         let seq = state.sent.wrapping_add(1);
-        state.on_sent(seq);
+        state.on_sent(seq, bytes);
         seq
     }
     /// A frame assigned a sequence but cancelled before enqueueing needs no ACK.
     pub fn discard(&self, seq: u32) {
-        self.state
-            .lock()
-            .unwrap()
-            .pending
-            .retain(|(s, _)| *s != seq);
+        let mut state = self.state.lock().unwrap();
+        if let Some(index) = state.pending.iter().position(|(s, _, _)| *s == seq) {
+            let (_, _, bytes) = state.pending.remove(index).unwrap();
+            state.pending_bytes -= bytes;
+        }
+        drop(state);
         self.cv.notify_all();
     }
     pub fn ack(&self, seq: u32) {
@@ -135,14 +155,21 @@ impl Flow {
         self.cv.notify_all();
     }
     pub fn wait_window(&self, fps: u8, stop: &AtomicBool, timeout: Duration) -> bool {
+        self.wait_room(fps, 1, stop, timeout)
+    }
+    /// 编码后知道真实大小，再等字节预算；等待期间必须保留这一帧，否则后续增量帧失去参考。
+    pub fn wait_room(&self, fps: u8, bytes: usize, stop: &AtomicBool, timeout: Duration) -> bool {
         let state = self.state.lock().unwrap();
         let (state, _) = self
             .cv
             .wait_timeout_while(state, timeout, |s| {
-                s.inflight() >= s.window(fps) && !stop.load(Ordering::Acquire)
+                !s.can_send(fps, bytes) && !stop.load(Ordering::Acquire)
             })
             .unwrap();
-        !stop.load(Ordering::Acquire) && state.inflight() < state.window(fps)
+        !stop.load(Ordering::Acquire) && state.can_send(fps, bytes)
+    }
+    pub fn ack_stalled(&self) -> bool {
+        self.state.lock().unwrap().ack_stalled()
     }
     pub fn rtt(&self) -> (f64, f64) {
         self.state.lock().unwrap().rtt()
@@ -197,11 +224,11 @@ mod tests {
         let mut f = FlowState::default();
         f.on_ack(100);
         assert_eq!(f.inflight(), 0);
-        f.on_sent(1);
+        f.on_sent(1, 100);
         f.on_ack(100);
         assert_eq!(f.inflight(), 1);
         f.on_ack(1);
-        f.on_sent(1000);
+        f.on_sent(1000, 100);
         assert_eq!(f.inflight(), 1);
         f.on_ack(1);
         assert_eq!(f.inflight(), 1);
@@ -211,17 +238,43 @@ mod tests {
     #[test]
     fn sequence_survives_pipeline_replacement_and_wraps() {
         let f = Flow::default();
-        assert_eq!(f.sent(), 1);
+        assert_eq!(f.sent(100), 1);
         // A replacement pipeline uses the same session flow, including late ACKs.
-        assert_eq!(f.sent(), 2);
+        assert_eq!(f.sent(100), 2);
         f.ack(1);
         assert!(f.wait_window(60, &AtomicBool::new(false), Duration::ZERO));
         let mut state = FlowState::default();
-        state.on_sent(u32::MAX);
-        state.on_sent(0);
+        state.on_sent(u32::MAX, 100);
+        state.on_sent(0, 100);
         state.on_ack(0);
         assert_eq!(state.inflight(), 0);
     }
+    #[test]
+    fn missing_video_ack_expires_even_when_control_still_works() {
+        let mut flow = FlowState::default();
+        flow.on_sent(1, 100);
+        flow.pending.front_mut().unwrap().1 = Instant::now() - ACK_TIMEOUT - Duration::from_secs(1);
+        assert!(flow.ack_stalled());
+        flow.on_ack(1);
+        assert!(!flow.ack_stalled());
+    }
+
+    #[test]
+    fn byte_budget_is_released_by_ack_and_cancelled_frames() {
+        let f = Flow::default();
+        let stop = AtomicBool::new(false);
+        let seq = f.sent(MAX_INFLIGHT_BYTES - 100);
+        assert!(f.wait_room(60, 100, &stop, Duration::ZERO));
+        assert!(!f.wait_room(60, 101, &stop, Duration::ZERO));
+        f.ack(seq);
+        assert!(f.wait_room(60, MAX_INFLIGHT_BYTES, &stop, Duration::ZERO));
+        let seq = f.sent(MAX_INFLIGHT_BYTES);
+        assert!(!f.wait_window(60, &stop, Duration::ZERO));
+        f.discard(seq);
+        assert!(f.wait_room(60, MAX_INFLIGHT_BYTES, &stop, Duration::ZERO));
+        assert!(!f.wait_room(60, MAX_INFLIGHT_BYTES + 1, &stop, Duration::ZERO));
+    }
+
     #[test]
     fn stopped_pipeline_cannot_emit_another_frame() {
         assert!(!Flow::default().wait_window(30, &AtomicBool::new(true), Duration::ZERO));

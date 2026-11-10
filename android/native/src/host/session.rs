@@ -194,6 +194,10 @@ impl Platform for Phone {
         Ok(())
     }
 
+    fn video_stalled(&self) -> bool {
+        self.shared.video.ack_stalled(self.id)
+    }
+
     /// 清理在 Drop 里（会话被取消时也要做）
     async fn stop(self) {}
 }

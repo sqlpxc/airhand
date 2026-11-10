@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
         max_conns_per_ip,
         new_codes_per_ip,
         connects_per_minute,
-    });
+    })?;
     tokio::spawn(broker.clone().janitor());
     {
         let broker = broker.clone();

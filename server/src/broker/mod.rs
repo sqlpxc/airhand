@@ -173,9 +173,9 @@ async fn writer_loop(mut send: SendStream, mut rx: mpsc::Receiver<ServerMsg>) {
 }
 
 impl Broker {
-    pub fn new(cfg: Config) -> Arc<Self> {
-        let bindings = Bindings::open(cfg.db.as_deref());
-        Arc::new(Self {
+    pub fn new(cfg: Config) -> Result<Arc<Self>> {
+        let bindings = Bindings::open(cfg.db.as_deref())?;
+        Ok(Arc::new(Self {
             cfg,
             key: bindings.server_key(),
             hosts: Ranked::default_with(Rank::Hosts),
@@ -189,7 +189,7 @@ impl Broker {
             new_codes: Limiter::new(Rank::NewCodes, limits::NEW_CODE_WINDOW),
             conns: Ranked::default_with(Rank::Conns),
             next_conn: AtomicU64::new(1),
-        })
+        }))
     }
 
     /// 周期性清理过期数据。

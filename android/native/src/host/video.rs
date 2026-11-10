@@ -141,12 +141,21 @@ impl VideoHub {
         let fps = st.settings.fps;
         if let Some(o) = st.sessions.get_mut(&id) {
             o.flow.on_ack(seq);
-            if o.need_key && o.flow.inflight() < o.flow.window(fps) {
+            if o.need_key && o.flow.can_send(fps, 1) {
                 st.force_key = true;
             }
         }
         drop(st);
         self.cv.notify_all();
+    }
+
+    pub fn ack_stalled(&self, id: u64) -> bool {
+        self.st
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&id)
+            .is_some_and(|o| o.flow.ack_stalled())
     }
 
     /// 只修改该会话的需求；共享编码参数按所有观看者合并，不由最后一次修改覆盖。
@@ -256,7 +265,7 @@ impl VideoHub {
         let mut want_key = false;
         let fps = st.settings.fps;
         for (id, o) in st.sessions.iter_mut() {
-            if o.flow.inflight() >= o.flow.window(fps) {
+            if !o.flow.can_send(fps, bytes.len() - 4) {
                 o.need_key = true;
                 continue;
             }
@@ -267,7 +276,7 @@ impl VideoHub {
             match o.tx.try_send(bytes.clone()) {
                 Ok(()) => {
                     o.need_key = false;
-                    o.flow.on_sent(seq);
+                    o.flow.on_sent(seq, bytes.len() - 4);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // 丢了一帧，之后的帧解不出来：从下一个关键帧重新开始
@@ -339,7 +348,7 @@ impl State {
             || self
                 .sessions
                 .values()
-                .any(|o| o.flow.inflight() < o.flow.window(self.settings.fps))
+                .any(|o| o.flow.can_send(self.settings.fps, 1))
     }
 
     /// 使用仍在接收的最快会话，慢订阅者不能把其它人的共享码率一起拉低。
