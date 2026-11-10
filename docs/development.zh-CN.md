@@ -24,7 +24,7 @@ cargo test --lib
 # 声音环回采集（需要声音输出设备，会以 -60 dBFS 播放 1.5 秒测试音，几乎听不见）
 cargo test --lib loopback_captures_tone -- --ignored --nocapture
 
-# android/native/：Android 的 Rust 核心（在当前电脑上跑：在途帧控制、关键帧、声音分发、命令格式）
+# android/native/：Android 的 Rust 核心（在当前电脑上跑：在途控制、关键帧、声音分发、命令格式）
 cargo test
 # android/：手势（触控板 / 触屏 / 多点触摸 / 直通）、键盘、控制码、文案（Rust 的每种问题 / 提示 / 系统操作都有中英文文案）
 ./gradlew testDebugUnitTest -Pairhand.abis=x86_64

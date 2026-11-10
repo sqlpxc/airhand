@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use airhand_proto::session::{CursorShape, DisplayInfo, Notice};
 use tracing::{info, warn};
 
+use super::pace::Pacer;
+
 /// 一帧 BGRA 图像（紧密排列，stride = width * 4）。
 pub struct Frame {
     pub width: u32,
@@ -281,9 +283,9 @@ fn capture_loop(shared: Arc<CaptureShared>) {
     }
     let mut pool = FramePool::default();
     let mut cap: Option<Box<dyn Capturer>> = None;
-    let mut last = Instant::now() - Duration::from_secs(1);
     let mut failures = 0u32;
     let mut fps = shared.max_fps();
+    let mut pacer = Pacer::new(fps);
     while !shared.stop.load(Ordering::Acquire) {
         let c = match cap.as_mut() {
             Some(c) => c,
@@ -291,6 +293,7 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 Ok(c) => {
                     failures = 0;
                     fps = shared.max_fps();
+                    pacer.set_fps(fps);
                     cap.insert(c)
                 }
                 Err(e) => {
@@ -311,21 +314,21 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 }
             },
         };
-        // 按订阅者中最高的帧率节流；DXGI 会在等待期间累积画面更新
+        // 按订阅者中最高的帧率节流（按画面的时间戳，见 pace）；DXGI 会在等待期间累积画面更新
         let max_fps = shared.max_fps();
         if max_fps != fps {
             fps = max_fps;
             c.set_fps(fps);
+            pacer.set_fps(fps);
         }
-        let interval = Duration::from_secs_f64(1.0 / max_fps as f64);
-        let since = last.elapsed();
-        if since < interval {
-            std::thread::sleep(interval - since);
+        let wait = pacer.wait(Instant::now());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
         }
         match c.next(Duration::from_millis(100), &mut pool) {
             Ok(u) => {
-                if u.frame.is_some() {
-                    last = Instant::now();
+                if let Some(f) = &u.frame {
+                    pacer.done(f.captured);
                 }
                 if u.frame.is_some() || u.cursor_visible.is_some() || u.cursor_shape.is_some() {
                     shared.slot.publish(u);

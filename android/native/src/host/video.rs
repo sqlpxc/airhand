@@ -1,15 +1,16 @@
 //! 被控端的画面分发：Kotlin 那边只有一个编码器（手机只有一块屏幕，MediaProjection 也只能建一个虚拟显示器），
 //! 编出来的帧发给所有会话。和桌面版的编码管线（`client/src-tauri/src/host/pipeline.rs`）用同样的低延迟办法：
 //!
-//! * **在途帧控制**：每个会话单独限制已发送、未确认的帧；只要有一个会话能接收就继续编码。
+//! * **在途控制**：每个会话单独限制已发送、未确认的字节（[`Flow`]，与桌面版相同）；只要有一个会话能接收就继续编码。
 //!   跟不上的会话跳过帧，恢复后从关键帧重新加入；所有会话都堵住时才等待；
-//! * **自适应码率**：按阻塞次数和 RTT 膨胀程度下调 / 恢复码率（[`Abr`]，与桌面版相同）；
+//! * **码率**：每个会话各自按网络上的排队和带宽估计（与桌面版相同），共享的编码器用还在接收的会话里最高的那个：
+//!   慢的观看者跳帧，不拉低别人的画质；
 //! * 新加入的会话从关键帧开始收（[`Out::need_key`]）。
 //!
 //! Kotlin 的渲染线程每一轮调用 [`VideoHub::tick`]：设置变了（帧率、分辨率上限、编码格式、码率）
 //! 或者需要关键帧时返回一个 JSON，见 [`Tick`]。
 
-use airhand_link::flow::{Abr, FlowState as Flow};
+use airhand_link::flow::{FlowState as Flow, frame_bytes};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -24,7 +25,7 @@ use tracing::{debug, info};
 
 use crate::queue::Queue;
 
-/// 每个会话的画面队列（打包好的画面包）。在途帧控制之下一般只有一两帧；容量和在途帧窗口的上限一样，
+/// 每个会话的画面队列（打包好的画面包）。在途控制之下一般只有一两帧；容量和在途帧数的上限一样，
 /// 网络慢、写不进流的时候在途的帧也都放得下，不会因为队列满了丢帧、再去要关键帧
 pub const QUEUE: usize = airhand_link::flow::MAX_WINDOW as usize;
 
@@ -44,7 +45,6 @@ struct State {
     told_kbps: u32,
     force_key: bool,
     seq: u32,
-    abr: Abr,
     /// H.264 / HEVC 的参数集（MediaCodec 单独给出的 codec config），拼在每个关键帧前面
     config: Vec<u8>,
 }
@@ -65,7 +65,7 @@ pub struct Tick {
     pub fps: u8,
     pub max_short: u16,
     pub codec: Codec,
-    /// 当前目标码率（自适应码率调整后的）
+    /// 当前目标码率：还在接收的会话里按网络估计得最高的（见模块说明）
     pub kbps: u32,
     /// 需要马上编一个关键帧
     pub key: bool,
@@ -83,7 +83,6 @@ impl VideoHub {
                 told_kbps: 0,
                 force_key: false,
                 seq: 0,
-                abr: Abr::new(settings.bitrate_kbps),
                 config: Vec::new(),
             }),
             cv: Condvar::new(),
@@ -138,10 +137,10 @@ impl VideoHub {
 
     pub fn ack(&self, id: u64, seq: u32, arrived: Option<u64>) {
         let mut st = self.st.lock().unwrap();
-        let fps = st.settings.fps;
+        let frame = st.frame_bytes();
         if let Some(o) = st.sessions.get_mut(&id) {
             o.flow.on_ack(seq, arrived);
-            if o.need_key && o.flow.can_send(fps, 1) {
+            if o.need_key && o.flow.can_send(frame) {
                 st.force_key = true;
             }
         }
@@ -176,13 +175,7 @@ impl VideoHub {
     /// 渲染线程每一轮调用：需要 Kotlin 做点什么（设置变了、码率变了、要关键帧）时返回 [`Tick`]
     pub fn tick(&self) -> Option<Tick> {
         let mut st = self.st.lock().unwrap();
-        if st.settings.adaptive {
-            let (srtt, min_rtt) = st.available_rtt();
-            st.abr.tick(srtt, min_rtt);
-        } else {
-            st.abr.current = st.settings.bitrate_kbps;
-        }
-        let kbps = st.abr.current;
+        let kbps = st.kbps();
         if st.version == st.told_version && kbps == st.told_kbps && !st.force_key {
             return None;
         }
@@ -219,7 +212,10 @@ impl VideoHub {
             .unwrap();
         let open = st.window_open();
         if !open {
-            st.abr.blocked += 1;
+            // 编码器要等：每个会话的码率控制都把它算作拥塞的迹象（见 airhand_link::flow）
+            for o in st.sessions.values_mut() {
+                o.flow.note_blocked();
+            }
         }
         open
     }
@@ -263,9 +259,10 @@ impl VideoHub {
         };
         let bytes = Bytes::from(media::frame(&header.encode(), &[config, data]));
         let mut want_key = false;
-        let fps = st.settings.fps;
         for (id, o) in st.sessions.iter_mut() {
-            if !o.flow.can_send(fps, bytes.len() - 4) {
+            if !o.flow.can_send(bytes.len() - 4) {
+                // 跟不上：跳过这一帧，之后从关键帧重新开始
+                o.flow.note_blocked();
                 o.need_key = true;
                 continue;
             }
@@ -338,28 +335,33 @@ impl State {
         if self.settings != s {
             self.settings = s;
             self.version = self.version.wrapping_add(1);
-            self.abr.reset(s.bitrate_kbps);
             info!(?s, "shared quality settings updated");
+        }
+        // 共享的编码器按合并后的码率编：每个会话都按它估计（码率变了从它重新开始，新加入的会话也是）
+        for o in self.sessions.values_mut() {
+            o.flow.set_target(s.bitrate_kbps, s.adaptive);
         }
     }
 
-    fn window_open(&self) -> bool {
-        self.sessions.is_empty()
-            || self
-                .sessions
-                .values()
-                .any(|o| o.flow.can_send(self.settings.fps, 1))
+    /// 共享的编码器该用的码率：还在接收的会话里估计得最高的，慢的观看者不能把其它人的画质一起拉低
+    /// （它跳帧，恢复后从关键帧重新加入）
+    fn kbps(&self) -> u32 {
+        let receiving = self.sessions.values().filter(|o| !o.need_key);
+        receiving
+            .map(|o| o.flow.bitrate_kbps())
+            .max()
+            .or_else(|| self.sessions.values().map(|o| o.flow.bitrate_kbps()).max())
+            .unwrap_or(self.settings.bitrate_kbps)
     }
 
-    /// 使用仍在接收的最快会话，慢订阅者不能把其它人的共享码率一起拉低。
-    fn available_rtt(&self) -> (f64, f64) {
-        self.sessions
-            .values()
-            .filter(|o| !o.need_key)
-            .map(|o| o.flow.rtt())
-            .filter(|r| r.0 > 0.0)
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .unwrap_or_default()
+    /// 平均一帧多大（按编码器现在的码率）
+    fn frame_bytes(&self) -> usize {
+        frame_bytes(self.kbps(), self.settings.fps)
+    }
+
+    fn window_open(&self) -> bool {
+        let frame = self.frame_bytes();
+        self.sessions.is_empty() || self.sessions.values().any(|o| o.flow.can_send(frame))
     }
 }
 
@@ -439,26 +441,34 @@ mod tests {
         );
     }
 
+    /// 一帧占在途字节上限的 2/5：发了两帧之后就放不下平均大小的下一帧了
+    fn big() -> Vec<u8> {
+        vec![0; Flow::default().window_bytes() * 2 / 5]
+    }
+
     #[test]
     fn inflight_window_blocks_until_acked() {
         let (hub, _) = hub();
         let (tx, mut rx) = mpsc::channel(QUEUE);
         hub.add(7, tx);
-        hub.push(&[1], true, false, 0, Codec::AV1, 8, 8);
+        hub.push(&big(), true, false, 0, Codec::AV1, 8, 8);
         assert!(hub.wait_window(Duration::ZERO));
-        hub.push(&[2], false, false, 0, Codec::AV1, 8, 8);
-        hub.push(&[3], false, false, 0, Codec::AV1, 8, 8);
-        // 还没有 RTT 样本时窗口是 3 帧
+        hub.push(&big(), false, false, 0, Codec::AV1, 8, 8);
         assert!(!hub.wait_window(Duration::from_millis(5)));
-        let seqs: Vec<u32> = (0..3)
+        // 放不下的帧不发
+        hub.push(&big(), false, false, 0, Codec::AV1, 8, 8);
+        let seqs: Vec<u32> = (0..2)
             .map(|_| decode(&rx.try_recv().unwrap()).seq)
             .collect();
-        hub.ack(7, seqs[1], None);
-        assert!(hub.wait_window(Duration::ZERO));
+        assert!(rx.try_recv().is_err());
+        let inflight = || hub.st.lock().unwrap().sessions[&7].flow.inflight();
         // 累积确认；旧的 / 没发过的序号不影响
+        hub.ack(7, seqs[1] + 100, None);
         hub.ack(7, seqs[0], None);
-        hub.ack(7, seqs[2] + 100, None);
-        hub.ack(7, seqs[2], None);
+        hub.ack(7, seqs[0], None);
+        assert_eq!(inflight(), 1);
+        hub.ack(7, seqs[1], None);
+        assert_eq!(inflight(), 0);
         assert!(hub.wait_window(Duration::ZERO));
     }
 
@@ -484,7 +494,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(QUEUE);
         hub.add(1, tx);
         for i in 0..3 {
-            hub.push(&[1], i == 0, false, 0, Codec::AV1, 8, 8);
+            hub.push(&big(), i == 0, false, 0, Codec::AV1, 8, 8);
         }
         assert!(!hub.wait_window(Duration::ZERO));
         drop(rx);
@@ -530,11 +540,11 @@ mod tests {
         let _ = hub.tick();
         for i in 0..12 {
             assert!(hub.wait_window(Duration::ZERO));
-            hub.push(&[1], i == 0, false, i, Codec::H264, 8, 8);
+            hub.push(&big(), i == 0, false, i, Codec::H264, 8, 8);
             hub.ack(1, decode(&fast_rx.try_recv().unwrap()).seq, None);
         }
         let mut last = 0;
-        for _ in 0..3 {
+        for _ in 0..2 {
             last = decode(&slow_rx.try_recv().unwrap()).seq;
         }
         assert!(

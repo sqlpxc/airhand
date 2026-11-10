@@ -106,9 +106,24 @@ pub async fn read_packet<R>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, Wi
 where
     R: AsyncRead + Unpin,
 {
+    Ok(read_packet_timed(r, max, || ()).await?.map(|(p, ())| p))
+}
+
+/// 同 [`read_packet`]，另外返回读完长度前缀时 `clock()` 的值：这一帧开始到达的时刻。
+/// 读任务闲着的话就是第一个字节到的时刻；前面的还没读完的话是读完前面那一帧的时刻（它已经在排队了）。
+/// 不含这一帧自己传了多久：被控端拿它算排队时延（见 `airhand_link::flow`）
+pub async fn read_packet_timed<R, T>(
+    r: &mut R,
+    max: usize,
+    clock: impl FnOnce() -> T,
+) -> Result<Option<(Vec<u8>, T)>, WireError>
+where
+    R: AsyncRead + Unpin,
+{
     let Some(len) = read_len(r, max).await? else {
         return Ok(None);
     };
+    let at = clock();
     let mut buf = Vec::with_capacity(len);
     while buf.len() < len {
         // take 限制住这一帧剩下的长度，不会读进下一帧；buf 的容量正好够，不会再分配
@@ -118,7 +133,7 @@ where
         }
     }
     debug_assert_eq!(buf.capacity(), len);
-    Ok(Some(buf))
+    Ok(Some((buf, at)))
 }
 
 #[cfg(test)]

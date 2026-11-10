@@ -156,7 +156,7 @@ impl Default for Stats {
     }
 }
 
-/// 最近收到的画面帧是什么时候从网络上读完的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
+/// 最近收到的画面帧是什么时候开始从网络上到达的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
 /// （`ControllerMsg::Ack::arrived`）。在途的帧不超过 `flow::MAX_WINDOW` 个，记最近 64 个就够了
 pub(super) struct Arrivals([Option<(u32, u64)>; 64]);
 

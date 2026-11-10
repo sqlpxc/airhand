@@ -11,7 +11,8 @@
 //!
 //! * 同时最多有 [`MAX_PENDING_APPROVALS`] 个请求在等本机用户回答，再来的不问、直接回绝（[`ApprovalSlots`]）；
 //! * 同意之前只回应 Ping、记下画质和声音设置（同意之后随 [`Start`] 一起生效），不发画面、不执行任何输入；
-//! * 一直回应 Ping（[`HostMsg::Pong`]），[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联；
+//! * 一直回应 Ping（[`HostMsg::Pong`]），[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联。Ping 和画面确认在读任务里
+//!   就处理了（确认交给 [`Platform::acks`]），不等这里：这里可能正等着平台重建编码管线（见 [`super::HostStreams`]）；
 //! * 本机用户断开所有控制端（[`Incoming::kick`]）时发 [`HostMsg::Bye`]，然后结束；
 //! * 控制端的请求换成 [`Request`] 交给平台：画质设置做过范围校验，过时的输入已经换成了"释放所有按键"
 //!   （见 [`super::HostStreams`]），对方版本新增的输入事件已经去掉了。
@@ -34,6 +35,19 @@ use tracing::{info, warn};
 
 use super::queue::Outbox;
 use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
+
+/// 画面确认交给谁（[`Platform::acks`]）：桌面版是会话的 [`crate::flow::Flow`]，Android 是画面分发。
+/// 在读任务里调用：要快，不能等什么
+pub trait Acks: Send + Sync + 'static {
+    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 [`ControllerMsg::Ack`]
+    fn ack(&self, seq: u32, arrived: Option<u64>);
+}
+
+impl Acks for crate::flow::Flow {
+    fn ack(&self, seq: u32, arrived: Option<u64>) {
+        crate::flow::Flow::ack(self, seq, arrived);
+    }
+}
 use super::{Admission, Gate, Incoming};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
@@ -72,8 +86,6 @@ impl ApprovalSlots {
 pub enum Request {
     /// 一批输入（不会是空的）。过时的已经换成了 [`InputEvent::ReleaseAll`]，不认识的事件已经去掉了
     Input(Vec<InputEvent>),
-    /// 控制端收到了第 `seq` 帧（累积确认，在途帧控制用）；`arrived` 见 [`ControllerMsg::Ack`]
-    Ack { seq: u32, arrived: Option<u64> },
     /// 画质设置变了（做过范围校验）
     Settings(QualitySettings),
     /// 控制端要一个关键帧（例如解码器重置了）
@@ -126,6 +138,9 @@ pub trait Platform: Send {
     fn answered(&mut self, allowed: bool) {
         let _ = allowed;
     }
+
+    /// 画面确认交给谁。会话一开始取一次；确认在读任务里就交给它，不经过 [`Platform::request`]
+    fn acks(&self) -> Arc<dyn Acks>;
 
     /// 会话开始（不用同意，或者本机用户同意了）：发 [`HostMsg::Hello`] 和开始时的提示，开始采集
     fn start(&mut self, start: Start) -> impl Future<Output = Result<()>> + Send;
@@ -255,6 +270,7 @@ async fn drive<P: Platform>(
         out.send(&HostMsg::Bye(*kick.borrow_and_update()))?;
         return Ok(());
     }
+    incoming.set_acks(platform.acks());
     let mut start = Start {
         settings: admitted.settings,
         audio: admitted.audio,
@@ -284,7 +300,6 @@ async fn drive<P: Platform>(
     };
     let mut watchdog = tokio::time::interval(WATCHDOG);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_msg = Instant::now();
     // 被控端服务还在（踢人的发送端还在）
     let mut kickable = true;
 
@@ -297,16 +312,11 @@ async fn drive<P: Platform>(
         tokio::select! {
             msg = incoming.recv() => {
                 let Some(msg) = msg else { return Ok(()) };
-                last_msg = Instant::now();
                 let req = match msg {
-                    // 同意之前也回应：控制端不会把等待当成失联
-                    ControllerMsg::Ping { t } => {
-                        out.send(&HostMsg::Pong { t })?;
-                        continue;
-                    }
+                    // 读任务已经处理了（见模块说明），不会到这里
+                    ControllerMsg::Ping { .. } | ControllerMsg::Ack { .. } => continue,
                     ControllerMsg::Input { events, .. } if events.is_empty() => continue,
                     ControllerMsg::Input { events, .. } => Request::Input(events),
-                    ControllerMsg::Ack { seq, arrived } => Request::Ack { seq, arrived },
                     ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
                     ControllerMsg::RequestKeyframe => Request::Keyframe,
                     ControllerMsg::SelectDisplay { index } => Request::SelectDisplay(index),
@@ -366,7 +376,7 @@ async fn drive<P: Platform>(
                 if open && platform.video_stalled() {
                     bail!("the controller stopped acknowledging video");
                 }
-                if last_msg.elapsed() > PEER_TIMEOUT {
+                if incoming.silent_for() > PEER_TIMEOUT {
                     bail!("the controller stopped responding");
                 }
             }
@@ -378,6 +388,7 @@ async fn drive<P: Platform>(
 mod tests {
     use super::*;
     use crate::host::queue::{self, LaneReceiver};
+    use crate::host::streams::Express;
     use crate::tasks::OwnedTask;
     use airhand_proto::framing;
     use airhand_proto::handshake::Negotiated;
@@ -392,6 +403,7 @@ mod tests {
         Start(Start),
         Request(Request),
         Event(u32),
+        Ack(u32, Option<u64>),
     }
 
     #[derive(Clone, Default)]
@@ -412,8 +424,17 @@ mod tests {
         events: mpsc::Receiver<u32>,
     }
 
+    impl Acks for Log {
+        fn ack(&self, seq: u32, arrived: Option<u64>) {
+            self.push(Call::Ack(seq, arrived));
+        }
+    }
+
     impl Platform for Fake {
         type Event = Option<u32>;
+        fn acks(&self) -> Arc<dyn Acks> {
+            Arc::new(self.log.clone())
+        }
         fn ask(&mut self, _: &Admitted) -> oneshot::Receiver<bool> {
             self.log.push(Call::Ask);
             self.answer.take().unwrap()
@@ -446,6 +467,8 @@ mod tests {
     struct Harness {
         log: Log,
         to_host: mpsc::Sender<ControllerMsg>,
+        /// 读任务自己处理的消息（Ping、确认）在这里处理，和真的读任务一样
+        express: Express,
         events: mpsc::Sender<u32>,
         kick: watch::Sender<ByeReason>,
         answer: Option<oneshot::Sender<bool>>,
@@ -477,11 +500,12 @@ mod tests {
     fn session_with(admission: Admission, approvals: ApprovalSlots) -> Harness {
         let log = Log::default();
         let (to_host, control_in) = mpsc::channel(16);
-        let mut incoming = ControllerReceiver::new(control_in, mpsc::channel(1).1);
         let (events_tx, events) = mpsc::channel(16);
         let (kick, mut kick_rx) = watch::channel(ByeReason::Kicked);
         let (answer_tx, answer) = oneshot::channel();
         let (out, control, _bulk) = queue::channel();
+        let express = Express::new(out.clone());
+        let mut incoming = ControllerReceiver::new(control_in, mpsc::channel(1).1, express.clone());
         let mut platform = Fake {
             log: log.clone(),
             answer: Some(answer),
@@ -505,6 +529,7 @@ mod tests {
         Harness {
             log,
             to_host,
+            express,
             events: events_tx,
             kick,
             answer: Some(answer_tx),
@@ -515,7 +540,9 @@ mod tests {
 
     impl Harness {
         async fn send(&self, m: ControllerMsg) {
-            self.to_host.send(m).await.unwrap();
+            if let Some(m) = self.express.handle(m) {
+                self.to_host.send(m).await.unwrap();
+            }
         }
 
         /// 让会话把手里的消息处理完
@@ -567,6 +594,8 @@ mod tests {
     #[tokio::test]
     async fn requests_reach_the_platform_and_pings_are_answered() {
         let mut h = session(Admission::Paired);
+        // 会话开始了才把确认交给平台
+        h.settle().await;
         h.send(ControllerMsg::Ping { t: 5 }).await;
         h.send(ControllerMsg::Input {
             t: 0,
@@ -593,9 +622,11 @@ mod tests {
         h.events.send(9).await.unwrap();
         assert!(matches!(h.received().await[..], [HostMsg::Pong { t: 5 }]));
         let mut log = h.log.take();
-        // 平台自己的事和控制端的消息谁先谁后不一定
-        let event = log.iter().position(|c| *c == Call::Event(9)).unwrap();
-        log.remove(event);
+        // 平台自己的事、读任务直接交给平台的确认，和控制端的其它消息谁先谁后不一定
+        for c in [Call::Event(9), Call::Ack(3, Some(9))] {
+            let i = log.iter().position(|x| *x == c).unwrap();
+            log.remove(i);
+        }
         assert_eq!(
             log,
             [
@@ -605,10 +636,6 @@ mod tests {
                 }),
                 Call::Request(Request::Input(click())),
                 Call::Request(Request::Settings(fast().sanitized())),
-                Call::Request(Request::Ack {
-                    seq: 3,
-                    arrived: Some(9)
-                }),
                 Call::Request(Request::Clipboard("hi".into())),
             ]
         );
@@ -680,11 +707,11 @@ mod tests {
     async fn unanswered() {
         let mut h = session(Admission::NeedsApproval);
         // 控制端一直在发 Ping：不算失联，但没人理会
-        let ping = h.to_host.clone();
+        let express = h.express.clone();
         let _pinger = OwnedTask(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = ping.send(ControllerMsg::Ping { t: 0 }).await;
+                assert!(express.handle(ControllerMsg::Ping { t: 0 }).is_none());
             }
         }));
         assert!((&mut h.task).await.unwrap().is_ok());

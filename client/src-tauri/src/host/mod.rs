@@ -10,6 +10,7 @@ pub mod gate;
 mod input;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+mod pace;
 mod pipeline;
 #[cfg(target_os = "macos")]
 pub(crate) mod sck;

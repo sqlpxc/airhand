@@ -148,7 +148,7 @@ class ScreenCapture(
     private fun render() {
         var dirty = false
         var force = false
-        var nextDue = 0L
+        val pacer = Pacer(settings.fps)
         val texMatrix = FloatArray(16)
         var lastPts = 0L
         while (running) {
@@ -194,6 +194,7 @@ class ScreenCapture(
                     encoder = null
                 }
                 if (next.kbps != settings.kbps) encoder?.setBitrate(next.kbps)
+                pacer.setFps(next.fps)
                 settings = next
                 if (o.optBoolean("key")) {
                     encoder?.requestKeyframe()
@@ -216,9 +217,9 @@ class ScreenCapture(
             if (consumeFrame()) dirty = true
             if (!dirty && !force) continue
 
-            // 帧率节流
-            val now = System.nanoTime()
-            if (now < nextDue) Thread.sleep((nextDue - now) / 1_000_000, ((nextDue - now) % 1_000_000).toInt())
+            // 帧率节流：按画面的时间戳排时间线（见 Pacer），不按上一帧画完的时刻
+            val wait = pacer.waitNanos(System.nanoTime())
+            if (wait > 0) Thread.sleep(wait / 1_000_000, (wait % 1_000_000).toInt())
             // 在途帧控制：网络跟不上时在这里等，期间新的画面覆盖旧的
             while (running && active && !Native.hostWaitWindow(h, 50)) {
                 if (consumeFrame()) dirty = true
@@ -242,7 +243,9 @@ class ScreenCapture(
             }
             dirty = false
             force = false
-            nextDue = System.nanoTime() + 1_000_000_000L / settings.fps
+            // 画面的时间戳不像是 nanoTime 的时钟（个别设备）就按现在算
+            val now = System.nanoTime()
+            pacer.done(if (pts in now - 1_000_000_000L..now) pts else now)
         }
     }
 

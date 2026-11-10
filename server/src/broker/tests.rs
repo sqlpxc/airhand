@@ -547,9 +547,17 @@ async fn controller_service_waits_for_the_host() {
 /// 未知视频编码仍经过真实控制端会话转发给界面并确认；后面的已知帧继续接收。
 #[tokio::test]
 async fn unknown_video_codec_does_not_end_the_controller_session() {
+    use airhand_link::host::Acks;
     use airhand_proto::media::{self, VideoHeader};
-    use airhand_proto::session::{Codec, ControllerMsg, HostMsg};
+    use airhand_proto::session::Codec;
     struct Ui(mpsc::UnboundedSender<Vec<u8>>);
+    /// 确认在读任务里就交给平台（Ping 也在那里回了）
+    struct AckTx(mpsc::UnboundedSender<(u32, Option<u64>)>);
+    impl Acks for AckTx {
+        fn ack(&self, seq: u32, arrived: Option<u64>) {
+            let _ = self.0.send((seq, arrived));
+        }
+    }
     impl SessionUi for Ui {
         fn packet(&self, p: Vec<u8>) -> Result<(), UiClosed> {
             self.0.send(p).map_err(|_| UiClosed)
@@ -574,7 +582,9 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
             approvals: Default::default(),
         };
         let gate = OpenGate(Identity::generate());
-        let (mut io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        let (ack_tx, mut acks) = mpsc::unbounded_channel();
+        io.incoming.set_acks(Arc::new(AckTx(ack_tx)));
         for seq in [1, 2] {
             let mut header = VideoHeader {
                 seq,
@@ -594,18 +604,14 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
                 .unwrap();
         }
         loop {
-            match timeout(Duration::from_secs(5), io.incoming.recv())
+            let (seq, arrived) = timeout(Duration::from_secs(5), acks.recv())
                 .await
                 .unwrap()
-                .unwrap()
-            {
-                // 确认带着画面到达控制端的时刻
-                ControllerMsg::Ack { seq: 2, arrived } => {
-                    assert!(arrived.is_some());
-                    break;
-                }
-                ControllerMsg::Ping { t } => io.out.send(&HostMsg::Pong { t }).unwrap(),
-                _ => {}
+                .unwrap();
+            // 确认带着画面开始到达控制端的时刻
+            assert!(arrived.is_some());
+            if seq == 2 {
+                break;
             }
         }
         io.close(session_id, Ok(())).await.unwrap();

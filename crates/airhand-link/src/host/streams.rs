@@ -1,10 +1,15 @@
 //! 被控端一个会话的四条流：打开、端到端握手、读写任务、结束。会话里收发什么、什么时候发，见 [`super::session`]。
+//!
+//! Ping 和画面确认在读任务里就处理掉（[`Express`]），不排进会话的主循环：主循环可能正等着平台做一件慢事
+//! （换显示器时要等编码线程退出、建硬件编码器），这期间 Pong 和确认都晚了，控制端测到的往返时延、
+//! 被控端的码率控制都会把它当成网络变慢。
 
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::{Negotiated, PublicKey};
-use airhand_proto::session::{ControllerMsg, InputEvent, QualitySettings};
+use airhand_proto::session::{ControllerMsg, HostMsg, InputEvent, QualitySettings};
 use airhand_proto::{Role, SessionLane};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
@@ -14,6 +19,7 @@ use tracing::{debug, info, warn};
 use super::Incoming;
 use super::clock::InputClock;
 use super::queue::{self, Outbox};
+use super::session::Acks;
 use crate::secure::{self, Admission, Gate, ResponderParams};
 use crate::tasks::OwnedTask;
 use crate::transport::{SessionStreams, open_session, write_audio, write_lane};
@@ -41,22 +47,26 @@ pub struct HostStreams {
     reader: OwnedTask<Result<()>>,
 }
 
-/// 控制和大块消息使用独立信箱，批量剪贴板不能占满 Ping / ACK 的接收位置。
+/// 控制端发来的消息，交给会话的主循环（Ping、确认已经在读任务里处理掉了，见模块说明）。
+/// 控制和大块消息使用独立信箱，批量剪贴板不能占满输入的接收位置。
 pub struct ControllerReceiver {
     control: mpsc::Receiver<ControllerMsg>,
     bulk: mpsc::Receiver<ControllerMsg>,
     bulk_open: bool,
+    express: Express,
 }
 
 impl ControllerReceiver {
     pub(crate) fn new(
         control: mpsc::Receiver<ControllerMsg>,
         bulk: mpsc::Receiver<ControllerMsg>,
+        express: Express,
     ) -> Self {
         Self {
             control,
             bulk,
             bulk_open: true,
+            express,
         }
     }
 
@@ -70,6 +80,58 @@ impl ControllerReceiver {
                     None => self.bulk_open = false,
                 }
             }
+        }
+    }
+
+    /// 画面确认从现在起交给 `acks`（只能设一次）。之前收到的丢掉：那时还没发过画面
+    pub fn set_acks(&self, acks: Arc<dyn Acks>) {
+        let _ = self.express.acks.set(acks);
+    }
+
+    /// 多久没收到控制端的任何消息了（包括读任务自己处理掉的 Ping、确认）
+    pub fn silent_for(&self) -> Duration {
+        self.express.heard.lock().unwrap().elapsed()
+    }
+}
+
+/// 读任务自己处理的消息（见模块说明）：
+///
+/// * Ping：马上回 Pong（只留最新值的槽位，见 [`super::queue`]）。同意之前也回：控制端不会把等待当成失联；
+/// * 画面确认：马上交给平台的 [`Acks`]；
+/// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
+#[derive(Clone)]
+pub(crate) struct Express {
+    out: Outbox,
+    acks: Arc<OnceLock<Arc<dyn Acks>>>,
+    /// 上次收到控制端消息的时刻（tokio 的时钟：测试里可以拨）
+    heard: Arc<Mutex<tokio::time::Instant>>,
+}
+
+impl Express {
+    pub(crate) fn new(out: Outbox) -> Self {
+        Self {
+            out,
+            acks: Arc::default(),
+            heard: Arc::new(Mutex::new(tokio::time::Instant::now())),
+        }
+    }
+
+    /// 处理得了的就地处理、返回 `None`；其它的原样返回，交给会话
+    pub(crate) fn handle(&self, m: ControllerMsg) -> Option<ControllerMsg> {
+        *self.heard.lock().unwrap() = tokio::time::Instant::now();
+        match m {
+            ControllerMsg::Ping { t } => {
+                // 写任务不在了：会话从 Writer::failed 知道
+                let _ = self.out.send(&HostMsg::Pong { t });
+                None
+            }
+            ControllerMsg::Ack { seq, arrived } => {
+                if let Some(acks) = self.acks.get() {
+                    acks.ack(seq, arrived);
+                }
+                None
+            }
+            m => Some(m),
         }
     }
 }
@@ -197,12 +259,15 @@ impl HostStreams {
                 write_audio(conn, session_id, audio_send, audio_rx, audio_sealer)
             )
         }));
-        // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话
+        // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话。
+        // Ping、画面确认在这里就处理掉（见模块说明）
         let capacity = 4 * 1024 * 1024 / SessionLane::Control.max_frame_size();
         let (in_tx, control_in) = mpsc::channel(capacity);
         let (bulk_in, bulk_rx) = mpsc::channel(2);
-        let incoming = ControllerReceiver::new(control_in, bulk_rx);
+        let express = Express::new(out.clone());
+        let incoming = ControllerReceiver::new(control_in, bulk_rx, express.clone());
         let reader = OwnedTask(tokio::spawn(async move {
+            let bulk_express = express.clone();
             // 大块通道（剪贴板）：结束了不算会话结束，控制流结束才是
             let bulk = async move {
                 let mut buf = Vec::new();
@@ -214,6 +279,9 @@ impl HostStreams {
                 )
                 .await?
                 {
+                    let Some(m) = bulk_express.handle(m) else {
+                        continue;
+                    };
                     if bulk_in.send(m).await.is_err() {
                         break;
                     }
@@ -229,11 +297,13 @@ impl HostStreams {
                     next_controller_msg(&mut recv, &mut opener, &mut buf, SessionLane::Control)
                         .await?
                 {
+                    if let &ControllerMsg::Ping { t } = &m {
+                        clock.stale(t, Instant::now());
+                    }
+                    let Some(m) = express.handle(m) else {
+                        continue;
+                    };
                     let m = match m {
-                        ControllerMsg::Ping { t } => {
-                            clock.stale(t, Instant::now());
-                            m
-                        }
                         ControllerMsg::Input { t, mut events } => {
                             // 对方版本新增的按钮、系统操作……：不执行
                             events.retain(InputEvent::understood);
@@ -291,11 +361,13 @@ impl HostStreams {
         } = self;
         drop((out, video, audio, incoming));
         reader.abort();
+        // 读任务手里也有一个 Outbox（回 Pong）：等它真的结束，写任务才知道没有人再发了
+        let read = (&mut reader.0).await;
         if !writer.0.is_finished() {
             let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer.0.0).await;
         }
         let result = match result {
-            Ok(()) => match (&mut reader.0).await {
+            Ok(()) => match read {
                 Ok(Err(e)) => Err(e),
                 _ => Ok(()),
             },
@@ -317,7 +389,8 @@ mod tests {
     async fn bulk_backpressure_cannot_delay_control_or_keep_a_closed_session_alive() {
         let (control, control_rx) = mpsc::channel(1);
         let (bulk, bulk_rx) = mpsc::channel(2);
-        let mut incoming = ControllerReceiver::new(control_rx, bulk_rx);
+        let (out, _control, _bulk) = queue::channel();
+        let mut incoming = ControllerReceiver::new(control_rx, bulk_rx, Express::new(out));
         for _ in 0..2 {
             bulk.try_send(ControllerMsg::Clipboard {
                 text: "x".repeat(1 << 20),
@@ -330,23 +403,63 @@ mod tests {
             })
             .is_err()
         );
-        control.send(ControllerMsg::Ping { t: 7 }).await.unwrap();
-        assert!(matches!(
-            incoming.recv().await,
-            Some(ControllerMsg::Ping { t: 7 })
-        ));
         control
-            .send(ControllerMsg::Ack {
-                seq: 3,
-                arrived: None,
-            })
+            .send(ControllerMsg::SelectDisplay { index: 7 })
             .await
             .unwrap();
         assert!(matches!(
             incoming.recv().await,
-            Some(ControllerMsg::Ack { seq: 3, .. })
+            Some(ControllerMsg::SelectDisplay { index: 7 })
+        ));
+        control
+            .send(ControllerMsg::Settings(QualitySettings::default()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            incoming.recv().await,
+            Some(ControllerMsg::Settings(_))
         ));
         drop(control);
         assert!(incoming.recv().await.is_none());
+    }
+
+    #[derive(Default)]
+    struct Log(Mutex<Vec<(u32, Option<u64>)>>);
+
+    impl Acks for Log {
+        fn ack(&self, seq: u32, arrived: Option<u64>) {
+            self.0.lock().unwrap().push((seq, arrived));
+        }
+    }
+
+    /// Ping 马上回 Pong、确认马上交给平台，都不进会话的主循环；会话开始之前的确认丢掉。
+    /// 任何消息都算控制端还在
+    #[tokio::test(start_paused = true)]
+    async fn pings_and_acks_take_the_express_lane() {
+        let (out, mut control, _bulk) = queue::channel();
+        let (_tx, rx) = mpsc::channel(1);
+        let incoming = ControllerReceiver::new(rx, mpsc::channel(1).1, Express::new(out));
+        let express = incoming.express.clone();
+        let ack = |seq| ControllerMsg::Ack {
+            seq,
+            arrived: Some(9),
+        };
+        assert!(express.handle(ack(1)).is_none());
+        let log = Arc::new(Log::default());
+        incoming.set_acks(log.clone());
+        assert!(express.handle(ack(2)).is_none());
+        assert_eq!(*log.0.lock().unwrap(), [(2, Some(9))]);
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(incoming.silent_for(), Duration::from_secs(10));
+        assert!(express.handle(ControllerMsg::Ping { t: 5 }).is_none());
+        assert_eq!(incoming.silent_for(), Duration::ZERO);
+        let pong = framing::decode_known(&control.try_recv().unwrap()[framing::PREFIX..]).unwrap();
+        assert!(matches!(pong, HostMsg::Pong { t: 5 }));
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let m = express.handle(ControllerMsg::RequestKeyframe);
+        assert!(matches!(m, Some(ControllerMsg::RequestKeyframe)));
+        assert_eq!(incoming.silent_for(), Duration::ZERO);
     }
 }

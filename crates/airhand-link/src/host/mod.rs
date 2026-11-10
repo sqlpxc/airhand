@@ -6,10 +6,11 @@
 //! * [`run`]：一直连着服务器（掉线自动重连，取回原来的控制码），每来一个控制端就调用 `session` 开始一个会话；
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
 //! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：同意流程（同时在等本机用户回答的请求有上限，
-//!   [`ApprovalSlots`]）、Pong、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
+//!   [`ApprovalSlots`]）、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
 //! * [`HostStreams`]：会话的四条流。先在控制流上做端到端握手（[`crate::secure::respond`]）：让不让这个控制端进来
 //!   由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），控制端确认了才算进来
 //!   （重放的握手消息走不到这一步）。过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
+//!   Ping 也在读任务里回 Pong，画面确认在读任务里交给平台的 [`Acks`]，不等会话的主循环；
 //! * [`Outbox`]（[`queue`]）：发给控制端的消息。按消息挑通道（大的走大块通道），只关心最新值的状态
 //!   （Pong、显示器列表、光标可见性）只留最新的一个、排在前面；
 //! * [`CursorCache`]：控制端缓存了哪些光标形状。
@@ -44,7 +45,7 @@ pub use clock::InputClock;
 pub use cursor::CursorCache;
 pub use queue::{Encoded, Outbox, SendError};
 pub use session::{
-    APPROVAL_TIMEOUT, ApprovalSlots, MAX_PENDING_APPROVALS, PEER_TIMEOUT, Platform, Request,
+    APPROVAL_TIMEOUT, Acks, ApprovalSlots, MAX_PENDING_APPROVALS, PEER_TIMEOUT, Platform, Request,
     Senders, Start, serve,
 };
 pub use streams::{Admitted, ControllerReceiver, HostStreams, Writer};

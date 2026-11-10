@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use airhand_link::flow::Flow;
 use airhand_link::host::{
-    Admission, CursorCache, Incoming, Outbox, Platform, Request, Senders, Start, serve,
+    Acks, Admission, CursorCache, Incoming, Outbox, Platform, Request, Senders, Start, serve,
 };
 use airhand_proto::session::{DisplayInfo, HostHello, HostMsg, Notice, QualitySettings};
 use anyhow::Result;
@@ -199,6 +199,11 @@ impl Desktop {
 impl Platform for Desktop {
     type Event = Tick;
 
+    /// 画面确认直接交给会话的在途控制（读任务里调用，不等这里换显示器、重建管线）
+    fn acks(&self) -> Arc<dyn Acks> {
+        self.flow.clone()
+    }
+
     async fn start(&mut self, start: Start) -> Result<()> {
         let (displays, codecs, env_notice) = tokio::task::spawn_blocking(|| {
             (
@@ -265,7 +270,6 @@ impl Platform for Desktop {
                     .unwrap_or(&fallback);
                 self.injector.handle(events, d);
             }
-            Request::Ack { seq, arrived } => self.flow.ack(seq, arrived),
             Request::Settings(s) => {
                 self.settings = s;
                 if let Some(p) = &self.pipeline {

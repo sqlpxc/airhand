@@ -10,7 +10,7 @@
 //!
 //! 声音走 QUIC 数据报（`airhand_proto::datagram`）：不重传，也不排在丢了的包后面等重传，
 //! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流，和数据报用同一把密钥、同一串计数。
-use crate::wire::{read_frame, read_packet};
+use crate::wire::{read_frame, read_packet, read_packet_timed};
 use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, Kind};
@@ -169,8 +169,8 @@ pub async fn open_session(
 pub enum FromHost {
     /// 控制流、大块通道上的消息
     Control(HostMsg),
-    /// 画面包（[`media`] 格式：头 + 码流），原样交给界面。`arrived`：从网络上读完的时刻
-    /// （控制端的时钟，微秒），确认时带给被控端（见 `ControllerMsg::Ack`）
+    /// 画面包（[`media`] 格式：头 + 码流），原样交给界面。`arrived`：开始从网络上到达的时刻
+    /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerMsg::Ack`）
     Video { packet: Vec<u8>, arrived: u64 },
     /// 声音包（[`media`] 格式：头 + Opus 包），原样交给界面
     Audio(Vec<u8>),
@@ -407,12 +407,11 @@ fn video_reader(
     let max = SessionLane::Video.max_frame_size();
     tasks.spawn(async move {
         loop {
-            let r = match read_packet(&mut recv, max).await {
-                Ok(Some(mut packet)) => match opener.open(&mut packet) {
-                    Ok(()) if Kind::of(&packet) == Some(Kind::Video) => Ok(Some(FromHost::Video {
-                        packet,
-                        arrived: crate::controller::now_us(),
-                    })),
+            let r = match read_packet_timed(&mut recv, max, crate::controller::now_us).await {
+                Ok(Some((mut packet, arrived))) => match opener.open(&mut packet) {
+                    Ok(()) if Kind::of(&packet) == Some(Kind::Video) => {
+                        Ok(Some(FromHost::Video { packet, arrived }))
+                    }
                     Ok(()) => Err(anyhow!("unexpected packet on the video stream")),
                     Err(e) => Err(e),
                 },

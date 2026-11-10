@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use airhand_link::host::{
-    Admitted, Encoded, Outbox, Platform, Request, SendError, Senders, Start, serve,
+    Acks, Admitted, Encoded, Outbox, Platform, Request, SendError, Senders, Start, serve,
 };
 use airhand_proto::SessionLane;
 use airhand_proto::handshake::PublicKey;
@@ -81,8 +81,27 @@ impl Drop for Phone {
     }
 }
 
+/// 这个会话的画面确认交给画面分发（读任务里调用）
+struct VideoAcks {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl Acks for VideoAcks {
+    fn ack(&self, seq: u32, arrived: Option<u64>) {
+        self.shared.video.ack(self.id, seq, arrived);
+    }
+}
+
 impl Platform for Phone {
     type Event = Result<Encoded, broadcast::error::RecvError>;
+
+    fn acks(&self) -> Arc<dyn Acks> {
+        Arc::new(VideoAcks {
+            shared: self.shared.clone(),
+            id: self.id,
+        })
+    }
 
     fn ask(&mut self, admitted: &Admitted) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
@@ -150,7 +169,6 @@ impl Platform for Phone {
         match req {
             // 晚到太久的输入已经换成了"释放所有按键"
             Request::Input(events) => sh.event(json!({ "type": "input", "events": events })),
-            Request::Ack { seq, arrived } => sh.video.ack(self.id, seq, arrived),
             Request::Settings(s) => sh.video.set_settings(self.id, s),
             Request::Keyframe => sh.video.request_keyframe(),
             // 手机只有一块屏幕
@@ -259,9 +277,11 @@ mod tests {
             // 会话开始时去掉了等回答的登记：再登记一次，看取消时会不会清掉
             let (pending_tx, pending_rx) = oneshot::channel();
             sh.add_pending(7, pending_tx);
+            // 一帧占在途字节上限的 2/5：发了两帧之后就放不下了
+            let big = vec![0; airhand_link::flow::FlowState::default().window_bytes() * 2 / 5];
             for i in 0..3 {
                 sh.video.push(
-                    &[1],
+                    &big,
                     i == 0,
                     false,
                     0,

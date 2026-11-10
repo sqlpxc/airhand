@@ -1,9 +1,10 @@
-//! 编码管线（每个会话一个线程）：取最新帧 → 节流 → 在途帧控制 → 编码 → 发送。
+//! 编码管线（每个会话一个线程）：取最新帧 → 节流 → 在途控制 → 编码 → 发送。
 //!
 //! 低延迟的关键：
 //! * 永远只编码**最新**的一帧，旧帧直接丢弃，不排队；
-//! * 在途（已发送未确认）帧数量受限，网络变慢时编码器等待而不是把数据堆进缓冲区；
-//! * 自适应码率根据阻塞情况与 RTT 膨胀程度下调/恢复码率。
+//! * 帧率按画面的时间戳节流（见 [`super::pace`]），处理花的时间不会累积成延迟；
+//! * 在途（已发送未确认）字节受限，网络变慢时编码器等待而不是把数据堆进缓冲区；
+//! * 码率按网络上的排队和带宽估计每帧调整（见 [`airhand_link::flow`]）。
 //!
 //! 画面停下来之后补画质：画面大面积变化（切换窗口、滚动）时，码率控制只能给这一帧分到大约一帧的码率，
 //! 文字是糊的；采集只在画面变化时才有新帧，不补的话控制端就一直停在这一帧上。把最后一帧再编几次，
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airhand_link::flow::{Abr, Flow};
+use airhand_link::flow::Flow;
 use airhand_link::host::{CursorCache, Outbox, SendError};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{HostMsg, Notice, QualitySettings};
@@ -24,6 +25,7 @@ use tracing::{info, warn};
 
 use super::capture::{self, Frame};
 use super::encoder::Encoder;
+use super::pace::Pacer;
 
 /// 画面停下来之后，同一帧最多再编这么多次
 const REFINE_FRAMES: u8 = 8;
@@ -150,8 +152,10 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     // 光标有变化还没发出去（大块通道的队列满了）：下一轮再发最新的
     let mut cursor_pending = false;
     let mut last_frame: Option<Arc<Frame>> = None;
-    let mut next_due = Instant::now();
-    let mut abr = Abr::new(settings.bitrate_kbps);
+    let mut pacer = Pacer::new(settings.fps);
+    // 码率估计属于会话（换显示器重建管线时接着用），画质设置里的码率是上限
+    ctrl.flow
+        .set_target(settings.bitrate_kbps, settings.adaptive);
     let mut reported_error: Option<String> = None;
     // 补画质：还要补几次、最早什么时候补
     let mut refine_left = 0u8;
@@ -168,9 +172,11 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             ver = v;
             settings = *ctrl.settings.lock().unwrap();
             sub.set_fps(settings.fps);
-            abr.reset(settings.bitrate_kbps);
+            pacer.set_fps(settings.fps);
+            ctrl.flow
+                .set_target(settings.bitrate_kbps, settings.adaptive);
             if let Some(e) = &mut enc {
-                e.set_bitrate(settings.bitrate_kbps);
+                e.set_bitrate(ctrl.flow.bitrate_kbps());
                 // 需要重建编码器（例如换了编码格式）：用上一帧马上重建，画面静止时也立即生效，
                 // 控制端也能马上收到新的 HostMsg::Encoder（界面上显示的是实际在用的格式）
                 if let Some(f) = &last_frame
@@ -232,10 +238,6 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             // 画面静止但控制端需要关键帧（例如解码器重置），或者该补画质了：重新编码上一帧
             let refine = refine_left > 0 && Instant::now() >= refine_due;
             if !((force || refine) && last_frame.is_some()) {
-                if settings.adaptive {
-                    let (srtt, min_rtt) = ctrl.flow.rtt();
-                    abr.tick(srtt, min_rtt);
-                }
                 continue;
             }
         } else if reported_error.take().is_some() {
@@ -245,17 +247,16 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             }
         }
 
-        // 帧率节流
-        let now = Instant::now();
-        if now < next_due {
-            std::thread::sleep(next_due - now);
+        // 帧率节流：按画面的时间戳排时间线（见 pace），不按上一帧编完的时刻
+        let wait = pacer.wait(Instant::now());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
         }
-        // 在途帧控制：网络跟不上时在这里等待（期间新的画面会覆盖旧画面，不会排队）
+        // 在途控制：网络跟不上时在这里等待（期间新的画面会覆盖旧画面，不会排队）
         while !ctrl
             .flow
             .wait_window(settings.fps, &ctrl.stop, Duration::from_millis(50))
         {
-            abr.blocked += 1;
             if ctrl.stop.load(Ordering::Acquire) {
                 return;
             }
@@ -272,7 +273,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             },
         };
         let started = Instant::now();
-        next_due = started + Duration::from_secs_f64(1.0 / settings.fps.max(1) as f64);
+        pacer.done(if fresh { frame.captured } else { started });
 
         let mut force = ctrl.force_key.swap(false, Ordering::AcqRel);
         if !enc
@@ -284,7 +285,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 frame.width,
                 frame.height,
                 &settings,
-                abr.current,
+                ctrl.flow.bitrate_kbps(),
                 hw_failures < 3,
             ) {
                 Ok(e) => {
@@ -303,11 +304,8 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             }
         }
         let e = enc.as_mut().unwrap();
-        if settings.adaptive {
-            let (srtt, min_rtt) = ctrl.flow.rtt();
-            abr.tick(srtt, min_rtt);
-            e.set_bitrate(abr.current);
-        }
+        // 不自适应时就是画质设置里的码率；编码器自己会跳过没变的
+        e.set_bitrate(ctrl.flow.bitrate_kbps());
 
         // 新画面、关键帧之后从头开始补；补的帧本身只减次数
         if fresh || force {
@@ -328,13 +326,10 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     });
                     break;
                 }
-                while !ctrl.flow.wait_room(
-                    settings.fps,
-                    size,
-                    &ctrl.stop,
-                    Duration::from_millis(50),
-                ) {
-                    abr.blocked += 1;
+                while !ctrl
+                    .flow
+                    .wait_room(size, &ctrl.stop, Duration::from_millis(50))
+                {
                     if ctrl.stop.load(Ordering::Acquire) {
                         return;
                     }

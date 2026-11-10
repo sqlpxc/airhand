@@ -517,7 +517,7 @@ impl ControllerService {
     }
 
     /// 界面收到了这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的，
-    /// 带着这一帧从网络上读完的时刻（见 `ControllerMsg::Ack`）
+    /// 带着这一帧开始从网络上到达的时刻（见 `ControllerMsg::Ack`）
     pub fn ack(&self, sid: u32, seq: u32) -> Result<(), Problem> {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;

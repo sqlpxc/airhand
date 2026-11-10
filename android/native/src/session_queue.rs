@@ -143,7 +143,7 @@ impl SessionUi for SessionQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use airhand_link::flow::FlowState;
+    use airhand_link::flow::{FlowState, MAX_WINDOW};
     use airhand_proto::media::{AudioHeader, VideoHeader};
     use airhand_proto::session::Codec;
 
@@ -152,7 +152,8 @@ mod tests {
         let q = SessionQueue::default();
         let mut flow = FlowState::default();
         q.event(SessionEvent::AwaitingApproval).unwrap();
-        for seq in 1..=flow.window(30) {
+        // 在途的帧最多这么多
+        for seq in 1..=MAX_WINDOW {
             let p = VideoHeader {
                 seq,
                 key: seq == 1,
