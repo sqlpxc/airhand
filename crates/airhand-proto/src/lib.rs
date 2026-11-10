@@ -285,8 +285,10 @@ pub mod features {
     pub mod session {
         use crate::Features;
 
+        /// 光标可见性和形状引用走控制流，图像走大块流，用代际引用处理乱序。
+        pub const CURSOR_UPDATES: Features = Features::from_bits(1 << 0);
         /// 本端支持的
-        pub const SUPPORTED: Features = Features::NONE;
+        pub const SUPPORTED: Features = CURSOR_UPDATES;
     }
 }
 

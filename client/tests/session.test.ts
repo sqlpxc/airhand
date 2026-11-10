@@ -43,6 +43,19 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   return { session, calls, timers, event: (ev: any) => sink.event(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
 }
 
+test("文字分块保留 emoji 的代理对，每块都能独立编码成 UTF-8", () => {
+  const { session } = sessionHarness();
+  const pieces: string[] = [];
+  session.input = { enqueue(events: any[]) { pieces.push(...events.map(e => e.text)); } };
+  const text = "x".repeat(511) + "😀" + "𠮷".repeat(600) + "\r\n末尾";
+  session.sendText(text);
+  assert.equal(pieces.join(""), text.replace(/\r\n/g, "\r"));
+  for (const piece of pieces) {
+    assert.ok(Array.from(piece).length <= 512);
+    assert.equal(Buffer.from(piece, "utf8").toString("utf8"), piece);
+  }
+});
+
 test("Closed before connect reply cannot resurrect SID, erase reason or remember a device", async () => {
   const h = sessionHarness();
   const connecting = h.session.start();

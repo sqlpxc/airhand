@@ -42,6 +42,7 @@
 //! 被控端的声音包走 QUIC 数据报（见 `airhand_proto::datagram`）。一条连接上可能有好几个会话，
 //! 连接的读任务按数据报开头的会话 ID 交给对应会话的 [`HostReceiver`]。
 
+mod cursor;
 mod queue;
 mod session;
 
@@ -59,7 +60,7 @@ use airhand_proto::framing;
 use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, SessionLane, datagram};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use quinn::Connection;
@@ -410,10 +411,10 @@ impl ControllerService {
             Some(dgram_rx),
             Openers {
                 control: init.opener,
-                bulk: secured.opener(SessionLane::Bulk),
-                video: secured.opener(SessionLane::Video),
-                audio: secured.opener(SessionLane::Audio),
-                datagrams: secured.datagram_opener(),
+                bulk: secured.bulk.opener,
+                video: secured.video.opener,
+                audio: secured.audio.opener,
+                datagrams: secured.datagram_opener,
             },
         );
 
@@ -434,7 +435,7 @@ impl ControllerService {
         let io = session::SessionIo {
             send,
             sealer: init.sealer,
-            bulk: (bulk_send, bulk_rx, secured.sealer(SessionLane::Bulk)),
+            bulk: (bulk_send, bulk_rx, secured.bulk.sealer),
             bulk_tx: bulk_tx.clone(),
             recv,
             ui,

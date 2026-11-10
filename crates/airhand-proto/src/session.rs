@@ -10,8 +10,9 @@
 //! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标（[`HostMsg::Cursor`]，
 //!   带着几十 KB 的图像）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板会把后面的
 //!   消息挡住大约 1.7 秒：确认迟到，被控端的在途帧窗口停住、测到的往返时延变大，自适应码率误判为拥塞；
-//!   输入晚到超过 [`INPUT_MAX_AGE`] 还会被当成过时的丢掉。光标的形状和可见性都走这里：它们之间的先后不能乱
-//!   （槽位里的形状要先到）。
+//!   输入晚到超过 [`INPUT_MAX_AGE`] 还会被当成过时的丢掉。
+//! * 双方支持 [`crate::features::session::CURSOR_UPDATES`] 时，光标可见性和完整形状引用走控制流，
+//!   图像走大块流。引用包含槽位和代际，跨流乱序不会让旧图像改变最新可见性；否则使用原来的 [`HostMsg::Cursor`]。
 //!
 //! 大块通道的优先级和画面一样（QUIC 轮流发，谁也不独占），比控制、声音低。
 //!
@@ -95,19 +96,39 @@ pub enum HostMsg {
     /// 原因不认识（[`ByeReason::Unknown`]，对方版本新增的）时会话照样结束
     #[n(9)]
     Bye(#[n(0)] ByeReason),
+    /// 完整的最新光标状态，走控制流。只在协商了 CURSOR_UPDATES 时发送。
+    /// 图像尚未到达时先应用 visible，保持旧图像，等指定代际的图像到达。
+    #[n(10)]
+    CursorUpdate {
+        #[n(0)]
+        visible: bool,
+        #[n(1)]
+        shape: Option<CursorRef>,
+    },
+    /// 一个槽位的新图像，走大块流，不携带可见性，也不自行选择光标形状。
+    #[n(11)]
+    CursorImage {
+        #[n(0)]
+        reference: CursorRef,
+        #[n(1)]
+        image: CursorShape,
+    },
 }
 
 impl HostMsg {
     /// 这条消息走哪条通道（见模块说明的"走哪条通道"）
     pub fn lane(&self) -> SessionLane {
         match self {
-            HostMsg::Cursor(_) | HostMsg::Clipboard { .. } => SessionLane::Bulk,
+            HostMsg::Cursor(_) | HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => {
+                SessionLane::Bulk
+            }
             HostMsg::Hello(_)
             | HostMsg::AwaitingApproval
             | HostMsg::Pong { .. }
             | HostMsg::Displays { .. }
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
+            | HostMsg::CursorUpdate { .. }
             | HostMsg::Bye(_) => SessionLane::Control,
         }
     }
@@ -176,6 +197,15 @@ open_enum! {
         /// 被控端上已经有好几个连接请求在等它的用户回答，这一个没有问（过一会儿再试）
         TooManyRequests = 4 => "tooManyRequests",
     }
+}
+
+/// 光标槽位里的某一代图像，防止槽位复用和跨通道乱序造成旧图像覆盖新图像。
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorRef {
+    #[n(0)]
+    pub slot: u8,
+    #[n(1)]
+    pub generation: u64,
 }
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]

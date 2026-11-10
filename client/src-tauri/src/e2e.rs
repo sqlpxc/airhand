@@ -17,7 +17,7 @@ use airhand_proto::session::{
     ByeReason, Codec, ControllerMsg, HostMsg, InputEvent, Notice, QualitySettings,
 };
 use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg, connect_outcome};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, SessionLane};
+use airhand_proto::{MAX_SIGNAL_MSG, Role};
 
 use airhand_link::ServerState;
 
@@ -197,7 +197,7 @@ async fn e2e_roundtrip() {
     // 剪贴板走大块通道
     let mut bulk = Ctl {
         send: bulk_send,
-        sealer: init.secured.sealer(SessionLane::Bulk),
+        sealer: init.secured.bulk.sealer,
     };
     let mut recv = HostReceiver::new(
         recv,
@@ -206,10 +206,10 @@ async fn e2e_roundtrip() {
         streams.audio,
         Some(datagrams),
         Openers {
-            bulk: init.secured.opener(SessionLane::Bulk),
-            video: init.secured.opener(SessionLane::Video),
-            audio: init.secured.opener(SessionLane::Audio),
-            datagrams: init.secured.datagram_opener(),
+            bulk: init.secured.bulk.opener,
+            video: init.secured.video.opener,
+            audio: init.secured.audio.opener,
+            datagrams: init.secured.datagram_opener,
             control: init.opener,
         },
     );
@@ -367,7 +367,8 @@ async fn e2e_roundtrip() {
                 rep.encoders.push((e.codec, e.name, e.hardware));
             }
             HostMsg::Pong { .. } => rep.pongs += 1,
-            HostMsg::Cursor(_) => rep.cursor += 1,
+            HostMsg::Cursor(_) | HostMsg::CursorUpdate { .. } => rep.cursor += 1,
+            HostMsg::CursorImage { .. } => {}
             HostMsg::Clipboard { text } => {
                 if text == to_host {
                     clip_echo += 1;

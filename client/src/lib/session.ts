@@ -885,9 +885,18 @@ export class RemoteSession {
 
   sendText(text: string) {
     if (!text) return;
-    // 统一换行，分块发送避免单条消息过大
+    // 统一换行，按 Unicode 码点分块，不能把 UTF-16 代理对切成两条无效的 JSON 字符串。
     const t = text.replace(/\r\n/g, "\n").replace(/\n/g, "\r");
-    for (let i = 0; i < t.length; i += 512) this.enqueue([{ type: "text", text: t.slice(i, i + 512) }], true);
+    let piece = "", count = 0;
+    for (const char of t) {
+      piece += char;
+      if (++count === 512) {
+        this.enqueue([{ type: "text", text: piece }], true);
+        piece = "";
+        count = 0;
+      }
+    }
+    if (piece) this.enqueue([{ type: "text", text: piece }], true);
   }
 
   /** 用户手动锁定了鼠标（发相对移动） */

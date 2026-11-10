@@ -245,6 +245,11 @@ async fn drive<P: Platform>(
     writer: &mut Writer,
     approvals: &ApprovalSlots,
 ) -> Result<()> {
+    // 本机用户可能在端到端握手期间已经点了断开，不能先开始采集再处理这个通知。
+    if kick.has_changed().unwrap_or(false) {
+        out.send(&HostMsg::Bye(*kick.borrow_and_update()))?;
+        return Ok(());
+    }
     let mut start = Start {
         settings: admitted.settings,
         audio: admitted.audio,
@@ -279,6 +284,10 @@ async fn drive<P: Platform>(
     let mut kickable = true;
 
     loop {
+        if kick.has_changed().unwrap_or(false) {
+            out.send(&HostMsg::Bye(*kick.borrow_and_update()))?;
+            return Ok(());
+        }
         let open = matches!(phase, Phase::Open);
         tokio::select! {
             msg = incoming.recv() => {
@@ -528,6 +537,21 @@ mod tests {
             fps: 250,
             codec: Codec::AV1,
             ..QualitySettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kick_during_the_handshake_prevents_start_and_approval() {
+        // current-thread runtime: send before yielding, so drive first sees the pending kick.
+        for admission in [Admission::Known, Admission::NeedsApproval] {
+            let mut h = session(admission);
+            h.kick.send_replace(ByeReason::Kicked);
+            assert!(matches!(
+                h.received().await[..],
+                [HostMsg::Bye(ByeReason::Kicked)]
+            ));
+            assert!(h.log.take().is_empty());
+            assert!(h.task.await.unwrap().is_ok());
         }
     }
 

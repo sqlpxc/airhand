@@ -25,8 +25,8 @@ use super::Injector;
 /// 只有文字输得慢的时候才会排起来
 const MAX_QUEUED: usize = 4 << 20;
 
-/// 一次交给注入器的文字最多这么多个字符。控制端本来就按这么长分块发；更长的（只有不守规矩的控制端会发）
-/// 在这里分开，不然一条消息里的文字能输上几分钟，会话结束了也停不下来
+/// 一次交给注入器的文字最多这么多个字符。每个事件、每段文字之间都检查取消，
+/// 包括前端已经分好的小段：不能把一整批小段重新合成一次不可取消的调用。
 const TEXT_PIECE: usize = 512;
 
 /// 注入器：各平台的 [`Injector`]（测试里是假的）
@@ -133,6 +133,12 @@ impl InjectorThread {
         self.send(Job::ReleaseAll);
     }
 
+    /// 马上取消尚未注入的事件，并唤醒空闲线程。停止编码器之前就应调用。
+    pub fn cancel(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.tx = None;
+    }
+
     fn send(&mut self, job: Job) {
         if let Some(tx) = &self.tx
             && tx.send(job).is_err()
@@ -193,20 +199,14 @@ fn inject<I: Inject>(
     display: &DisplayInfo,
     shared: &Shared,
 ) {
-    // 这一批里还没交给注入器的从哪里开始
-    let mut from = 0;
-    for (i, e) in events.iter().enumerate() {
-        let InputEvent::Text { text } = e else {
+    for event in events {
+        if shared.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let InputEvent::Text { text } = event else {
+            injector.handle(std::slice::from_ref(event), display);
             continue;
         };
-        // 字节数不超过的，字符数也不会超过
-        if text.len() <= TEXT_PIECE || text.chars().nth(TEXT_PIECE).is_none() {
-            continue;
-        }
-        if from < i {
-            injector.handle(&events[from..i], display);
-        }
-        from = i + 1;
         let mut rest = text.as_str();
         while !rest.is_empty() {
             if shared.closed.load(Ordering::Acquire) {
@@ -217,12 +217,13 @@ fn inject<I: Inject>(
                 .nth(TEXT_PIECE)
                 .map_or(rest.len(), |(at, _)| at);
             let (piece, tail) = rest.split_at(end);
-            injector.handle(&[InputEvent::Text { text: piece.into() }], display);
+            if piece.len() == text.len() {
+                injector.handle(std::slice::from_ref(event), display);
+            } else {
+                injector.handle(&[InputEvent::Text { text: piece.into() }], display);
+            }
             rest = tail;
         }
-    }
-    if from < events.len() {
-        injector.handle(&events[from..], display);
     }
 }
 
@@ -372,6 +373,19 @@ mod tests {
         assert_eq!(probe.next(), Call::Input(vec![key("KeyC", true)]));
     }
 
+    /// 正常前端一次发送 64 个 512 字符的事件：断开后不能继续执行这一批的剩余事件。
+    #[test]
+    fn frontend_text_chunks_remain_cancellable_inside_a_batch() {
+        let (mut thread, probe) = start();
+        let piece = text(&"界".repeat(TEXT_PIECE));
+        thread.handle(vec![piece.clone(); 64], &display());
+        assert_eq!(probe.next(), Call::Input(vec![piece]));
+        drop(thread);
+        probe.permit(1);
+        assert_eq!(probe.next(), Call::ReleaseAll);
+        assert!(probe.ended());
+    }
+
     /// 太长的文字分成小段输：一个字不少，和前后的事件的先后不变；会话结束了就不再往下输
     #[test]
     fn long_text_is_typed_in_pieces_and_stops_when_the_session_ends() {
@@ -383,7 +397,7 @@ mod tests {
             key("ShiftLeft", false),
         ];
         let (mut thread, probe) = start();
-        probe.permit(5);
+        probe.permit(6);
         thread.handle(batch.clone(), &display());
         assert_eq!(probe.next(), Call::Input(vec![key("ShiftLeft", true)]));
         let mut typed = String::new();
@@ -398,10 +412,8 @@ mod tests {
             typed += text;
         }
         assert_eq!(typed, long);
-        assert_eq!(
-            probe.next(),
-            Call::Input(vec![text("short"), key("ShiftLeft", false)])
-        );
+        assert_eq!(probe.next(), Call::Input(vec![text("short")]));
+        assert_eq!(probe.next(), Call::Input(vec![key("ShiftLeft", false)]));
         drop(thread);
         assert_eq!(probe.next(), Call::ReleaseAll);
         assert!(probe.ended());

@@ -2,21 +2,21 @@
 //!
 //! * 都保存在 config.toml 里（`[host]`、`[[paired]]`，见 [`crate::config`]），身份密钥和配对码加密保存；
 //! * 没配对过的控制端：默认要配对码（config.toml 的 `access`），配对码显示在托盘菜单里，从不经过服务器；
-//! * 有人连续输错 [`MAX_FAILURES`] 次配对码就暂停配对（`pairing_locked`，重启之后也一样），
+//! * 连续 [`MAX_FAILURES`] 次未成功的配对尝试就暂停配对（`pairing_locked`，重启之后也一样），
 //!   托盘里提示，本机用户换一个配对码才恢复：中间人（包括中转服务器）一共只能猜这么几次；
 //! * 更换控制码时配对码也换一个、配对过的控制端全部忘掉（见 [`DesktopGate::reset`]）。
 
 use std::sync::{Arc, Mutex};
 
 use airhand_link::host::{Access, Admitted, Gate};
-use airhand_link::secure::{Identity, hex};
+use airhand_link::secure::{Identity, PairingAttempt, hex};
 use airhand_proto::handshake::PublicKey;
 use tracing::{info, warn};
 
 use crate::config::{self, Paired};
 use crate::status::StatusHub;
 
-/// 连续输错这么多次配对码就暂停配对
+/// 未成功和在途的配对尝试合计上限
 pub const MAX_FAILURES: u32 = 5;
 
 pub struct DesktopGate {
@@ -29,8 +29,10 @@ pub struct DesktopGate {
 struct State {
     pairing: String,
     locked: bool,
-    /// 连续输错了几次（配对成功、换配对码时清零；不保存：重启之后从零数，但暂停是保存的）
+    /// 未成功几次（配对成功、换配对码时清零；不保存：重启之后从零数，但暂停是保存的）
     failures: u32,
+    pending: u32,
+    generation: u64,
     paired: Vec<Paired>,
 }
 
@@ -81,6 +83,8 @@ impl DesktopGate {
                 pairing,
                 locked: saved.pairing_locked,
                 failures: 0,
+                pending: 0,
+                generation: 0,
                 paired: saved.paired,
             }),
             hub,
@@ -112,6 +116,8 @@ impl DesktopGate {
         st.pairing = new_code();
         st.locked = false;
         st.failures = 0;
+        st.pending = 0;
+        st.generation += 1;
         if let Err(e) = config::save_pairing(&st.pairing, false) {
             warn!("can't save the pairing code: {e:#}");
         }
@@ -124,6 +130,9 @@ impl DesktopGate {
     pub fn forget_paired(&self) {
         let mut st = self.state.lock().unwrap();
         st.paired.clear();
+        // 已经拿到旧授权、尚未提交的配对不能在清空之后重新加入。
+        st.generation += 1;
+        st.pending = 0;
         if let Err(e) = config::save_paired(&st.paired) {
             warn!("can't save the paired controllers: {e:#}");
         }
@@ -134,25 +143,34 @@ impl DesktopGate {
 
     /// 更换控制码：配对码也换一个，配对过的控制端全部忘掉
     pub fn reset(&self) {
-        self.forget_paired();
-        self.new_pairing_code();
+        let mut st = self.state.lock().unwrap();
+        st.paired.clear();
+        st.pairing = new_code();
+        st.locked = false;
+        st.failures = 0;
+        st.pending = 0;
+        st.generation += 1;
+        if let Err(e) = config::save_paired(&st.paired) {
+            warn!("can't save the paired controllers: {e:#}");
+        }
+        if let Err(e) = config::save_pairing(&st.pairing, false) {
+            warn!("can't save the pairing code: {e:#}");
+        }
+        drop(st);
+        self.publish();
     }
 
-    /// 会话的端到端握手完成了：托盘里的这一项换成控制端在加密握手里报的名称，加上安全码
-    pub fn admitted(&self, session_id: u64, a: &Admitted) {
-        let (name, safety) = (a.name.clone(), a.safety.clone());
+    /// 会话已经通过认证并开始：只显示加密握手中确认过的名称。服务器的 Incoming 不发布到列表。
+    pub fn admitted(&self, session_id: u64, ip: std::net::IpAddr, a: &Admitted) {
         self.hub.send_modify(|s| {
-            if let Some(c) = s
-                .host
-                .controllers
-                .iter_mut()
-                .find(|c| c.session_id == session_id)
-            {
-                if !name.is_empty() {
-                    c.peer.name = name;
-                }
-                c.safety = Some(safety);
-            }
+            s.host.controllers.push(crate::status::Controller {
+                session_id,
+                peer: airhand_proto::signal::Peer {
+                    name: a.name.clone(),
+                    ip,
+                },
+                safety: Some(a.safety.clone()),
+            });
         });
     }
 }
@@ -166,38 +184,45 @@ impl Gate for DesktopGate {
         self.access
     }
 
-    fn pairing_code(&self) -> Option<String> {
-        let st = self.state.lock().unwrap();
-        (!st.locked).then(|| st.pairing.clone())
-    }
-
-    fn pairing_failed(&self) {
+    fn begin_pairing(&self) -> Option<Box<dyn PairingAttempt + '_>> {
         let mut st = self.state.lock().unwrap();
-        st.failures += 1;
-        warn!(
-            failures = st.failures,
-            "someone entered a wrong pairing code"
-        );
-        if st.failures >= MAX_FAILURES && !st.locked {
-            st.locked = true;
-            warn!(
-                "too many wrong pairing codes, pairing is paused until the local user picks a new code"
-            );
-            if let Err(e) = config::save_pairing(&st.pairing, true) {
-                warn!("can't save the pairing state: {e:#}");
-            }
+        if st.locked || st.failures + st.pending >= MAX_FAILURES {
+            return None;
         }
-        drop(st);
-        self.publish();
+        st.pending += 1;
+        Some(Box::new(Attempt {
+            gate: self,
+            code: st.pairing.clone(),
+            generation: st.generation,
+            completed: false,
+        }))
     }
 
     fn is_known(&self, key: &PublicKey) -> bool {
         let k = hex(key);
         self.state.lock().unwrap().paired.iter().any(|p| p.key == k)
     }
+}
 
-    fn paired(&self, key: PublicKey, name: &str) {
-        let mut st = self.state.lock().unwrap();
+struct Attempt<'a> {
+    gate: &'a DesktopGate,
+    code: String,
+    generation: u64,
+    completed: bool,
+}
+
+impl PairingAttempt for Attempt<'_> {
+    fn code(&self) -> &str {
+        &self.code
+    }
+
+    fn complete(mut self: Box<Self>, key: PublicKey, name: &str) -> bool {
+        let mut st = self.gate.state.lock().unwrap();
+        if st.generation != self.generation || st.locked {
+            return false;
+        }
+        st.pending -= 1;
+        self.completed = true;
         let k = hex(&key);
         st.paired.retain(|p| p.key != k);
         st.paired.push(Paired {
@@ -212,7 +237,31 @@ impl Gate for DesktopGate {
             warn!("can't save the paired controllers: {e:#}");
         }
         drop(st);
-        self.publish();
+        self.gate.publish();
+        true
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut st = self.gate.state.lock().unwrap();
+        if st.generation != self.generation {
+            return;
+        }
+        st.pending -= 1;
+        st.failures += 1;
+        warn!(failures = st.failures, "a pairing attempt did not complete");
+        if st.failures >= MAX_FAILURES {
+            st.locked = true;
+            if let Err(e) = config::save_pairing(&st.pairing, true) {
+                warn!("can't save the pairing state: {e:#}");
+            }
+        }
+        drop(st);
+        self.gate.publish();
     }
 }
 
@@ -220,31 +269,89 @@ impl Gate for DesktopGate {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn reserved_pairing_budget_rejects_a_real_handshake_without_publishing_a_controller() {
+        use airhand_link::secure::{
+            InitiatorParams, ResponderParams, controller_intro, initiate, respond,
+        };
+        let hub = crate::status::new_hub();
+        let gate = DesktopGate::load(hub.clone());
+        let reserved: Vec<_> = (0..MAX_FAILURES)
+            .map(|_| gate.begin_pairing().unwrap())
+            .collect();
+        let code = reserved[0].code().to_string();
+        let me = Identity::generate();
+        let intro = controller_intro("unverified", "test", Default::default(), false);
+        let (a, b) = tokio::io::duplex(65536);
+        let (mut ar, mut aw) = tokio::io::split(a);
+        let (mut br, mut bw) = tokio::io::split(b);
+        let (controller, host) = tokio::join!(
+            initiate(
+                &mut ar,
+                &mut aw,
+                InitiatorParams {
+                    session_id: 1,
+                    code: 123456,
+                    me: &me,
+                    host_key: None,
+                    pairing: Some(&code),
+                    intro: &intro
+                }
+            ),
+            respond(
+                &mut br,
+                &mut bw,
+                ResponderParams {
+                    session_id: 1,
+                    code: 123456,
+                    gate: &*gate
+                }
+            ),
+        );
+        let error = controller
+            .err()
+            .expect("a sixth concurrent attempt must be refused");
+        assert_eq!(
+            error.downcast_ref::<airhand_link::Problem>(),
+            Some(&airhand_link::Problem::PairingUnavailable)
+        );
+        assert!(host.is_err());
+        assert!(hub.borrow().host.controllers.is_empty());
+        assert_eq!(gate.state.lock().unwrap().pending, MAX_FAILURES);
+        drop(reserved);
+        assert!(hub.borrow().host.pairing_locked);
+    }
+
     #[test]
     fn wrong_codes_pause_pairing_until_a_new_code() {
         let hub = crate::status::new_hub();
         let gate = DesktopGate::load(hub.clone());
-        let code = gate.pairing_code().unwrap();
-        assert_eq!(code.len(), 6);
-        assert_eq!(hub.borrow().host.pairing.as_deref(), Some(code.as_str()));
-        for _ in 0..MAX_FAILURES - 1 {
-            gate.pairing_failed();
-        }
-        assert!(gate.pairing_code().is_some());
-        gate.pairing_failed();
-        assert_eq!(gate.pairing_code(), None);
+        let attempts: Vec<_> = (0..MAX_FAILURES)
+            .map(|_| gate.begin_pairing().unwrap())
+            .collect();
+        assert_eq!(attempts[0].code().len(), 6);
+        assert!(
+            gate.begin_pairing().is_none(),
+            "in-flight attempts already reserve the budget"
+        );
+        drop(attempts);
+        assert!(gate.begin_pairing().is_none());
         assert!(hub.borrow().host.pairing_locked);
         gate.new_pairing_code();
-        assert!(gate.pairing_code().is_some());
         assert!(!hub.borrow().host.pairing_locked);
 
+        let stale = gate.begin_pairing().unwrap();
+        gate.new_pairing_code();
         let key = *Identity::generate().public();
+        assert!(!stale.complete(key, "stale"));
         assert!(!gate.is_known(&key));
-        gate.paired(key, "PC");
+        assert!(gate.begin_pairing().unwrap().complete(key, "PC"));
         assert!(gate.is_known(&key));
         assert_eq!(hub.borrow().host.paired, 1);
+        let stale = gate.begin_pairing().unwrap();
         gate.reset();
+        assert!(!stale.complete(key, "stale"));
         assert!(!gate.is_known(&key));
-        assert_ne!(gate.pairing_code(), None);
+        assert_eq!(gate.state.lock().unwrap().pending, 0);
     }
 }

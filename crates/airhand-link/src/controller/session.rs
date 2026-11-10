@@ -227,11 +227,13 @@ pub(super) async fn run(
     let st = stats.clone();
     let clip_in = local_clip.clone();
     let reader = async move {
+        let mut cursor = super::cursor::CursorReceiver::default();
         loop {
             let msg = match recv.recv().await? {
                 // 画面、声音：只看一眼头做统计，原样交给界面
                 FromHost::Video(p) => {
-                    let h = VideoHeader::decode(&p)
+                    // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
+                    let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
                     {
                         let mut s = st.lock().unwrap();
@@ -314,6 +316,17 @@ pub(super) async fn run(
                 HostMsg::Cursor(c) => {
                     out.packet(media::cursor_packet(&c))
                         .map_err(|_| ui_closed())?;
+                }
+                HostMsg::CursorUpdate { visible, shape } => {
+                    let state = cursor.update(visible, shape);
+                    out.packet(media::cursor_packet(&state))
+                        .map_err(|_| ui_closed())?;
+                }
+                HostMsg::CursorImage { reference, image } => {
+                    if let Some(state) = cursor.image(reference, image) {
+                        out.packet(media::cursor_packet(&state))
+                            .map_err(|_| ui_closed())?;
+                    }
                 }
                 HostMsg::Encoder(e) => {
                     let _ = out.event(SessionEvent::Encoder {

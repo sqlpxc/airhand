@@ -7,8 +7,8 @@
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use airhand_proto::session::MAX_CLIPBOARD_TEXT;
@@ -94,6 +94,67 @@ fn write_text(t: &str) -> bool {
     false
 }
 
+/// 整个进程只有一个写入任务。正在写一项时，其余更新只保留最新的一项；
+/// 不让不同会话或连续更新创建无界的阻塞任务，也不让旧写入晚于新写入完成。
+#[derive(Default)]
+struct ClipboardWriter(Mutex<Writes>);
+
+#[derive(Default)]
+struct Writes {
+    running: bool,
+    pending: Option<Update>,
+}
+
+struct Update {
+    text: String,
+    synced: Weak<AtomicU64>,
+}
+
+impl ClipboardWriter {
+    fn busy(&self) -> bool {
+        self.0.lock().unwrap().running
+    }
+
+    /// true 表示调用方需要启动唯一的写任务。
+    fn push(&self, text: String, synced: &Arc<AtomicU64>) -> bool {
+        let mut state = self.0.lock().unwrap();
+        state.pending = Some(Update {
+            text,
+            synced: Arc::downgrade(synced),
+        });
+        !std::mem::replace(&mut state.running, true)
+    }
+
+    fn drain(&self, mut write: impl FnMut(&str) -> bool) {
+        loop {
+            let update = {
+                let mut state = self.0.lock().unwrap();
+                match state.pending.take() {
+                    Some(update) => update,
+                    None => {
+                        state.running = false;
+                        return;
+                    }
+                }
+            };
+            // 会话已经结束的、尚未开始的写入不再执行。
+            let Some(synced) = update.synced.upgrade() else {
+                continue;
+            };
+            if write(&update.text) {
+                synced.store(hash(&update.text), Ordering::Release);
+            } else {
+                tracing::debug!("writing the clipboard failed");
+            }
+        }
+    }
+}
+
+fn writer() -> &'static Arc<ClipboardWriter> {
+    static WRITER: OnceLock<Arc<ClipboardWriter>> = OnceLock::new();
+    WRITER.get_or_init(Arc::default)
+}
+
 /// 单个会话的同步状态。
 pub struct ClipSync {
     last_seq: u32,
@@ -111,15 +172,22 @@ impl ClipSync {
 
     /// 本机剪贴板有新文本（且不是对端刚写入的）时返回它。
     pub async fn poll(&mut self) -> Option<String> {
+        // 写入过程中不读取中间状态，否则 A、B 连续更新时会把短暂的 A 当成本机变化回传。
+        if writer().busy() {
+            return None;
+        }
         let seq = sequence();
         if seq == self.last_seq {
             return None;
         }
-        self.last_seq = seq;
         let text = tokio::task::spawn_blocking(read_text)
             .await
             .ok()
             .flatten()?;
+        if writer().busy() || sequence() != seq {
+            return None;
+        }
+        self.last_seq = seq;
         if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT {
             return None;
         }
@@ -130,22 +198,19 @@ impl ClipSync {
         Some(text)
     }
 
-    /// 写入对端发来的文本（后台线程执行，不阻塞网络读取）。
-    ///
-    /// 先记下哈希再写入：写入引起的本机剪贴板变化不会被当成新内容发回去。
+    /// 串行写入对端的最新文本。只有写入成功才更新同步哈希；写入期间 poll 不回传中间状态。
     pub fn apply(&self, text: String) {
         if text.len() > MAX_CLIPBOARD_TEXT {
             return;
         }
-        let h = hash(&text);
-        if self.synced.swap(h, Ordering::AcqRel) == h {
+        let writer = writer();
+        if !writer.busy() && self.synced.load(Ordering::Acquire) == hash(&text) {
             return;
         }
-        tokio::task::spawn_blocking(move || {
-            if !write_text(&text) {
-                tracing::debug!("writing the clipboard failed");
-            }
-        });
+        if writer.push(text, &self.synced) {
+            let writer = writer.clone();
+            tokio::task::spawn_blocking(move || writer.drain(write_text));
+        }
     }
 }
 
@@ -157,6 +222,48 @@ impl airhand_link::controller::ClipboardSync for ClipSync {
 
     fn apply(&self, text: String) {
         ClipSync::apply(self, text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn clipboard_writes_are_serial_and_keep_only_the_latest_pending_value() {
+        let writer = Arc::new(ClipboardWriter::default());
+        let synced = Arc::new(AtomicU64::new(0));
+        assert!(writer.push("A".into(), &synced));
+        let (started, ready) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let w = writer.clone();
+        let task = std::thread::spawn(move || {
+            let mut written = Vec::new();
+            w.drain(|text| {
+                if text == "A" {
+                    started.send(()).unwrap();
+                    wait.recv().unwrap();
+                }
+                written.push(text.to_string());
+                true
+            });
+            written
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(writer.busy());
+        assert!(!writer.push("B".into(), &synced));
+        assert!(!writer.push("C".into(), &synced));
+        release.send(()).unwrap();
+        assert_eq!(task.join().unwrap(), ["A", "C"]);
+        assert_eq!(synced.load(Ordering::Acquire), hash("C"));
+        assert!(!writer.busy());
+        assert!(writer.push("failed".into(), &synced));
+        writer.drain(|_| false);
+        assert_eq!(synced.load(Ordering::Acquire), hash("C"));
+        assert!(writer.push("cancelled".into(), &synced));
+        drop(synced);
+        writer.drain(|_| panic!("a closed session must not write queued text"));
     }
 }
 

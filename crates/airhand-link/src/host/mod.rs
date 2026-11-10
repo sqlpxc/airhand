@@ -77,8 +77,6 @@ pub trait HostEvents: Send + Sync + 'static {
     fn registered(&self, code: Reclaim, changed: bool) -> impl Future<Output = ()> + Send;
     /// 放弃了控制码（更换控制码）：保存的控制码也要忘掉，之后重新注册
     fn released(&self) -> impl Future<Output = ()> + Send;
-    /// 有控制端要连进来，会话随之开始
-    fn incoming(&self, session_id: u64, peer: &Peer);
     /// 会话结束了
     fn ended(&self, session_id: u64);
     /// 与服务器的连接断了（所有会话随之结束）
@@ -231,7 +229,6 @@ where
             msg = rx.recv() => match msg {
                 Some(ServerMsg::Incoming { session_id, peer }) => {
                     info!(session_id, name = %peer.name, ip = %peer.ip, "controller wants to connect");
-                    events.incoming(session_id, &peer);
                     let run = session(Incoming {
                         conn: sig.conn.clone(),
                         session_id,

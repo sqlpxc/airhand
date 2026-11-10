@@ -3,7 +3,7 @@
 //! * **走哪条通道由消息决定**（[`HostMsg::lane`]）：发的一方只管 [`Outbox::send`]，不用自己挑控制流还是大块通道。
 //!   大的消息（剪贴板、光标形状）在大块通道上排队，挡不住控制消息；
 //! * **只关心最新值的状态不排队**，各占一个槽位、只留最新的一个，写任务先发它们，再按顺序发排着队的：
-//!   Pong 和显示器列表（控制通道）、光标的可见性（大块通道）。网络慢的时候它们不会越积越多、把队列占满，
+//!   Pong、显示器列表和新的 CursorUpdate（控制通道），旧端的光标可见性在大块通道。网络慢时不会越积越多、占满队列，
 //!   Pong 也不会排在一串提示后面、把控制端测到的往返时延拉长；
 //! * 其它消息按顺序排队，有上限。满了怎么办由发的一方决定（[`SendError::Full`]）：控制消息排满了说明对方早就不收了，
 //!   会话结束；剪贴板丢掉这一次；光标形状下一轮再发那时最新的。
@@ -11,7 +11,8 @@
 //! 槽位里的状态不能越过还排着队、带着同一个状态的消息，不然新的会被旧的盖掉：
 //!
 //! * 显示器列表不越过 [`HostMsg::Hello`]（它带着开始时的显示器列表）；
-//! * 光标的可见性不越过带着形状的 [`HostMsg::Cursor`]（它也带着可见性）。
+//! * 旧端的光标可见性不越过带着形状的 [`HostMsg::Cursor`]（它也带着可见性）。新端的图像没有可见性，
+//!   [`HostMsg::CursorUpdate`] 使用完整的带代际引用，不需要等大块通道。
 //!
 //! 反过来，这样的消息排进队列时，槽位里更早的那个值就作废了（它带着的更新）。
 
@@ -38,7 +39,7 @@ const BULK_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL: usize = 0;
 const BULK: usize = 1;
 /// 每条通道最多这么多个槽位
-const SLOTS: usize = 2;
+const SLOTS: usize = 3;
 
 /// 只留最新值的槽位：在哪条通道上、第几个（写任务按这个先后发）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,10 @@ const PONG: Slot = Slot {
 const DISPLAYS: Slot = Slot {
     lane: CONTROL,
     index: 1,
+};
+const CURSOR_UPDATE: Slot = Slot {
+    lane: CONTROL,
+    index: 2,
 };
 const CURSOR_VISIBLE: Slot = Slot {
     lane: BULK,
@@ -79,6 +84,8 @@ impl Place {
             HostMsg::Pong { .. } => Place::Latest(PONG),
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
             HostMsg::Hello(_) => queued(Some(DISPLAYS)),
+            HostMsg::CursorUpdate { .. } => Place::Latest(CURSOR_UPDATE),
+            HostMsg::CursorImage { .. } => queued(None),
             HostMsg::Cursor(CursorState { shape: None, .. }) => Place::Latest(CURSOR_VISIBLE),
             HostMsg::Cursor(CursorState { shape: Some(_), .. }) => queued(Some(CURSOR_VISIBLE)),
             HostMsg::AwaitingApproval
@@ -508,6 +515,31 @@ mod tests {
         let out = drain(&mut control);
         assert_eq!(out.len(), 1);
         assert_eq!(shown(&out[0]), "fresh");
+    }
+
+    #[test]
+    fn fast_cursor_state_bypasses_a_full_bulk_lane() {
+        let (tx, mut control, _bulk) = channel();
+        while tx.send(&clipboard(1 << 20)).is_ok() {}
+        let reference = airhand_proto::session::CursorRef {
+            slot: 2,
+            generation: 7,
+        };
+        tx.send(&HostMsg::CursorUpdate {
+            visible: true,
+            shape: Some(reference),
+        })
+        .unwrap();
+        tx.send(&HostMsg::CursorUpdate {
+            visible: false,
+            shape: Some(reference),
+        })
+        .unwrap();
+        let messages = drain(&mut control);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(messages[0], HostMsg::CursorUpdate { visible: false, shape: Some(r) } if r == reference)
+        );
     }
 
     /// 光标的可见性只留最新的，排在剪贴板前面，但不越过带着形状的光标消息

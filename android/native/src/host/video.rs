@@ -1,8 +1,8 @@
 //! 被控端的画面分发：Kotlin 那边只有一个编码器（手机只有一块屏幕，MediaProjection 也只能建一个虚拟显示器），
 //! 编出来的帧发给所有会话。和桌面版的编码管线（`client/src-tauri/src/host/pipeline.rs`）用同样的低延迟办法：
 //!
-//! * **在途帧控制**：每个会话记录已发送、未确认的帧，超过窗口（≈ 基础 RTT × 帧率 + 2）时
-//!   Kotlin 的渲染线程在 [`VideoHub::wait_window`] 里等，期间新画面覆盖旧画面，不会排队；
+//! * **在途帧控制**：每个会话单独限制已发送、未确认的帧；只要有一个会话能接收就继续编码。
+//!   跟不上的会话跳过帧，恢复后从关键帧重新加入；所有会话都堵住时才等待；
 //! * **自适应码率**：按阻塞次数和 RTT 膨胀程度下调 / 恢复码率（[`Abr`]，与桌面版相同）；
 //! * 新加入的会话从关键帧开始收（[`Out::need_key`]）。
 //!
@@ -52,6 +52,7 @@ struct State {
 struct Out {
     tx: mpsc::Sender<Bytes>,
     flow: Flow,
+    settings: QualitySettings,
     /// 还没收到过关键帧（刚加入，或者队列满了丢过帧）：非关键帧不发给它
     need_key: bool,
 }
@@ -97,16 +98,18 @@ impl VideoHub {
     }
 
     /// 会话开始看画面
-    pub fn add(&self, id: u64, tx: mpsc::Sender<Bytes>) {
+    pub fn subscribe(&self, id: u64, tx: mpsc::Sender<Bytes>, settings: QualitySettings) {
         let mut st = self.st.lock().unwrap();
         st.sessions.insert(
             id,
             Out {
                 tx,
                 flow: Flow::default(),
+                settings: settings.sanitized(),
                 need_key: true,
             },
         );
+        st.merge_settings();
         st.force_key = true;
         let first = st.sessions.len() == 1;
         drop(st);
@@ -116,9 +119,15 @@ impl VideoHub {
         self.cv.notify_all();
     }
 
+    #[cfg(test)]
+    fn add(&self, id: u64, tx: mpsc::Sender<Bytes>) {
+        self.subscribe(id, tx, QualitySettings::default());
+    }
+
     pub fn remove(&self, id: u64) {
         let mut st = self.st.lock().unwrap();
         let removed = st.sessions.remove(&id).is_some();
+        st.merge_settings();
         let empty = st.sessions.is_empty();
         drop(st);
         if removed && empty {
@@ -129,23 +138,26 @@ impl VideoHub {
 
     pub fn ack(&self, id: u64, seq: u32) {
         let mut st = self.st.lock().unwrap();
+        let fps = st.settings.fps;
         if let Some(o) = st.sessions.get_mut(&id) {
             o.flow.on_ack(seq);
+            if o.need_key && o.flow.inflight() < o.flow.window(fps) {
+                st.force_key = true;
+            }
         }
         drop(st);
         self.cv.notify_all();
     }
 
-    /// 控制端改了画质。多个控制端时以最后一次修改为准
-    pub fn set_settings(&self, s: QualitySettings) {
-        let s = s.sanitized();
+    /// 只修改该会话的需求；共享编码参数按所有观看者合并，不由最后一次修改覆盖。
+    pub fn set_settings(&self, id: u64, s: QualitySettings) {
         let mut st = self.st.lock().unwrap();
-        if st.settings != s {
-            st.settings = s;
-            st.version = st.version.wrapping_add(1);
-            st.abr.reset(s.bitrate_kbps);
-            info!(?s, "quality settings updated");
+        if let Some(o) = st.sessions.get_mut(&id) {
+            o.settings = s.sanitized();
+            st.merge_settings();
         }
+        drop(st);
+        self.cv.notify_all();
     }
 
     pub fn request_keyframe(&self) {
@@ -156,7 +168,7 @@ impl VideoHub {
     pub fn tick(&self) -> Option<Tick> {
         let mut st = self.st.lock().unwrap();
         if st.settings.adaptive {
-            let (srtt, min_rtt) = st.worst_rtt();
+            let (srtt, min_rtt) = st.available_rtt();
             st.abr.tick(srtt, min_rtt);
         } else {
             st.abr.current = st.settings.bitrate_kbps;
@@ -178,22 +190,25 @@ impl VideoHub {
         })
     }
 
-    /// 等到所有会话的在途帧都低于窗口。返回 false 表示超时（算一次阻塞，自适应码率据此下调）
+    /// 等到至少一个会话有窗口。所有会话都堵住才算一次全局阻塞。
     pub fn wait_window(&self, timeout: Duration) -> bool {
         let mut st = self.st.lock().unwrap();
         // Defensive cleanup as well as the session's RAII guard: a closed
         // transport can never acknowledge any outstanding frames.
         let was_active = !st.sessions.is_empty();
+        let before = st.sessions.len();
         st.sessions.retain(|_, o| !o.tx.is_closed());
+        if st.sessions.len() != before {
+            st.merge_settings();
+        }
         if was_active && st.sessions.is_empty() {
             self.report_active(false);
         }
-        let fps = st.settings.fps;
         let (mut st, _) = self
             .cv
-            .wait_timeout_while(st, timeout, |s| !s.window_open(fps))
+            .wait_timeout_while(st, timeout, |s| !s.window_open())
             .unwrap();
-        let open = st.window_open(fps);
+        let open = st.window_open();
         if !open {
             st.abr.blocked += 1;
         }
@@ -239,7 +254,12 @@ impl VideoHub {
         };
         let bytes = Bytes::from(media::frame(&header.encode(), &[config, data]));
         let mut want_key = false;
+        let fps = st.settings.fps;
         for (id, o) in st.sessions.iter_mut() {
+            if o.flow.inflight() >= o.flow.window(fps) {
+                o.need_key = true;
+                continue;
+            }
             if o.need_key && !key {
                 want_key = true;
                 continue;
@@ -290,18 +310,47 @@ fn starts_with_parameter_set(data: &[u8], codec: Codec) -> bool {
 }
 
 impl State {
-    fn window_open(&self, fps: u8) -> bool {
-        self.sessions
-            .values()
-            .all(|o| o.need_key || o.flow.inflight() < o.flow.window(fps))
+    /// 单编码器：帧率和码率满足前台需求，尺寸服从最严格上限；编码偏好不一致时用共同基线 H.264。
+    fn merge_settings(&mut self) {
+        let mut all = self.sessions.values().map(|o| o.settings);
+        let Some(mut s) = all.next() else { return };
+        for other in all {
+            s.fps = s.fps.max(other.fps);
+            s.bitrate_kbps = s.bitrate_kbps.max(other.bitrate_kbps);
+            s.max_short = match (s.max_short, other.max_short) {
+                (0, n) | (n, 0) => n,
+                (a, b) => a.min(b),
+            };
+            s.adaptive |= other.adaptive;
+            if s.codec != other.codec {
+                s.codec = Codec::H264;
+            }
+        }
+        if self.settings != s {
+            self.settings = s;
+            self.version = self.version.wrapping_add(1);
+            self.abr.reset(s.bitrate_kbps);
+            info!(?s, "shared quality settings updated");
+        }
     }
 
-    /// 最慢的会话的 (平滑 RTT, 基础 RTT)
-    fn worst_rtt(&self) -> (f64, f64) {
+    fn window_open(&self) -> bool {
+        self.sessions.is_empty()
+            || self
+                .sessions
+                .values()
+                .any(|o| o.flow.inflight() < o.flow.window(self.settings.fps))
+    }
+
+    /// 使用仍在接收的最快会话，慢订阅者不能把其它人的共享码率一起拉低。
+    fn available_rtt(&self) -> (f64, f64) {
         self.sessions
             .values()
+            .filter(|o| !o.need_key)
             .map(|o| o.flow.rtt())
-            .fold((0.0, 0.0), |acc, r| if r.0 > acc.0 { r } else { acc })
+            .filter(|r| r.0 > 0.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap_or_default()
     }
 }
 
@@ -438,16 +487,21 @@ mod tests {
     #[test]
     fn settings_changes_are_reported_once() {
         let (hub, _) = hub();
+        let (tx, _rx) = mpsc::channel(QUEUE);
+        hub.add(1, tx);
         let first = hub.tick().unwrap();
         assert_eq!(first.kbps, 4000);
         assert!(hub.tick().is_none());
-        hub.set_settings(QualitySettings {
-            fps: 60,
-            bitrate_kbps: 8000,
-            max_short: 720,
-            adaptive: false,
-            codec: Codec::H265,
-        });
+        hub.set_settings(
+            1,
+            QualitySettings {
+                fps: 60,
+                bitrate_kbps: 8000,
+                max_short: 720,
+                adaptive: false,
+                codec: Codec::H265,
+            },
+        );
         let t = hub.tick().unwrap();
         assert_eq!(
             (t.fps, t.kbps, t.max_short, t.codec),
@@ -455,6 +509,83 @@ mod tests {
         );
         assert!(t.version > first.version);
         assert!(hub.tick().is_none());
+    }
+
+    #[test]
+    fn slow_viewer_does_not_block_fast_viewer_and_recovers_at_a_keyframe() {
+        let (hub, _) = hub();
+        let (fast, mut fast_rx) = mpsc::channel(QUEUE);
+        let (slow, mut slow_rx) = mpsc::channel(QUEUE);
+        hub.add(1, fast);
+        hub.add(2, slow);
+        let _ = hub.tick();
+        for i in 0..12 {
+            assert!(hub.wait_window(Duration::ZERO));
+            hub.push(&[1], i == 0, false, i, Codec::H264, 8, 8);
+            hub.ack(1, decode(&fast_rx.try_recv().unwrap()).seq);
+        }
+        let mut last = 0;
+        for _ in 0..3 {
+            last = decode(&slow_rx.try_recv().unwrap()).seq;
+        }
+        assert!(
+            slow_rx.try_recv().is_err(),
+            "slow viewer stays within its window"
+        );
+        assert!(
+            hub.tick().is_none(),
+            "a stalled viewer must not cause a keyframe storm"
+        );
+        hub.ack(2, last);
+        assert!(hub.tick().unwrap().key);
+        hub.push(&[2], false, false, 12, Codec::H264, 8, 8);
+        assert!(
+            slow_rx.try_recv().is_err(),
+            "delta frames after a gap are not decodable"
+        );
+        hub.push(&[3], true, false, 13, Codec::H264, 8, 8);
+        assert!(decode(&slow_rx.try_recv().unwrap()).key);
+    }
+
+    #[test]
+    fn viewers_keep_their_settings_and_share_a_decodable_format() {
+        let (hub, _) = hub();
+        let (a, _ar) = mpsc::channel(QUEUE);
+        let (b, _br) = mpsc::channel(QUEUE);
+        let foreground = QualitySettings {
+            fps: 60,
+            codec: Codec::AV1,
+            max_short: 1080,
+            ..Default::default()
+        };
+        hub.subscribe(1, a, foreground);
+        hub.subscribe(
+            2,
+            b,
+            QualitySettings {
+                fps: 5,
+                codec: Codec::H264,
+                max_short: 720,
+                ..Default::default()
+            },
+        );
+        let settings = hub.tick().unwrap();
+        assert_eq!(
+            (settings.fps, settings.codec, settings.max_short),
+            (60, Codec::H264, 720)
+        );
+        hub.set_settings(
+            2,
+            QualitySettings {
+                fps: 5,
+                codec: Codec::H265,
+                max_short: 720,
+                ..Default::default()
+            },
+        );
+        assert_eq!(hub.st.lock().unwrap().settings.codec, Codec::H264);
+        hub.remove(2);
+        assert_eq!(hub.st.lock().unwrap().settings, foreground);
     }
 
     #[test]

@@ -151,13 +151,16 @@ impl VideoHeader {
 
     /// 解析画面包的头；不是画面包或者编码格式不认识时为 `None`
     pub fn decode(packet: &[u8]) -> Option<Self> {
+        Self::decode_any(packet).filter(|h| h.codec.is_known())
+    }
+
+    /// 解析公共头，保留未知编码。传输层仍可读取序号并交给界面确认，
+    /// 只有实际解码器需要过滤编码格式，不能把未知格式误判成损坏的包。
+    pub fn decode_any(packet: &[u8]) -> Option<Self> {
         if Kind::of(packet)? != Kind::Video {
             return None;
         }
         let codec = Codec::from_code(packet[2] as u32);
-        if !codec.is_known() {
-            return None;
-        }
         Some(Self {
             seq: u32_at(packet, 4),
             key: packet[1] & FLAG_KEY != 0,
@@ -245,6 +248,28 @@ pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::session::{CursorShape, CursorSlot};
+
+    #[test]
+    fn unknown_video_codec_preserves_the_header_and_ack_sequence() {
+        let mut packet = VideoHeader {
+            seq: 42,
+            key: true,
+            codec: Codec::H264,
+            width: 1920,
+            height: 1080,
+            capture_us: 100,
+        }
+        .encode()
+        .to_vec();
+        packet[2] = 99;
+        let h = VideoHeader::decode_any(&packet).unwrap();
+        assert_eq!(h.seq, 42);
+        assert_eq!(h.codec, Codec::Unknown(99));
+        assert!(VideoHeader::decode(&packet).is_none());
+        assert!(VideoHeader::decode_any(&packet[..20]).is_none());
+        packet[3] = 255;
+        assert!(VideoHeader::decode_any(&packet).is_none());
+    }
 
     #[test]
     fn video_header_roundtrip() {

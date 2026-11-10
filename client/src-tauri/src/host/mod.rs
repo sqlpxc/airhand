@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use airhand_link::ServerState;
 use airhand_link::host::HostEvents;
-use airhand_proto::signal::{Peer, Reclaim};
+use airhand_proto::signal::Reclaim;
 
 use gate::DesktopGate;
 use tauri::async_runtime::JoinHandle;
@@ -31,7 +31,7 @@ use tracing::warn;
 pub use airhand_link::host::HostCmd;
 
 use crate::config;
-use crate::status::{Controller, StatusHub};
+use crate::status::StatusHub;
 
 /// 在"每显示器 DPI 感知"上下文中执行（线程级）。
 ///
@@ -169,17 +169,6 @@ impl HostEvents for TrayStatus {
 
     async fn released(&self) {
         save_code(None).await;
-    }
-
-    fn incoming(&self, session_id: u64, peer: &Peer) {
-        let peer = peer.clone();
-        self.0.send_modify(|s| {
-            s.host.controllers.push(Controller {
-                session_id,
-                peer,
-                safety: None,
-            })
-        });
     }
 
     fn ended(&self, session_id: u64) {

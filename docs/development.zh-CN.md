@@ -131,6 +131,8 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 ### 一份协议，三份实现
 
+`crates/airhand-proto/tests/v9.rs` 保存固定的 v9 CBOR 字节样例，不能随着实现重新生成：现有消息的编号和字段位置必须保持兼容，新增消息另加样例。`secure` 的握手测试覆盖没有新能力位的旧端，光标接收测试覆盖两个通道的乱序；服务器测试经过真实 QUIC 和控制端会话检查未知视频格式仍能确认、后续帧继续接收。
+
 Rust、控制台（TypeScript）和 Android（Kotlin）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令、连接选项（`airhand_link::controller::Command`、`ConnectOptions`）。界面和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`），带字段的联合类型用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）和 `./gradlew testDebugUnitTest`（`ProtocolTest`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边的测试通过。
 
 ### 消息是类型，不是文字

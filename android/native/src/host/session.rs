@@ -27,6 +27,7 @@ use airhand_link::host::Incoming;
 
 pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
     let id = inc.session_id;
+    let ip = inc.peer.ip;
     let sh = shared.clone();
     serve(
         inc,
@@ -34,13 +35,8 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
         video::QUEUE,
         audio::QUEUE,
         move |admitted, senders| {
-            // 列表里换成控制端在加密握手里报的名称，加上安全码（问本机用户时一起显示）
-            sh.update_controller(id, |c| {
-                if !admitted.name.is_empty() {
-                    c.name = admitted.name.clone();
-                }
-                c.safety = Some(admitted.safety.clone());
-            });
+            // Confirm 验证之后才发布身份；pending/active 由下面的协议阶段更新。
+            sh.admitted(id, ip, admitted);
             Phone::new(sh, id, admitted.key, senders)
         },
     )
@@ -140,8 +136,8 @@ impl Platform for Phone {
                 })))?;
             }
         }
-        sh.video.set_settings(start.settings);
-        sh.video.add(self.id, self.video.clone());
+        sh.video
+            .subscribe(self.id, self.video.clone(), start.settings);
         if start.audio {
             sh.audio
                 .subscribe(self.id, self.audio.clone(), self.out.clone());
@@ -155,7 +151,7 @@ impl Platform for Phone {
             // 晚到太久的输入已经换成了"释放所有按键"
             Request::Input(events) => sh.event(json!({ "type": "input", "events": events })),
             Request::Ack(seq) => sh.video.ack(self.id, seq),
-            Request::Settings(s) => sh.video.set_settings(s),
+            Request::Settings(s) => sh.video.set_settings(self.id, s),
             Request::Keyframe => sh.video.request_keyframe(),
             // 手机只有一块屏幕
             Request::SelectDisplay(_) => {}

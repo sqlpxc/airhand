@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::{Negotiated, PublicKey};
 use airhand_proto::session::{ControllerMsg, InputEvent, QualitySettings};
-use airhand_proto::{MAX_CONTROL_MSG, Role, SessionLane};
+use airhand_proto::{MAX_CONTROL_MSG, Role};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -141,13 +141,13 @@ impl HostStreams {
             "end-to-end session established"
         );
         let (video_sealer, audio_sealer, bulk_sealer, datagrams) = (
-            r.secured.sealer(SessionLane::Video),
-            r.secured.sealer(SessionLane::Audio),
-            r.secured.sealer(SessionLane::Bulk),
-            r.secured.datagram_sealer(),
+            r.secured.video.sealer,
+            r.secured.audio.sealer,
+            r.secured.bulk.sealer,
+            r.secured.datagram_sealer,
         );
         let mut opener = r.opener;
-        let mut bulk_opener = r.secured.opener(SessionLane::Bulk);
+        let mut bulk_opener = r.secured.bulk.opener;
         let control_sealer = r.sealer;
         let (out, ctl_rx, bulk_rx) = queue::channel();
         let (video_tx, video_rx) = mpsc::channel(video_queue);

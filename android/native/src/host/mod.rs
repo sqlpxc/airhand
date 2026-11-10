@@ -26,7 +26,7 @@ use airhand_link::host::{Access, Encoded, Gate, HostCmd, HostEvents, Outbox};
 use airhand_link::secure::Identity;
 use airhand_proto::handshake::PublicKey;
 use airhand_proto::session::{Codec, DisplayInfo, EncoderInfo, HostMsg, Notice, SystemAction};
-use airhand_proto::signal::{Peer, Reclaim};
+use airhand_proto::signal::Reclaim;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -142,7 +142,7 @@ pub(crate) struct ControllerView {
     /// 会话 id。是随机的 u64，转成字符串（Kotlin 的 JSON 解析会把超过 Long 的数字变成浮点数）
     #[serde(serialize_with = "as_string")]
     id: u64,
-    /// 端到端握手之后是控制端在加密握手里报的名称（之前是服务器转来的）
+    /// 控制端在加密握手里确认过的名称
     pub name: String,
     ip: String,
     /// 安全码：控制端显示的是同一个，请本机用户同意时一起显示（见 `airhand_proto::handshake`）。握手之前为 null
@@ -170,6 +170,23 @@ impl Shared {
     fn report_controllers(&self) {
         let list = self.controllers.lock().unwrap().clone();
         self.event(json!({ "type": "controllers", "list": list }));
+    }
+
+    pub fn admitted(
+        &self,
+        session_id: u64,
+        ip: std::net::IpAddr,
+        admitted: &airhand_link::host::Admitted,
+    ) {
+        self.controllers.lock().unwrap().push(ControllerView {
+            id: session_id,
+            name: admitted.name.clone(),
+            ip: ip.to_string(),
+            safety: Some(admitted.safety.clone()),
+            pending: false,
+            active: false,
+        });
+        self.report_controllers();
     }
 
     pub fn update_controller(&self, id: u64, f: impl FnOnce(&mut ControllerView)) {
@@ -214,17 +231,9 @@ impl Gate for Shared {
         }
     }
 
-    fn pairing_code(&self) -> Option<String> {
-        None
-    }
-
-    fn pairing_failed(&self) {}
-
     fn is_known(&self, key: &PublicKey) -> bool {
         self.trusted.lock().unwrap().contains(key)
     }
-
-    fn paired(&self, _: PublicKey, _: &str) {}
 }
 
 pub struct Host {
@@ -386,18 +395,6 @@ impl HostEvents for Shared {
 
     async fn released(&self) {
         self.event(json!({ "type": "released" }));
-    }
-
-    fn incoming(&self, session_id: u64, peer: &Peer) {
-        self.controllers.lock().unwrap().push(ControllerView {
-            id: session_id,
-            name: peer.name.clone(),
-            ip: peer.ip.to_string(),
-            safety: None,
-            pending: false,
-            active: false,
-        });
-        self.report_controllers();
     }
 
     fn ended(&self, session_id: u64) {

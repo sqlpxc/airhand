@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use airhand_link::flow::{Abr, Flow};
 use airhand_link::host::{CursorCache, Outbox, SendError};
 use airhand_proto::media::{self, VideoHeader};
-use airhand_proto::session::{CursorState, HostMsg, Notice, QualitySettings};
+use airhand_proto::session::{HostMsg, Notice, QualitySettings};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -48,7 +48,7 @@ struct Ctrl {
 }
 
 impl Pipeline {
-    /// `video`：画面流的发送队列；`out`：控制消息（编码器、采集失败的提示走控制通道，光标走大块通道：
+    /// `video`：画面流的发送队列；`out`：控制消息（编码器、采集失败和光标状态走控制通道，光标图像走大块通道：
     /// 形状图像有几十 KB，不能挡控制消息）；`cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
     pub fn start(
         display: u8,
@@ -192,8 +192,8 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
 
         // 光标变化：只发送可见性 +（如有变化）形状。控制端已经有的形状（动画光标循环到的帧）只发槽位。
-        // 走大块通道，和剪贴板共用、和画面分带宽：队列满了不等（不能让编码线程卡在一个大剪贴板后面），
-        // 下一轮（最多 40 ms 之后）再发那时最新的状态。只有可见性变了的话占的是只留最新值的槽位，不会排满
+        // 图像走大块通道，和剪贴板共用：队列满了不等，下一轮再发最新形状。
+        // 新端的可见性和完整形状引用独立走控制通道；旧端仍使用同一条有序的光标消息。
         if cs > cursor_seq {
             cursor_seq = cs;
             cursor_pending = true;
@@ -201,23 +201,16 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         if cursor_pending {
             let c = slot.cursor();
             let shape = match &c.shape {
-                Some(s) if c.shape_seq > shape_seq => Some(ctrl.cursors.lock().unwrap().place(s)),
+                Some(s) if c.shape_seq > shape_seq => Some(s.as_ref()),
                 _ => None,
             };
-            let msg = HostMsg::Cursor(CursorState {
-                visible: c.visible,
-                shape,
-            });
-            match out.send(&msg) {
+            match ctrl.cursors.lock().unwrap().send(&out, c.visible, shape) {
                 Ok(()) => {
                     shape_seq = c.shape_seq;
                     cursor_pending = false;
                 }
                 Err(e) => {
-                    // 没发出去：控制端没有这个形状，下次还得带图像
-                    if let HostMsg::Cursor(CursorState { shape: Some(s), .. }) = &msg {
-                        ctrl.cursors.lock().unwrap().forget(s);
-                    }
+                    // 没发出去的图像由 CursorCache 忘掉；可见性已经独立发送。
                     if e == SendError::Closed {
                         break;
                     }

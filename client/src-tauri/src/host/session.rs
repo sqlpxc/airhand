@@ -86,6 +86,7 @@ fn ticker(period: Duration) -> Interval {
 
 pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
     let session_id = inc.session_id;
+    let ip = inc.peer.ip;
     // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）。
     // 进来的时候控制端已经确认过了（重放的握手消息走不到这里），这时才在托盘里显示它、开始采集
     serve(
@@ -96,8 +97,14 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
         |admitted, senders| {
             // 桌面被控端不请本机用户同意（无人值守），gate 不会要求它
             debug_assert_ne!(admitted.admission, Admission::NeedsApproval);
-            gate.admitted(session_id, admitted);
-            Desktop::new(session_id, senders)
+            let mut desktop = Desktop::new(session_id, senders);
+            desktop.cursors = Arc::new(Mutex::new(CursorCache::with_fast_updates(
+                admitted
+                    .negotiated
+                    .has(airhand_proto::features::session::CURSOR_UPDATES),
+            )));
+            desktop.identity = Some((gate.clone(), ip, admitted.clone()));
+            desktop
         },
     )
     .await
@@ -106,6 +113,12 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
 /// 桌面版一个会话里的东西
 struct Desktop {
     session_id: u64,
+    /// 认证完成后暂存，只有 start 成功才发布为活动控制端。
+    identity: Option<(
+        Arc<DesktopGate>,
+        std::net::IpAddr,
+        airhand_link::host::Admitted,
+    )>,
     out: Outbox,
     video: mpsc::Sender<Bytes>,
     audio: mpsc::Sender<Bytes>,
@@ -141,6 +154,7 @@ impl Desktop {
     fn new(session_id: u64, senders: Senders) -> Self {
         Self {
             session_id,
+            identity: None,
             out: senders.out,
             video: senders.video,
             audio: senders.audio,
@@ -237,6 +251,9 @@ impl Platform for Desktop {
         }
         if start.audio {
             self.subscribe_audio()?;
+        }
+        if let Some((gate, ip, admitted)) = self.identity.take() {
+            gate.admitted(self.session_id, ip, &admitted);
         }
         Ok(())
     }
@@ -356,7 +373,7 @@ impl Platform for Desktop {
     }
 
     async fn stop(mut self) {
-        self.injector.release_all();
+        self.injector.cancel();
         // 先停掉还拿着画面 / 声音发送端的东西，写任务才能把排着队的（例如 Bye）发完
         if let Some(p) = self.pipeline.take() {
             p.stop().await;

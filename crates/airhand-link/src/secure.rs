@@ -3,7 +3,7 @@
 //! * [`Identity`]：一台设备的长期 X25519 密钥（Noise 的静态密钥），由各端自己保存；
 //! * [`initiate`] / [`respond`]：控制端 / 被控端在控制通道上握手（最后是控制端的确认），得到 [`Secured`]
 //!   和双方协商好的 [`Negotiated`]；
-//! * [`Secured`]：派生出每条通道、每个方向的密钥：[`FrameSealer`] / [`FrameOpener`]（流上的帧）、
+//! * [`Secured`]：握手一次性派生的通道密钥集合：[`FrameSealer`] / [`FrameOpener`]（流上的帧）、
 //!   [`DatagramSealer`] / [`DatagramOpener`]（声音数据报）。
 //!
 //! 加解密都是原地做的：发送的帧预留了认证标签的位置（`airhand_proto::framing::encode_with_spare`、
@@ -255,8 +255,25 @@ impl ReplayWindow {
 
 // ───────────────────────────── 会话的密钥 ─────────────────────────────
 
-/// 握手的结果：会话的密钥（各通道、各方向从这里派生），对方是谁，安全码
+/// 每条通道的密钥只能移交一次。没有 Clone，也没有重新从计数器 0 创建加密端的公开接口。
+pub struct LaneKeys {
+    pub sealer: FrameSealer,
+    pub opener: FrameOpener,
+}
+
+/// 握手之后可移交给媒体和大块通道的密钥；控制通道已经在握手中消耗了第一帧。
 pub struct Secured {
+    pub peer: PublicKey,
+    pub safety: String,
+    pub video: LaneKeys,
+    pub audio: LaneKeys,
+    pub bulk: LaneKeys,
+    pub datagram_sealer: DatagramSealer,
+    pub datagram_opener: DatagramOpener,
+}
+
+/// 仅握手内部持有的原始材料，消费后派生一次全部通道密钥。
+struct KeyMaterial {
     /// 本端是哪一边（控制端是 Noise 的发起方）
     role: Role,
     /// 发起方 → 响应方、响应方 → 发起方
@@ -270,14 +287,33 @@ pub struct Secured {
     pub safety: String,
 }
 
-impl Drop for Secured {
+impl Drop for KeyMaterial {
     fn drop(&mut self) {
         self.i2r = [0; 32];
         self.r2i = [0; 32];
     }
 }
 
-impl Secured {
+impl KeyMaterial {
+    fn split(self) -> (Secured, LaneKeys) {
+        let lane = |lane| LaneKeys {
+            sealer: self.sealer(lane),
+            opener: self.opener(lane),
+        };
+        (
+            Secured {
+                peer: self.peer,
+                safety: self.safety.clone(),
+                video: lane(SessionLane::Video),
+                audio: lane(SessionLane::Audio),
+                bulk: lane(SessionLane::Bulk),
+                datagram_sealer: self.datagram_sealer(),
+                datagram_opener: self.datagram_opener(),
+            },
+            lane(SessionLane::Control),
+        )
+    }
+
     fn new(role: Role, hs: &mut snow::HandshakeState) -> Result<Self> {
         let peer: PublicKey = hs
             .get_remote_static()
@@ -310,28 +346,28 @@ impl Secured {
         aead_key(&out)
     }
 
-    pub fn sealer(&self, lane: SessionLane) -> FrameSealer {
+    fn sealer(&self, lane: SessionLane) -> FrameSealer {
         FrameSealer {
             key: self.key(true, &lane_label(lane)),
             counter: 0,
         }
     }
 
-    pub fn opener(&self, lane: SessionLane) -> FrameOpener {
+    fn opener(&self, lane: SessionLane) -> FrameOpener {
         FrameOpener {
             key: self.key(false, &lane_label(lane)),
             counter: 0,
         }
     }
 
-    pub fn datagram_sealer(&self) -> DatagramSealer {
+    fn datagram_sealer(&self) -> DatagramSealer {
         DatagramSealer {
             key: self.key(true, b"airhand datagram"),
             counter: 0,
         }
     }
 
-    pub fn datagram_opener(&self) -> DatagramOpener {
+    fn datagram_opener(&self) -> DatagramOpener {
         DatagramOpener {
             key: self.key(false, b"airhand datagram"),
             window: ReplayWindow::default(),
@@ -376,7 +412,9 @@ async fn send_step<W: AsyncWrite + Unpin, T: airhand_proto::minicbor::Encode<()>
     w: &mut W,
     msg: &T,
 ) -> Result<()> {
-    write_frame(w, &framing::to_vec(msg)).await?;
+    tokio::time::timeout(STEP_TIMEOUT, write_frame(w, &framing::to_vec(msg)))
+        .await
+        .context("the end-to-end handshake writer timed out")??;
     Ok(())
 }
 
@@ -508,8 +546,13 @@ where
         reply.verdict
     };
     anyhow::ensure!(hs.is_handshake_finished(), "the handshake didn't finish");
-    let secured = Secured::new(Role::Controller, &mut hs)?;
-    let mut opener = secured.opener(SessionLane::Control);
+    let (
+        secured,
+        LaneKeys {
+            mut opener,
+            mut sealer,
+        },
+    ) = KeyMaterial::new(Role::Controller, &mut hs)?.split();
     let mut verdict = verdict.context("the host sent no verdict")?;
     opener.open(&mut verdict)?;
     let verdict: HostVerdict = framing::decode_known(&verdict)?;
@@ -527,12 +570,14 @@ where
         (SESSION_MIN..=SESSION_VERSION).contains(&version),
         "the host chose session version {version}, which we can't speak"
     );
-    let negotiated = Negotiated::new(version, verdict.features);
+    let mut negotiated = Negotiated::new(version, verdict.features);
+    negotiated.features = negotiated.features.common(p.intro.features);
     // 确认（见 airhand_proto::handshake 的"确认"）：被控端解开它才算本机进来了，重放的握手消息走不到这一步
-    let mut sealer = secured.sealer(SessionLane::Control);
     let mut confirm = framing::encode_with_spare(&Confirm::default(), TAG_LEN);
     sealer.seal_frame(&mut confirm)?;
-    send.write_all(&confirm).await?;
+    tokio::time::timeout(STEP_TIMEOUT, send.write_all(&confirm))
+        .await
+        .context("the handshake confirmation writer timed out")??;
     debug!(?pattern, ?negotiated, safety = %secured.safety, "end-to-end handshake done");
     Ok(Initiated {
         negotiated,
@@ -597,18 +642,24 @@ pub enum Access {
     Pairing,
 }
 
-/// 被控端：自己是谁，认得哪些控制端，配对码是什么（各平台自己保存）
+/// 一个已占名额的配对尝试。实现必须把失败和在途尝试一起计入本机预算；
+/// 丢弃（包括超时、取消、格式错误）算一次未成功尝试。换配对码后旧尝试不能提交。
+pub trait PairingAttempt: Send {
+    fn code(&self) -> &str;
+    /// 在本机同一把锁下检查代际并记住控制端，成功才返回 true。
+    fn complete(self: Box<Self>, key: PublicKey, name: &str) -> bool;
+}
+
+/// 被控端：自己是谁，认得哪些控制端，配对尝试的本机预算（各平台自己保存）。
 pub trait Gate: Send + Sync + 'static {
     fn identity(&self) -> Identity;
     fn access(&self) -> Access;
-    /// 现在的配对码；`None` 表示不接受配对（没有设置，或者输错太多次、暂停了）
-    fn pairing_code(&self) -> Option<String>;
-    /// 有人输错了配对码（连续错几次就暂停配对，要本机用户换一个配对码）
-    fn pairing_failed(&self);
+    /// 原子地占一个配对名额；None 表示不接受配对或预算已用完。
+    fn begin_pairing(&self) -> Option<Box<dyn PairingAttempt + '_>> {
+        None
+    }
     /// 这个控制端配对过（或者本机用户这次运行里同意过）
     fn is_known(&self, key: &PublicKey) -> bool;
-    /// 配对成功：记住这个控制端
-    fn paired(&self, key: PublicKey, name: &str);
 }
 
 /// 被控端为什么让这个控制端进来
@@ -679,13 +730,16 @@ where
     let me = p.gate.identity();
     let mut reply = HandshakeReply::default();
     let mut psk = None;
+    let mut pairing = None;
     if pattern == Pattern::Pairing {
-        let Some(code) = p.gate.pairing_code() else {
+        let Some(attempt) = p.gate.begin_pairing() else {
             fail(send, HandshakeError::PairingUnavailable).await;
             bail!("a controller tried to pair, but pairing is off");
         };
+        let password = handshake::pake_password(p.session_id, p.code, attempt.code());
+        pairing = Some(attempt);
         let (spake, msg_b) = Spake2::<Ed25519Group>::start_b(
-            &Password::new(handshake::pake_password(p.session_id, p.code, &code)),
+            &Password::new(password),
             &PakeId::new(PAKE_CONTROLLER),
             &PakeId::new(PAKE_HOST),
         );
@@ -735,7 +789,7 @@ where
         match hs.read_message(&finish.noise, &mut payload) {
             Ok(n) => payload[..n].to_vec(),
             Err(_) if pattern == Pattern::Pairing => {
-                p.gate.pairing_failed();
+                drop(pairing.take());
                 fail(send, HandshakeError::PairingFailed).await;
                 bail!("a controller entered a wrong pairing code");
             }
@@ -747,7 +801,13 @@ where
     };
     anyhow::ensure!(hs.is_handshake_finished(), "the handshake didn't finish");
     let intro: ControllerIntro = framing::decode_known(&intro_bytes)?;
-    let secured = Secured::new(Role::Host, &mut hs)?;
+    let (
+        secured,
+        LaneKeys {
+            mut opener,
+            mut sealer,
+        },
+    ) = KeyMaterial::new(Role::Host, &mut hs)?.split();
 
     // 决定：版本，然后是让不让进来
     let version = intro.max.min(SESSION_VERSION);
@@ -779,7 +839,6 @@ where
         min: SESSION_MIN,
         max: SESSION_VERSION,
     };
-    let mut sealer = secured.sealer(SessionLane::Control);
     reply.verdict = Some(sealer.seal(&framing::to_vec(&verdict))?);
     send_step(send, &reply).await?;
     if let Some(r) = refused {
@@ -789,7 +848,6 @@ where
 
     // 等控制端的确认（见 airhand_proto::handshake 的"确认"）：解得开它才算这个控制端真的在连。
     // 重放的第 1 条消息走不到这里（重放的一方算不出会话密钥），在这之前什么也不记、什么也不显示
-    let mut opener = secured.opener(SessionLane::Control);
     read_step(recv, &mut buf)
         .await
         .context("waiting for the controller to confirm the handshake")?;
@@ -798,9 +856,12 @@ where
         .context("the controller's confirmation failed authentication")?;
     let _: Confirm = framing::decode_known(&buf)?;
 
-    if admission == Admission::Paired {
+    if let Some(attempt) = pairing {
+        anyhow::ensure!(
+            attempt.complete(secured.peer, &intro.name),
+            "pairing was revoked during the handshake"
+        );
         info!(name = %intro.name, key = %hex(&secured.peer), "a controller paired with this host");
-        p.gate.paired(secured.peer, &intro.name);
     }
     Ok(Responded {
         negotiated,
@@ -876,17 +937,38 @@ mod tests {
         fn access(&self) -> Access {
             self.access
         }
-        fn pairing_code(&self) -> Option<String> {
-            self.code.lock().unwrap().clone()
-        }
-        fn pairing_failed(&self) {
-            self.failures.fetch_add(1, Ordering::Relaxed);
+        fn begin_pairing(&self) -> Option<Box<dyn PairingAttempt + '_>> {
+            Some(Box::new(TestAttempt {
+                gate: self,
+                code: self.code.lock().unwrap().clone()?,
+                completed: false,
+            }))
         }
         fn is_known(&self, key: &PublicKey) -> bool {
             self.known.lock().unwrap().contains(key)
         }
-        fn paired(&self, key: PublicKey, _: &str) {
-            self.known.lock().unwrap().insert(key);
+    }
+
+    struct TestAttempt<'a> {
+        gate: &'a TestGate,
+        code: String,
+        completed: bool,
+    }
+    impl PairingAttempt for TestAttempt<'_> {
+        fn code(&self) -> &str {
+            &self.code
+        }
+        fn complete(mut self: Box<Self>, key: PublicKey, _: &str) -> bool {
+            self.gate.known.lock().unwrap().insert(key);
+            self.completed = true;
+            true
+        }
+    }
+    impl Drop for TestAttempt<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.gate.failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -970,8 +1052,8 @@ mod tests {
         assert_eq!(c.negotiated.version, SESSION_VERSION);
 
         // 两边的密钥对得上：控制端 → 被控端、被控端 → 控制端，每条通道
-        let mut c_send = c.secured.sealer(SessionLane::Video);
-        let mut h_recv = h.secured.opener(SessionLane::Video);
+        let mut c_send = c.secured.video.sealer;
+        let mut h_recv = h.secured.video.opener;
         let mut frame = airhand_proto::media::frame(&[7; 24], &[b"hello"]);
         let cap = frame.capacity();
         c_send.seal_frame(&mut frame).unwrap();
@@ -996,6 +1078,59 @@ mod tests {
         let (c, h) = (c.unwrap(), h.unwrap());
         assert_eq!(c.secured.safety, h.secured.safety);
         assert_eq!(h.secured.peer, *me.public());
+    }
+
+    #[tokio::test]
+    async fn old_peer_without_cursor_feature_negotiates_the_legacy_session() {
+        let gate = TestGate::new(Access::Open, None);
+        let me = Identity::generate();
+        let ((mut cr, mut cw), (mut hr, mut hw)) = pipes();
+        let mut intro = test_intro();
+        intro.features = airhand_proto::Features::NONE;
+        let (c, h) = tokio::join!(
+            initiate(
+                &mut cr,
+                &mut cw,
+                InitiatorParams {
+                    session_id: 42,
+                    code: 123456,
+                    me: &me,
+                    host_key: None,
+                    pairing: None,
+                    intro: &intro
+                }
+            ),
+            respond(
+                &mut hr,
+                &mut hw,
+                ResponderParams {
+                    session_id: 42,
+                    code: 123456,
+                    gate: &gate
+                }
+            ),
+        );
+        let (c, h) = (c.unwrap(), h.unwrap());
+        assert_eq!(c.negotiated, h.negotiated);
+        assert!(
+            !c.negotiated
+                .has(airhand_proto::features::session::CURSOR_UPDATES)
+        );
+        let mut tx = h.sealer;
+        let mut rx = c.opener;
+        let mut msg = framing::encode(&airhand_proto::session::HostMsg::Cursor(
+            airhand_proto::session::CursorState {
+                visible: false,
+                shape: None,
+            },
+        ));
+        tx.seal_frame(&mut msg).unwrap();
+        let mut payload = msg[4..].to_vec();
+        rx.open(&mut payload).unwrap();
+        assert!(matches!(
+            framing::decode_known::<airhand_proto::session::HostMsg>(&payload).unwrap(),
+            airhand_proto::session::HostMsg::Cursor(_)
+        ));
     }
 
     #[tokio::test]
@@ -1047,7 +1182,7 @@ mod tests {
     async fn a_replayed_first_message_is_not_admitted() {
         let gate = TestGate::new(Access::Pairing, None);
         let me = Identity::generate();
-        gate.paired(*me.public(), "ctl");
+        gate.known.lock().unwrap().insert(*me.public());
         // 录下一次真的握手里控制端的第 1 条消息
         let ((mut cr, mut cw), (mut mr, mut mw)) = pipes();
         let ((mut hr, mut hw), (mut nr, mut nw)) = pipes();
@@ -1243,8 +1378,8 @@ mod tests {
         i.read_message(&m[..n], &mut p).unwrap();
         let n = i.write_message(&[], &mut m).unwrap();
         r.read_message(&m[..n], &mut p).unwrap();
-        let ctl = Secured::new(Role::Controller, &mut i).unwrap();
-        let host = Secured::new(Role::Host, &mut r).unwrap();
+        let ctl = KeyMaterial::new(Role::Controller, &mut i).unwrap();
+        let host = KeyMaterial::new(Role::Host, &mut r).unwrap();
 
         let frames: Vec<Vec<u8>> = {
             let mut s = ctl.sealer(SessionLane::Control);

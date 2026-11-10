@@ -12,7 +12,7 @@ use airhand_link::wire::{read_msg, write_msg};
 use airhand_proto::handshake::PublicKey;
 use airhand_proto::session::{ByeReason, QualitySettings};
 use airhand_proto::signal::{
-    ClientMsg, ConnectError, Peer, Reclaim, ResumeToken, SessionGrant, connect_outcome,
+    ClientMsg, ConnectError, Reclaim, ResumeToken, SessionGrant, connect_outcome,
 };
 use airhand_proto::{CODE_MAX, CODE_MIN, datagram};
 use quinn::VarInt;
@@ -35,14 +35,9 @@ impl Gate for OpenGate {
     fn access(&self) -> Access {
         Access::Open
     }
-    fn pairing_code(&self) -> Option<String> {
-        None
-    }
-    fn pairing_failed(&self) {}
     fn is_known(&self, _: &PublicKey) -> bool {
         false
     }
-    fn paired(&self, _: PublicKey, _: &str) {}
 }
 
 /// 回应这个被控端收到的会话请求：端到端握手、打开会话。会话一直开着，直到任务被中止
@@ -329,7 +324,6 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     // 这一次是真正的会话：经服务器转发的流上做端到端握手，之后都是密文
     use airhand_link::secure::{self, InitiatorParams, ResponderParams};
     use airhand_link::transport::Openers;
-    use airhand_proto::SessionLane;
     let grant = ask(&mut ctrl, 2, id.code, None).await.unwrap();
     let _ = next(&mut host).await;
     let h = open_session(&host.conn, grant.session_id, Role::Host)
@@ -375,10 +369,10 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
         None,
         Openers {
             control: init.opener,
-            bulk: init.secured.opener(SessionLane::Bulk),
-            video: init.secured.opener(SessionLane::Video),
-            audio: init.secured.opener(SessionLane::Audio),
-            datagrams: init.secured.datagram_opener(),
+            bulk: init.secured.bulk.opener,
+            video: init.secured.video.opener,
+            audio: init.secured.audio.opener,
+            datagrams: init.secured.datagram_opener,
         },
     );
     assert!(
@@ -547,6 +541,115 @@ async fn controller_service_waits_for_the_host() {
     assert!(connect(token).await.is_ok());
 }
 
+/// 未知视频编码仍经过真实控制端会话转发给界面并确认；后面的已知帧继续接收。
+#[tokio::test]
+async fn unknown_video_codec_does_not_end_the_controller_session() {
+    use airhand_proto::media::{self, VideoHeader};
+    use airhand_proto::session::{Codec, ControllerMsg, HostMsg};
+    struct Ui(mpsc::UnboundedSender<Vec<u8>>);
+    impl SessionUi for Ui {
+        fn packet(&self, p: Vec<u8>) -> Result<(), UiClosed> {
+            self.0.send(p).map_err(|_| UiClosed)
+        }
+        fn event(&self, _: SessionEvent) -> Result<(), UiClosed> {
+            Ok(())
+        }
+    }
+    let (_broker, cfg) = start().await;
+    let (mut host, id) = register(&cfg, None).await;
+    let host_task = tokio::spawn(async move {
+        let ServerMsg::Incoming { session_id, peer } = next(&mut host).await else {
+            panic!()
+        };
+        let (_kick_tx, kick) = watch::channel(ByeReason::Kicked);
+        let inc = Incoming {
+            conn: host.conn.clone(),
+            session_id,
+            code: id.code,
+            peer,
+            kick,
+            approvals: Default::default(),
+        };
+        let gate = OpenGate(Identity::generate());
+        let (mut io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        for seq in [1, 2] {
+            let mut header = VideoHeader {
+                seq,
+                key: true,
+                codec: Codec::H264,
+                width: 8,
+                height: 8,
+                capture_us: 0,
+            }
+            .encode();
+            if seq == 1 {
+                header[2] = 99;
+            }
+            io.video
+                .send(media::frame(&header, &[&[1]]).into())
+                .await
+                .unwrap();
+        }
+        loop {
+            match timeout(Duration::from_secs(5), io.incoming.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ControllerMsg::Ack { seq: 2 } => break,
+                ControllerMsg::Ping { t } => io.out.send(&HostMsg::Pong { t }).unwrap(),
+                _ => {}
+            }
+        }
+        io.close(session_id, Ok(())).await.unwrap();
+    });
+    let (packets, mut received) = mpsc::unbounded_channel();
+    let svc = ControllerService::start(
+        Arc::new(cfg),
+        tokio::runtime::Handle::current(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        Identity::generate(),
+    );
+    let ui = Arc::new(Ui(packets));
+    let session = timeout(Duration::from_secs(5), async {
+        loop {
+            match svc
+                .connect(
+                    &id.code.to_string(),
+                    ConnectOptions::default(),
+                    ui.clone(),
+                    Frontend::Browser,
+                )
+                .await
+            {
+                Err(Problem::NotConnected) => tokio::time::sleep(Duration::from_millis(10)).await,
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for seq in [1, 2] {
+        let packet = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let h = VideoHeader::decode_any(&packet).unwrap();
+        assert_eq!(h.seq, seq);
+        assert_eq!(
+            h.codec,
+            if seq == 1 {
+                Codec::Unknown(99)
+            } else {
+                Codec::H264
+            }
+        );
+        svc.ack(session.sid, seq).unwrap();
+    }
+    host_task.await.unwrap();
+}
+
 /// 测试用的数据库文件。放在 target/ 里：服务器的后台任务在测试结束前一直开着数据库，Windows 上删不掉
 fn temp_db() -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -677,7 +780,6 @@ async fn host_service_rekeys_on_kick_all() {
             let _ = self.0.send((code, changed));
         }
         async fn released(&self) {}
-        fn incoming(&self, _: u64, _: &Peer) {}
         fn ended(&self, _: u64) {}
         fn offline(&self) {}
     }
@@ -727,7 +829,6 @@ async fn host_service_retries_an_unanswered_rekey() {
         fn server(&self, _: airhand_link::ServerState) {}
         async fn registered(&self, _: Reclaim, _: bool) {}
         async fn released(&self) {}
-        fn incoming(&self, _: u64, _: &Peer) {}
         fn ended(&self, _: u64) {}
         fn offline(&self) {}
     }
