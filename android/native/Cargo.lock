@@ -80,6 +80,7 @@ dependencies = [
  "sha2",
  "snow",
  "spake2",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -92,7 +93,6 @@ dependencies = [
  "postcard",
  "serde",
  "thiserror 2.0.21",
- "tokio",
  "tracing",
 ]
 

@@ -103,7 +103,7 @@ impl X11Injector {
                     c.fake(xproto::MOTION_NOTIFY_EVENT, 1, clamp(*dx), clamp(*dy))?;
                 }
                 InputEvent::MouseButton { button, down } => {
-                    // 不认识的按钮（对方版本新增的）HostSession 已经滤掉了，这里再防一手
+                    // 不认识的按钮（对方版本新增的）HostStreams 已经滤掉了，这里再防一手
                     if !button.is_known() {
                         continue;
                     }

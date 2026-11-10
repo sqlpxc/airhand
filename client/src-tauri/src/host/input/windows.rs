@@ -133,7 +133,7 @@ impl WinInjector {
                     self.batch.push(mouse(MOUSEEVENTF_MOVE, *dx, *dy, 0));
                 }
                 InputEvent::MouseButton { button, down } => {
-                    // 不认识的按钮（对方版本新增的）HostSession 已经滤掉了，这里再防一手
+                    // 不认识的按钮（对方版本新增的）HostStreams 已经滤掉了，这里再防一手
                     if !button.is_known() {
                         continue;
                     }

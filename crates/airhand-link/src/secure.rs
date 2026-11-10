@@ -11,7 +11,8 @@
 
 use std::time::Duration;
 
-use airhand_proto::framing::{self, read_frame, write_frame};
+use crate::wire::{read_frame, write_frame};
+use airhand_proto::framing;
 use airhand_proto::handshake::{
     self, Confirm, ControllerIntro, HandshakeError, HandshakeFinish, HandshakeInit, HandshakeReply,
     HostVerdict, PAKE_CONTROLLER, PAKE_HOST, Pattern, PublicKey, Refusal, TAG_LEN,

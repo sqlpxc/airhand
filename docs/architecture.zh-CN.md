@@ -20,7 +20,7 @@ flowchart LR
 
 界面和控制端服务之间（Tauri 命令、网页版的 WebSocket、Android 的 JNI）用同一套 JSON：对会话的操作都是 `airhand_link::controller::Command`，会话事件都是 `SessionEvent`。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的协议样例（媒体包、输入事件、命令），TypeScript 和 Kotlin 的测试读同一个文件，三边的实现对不上测试就会失败。
 
-被控端与服务器的连接（注册、取回控制码、断开所有控制端、更换控制码）和会话各条通道的收发在 `airhand_link::host`，桌面版和 Android 共用；采集、编码、注入输入、请本机用户同意由各平台自己做。
+被控端与服务器的连接（注册、取回控制码、断开所有控制端、更换控制码）、会话各条通道的收发，以及会话本身都在 `airhand_link::host`，桌面版和 Android 共用。协议层的事只有一份，在 `host::serve`：同意流程、回应 Ping、失联检测、本机用户断开所有控制端时发 `Bye`、画质设置的校验；各平台实现 `host::Platform`，只管真正不同的事：采集、编码、注入输入、怎么请本机用户同意。发给控制端的消息经 `host::Outbox`：按消息挑通道（剪贴板、光标形状走大块通道），只关心最新值的状态（Pong、显示器列表、光标可见性）只留最新的一个、排在前面发，和控制端的命令队列是同一个设计。
 
 **鼠标**平时用绝对坐标（本机指针在画面的哪里，被控端光标就在哪里）。被控端的光标隐藏时（例如游戏里按住右键转视角、第一人称游戏）改发相对移动：游戏这时自己把光标拉回原位、只看移动了多少，绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动）。被控端用真实鼠标的方式注入相对移动（Windows `SendInput`、macOS 带移动量的 `CGEvent`、X11 XTEST 相对移动）。控制台这时锁定本机指针（Pointer Lock，原始移动量），按 Esc 解除；也可以手动锁定（Ctrl+Alt+Shift+M 或工具栏）。Android 控制端的触控板滑动、触屏拖动发相对移动，外接鼠标被抓住（pointer capture）；菜单里也有“锁定鼠标”。macOS 被控端检测不到光标隐藏，玩游戏时手动锁定。
 
@@ -52,12 +52,12 @@ flowchart LR
 
 | 目录 | 内容 |
 |---|---|
-| `crates/airhand-proto` | 协议：信令和版本握手、端到端握手的消息、会话控制消息、媒体包、帧格式和兼容规则 |
-| `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，端到端加密（`secure`：身份、Noise 握手、每条通道的加密），会话的几条流，与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接，`Problem`。桌面客户端、网页控制台和 Android 共用；`tests/protocol.json` 是三边共用的协议样例 |
-| `server/` | 中转服务器（quinn + rustls）及其 `Dockerfile` |
+| `crates/airhand-proto` | 协议：信令和版本握手、端到端握手的消息、会话控制消息、媒体包、帧格式和兼容规则。只做编解码：不碰 IO、不依赖异步运行时，能编译成 wasm，解析对方数据的函数都只吃字节（方便 fuzz） |
+| `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，端到端加密（`secure`：身份、Noise 握手、每条通道的加密），从流里读写帧（`wire`），会话的几条流，与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接和会话（`host`），`Problem`。桌面客户端、网页控制台和 Android 共用（除了 `wire` 都在默认的 `client` feature 里，中转服务器只用 `wire`）；`tests/protocol.json` 是三边共用的协议样例 |
+| `server/` | 中转服务器（quinn + rustls）及其 `Dockerfile`。`src/broker/`：`registry`（控制码登记、连接请求）、`relay`（会话通道的配对和转发、数据报）、`limits`（限速）、`tokens`（密钥和重连凭证）；锁的先后在调试构建里有检查（`lock.rs`） |
 | `web/` | 网页控制台服务（axum：静态网页 + WebSocket，HTTP / HTTPS 同一端口）及其 `Dockerfile`、`docker-compose.yml`。和 `client/src-tauri/` 一样是独立的 Cargo 工作区 |
 | `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`、托盘、控制台窗口和命令 |
-| `android/native/` | Android 的 Rust 核心（JNI）：控制端用 `airhand-link`；被控端的网络部分（服务器连接和会话的各条通道用 `airhand_link::host`，在途帧控制和自适应码率与桌面版相同）。和 `client/src-tauri/`、`web/` 一样是独立的 Cargo 工作区 |
+| `android/native/` | Android 的 Rust 核心（JNI）：控制端用 `airhand-link`；被控端的网络部分（服务器连接、会话和它的各条通道用 `airhand_link::host`，Android 只实现 `host::Platform`；在途帧控制和自适应码率与桌面版相同）。和 `client/src-tauri/`、`web/` 一样是独立的 Cargo 工作区 |
 | `android/app/` | Android 应用（Kotlin + Jetpack Compose）：手机和电视界面、MediaCodec 解码 / 编码、屏幕录制、无障碍服务（远程操作） |
 | `client/src/` | `lib/session.ts` 管理会话，`connection-attempt.ts` 隔离连接代际，`media.ts` 解析媒体包，`video.ts` 管理解码 / 画面队列，`input.ts` 管理输入（含相对移动和指针锁定）；控制台界面（React 19 + TypeScript，不依赖 UI 库），桌面版和网页版共用，区别只在 `client/src/lib/backend/`；文案在 `client/src/locales/` |
 | `assets/icon.svg` | 应用图标源文件 |

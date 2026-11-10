@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 airhand-proto = { path = "../crates/airhand-proto" }
+# 只用它的 wire 模块（从流里读写长度前缀帧：协议库只做编解码，不碰 IO）。关掉默认的 client：
+# 服务器不用把 Noise、SPAKE2 这些客户端才用的库编译进去（Docker 构建的 `cargo build -p airhand-server` 也是）
+airhand-link = { path = "../crates/airhand-link", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rcgen = "0.14"
@@ -20,5 +23,6 @@ sha2 = "0.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
-# 测试用真实的客户端链路（QUIC + 握手）连进程内的服务器
+# 测试用真实的客户端链路（QUIC + 握手）连进程内的服务器。只在编译测试时打开 client，
+# 不影响服务器本身的构建（resolver 2 起 dev-dependencies 的 feature 不带进正常构建）
 airhand-link = { path = "../crates/airhand-link" }

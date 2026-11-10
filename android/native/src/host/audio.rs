@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airhand_link::host::Control;
+use airhand_link::host::Outbox;
 use airhand_proto::media::{self, AudioHeader};
 use airhand_proto::session::{HostMsg, Notice};
 use bytes::Bytes;
@@ -38,8 +38,8 @@ struct State {
 struct Sub {
     /// 声音流
     tx: mpsc::Sender<Bytes>,
-    /// 控制流（提示）
-    ctl: Control,
+    /// 控制消息（提示）
+    ctl: Outbox,
     seq: u32,
     last: Option<Instant>,
 }
@@ -59,7 +59,7 @@ impl AudioHub {
     }
 
     /// 会话打开声音。采集已经失败了的话马上告诉它
-    pub fn subscribe(&self, id: u64, tx: mpsc::Sender<Bytes>, ctl: Control) {
+    pub fn subscribe(&self, id: u64, tx: mpsc::Sender<Bytes>, ctl: Outbox) {
         let mut st = self.st.lock().unwrap();
         if let Some(detail) = &st.failure {
             let _ = ctl.send(&HostMsg::Notice(Some(Notice::AudioFailed {
@@ -119,7 +119,7 @@ impl AudioHub {
             return;
         }
         st.failure = failure.clone();
-        let notice = Control::encode(&HostMsg::Notice(Some(match failure {
+        let notice = Outbox::encode(&HostMsg::Notice(Some(match failure {
             Some(detail) => Notice::AudioFailed { detail },
             None => Notice::AudioRecovered,
         })));
@@ -132,11 +132,12 @@ impl AudioHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airhand_link::host::queue::{self, LaneReceiver};
     use airhand_proto::framing;
 
-    fn notice(rx: &mut mpsc::Receiver<Bytes>) -> Notice {
+    fn notice(rx: &mut LaneReceiver) -> Notice {
         let b = rx.try_recv().unwrap();
-        match framing::decode_known::<HostMsg>(&b[4..]).unwrap() {
+        match framing::decode_known::<HostMsg>(&b[framing::PREFIX..]).unwrap() {
             HostMsg::Notice(Some(n)) => n,
             other => panic!("{other:?}"),
         }
@@ -147,8 +148,8 @@ mod tests {
         let events = Arc::new(Queue::new(16));
         let hub = AudioHub::new(events.clone());
         let (tx, mut rx) = mpsc::channel(QUEUE);
-        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
-        hub.subscribe(1, tx, Control::new(ctl_tx));
+        let (ctl_tx, mut ctl_rx, _bulk) = queue::channel();
+        hub.subscribe(1, tx, ctl_tx);
         assert_eq!(
             events.pop(Duration::ZERO).unwrap(),
             r#"{"active":true,"type":"audio"}"#
@@ -168,8 +169,8 @@ mod tests {
         assert!(matches!(notice(&mut ctl_rx), Notice::AudioFailed { .. }));
         // 之后打开声音的会话马上收到
         let (tx2, _rx2) = mpsc::channel(QUEUE);
-        let (ctl2_tx, mut ctl2_rx) = mpsc::channel(8);
-        hub.subscribe(2, tx2, Control::new(ctl2_tx));
+        let (ctl2_tx, mut ctl2_rx, _bulk2) = queue::channel();
+        hub.subscribe(2, tx2, ctl2_tx);
         assert!(matches!(notice(&mut ctl2_rx), Notice::AudioFailed { .. }));
         hub.set_failure(None);
         assert!(matches!(notice(&mut ctl_rx), Notice::AudioRecovered));

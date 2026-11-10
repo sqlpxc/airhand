@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_link::flow::{Abr, Flow};
-use airhand_link::host::{Control, CursorCache};
+use airhand_link::host::{CursorCache, Outbox, SendError};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{CursorState, HostMsg, Notice, QualitySettings};
 use bytes::Bytes;
@@ -48,15 +48,13 @@ struct Ctrl {
 }
 
 impl Pipeline {
-    /// `video`：画面流的发送队列；`control`：控制流（编码器、采集失败的提示）；`bulk`：大块通道（光标，
+    /// `video`：画面流的发送队列；`out`：控制消息（编码器、采集失败的提示走控制通道，光标走大块通道：
     /// 形状图像有几十 KB，不能挡控制消息）；`cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
-    #[allow(clippy::too_many_arguments)]
     pub fn start(
         display: u8,
         settings: QualitySettings,
         video: mpsc::Sender<Bytes>,
-        control: Control,
-        bulk: Control,
+        out: Outbox,
         flow: Arc<Flow>,
         cursors: Arc<Mutex<CursorCache>>,
     ) -> Self {
@@ -71,7 +69,7 @@ impl Pipeline {
         let c = ctrl.clone();
         let thread = std::thread::Builder::new()
             .name("airhand-encoder".into())
-            .spawn(move || run(c, display, video, control, bulk))
+            .spawn(move || run(c, display, video, out))
             .expect("spawn encoder");
         Self {
             ctrl,
@@ -124,7 +122,22 @@ fn send_cancellable(out: &mpsc::Sender<Bytes>, stop: &AtomicBool, mut bytes: Byt
     }
 }
 
-fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control, bulk: Control) {
+/// 发一条控制消息；控制通道排满了（网络跟不上）就等着，直到管线被停下
+fn send_msg_cancellable(out: &Outbox, stop: &AtomicBool, msg: &HostMsg) -> bool {
+    let msg = Outbox::encode(msg);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        match out.send_encoded(msg.clone()) {
+            Ok(()) => return true,
+            Err(SendError::Closed) => return false,
+            Err(SendError::Full) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
@@ -145,8 +158,8 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
     let mut refine_due = Instant::now();
     info!(screen, ?settings, "encoding pipeline started");
 
-    // 控制流的队列满了（网络跟不上）就等着，直到管线被停下
-    let send = |msg: &HostMsg| send_cancellable(control.queue(), &ctrl.stop, Control::encode(msg));
+    // 控制通道的队列满了（网络跟不上）就等着，直到管线被停下
+    let send = |msg: &HostMsg| send_msg_cancellable(&out, &ctrl.stop, msg);
     let notice = |n: Notice| send(&HostMsg::Notice(Some(n)));
 
     while !ctrl.stop.load(Ordering::Acquire) {
@@ -180,7 +193,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
 
         // 光标变化：只发送可见性 +（如有变化）形状。控制端已经有的形状（动画光标循环到的帧）只发槽位。
         // 走大块通道，和剪贴板共用、和画面分带宽：队列满了不等（不能让编码线程卡在一个大剪贴板后面），
-        // 下一轮（最多 40 ms 之后）再发那时最新的状态
+        // 下一轮（最多 40 ms 之后）再发那时最新的状态。只有可见性变了的话占的是只留最新值的槽位，不会排满
         if cs > cursor_seq {
             cursor_seq = cs;
             cursor_pending = true;
@@ -195,7 +208,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
                 visible: c.visible,
                 shape,
             });
-            match bulk.queue().try_send(Control::encode(&msg)) {
+            match out.send(&msg) {
                 Ok(()) => {
                     shape_seq = c.shape_seq;
                     cursor_pending = false;
@@ -205,7 +218,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, control: Control
                     if let HostMsg::Cursor(CursorState { shape: Some(s), .. }) = &msg {
                         ctrl.cursors.lock().unwrap().forget(s);
                     }
-                    if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                    if e == SendError::Closed {
                         break;
                     }
                 }
@@ -370,5 +383,34 @@ mod tests {
             std::thread::spawn(move || send_cancellable(&tx, &flag, Bytes::from_static(b"new")));
         stop.store(true, Ordering::Release);
         assert!(!thread.join().unwrap());
+    }
+
+    /// 控制通道排满了：编码线程等着，直到有空位或者管线被停下；写任务不在了就不等了
+    #[test]
+    fn control_messages_wait_for_room_or_stop() {
+        use airhand_link::host::queue;
+        use airhand_proto::session::Notice;
+        let (out, mut control, _bulk) = queue::channel();
+        let n = HostMsg::Notice(Some(Notice::NoDisplays));
+        while out.send(&n).is_ok() {}
+        let stop = Arc::new(AtomicBool::new(false));
+        let (o, s) = (out.clone(), stop.clone());
+        let waiting = std::thread::spawn(move || send_msg_cancellable(&o, &s, &n));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!waiting.is_finished());
+        // 写任务发走了一条：放进去了
+        assert!(control.try_recv().is_some());
+        assert!(waiting.join().unwrap());
+
+        let n = HostMsg::Notice(Some(Notice::NoDisplays));
+        let (o, s) = (out.clone(), stop.clone());
+        let waiting = std::thread::spawn(move || send_msg_cancellable(&o, &s, &n));
+        std::thread::sleep(Duration::from_millis(30));
+        stop.store(true, Ordering::Release);
+        assert!(!waiting.join().unwrap());
+
+        drop(control);
+        stop.store(false, Ordering::Release);
+        assert!(!send_msg_cancellable(&out, &stop, &HostMsg::Notice(None)));
     }
 }

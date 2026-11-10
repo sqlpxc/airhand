@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airhand_proto::framing::{read_frame, write_frame};
+use crate::wire::{read_frame, write_frame};
 use airhand_proto::signal::{ClientHello, ServerHello};
 use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};

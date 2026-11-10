@@ -11,10 +11,10 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 # 其它消息：带编号、能前后兼容的 CBOR（见 framing 模块）
 minicbor = { version = "2", features = ["derive", "alloc", "std"] }
-tokio = { version = "1", features = ["io-util"] }
+# 这个库只做编解码，不碰 IO、不依赖异步运行时（从流里读写帧在 airhand-link 的 wire 模块）：
+# 这样它能编译成 wasm，解析对方数据的函数也都只吃字节，可以直接拿去 fuzz
 thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "rt", "macros"] }
 serde_json = "1"

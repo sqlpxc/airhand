@@ -48,6 +48,7 @@ use std::time::Duration;
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::SessionLane;
 use crate::cbor::open_enum;
 
 /// 被控端 → 控制端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
@@ -93,6 +94,22 @@ pub enum HostMsg {
     /// 原因不认识（[`ByeReason::Unknown`]，对方版本新增的）时会话照样结束
     #[n(9)]
     Bye(#[n(0)] ByeReason),
+}
+
+impl HostMsg {
+    /// 这条消息走哪条通道（见模块说明的"走哪条通道"）
+    pub fn lane(&self) -> SessionLane {
+        match self {
+            HostMsg::Cursor(_) | HostMsg::Clipboard { .. } => SessionLane::Bulk,
+            HostMsg::Hello(_)
+            | HostMsg::AwaitingApproval
+            | HostMsg::Pong { .. }
+            | HostMsg::Displays { .. }
+            | HostMsg::Notice(_)
+            | HostMsg::Encoder(_)
+            | HostMsg::Bye(_) => SessionLane::Control,
+        }
+    }
 }
 
 /// 被控端给控制端的提示。

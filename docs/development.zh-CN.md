@@ -5,8 +5,13 @@
 ## 测试
 
 ```bash
-# 仓库根目录：协议 + 链路库 + 服务器
+# 仓库根目录：协议 + 链路库 + 服务器（调试构建里服务器的每次加锁都检查先后，见 server/src/broker/lock.rs）
 cargo test
+# 服务器只用 airhand-link 的 wire（关掉了默认的 client）：上面的 cargo test 总是带着 client 编译它，这里单独检查一下
+cargo test -p airhand-link --no-default-features
+
+# crates/airhand-proto/fuzz/：服务器在认证之前就要解析的东西（版本握手、信令消息、会话头），需要 nightly 和 cargo-fuzz
+cargo +nightly fuzz run signal    # 还有 hello、session_header
 
 # web/：网页控制台（WebSocket 协议、访问密码、HTTPS 证书）
 cargo test

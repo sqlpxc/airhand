@@ -54,7 +54,8 @@ use std::time::{Duration, Instant};
 
 use crate::secure::{self, Identity, InitiatorParams};
 use crate::transport::{HostReceiver, Openers, open_session};
-use airhand_proto::framing::{self, read_msg, write_msg};
+use crate::wire::{read_msg, write_msg};
+use airhand_proto::framing;
 use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};

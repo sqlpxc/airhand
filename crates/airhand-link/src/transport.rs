@@ -5,12 +5,13 @@
 //!
 //! * 双方：[`open_session`] 打开四条流，之后在控制流上握手（[`crate::secure`]）；
 //! * 双方：[`write_lane`] 把排好队的帧加密后写进一条流；被控端的 [`write_audio`] 把声音包加密后发成数据报
-//!   （见 [`crate::host::HostSession`]）；
+//!   （见 [`crate::host::HostStreams`]）；
 //! * 控制端：[`HostReceiver`] 从四条流和数据报读被控端发来的东西，解密。
 //!
 //! 声音走 QUIC 数据报（`airhand_proto::datagram`）：不重传，也不排在丢了的包后面等重传，
 //! 在 QUIC 包里排在所有流的前面。放不进一个数据报的包（很少见）才走声音流。
-use airhand_proto::framing::{self, Decoded, read_frame, read_packet};
+use crate::wire::{read_frame, read_packet};
+use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::media::{self, AudioHeader, Kind};
 use airhand_proto::session::HostMsg;
@@ -18,6 +19,7 @@ use airhand_proto::{MAX_CONTROL_MSG, Role, SessionHeader, SessionLane, datagram}
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
+use std::future::Future;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -36,14 +38,27 @@ pub fn seal(frame: Bytes, sealer: &mut FrameSealer) -> Result<Bytes> {
     Ok(Bytes::from(v))
 }
 
-/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 关闭后正常结束这条流。
+/// 写任务从哪里取下一帧（明文，已经带长度前缀）：控制端的大块通道是普通的 `mpsc` 队列，
+/// 被控端的两条消息通道是 [`crate::host::queue`]（有只留最新值的槽位）
+pub trait Frames: Send {
+    /// 下一帧；`None` 表示发完了，正常结束这条流
+    fn next(&mut self) -> impl Future<Output = Option<Bytes>> + Send;
+}
+
+impl Frames for mpsc::Receiver<Bytes> {
+    async fn next(&mut self) -> Option<Bytes> {
+        self.recv().await
+    }
+}
+
+/// 把 `rx` 里排好队的帧（明文，已经带长度前缀）加密后依次写进一条流，`rx` 发完后正常结束这条流。
 /// 十秒钟写不进去一帧算对方失联
 pub async fn write_lane(
     mut send: SendStream,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: impl Frames,
     mut sealer: FrameSealer,
 ) -> Result<()> {
-    while let Some(bytes) = rx.recv().await {
+    while let Some(bytes) = rx.next().await {
         let sealed = seal(bytes, &mut sealer)?;
         tokio::time::timeout(Duration::from_secs(10), send.write_chunk(sealed))
             .await

@@ -22,13 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_link::ServerState;
-use airhand_link::host::{Access, Control, Gate, HostCmd, HostEvents};
+use airhand_link::host::{Access, Encoded, Gate, HostCmd, HostEvents, Outbox};
 use airhand_link::secure::Identity;
 use airhand_proto::handshake::PublicKey;
 use airhand_proto::session::{Codec, DisplayInfo, EncoderInfo, HostMsg, Notice, SystemAction};
 use airhand_proto::signal::{Peer, Reclaim};
 use anyhow::Result;
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -98,15 +97,6 @@ pub enum Op {
     Approval { required: bool },
 }
 
-/// 发给所有会话的消息（已编码），和走哪条通道（见 `airhand_proto::session` 的"走哪条通道"）
-#[derive(Debug, Clone)]
-pub(crate) enum Broadcast {
-    /// 控制通道：显示器变化、编码器信息、提示……
-    Control(Bytes),
-    /// 大块通道：剪贴板
-    Bulk(Bytes),
-}
-
 /// 会话开始时告诉控制端的信息，以及之后的变化
 pub(crate) struct Info {
     pub hostname: String,
@@ -127,8 +117,9 @@ pub(crate) struct Shared {
     pub events: Arc<Queue<String>>,
     pub video: video::VideoHub,
     pub audio: audio::AudioHub,
-    /// 发给所有会话的消息（显示器变化、编码器信息、提示、剪贴板……），已编码
-    pub broadcast: broadcast::Sender<Broadcast>,
+    /// 发给所有会话的消息（显示器变化、编码器信息、提示、剪贴板……），已编码（同一条消息只编码一次），
+    /// 带着走哪条通道（见 `airhand_link::host::queue`）
+    pub broadcast: broadcast::Sender<Encoded>,
     controllers: Mutex<Vec<ControllerView>>,
     /// 有人连接时先请本机用户同意
     approval: AtomicBool,
@@ -168,12 +159,8 @@ impl Shared {
     }
 
     fn broadcast(&self, msg: &HostMsg) {
-        let encoded = Control::encode(msg);
-        // 剪贴板（最多 1 MiB）走大块通道，不挡控制消息
-        let _ = self.broadcast.send(match msg {
-            HostMsg::Clipboard { .. } | HostMsg::Cursor(_) => Broadcast::Bulk(encoded),
-            _ => Broadcast::Control(encoded),
-        });
+        // 剪贴板（最多 1 MiB）走大块通道，不挡控制消息：Outbox 按消息挑通道
+        let _ = self.broadcast.send(Outbox::encode(msg));
     }
 
     fn notice(&self, n: Notice) {

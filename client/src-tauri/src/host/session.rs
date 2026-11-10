@@ -1,14 +1,19 @@
-//! 被控端的单个远控会话。
+//! 被控端的单个远控会话：桌面版的 [`Platform`]。协议层的事（同意流程、Pong、失联检测、踢人时发 Bye、
+//! 画质设置的校验）在 [`airhand_link::host::serve`]，这里只管采集、编码、注入输入、剪贴板、声音，
+//! 以及定时检查权限和显示器有没有变化。
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use airhand_link::flow::Flow;
-use airhand_link::host::{Admission, CursorCache, HostSession, Incoming, PEER_TIMEOUT};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use airhand_proto::session::{
-    ControllerMsg, DisplayInfo, HostHello, HostMsg, Notice, Platform, QualitySettings,
+use airhand_link::host::{
+    Admission, CursorCache, Incoming, Outbox, Platform, Request, Senders, Start, serve,
 };
+use airhand_proto::session::{DisplayInfo, HostHello, HostMsg, Notice, QualitySettings};
 use anyhow::Result;
+use bytes::Bytes;
+use tokio::sync::mpsc;
+use tokio::time::{Interval, MissedTickBehavior};
 use tracing::{info, warn};
 
 use super::audio::{self, AudioSubscription};
@@ -24,11 +29,11 @@ const VIDEO_QUEUE: usize = 2;
 
 /// 告诉控制端的平台（控制端据此选快捷键、提示的说法）
 #[cfg(windows)]
-const PLATFORM: Platform = Platform::Windows;
+const PLATFORM: airhand_proto::session::Platform = airhand_proto::session::Platform::Windows;
 #[cfg(target_os = "macos")]
-const PLATFORM: Platform = Platform::Mac;
+const PLATFORM: airhand_proto::session::Platform = airhand_proto::session::Platform::Mac;
 #[cfg(not(any(windows, target_os = "macos")))]
-const PLATFORM: Platform = Platform::Linux;
+const PLATFORM: airhand_proto::session::Platform = airhand_proto::session::Platform::Linux;
 /// 检查系统权限是否有变化的间隔
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
 /// 检查显示器有没有变化（插拔、旋转、改分辨率 / 缩放 / 排列）的间隔
@@ -60,94 +65,9 @@ fn notice(n: Notice) -> HostMsg {
     HostMsg::Notice(Some(n))
 }
 
-pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
-    let session_id = inc.session_id;
-    // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）。
-    // 返回的时候控制端已经确认过了（重放的握手消息走不到这里），这时才在托盘里显示它、开始采集
-    let (mut io, admitted) = match HostSession::open(&inc, VIDEO_QUEUE, audio::QUEUE, &*gate).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(session_id, "controller not admitted: {e:#}");
-            return Err(e);
-        }
-    };
-    // 桌面被控端不请本机用户同意（无人值守），gate 不会要求它
-    debug_assert_ne!(admitted.admission, Admission::NeedsApproval);
-    gate.admitted(session_id, &admitted);
-    let mut kick = inc.kick;
-    let ctl = io.ctl.clone();
-    let bulk = io.bulk.clone();
-
-    let (mut displays, codecs, env_notice) = tokio::task::spawn_blocking(|| {
-        (
-            capture::displays(),
-            super::encoder::available_codecs(),
-            capture::environment_notice(),
-        )
-    })
-    .await
-    .unwrap_or_default();
-    let mut current: u8 = 0;
-    let (hostname, os) = crate::sysinfo::host_identity();
-    info!(session_id, displays = displays.len(), "session started");
-
-    ctl.send(&HostMsg::Hello(HostHello {
-        hostname,
-        os,
-        version: config::VERSION.to_string(),
-        displays: displays.clone(),
-        current_display: current,
-        codecs,
-        platform: PLATFORM,
-        // 桌面被控端只有鼠标键盘：不接收触摸，也没有手机那样的系统操作（快捷键由控制端发按键）
-        touch: false,
-        actions: Vec::new(),
-    }))?;
-    if displays.is_empty() {
-        ctl.send(&notice(Notice::NoDisplays))?;
-    }
-    if let Some(n) = env_notice {
-        ctl.send(&notice(n))?;
-    }
-    // 缺少系统权限（macOS）：告诉控制端为什么没有画面 / 不能操作；之后权限有变化时再发
-    let mut missing = super::missing_permissions();
-    if missing != (false, false) {
-        ctl.send(&notice(permission_notice(missing)))?;
-    }
-
-    // 开始时的画质在握手里：编码器一开始就按它建，不用先建一个默认的、等设置到了再重建
-    let mut settings = admitted.settings;
-    let flow = Arc::new(Flow::default());
-    // 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
-    let cursors = Arc::new(Mutex::new(CursorCache::default()));
-    let start = |display: u8, settings: QualitySettings| {
-        Pipeline::start(
-            display,
-            settings,
-            io.video.clone(),
-            ctl.clone(),
-            bulk.clone(),
-            flow.clone(),
-            cursors.clone(),
-        )
-    };
-    let mut pipeline = (!displays.is_empty()).then(|| start(current, settings));
-    let mut injector = Injector::new();
-    // 开始时要不要声音也在握手里
-    let subscribe_audio = || -> Result<AudioSubscription> {
-        let s = audio::subscribe(io.audio.clone());
-        // 别的会话已经在采集、并且正打不开：马上告诉这个控制端
-        if let Some(detail) = s.failure() {
-            ctl.send(&notice(Notice::AudioFailed { detail }))?;
-        }
-        Ok(s)
-    };
-    let mut sound: Option<AudioSubscription> = if admitted.audio {
-        Some(subscribe_audio()?)
-    } else {
-        None
-    };
-    let fallback = DisplayInfo {
+/// 列不出显示器时注入输入用的
+fn fallback_display() -> DisplayInfo {
+    DisplayInfo {
         index: 0,
         name: String::new(),
         x: 0,
@@ -155,131 +75,292 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
         width: 1,
         height: 1,
         primary: true,
-    };
-    let mut clip = ClipSync::new();
-    let mut clip_tick = tokio::time::interval(clipboard::POLL);
-    clip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
-    let mut permission_tick = tokio::time::interval(PERMISSION_CHECK);
-    permission_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut display_tick = tokio::time::interval(DISPLAY_CHECK);
-    display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_msg = Instant::now();
+    }
+}
 
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                msg = io.incoming.recv() => {
-                    let Some(msg) = msg else { break };
-                    last_msg = Instant::now();
-                    match msg {
-                        // 晚到太久的输入已经在 HostSession 里换成了"释放所有按键"
-                        ControllerMsg::Input { events, .. } => {
-                            let d = displays.get(current as usize).unwrap_or(&fallback);
-                            injector.handle(&events, d);
-                        }
-                        ControllerMsg::Ack { seq } => flow.ack(seq),
-                        ControllerMsg::Settings(s) => {
-                            settings = s.sanitized();
-                            if let Some(p) = &pipeline {
-                                p.update_settings(settings);
-                            }
-                        }
-                        ControllerMsg::RequestKeyframe => {
-                            if let Some(p) = &pipeline {
-                                p.request_keyframe();
-                            }
-                        }
-                        ControllerMsg::SelectDisplay { index } => {
-                            if (index as usize) < displays.len() && index != current {
-                                current = index;
-                                injector.release_all();
-                                // 先停旧管线再启动新管线（新管线从关键帧开始）
-                                if let Some(p) = pipeline.take() { p.stop().await; }
-                                pipeline = Some(start(current, settings));
-                                ctl.send(&HostMsg::Displays { displays: displays.clone(), current })?;
-                            }
-                        }
-                        ControllerMsg::Ping { t } => ctl.send(&HostMsg::Pong { t })?,
-                        ControllerMsg::Clipboard { text } => clip.apply(text),
-                        ControllerMsg::Audio { enabled } => {
-                            if !enabled {
-                                sound = None;
-                            } else if sound.is_none() {
-                                sound = Some(subscribe_audio()?);
-                            }
-                        }
-                    }
+fn ticker(period: Duration) -> Interval {
+    let mut t = tokio::time::interval(period);
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    t
+}
+
+pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
+    let session_id = inc.session_id;
+    // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）。
+    // 进来的时候控制端已经确认过了（重放的握手消息走不到这里），这时才在托盘里显示它、开始采集
+    serve(
+        inc,
+        &*gate,
+        VIDEO_QUEUE,
+        audio::QUEUE,
+        |admitted, senders| {
+            // 桌面被控端不请本机用户同意（无人值守），gate 不会要求它
+            debug_assert_ne!(admitted.admission, Admission::NeedsApproval);
+            gate.admitted(session_id, admitted);
+            Desktop::new(session_id, senders)
+        },
+    )
+    .await
+}
+
+/// 桌面版一个会话里的东西
+struct Desktop {
+    session_id: u64,
+    out: Outbox,
+    video: mpsc::Sender<Bytes>,
+    audio: mpsc::Sender<Bytes>,
+    displays: Vec<DisplayInfo>,
+    /// 正在看的显示器（`displays` 里的序号）
+    current: u8,
+    settings: QualitySettings,
+    flow: Arc<Flow>,
+    /// 控制端缓存了哪些光标形状：整个会话一份，换显示器（重建管线）时接着用
+    cursors: Arc<Mutex<CursorCache>>,
+    pipeline: Option<Pipeline>,
+    injector: Injector,
+    sound: Option<AudioSubscription>,
+    clip: ClipSync,
+    clip_tick: Interval,
+    permission_tick: Interval,
+    display_tick: Interval,
+    /// 缺少的系统权限（macOS），见 [`super::missing_permissions`]
+    missing: (bool, bool),
+}
+
+/// 会话开始之后定时要做的事
+enum Tick {
+    Clipboard,
+    /// 声音采集打不开（`Some`）/ 恢复了
+    Audio(Option<String>),
+    Permissions,
+    Displays,
+}
+
+impl Desktop {
+    fn new(session_id: u64, senders: Senders) -> Self {
+        Self {
+            session_id,
+            out: senders.out,
+            video: senders.video,
+            audio: senders.audio,
+            displays: Vec::new(),
+            current: 0,
+            settings: QualitySettings::default(),
+            flow: Arc::new(Flow::default()),
+            cursors: Arc::default(),
+            pipeline: None,
+            injector: Injector::new(),
+            sound: None,
+            clip: ClipSync::new(),
+            clip_tick: ticker(clipboard::POLL),
+            permission_tick: ticker(PERMISSION_CHECK),
+            display_tick: ticker(DISPLAY_CHECK),
+            missing: (false, false),
+        }
+    }
+
+    /// 停掉现在的编码管线（新管线从关键帧开始，旧的编码帧不能夹在中间），在 `current` 上重新开始
+    async fn restart_pipeline(&mut self) {
+        self.injector.release_all();
+        if let Some(p) = self.pipeline.take() {
+            p.stop().await;
+        }
+        self.pipeline = Some(Pipeline::start(
+            self.current,
+            self.settings,
+            self.video.clone(),
+            self.out.clone(),
+            self.flow.clone(),
+            self.cursors.clone(),
+        ));
+    }
+
+    fn subscribe_audio(&mut self) -> Result<()> {
+        let s = audio::subscribe(self.audio.clone());
+        // 别的会话已经在采集、并且正打不开：马上告诉这个控制端
+        if let Some(detail) = s.failure() {
+            self.out.send(&notice(Notice::AudioFailed { detail }))?;
+        }
+        self.sound = Some(s);
+        Ok(())
+    }
+}
+
+impl Platform for Desktop {
+    type Event = Tick;
+
+    async fn start(&mut self, start: Start) -> Result<()> {
+        let (displays, codecs, env_notice) = tokio::task::spawn_blocking(|| {
+            (
+                capture::displays(),
+                super::encoder::available_codecs(),
+                capture::environment_notice(),
+            )
+        })
+        .await
+        .unwrap_or_default();
+        self.displays = displays;
+        let (hostname, os) = crate::sysinfo::host_identity();
+        info!(
+            session_id = self.session_id,
+            displays = self.displays.len(),
+            "desktop session starting"
+        );
+        self.out.send(&HostMsg::Hello(HostHello {
+            hostname,
+            os,
+            version: config::VERSION.to_string(),
+            displays: self.displays.clone(),
+            current_display: self.current,
+            codecs,
+            platform: PLATFORM,
+            // 桌面被控端只有鼠标键盘：不接收触摸，也没有手机那样的系统操作（快捷键由控制端发按键）
+            touch: false,
+            actions: Vec::new(),
+        }))?;
+        if self.displays.is_empty() {
+            self.out.send(&notice(Notice::NoDisplays))?;
+        }
+        if let Some(n) = env_notice {
+            self.out.send(&notice(n))?;
+        }
+        // 缺少系统权限（macOS）：告诉控制端为什么没有画面 / 不能操作；之后权限有变化时再发
+        self.missing = super::missing_permissions();
+        if self.missing != (false, false) {
+            self.out.send(&notice(permission_notice(self.missing)))?;
+        }
+        // 开始时的画质在握手里：编码器一开始就按它建，不用先建一个默认的、等设置到了再重建
+        self.settings = start.settings;
+        if !self.displays.is_empty() {
+            self.restart_pipeline().await;
+        }
+        if start.audio {
+            self.subscribe_audio()?;
+        }
+        Ok(())
+    }
+
+    async fn request(&mut self, req: Request) -> Result<()> {
+        match req {
+            // 晚到太久的输入已经换成了"释放所有按键"
+            Request::Input(events) => {
+                let fallback = fallback_display();
+                let d = self
+                    .displays
+                    .get(self.current as usize)
+                    .unwrap_or(&fallback);
+                self.injector.handle(&events, d);
+            }
+            Request::Ack(seq) => self.flow.ack(seq),
+            Request::Settings(s) => {
+                self.settings = s;
+                if let Some(p) = &self.pipeline {
+                    p.update_settings(s);
                 }
-                _ = clip_tick.tick() => {
-                    // 走大块通道：1 MiB 的剪贴板不挡控制消息。网络慢、前面排满了就丢掉这一次
-                    if let Some(text) = clip.poll().await
-                        && let Err(e) = bulk.send(&HostMsg::Clipboard { text })
-                    {
-                        warn!(session_id, "dropped a clipboard update: {e:#}");
-                    }
+            }
+            Request::Keyframe => {
+                if let Some(p) = &self.pipeline {
+                    p.request_keyframe();
                 }
-                _ = kick.changed() => {
-                    let reason = *kick.borrow_and_update();
-                    info!(session_id, ?reason, "the local user disconnected the controller");
-                    ctl.send(&HostMsg::Bye(reason))?;
-                    break;
+            }
+            Request::SelectDisplay(index) => {
+                if (index as usize) < self.displays.len() && index != self.current {
+                    self.current = index;
+                    self.restart_pipeline().await;
+                    self.out.send(&HostMsg::Displays {
+                        displays: self.displays.clone(),
+                        current: self.current,
+                    })?;
                 }
-                e = io.writer.failed() => return Err(e),
-                _ = watchdog.tick() => {
-                    if last_msg.elapsed() > PEER_TIMEOUT {
-                        anyhow::bail!("the controller stopped responding");
-                    }
-                }
-                // 声音采集打不开 / 恢复了（只在控制端开着声音时）
-                failure = audio_failure(&mut sound) => {
-                    ctl.send(&notice(match failure {
-                        Some(detail) => Notice::AudioFailed { detail },
-                        None => Notice::AudioRecovered,
-                    }))?;
-                }
-                // 例如本机用户在会话中途打开了"辅助功能"：更新（两项都授予时撤下）控制端的提示
-                _ = permission_tick.tick() => {
-                    let now = super::missing_permissions();
-                    if now != missing {
-                        info!(session_id, screen = !now.0, input = !now.1, "permissions changed");
-                        missing = now;
-                        ctl.send(&notice(permission_notice(now)))?;
-                    }
-                }
-                // 显示器变了：鼠标坐标是按这里的列表换算的，旧列表会让点击落到别的位置
-                // （例如把显示器转成竖屏后宽高对调）。更新列表并告诉控制端；采集线程自己会重新打开。
-                // 正在看的显示器换了序号就跟着它走，被拔掉了就改看主显示器
-                _ = display_tick.tick() => {
-                    let now = tokio::task::spawn_blocking(capture::displays).await.unwrap_or_default();
-                    // 列不出来（例如切换显示模式的瞬间）时保留原来的列表
-                    if !now.is_empty() && now != displays {
-                        let next = follow_display(&displays, current, &now);
-                        info!(session_id, ?now, current = next, "displays changed");
-                        displays = now;
-                        if next != current || pipeline.is_none() {
-                            current = next;
-                            injector.release_all();
-                            if let Some(p) = pipeline.take() { p.stop().await; }
-                            pipeline = Some(start(current, settings));
-                        }
-                        ctl.send(&HostMsg::Displays { displays: displays.clone(), current })?;
-                    }
+            }
+            Request::Clipboard(text) => self.clip.apply(text),
+            Request::Audio(enabled) => {
+                if !enabled {
+                    self.sound = None;
+                } else if self.sound.is_none() {
+                    self.subscribe_audio()?;
                 }
             }
         }
         Ok(())
     }
-    .await;
 
-    injector.release_all();
-    // 先停掉还拿着画面 / 声音发送端的东西，写任务才能把排着队的（例如 Bye）发完
-    if let Some(p) = pipeline {
-        p.stop().await;
+    async fn next_event(&mut self) -> Tick {
+        tokio::select! {
+            _ = self.clip_tick.tick() => Tick::Clipboard,
+            // 声音采集打不开 / 恢复了（只在控制端开着声音时）
+            failure = audio_failure(&mut self.sound) => Tick::Audio(failure),
+            _ = self.permission_tick.tick() => Tick::Permissions,
+            _ = self.display_tick.tick() => Tick::Displays,
+        }
     }
-    drop(sound);
-    drop((ctl, bulk));
-    io.close(session_id, result).await
+
+    async fn event(&mut self, tick: Tick) -> Result<()> {
+        let session_id = self.session_id;
+        match tick {
+            Tick::Clipboard => {
+                // 走大块通道：1 MiB 的剪贴板不挡控制消息。网络慢、前面排满了就丢掉这一次
+                if let Some(text) = self.clip.poll().await
+                    && let Err(e) = self.out.send(&HostMsg::Clipboard { text })
+                {
+                    warn!(session_id, "dropped a clipboard update: {e:#}");
+                }
+            }
+            Tick::Audio(failure) => {
+                self.out.send(&notice(match failure {
+                    Some(detail) => Notice::AudioFailed { detail },
+                    None => Notice::AudioRecovered,
+                }))?;
+            }
+            // 例如本机用户在会话中途打开了"辅助功能"：更新（两项都授予时撤下）控制端的提示
+            Tick::Permissions => {
+                let now = super::missing_permissions();
+                if now != self.missing {
+                    info!(
+                        session_id,
+                        screen = !now.0,
+                        input = !now.1,
+                        "permissions changed"
+                    );
+                    self.missing = now;
+                    self.out.send(&notice(permission_notice(now)))?;
+                }
+            }
+            // 显示器变了：鼠标坐标是按这里的列表换算的，旧列表会让点击落到别的位置
+            // （例如把显示器转成竖屏后宽高对调）。更新列表并告诉控制端；采集线程自己会重新打开。
+            // 正在看的显示器换了序号就跟着它走，被拔掉了就改看主显示器
+            Tick::Displays => {
+                let now = tokio::task::spawn_blocking(capture::displays)
+                    .await
+                    .unwrap_or_default();
+                // 列不出来（例如切换显示模式的瞬间）时保留原来的列表
+                if !now.is_empty() && now != self.displays {
+                    let next = follow_display(&self.displays, self.current, &now);
+                    info!(session_id, ?now, current = next, "displays changed");
+                    self.displays = now;
+                    if next != self.current || self.pipeline.is_none() {
+                        self.current = next;
+                        self.restart_pipeline().await;
+                    }
+                    // 只留最新的一个（见 airhand_link::host::queue）
+                    self.out.send(&HostMsg::Displays {
+                        displays: self.displays.clone(),
+                        current: self.current,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn stop(mut self) {
+        self.injector.release_all();
+        // 先停掉还拿着画面 / 声音发送端的东西，写任务才能把排着队的（例如 Bye）发完
+        if let Some(p) = self.pipeline.take() {
+            p.stop().await;
+        }
+        self.sound = None;
+    }
 }
 
 #[cfg(test)]

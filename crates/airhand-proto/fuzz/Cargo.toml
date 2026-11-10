@@ -1,0 +1,42 @@
+# 服务器在认证之前就要解析的东西：版本握手、信令消息、会话头。协议库只吃字节、不碰 IO，所以直接拿来当入口。
+#
+#   cargo install cargo-fuzz
+#   cd crates/airhand-proto/fuzz && cargo +nightly fuzz run signal
+#
+# 独立的工作区：平时的 cargo build / test 不会编译它（需要 nightly 和 libFuzzer）
+[package]
+name = "airhand-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+airhand-proto = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "hello"
+path = "fuzz_targets/hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signal"
+path = "fuzz_targets/signal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_header"
+path = "fuzz_targets/session_header.rs"
+test = false
+doc = false
+bench = false

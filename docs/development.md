@@ -5,8 +5,13 @@
 ## Tests
 
 ```bash
-# repository root: protocol + link library + server
+# repository root: protocol + link library + server (debug builds check the order of every server lock, see server/src/broker/lock.rs)
 cargo test
+# the server only uses airhand-link's wire module (default client feature off); the cargo test above always builds it with client, so check this separately
+cargo test -p airhand-link --no-default-features
+
+# crates/airhand-proto/fuzz/: what the server parses before any authentication (version handshake, signaling messages, session headers); needs nightly and cargo-fuzz
+cargo +nightly fuzz run signal    # also hello, session_header
 
 # web/: web console (WebSocket protocol, password, HTTPS certificate)
 cargo test

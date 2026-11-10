@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use airhand_link::secure::{self, FrameSealer, Identity, InitiatorParams};
 use airhand_link::transport::{FromHost, HostReceiver, Openers, open_session, session_datagrams};
-use airhand_proto::framing::{read_msg, write_msg};
+use airhand_link::wire::{read_msg, write_msg};
 use airhand_proto::handshake::TAG_LEN;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{

@@ -3,10 +3,14 @@
 //! 负载是什么：
 //!
 //! * 信令流上的第一条消息（版本握手）：永远不变的 postcard 编码（见 [`crate::signal`] 的"版本握手"）；
-//! * 其它信令消息、端到端握手、会话的控制消息：CBOR（[`write_msg`] / [`read_msg`]）；
-//! * 画面流、声音流：媒体包（见 [`crate::media`]），原样读出来交给界面（[`read_packet`]）。
+//! * 其它信令消息、端到端握手、会话的控制消息：CBOR（[`encode`] / [`decode`]）；
+//! * 画面流、声音流：媒体包（见 [`crate::media`]），原样读出来交给界面。
 //!
 //! 会话流上的负载在端到端握手之后都是密文（见 `airhand_link::secure`），解密之后才是上面的格式。
+//!
+//! 这里只有编解码，不碰 IO，也不依赖任何异步运行时：从流里读写帧在 `airhand_link::wire`（它用的就是这里的
+//! [`payload_len`] / [`decode`]）。手里已经有一段字节的（网页里的 wasm、fuzz）用 [`split`] / [`take_msg`]：
+//! 和 `airhand_link::wire::read_msg` 走的是同一段解码代码。
 //!
 //! # 兼容规则
 //!
@@ -31,12 +35,12 @@
 use minicbor::{Decode, Encode};
 
 use crate::cbor;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// 长度前缀的字节数（`u32 LE`）
+pub const PREFIX: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
     #[error("encoding error: {0}")]
     Decode(#[from] minicbor::decode::Error),
     #[error("encoding error: {0}")]
@@ -90,116 +94,57 @@ pub fn decode_known<'b, T: Decode<'b, ()>>(payload: &'b [u8]) -> Result<T, Frame
     minicbor::decode(payload).map_err(|e| cbor::strict(e).into())
 }
 
-/// 写一帧：长度前缀 + `payload`
-pub async fn write_frame<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    payload: &[u8],
-) -> Result<(), FrameError> {
-    let mut buf = Vec::with_capacity(4 + payload.len());
+/// 一帧：长度前缀 + `payload`
+pub fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(PREFIX + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(payload);
-    w.write_all(&buf).await?;
-    Ok(())
+    buf
 }
 
-pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> Result<(), FrameError>
-where
-    W: AsyncWrite + Unpin,
-    T: Encode<()>,
-{
-    w.write_all(&encode(msg)).await?;
-    Ok(())
-}
-
-/// 读长度前缀。对端在帧边界处正常关闭时返回 `Ok(None)`，关在半截里是错误
-async fn read_len<R: AsyncRead + Unpin>(
-    r: &mut R,
-    max: usize,
-) -> Result<Option<usize>, FrameError> {
-    let mut len = [0u8; 4];
-    let mut got = 0;
-    while got < 4 {
-        let n = r.read(&mut len[got..]).await?;
-        if n == 0 {
-            if got == 0 {
-                return Ok(None);
-            }
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-        }
-        got += n;
-    }
-    let len = u32::from_le_bytes(len) as usize;
+/// 长度前缀说负载有多长；超过 `max` 是错误（对方说多长就分配多长的话，一个前缀就能让这边分配 4 GiB）
+pub fn payload_len(prefix: [u8; PREFIX], max: usize) -> Result<usize, FrameError> {
+    let len = u32::from_le_bytes(prefix) as usize;
     if len > max {
         return Err(FrameError::TooLarge(len));
     }
-    Ok(Some(len))
+    Ok(len)
 }
 
-/// 读一帧的负载放进 `buf`（由调用方复用）。对端在帧边界处正常关闭时返回 `Ok(false)`
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    r: &mut R,
-    max: usize,
-    buf: &mut Vec<u8>,
-) -> Result<bool, FrameError> {
-    let Some(len) = read_len(r, max).await? else {
-        return Ok(false);
+/// [`split`] 切下来的：`(负载, 剩下的字节)`；还不够一帧时为 `None`
+pub type Split<'b> = Option<(&'b [u8], &'b [u8])>;
+
+/// 从 `buf` 开头切下一帧：`(负载, 剩下的字节)`。还不够一帧（要等更多数据）时返回 `Ok(None)`
+pub fn split(buf: &[u8], max: usize) -> Result<Split<'_>, FrameError> {
+    let Some((prefix, rest)) = buf.split_first_chunk::<PREFIX>() else {
+        return Ok(None);
     };
-    buf.clear();
-    buf.resize(len, 0);
-    r.read_exact(buf).await?;
-    Ok(true)
+    let len = payload_len(*prefix, max)?;
+    Ok(rest.split_at_checked(len))
 }
 
-/// 读一条消息，不认识的跳过（见模块说明）。对端在消息边界处正常关闭时返回 `Ok(None)`。
-///
-/// `buf` 由调用方复用，避免每条消息都分配内存。
-pub async fn read_msg<R, T>(
-    r: &mut R,
+/// 从 `buf` 开头取下一条消息，不认识的跳过（见模块说明），`buf` 前移到这条消息后面。
+/// 剩下的不够一帧时返回 `Ok(None)`（`buf` 停在那一帧开头）
+pub fn take_msg<'b, T: Decode<'b, ()>>(
+    buf: &mut &'b [u8],
     max: usize,
-    buf: &mut Vec<u8>,
-) -> Result<Option<T>, FrameError>
-where
-    R: AsyncRead + Unpin,
-    T: for<'b> Decode<'b, ()>,
-{
+) -> Result<Option<T>, FrameError> {
     loop {
-        if !read_frame(r, max, buf).await? {
+        let Some((payload, rest)) = split(buf, max)? else {
             return Ok(None);
-        }
-        match decode(buf)? {
+        };
+        *buf = rest;
+        match decode(payload)? {
             Decoded::Msg(m) => return Ok(Some(m)),
             Decoded::Unknown(variant) => {
                 tracing::debug!(
                     variant,
-                    len = buf.len(),
+                    len = payload.len(),
                     "skipping a message from a newer version"
                 );
             }
         }
     }
-}
-
-/// 读取一帧的原始负载（媒体包），读进一块新内存：之后原样交给界面，不再拷贝。
-/// 对端在帧边界处正常关闭时返回 `Ok(None)`
-///
-/// 直接读进未初始化的空间（`read_buf`），不先把整块内存清零：画面包可能有几 MiB，每帧都清零一遍是白做的
-pub async fn read_packet<R>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, FrameError>
-where
-    R: AsyncRead + Unpin,
-{
-    let Some(len) = read_len(r, max).await? else {
-        return Ok(None);
-    };
-    let mut buf = Vec::with_capacity(len);
-    while buf.len() < len {
-        // take 限制住这一帧剩下的长度，不会读进下一帧；buf 的容量正好够，不会再分配
-        let left = (len - buf.len()) as u64;
-        if (&mut *r).take(left).read_buf(&mut buf).await? == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-        }
-    }
-    debug_assert_eq!(buf.capacity(), len);
-    Ok(Some(buf))
 }
 
 #[cfg(test)]
@@ -208,8 +153,13 @@ mod tests {
     use crate::session::*;
     use crate::signal::*;
 
-    #[tokio::test]
-    async fn roundtrip() {
+    /// 下一条消息（一定有）
+    fn next<'b, T: Decode<'b, ()>>(r: &mut &'b [u8]) -> T {
+        take_msg(r, 1 << 20).unwrap().unwrap()
+    }
+
+    #[test]
+    fn roundtrip() {
         let msgs = vec![
             HostMsg::Pong { t: 99 },
             HostMsg::Notice(Some(Notice::CaptureFailed {
@@ -238,21 +188,57 @@ mod tests {
         ];
         let mut wire = Vec::new();
         for m in &msgs {
-            write_msg(&mut wire, m).await.unwrap();
+            wire.extend(encode(m));
         }
         let mut r = &wire[..];
-        let mut buf = Vec::new();
         for m in &msgs {
-            let back: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+            let back: HostMsg = next(&mut r);
             assert_eq!(format!("{back:?}"), format!("{m:?}"));
         }
-        let c: Option<HostMsg> = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap();
+        let c: Option<HostMsg> = take_msg(&mut r, 1 << 20).unwrap();
         assert!(c.is_none());
+        assert!(r.is_empty());
+    }
+
+    /// 一帧一帧地切：不够一帧时等更多数据，不动 `buf`；长度前缀超过上限是错误
+    #[test]
+    fn frames_are_split_at_their_boundaries() {
+        let mut wire = frame(b"abc");
+        wire.extend(frame(b""));
+        wire.extend(frame(b"de"));
+        assert_eq!(wire[..PREFIX], [3, 0, 0, 0]);
+        let (a, rest) = split(&wire, 16).unwrap().unwrap();
+        assert_eq!(a, b"abc");
+        let (b, rest) = split(rest, 16).unwrap().unwrap();
+        assert!(b.is_empty());
+        let (c, rest) = split(rest, 16).unwrap().unwrap();
+        assert_eq!(c, b"de");
+        assert!(rest.is_empty());
+        // 每一种截断：都是"还不够"
+        for cut in 0..PREFIX + 3 {
+            assert!(split(&wire[..cut], 16).unwrap().is_none(), "{cut}");
+        }
+        assert!(matches!(split(&wire, 2), Err(FrameError::TooLarge(3))));
+        // 上限只看长度前缀：负载还没到也一样报错（不会先分配）
+        assert!(matches!(
+            split(&[0xff, 0xff, 0xff, 0xff], 1 << 20),
+            Err(FrameError::TooLarge(0xffff_ffff))
+        ));
+        assert_eq!(payload_len([0, 1, 0, 0], 256).unwrap(), 256);
+
+        // 取消息：停在不完整的那一帧开头
+        let mut wire = encode(&HostMsg::Pong { t: 1 });
+        let whole = wire.len();
+        wire.extend(encode(&HostMsg::Pong { t: 2 }));
+        let mut r = &wire[..wire.len() - 1];
+        assert!(matches!(next(&mut r), HostMsg::Pong { t: 1 }));
+        assert!(take_msg::<HostMsg>(&mut r, 1 << 20).unwrap().is_none());
+        assert_eq!(r.len(), wire.len() - 1 - whole);
     }
 
     /// 对方版本新增的消息：跳过，后面的照常读；新的提示是 None；认识但解不出来的是错误
-    #[tokio::test]
-    async fn unknown_messages_are_skipped() {
+    #[test]
+    fn unknown_messages_are_skipped() {
         #[derive(minicbor::Encode)]
         enum Future {
             #[n(200)]
@@ -278,10 +264,9 @@ mod tests {
         wire.extend(encode(&FutureNotice::Notice(Smell::Burnt { how: 1 })));
         wire.extend(encode(&HostMsg::Pong { t: 5 }));
         let mut r = &wire[..];
-        let mut buf = Vec::new();
-        let m: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        let m: HostMsg = next(&mut r);
         assert!(matches!(m, HostMsg::Notice(None)), "{m:?}");
-        let m: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        let m: HostMsg = next(&mut r);
         assert!(matches!(m, HostMsg::Pong { t: 5 }));
         let Decoded::<HostMsg>::Unknown(v) =
             decode(&to_vec(&Future::Hologram { depth: 3 })).unwrap()
@@ -300,7 +285,7 @@ mod tests {
             },
         }
         let wire = encode(&Broken::Pong { t: "x".into() });
-        let r: Result<Option<HostMsg>, _> = read_msg(&mut &wire[..], 1 << 20, &mut buf).await;
+        let r: Result<Option<HostMsg>, _> = take_msg(&mut &wire[..], 1 << 20);
         assert!(matches!(r, Err(FrameError::Decode(_))));
     }
 
@@ -348,65 +333,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn packets_are_read_raw() {
-        use crate::media::{AudioHeader, HEADER_LEN, frame};
-        let h = AudioHeader {
-            seq: 1,
-            start: false,
-            capture_us: 5,
-        };
-        let mut wire = frame(&h.encode(), &[&[1, 2]]);
-        wire.extend_from_slice(&frame(&h.encode(), &[]));
-        let mut r = &wire[..];
-        let a = read_packet(&mut r, 1024).await.unwrap().unwrap();
-        assert_eq!(a.len(), HEADER_LEN + 2);
-        assert_eq!(AudioHeader::decode(&a), Some(h));
-        assert_eq!(
-            read_packet(&mut r, 1024).await.unwrap().unwrap().len(),
-            HEADER_LEN
-        );
-        assert!(read_packet(&mut r, 1024).await.unwrap().is_none());
-        // 关在半截里
-        let mut r = &wire[..6];
-        assert!(read_packet(&mut r, 1024).await.is_err());
-        assert!(matches!(
-            read_packet(&mut &wire[..], 10).await,
-            Err(FrameError::TooLarge(26))
-        ));
-        // 一个字节一个字节地到（流上的数据通常是分几次到的）：照样拼成完整的一帧，不多读下一帧
-        let mut slow = tokio_test_reader(&wire);
-        let a = read_packet(&mut slow, 1024).await.unwrap().unwrap();
-        assert_eq!(a.len(), HEADER_LEN + 2);
-        assert_eq!(a.capacity(), a.len());
-        let b = read_packet(&mut slow, 1024).await.unwrap().unwrap();
-        assert_eq!(b.len(), HEADER_LEN);
-        assert!(read_packet(&mut slow, 1024).await.unwrap().is_none());
-    }
-
-    /// 每次最多读出一个字节的读取端
-    fn tokio_test_reader(data: &[u8]) -> impl AsyncRead + Unpin + '_ {
-        struct OneByte<'a>(&'a [u8]);
-        impl AsyncRead for OneByte<'_> {
-            fn poll_read(
-                mut self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> std::task::Poll<std::io::Result<()>> {
-                if let Some((&b, rest)) = self.0.split_first()
-                    && buf.remaining() > 0
-                {
-                    buf.put_slice(&[b]);
-                    self.0 = rest;
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-        }
-        OneByte(data)
-    }
-
-    #[tokio::test]
-    async fn signal_roundtrip() {
+    #[test]
+    fn signal_roundtrip() {
         let token = [7u8; 16];
         let reclaim = Reclaim {
             code: 123_456,
@@ -431,13 +359,9 @@ mod tests {
                 rekey: true,
             },
         ];
-        let mut buf = Vec::new();
         for m in client {
             let wire = encode(&m);
-            let back: ClientMsg = read_msg(&mut &wire[..], 1024, &mut buf)
-                .await
-                .unwrap()
-                .unwrap();
+            let back: ClientMsg = take_msg(&mut &wire[..], 1024).unwrap().unwrap();
             assert_eq!(format!("{back:?}"), format!("{m:?}"));
         }
         let peer = |ip: &str| Peer {
@@ -474,47 +398,34 @@ mod tests {
             },
         ] {
             let wire = encode(&m);
-            let back: ServerMsg = read_msg(&mut &wire[..], 1024, &mut buf)
-                .await
-                .unwrap()
-                .unwrap();
+            let back: ServerMsg = take_msg(&mut &wire[..], 1024).unwrap().unwrap();
             assert_eq!(format!("{back:?}"), format!("{m:?}"));
         }
     }
 
     /// 会话开始、等待同意、触摸和系统操作
-    #[tokio::test]
-    async fn session_start_and_touch_roundtrip() {
+    #[test]
+    fn session_start_and_touch_roundtrip() {
         let mut wire = Vec::new();
-        write_msg(&mut wire, &HostMsg::AwaitingApproval)
-            .await
-            .unwrap();
-        write_msg(&mut wire, &HostMsg::Bye(ByeReason::Declined))
-            .await
-            .unwrap();
-        write_msg(
-            &mut wire,
-            &HostMsg::Hello(HostHello {
-                hostname: "Pixel".into(),
-                os: "Android 15".into(),
-                version: "0.1.0".into(),
-                displays: vec![],
-                current_display: 0,
-                codecs: vec![Codec::H264, Codec::AV1],
-                platform: Platform::Android,
-                touch: true,
-                actions: vec![SystemAction::Back, SystemAction::VolumeDown],
-            }),
-        )
-        .await
-        .unwrap();
+        wire.extend(encode(&HostMsg::AwaitingApproval));
+        wire.extend(encode(&HostMsg::Bye(ByeReason::Declined)));
+        wire.extend(encode(&HostMsg::Hello(HostHello {
+            hostname: "Pixel".into(),
+            os: "Android 15".into(),
+            version: "0.1.0".into(),
+            displays: vec![],
+            current_display: 0,
+            codecs: vec![Codec::H264, Codec::AV1],
+            platform: Platform::Android,
+            touch: true,
+            actions: vec![SystemAction::Back, SystemAction::VolumeDown],
+        })));
         let mut r = &wire[..];
-        let mut buf = Vec::new();
-        let a: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        let a: HostMsg = next(&mut r);
         assert!(matches!(a, HostMsg::AwaitingApproval));
-        let b: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        let b: HostMsg = next(&mut r);
         assert!(matches!(b, HostMsg::Bye(ByeReason::Declined)));
-        let h: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
+        let h: HostMsg = next(&mut r);
         assert!(
             matches!(h, HostMsg::Hello(ref h) if h.platform == Platform::Android && h.touch
             && h.actions == [SystemAction::Back, SystemAction::VolumeDown]
@@ -543,10 +454,7 @@ mod tests {
             t: 1 << 40,
             events: events.clone(),
         });
-        let input: ControllerMsg = read_msg(&mut &wire[..], 1 << 20, &mut buf)
-            .await
-            .unwrap()
-            .unwrap();
+        let input: ControllerMsg = next(&mut &wire[..]);
         let ControllerMsg::Input { t, events: got } = input else {
             panic!()
         };
@@ -596,8 +504,8 @@ mod tests {
         assert_eq!(events, [InputEvent::MouseDelta { dx: 1, dy: 2 }]);
     }
 
-    #[tokio::test]
-    async fn too_large() {
+    #[test]
+    fn too_large() {
         let wire = encode(&ControllerMsg::Input {
             t: 0,
             events: vec![InputEvent::Text {
@@ -605,8 +513,67 @@ mod tests {
             }],
         });
         let mut r = &wire[..];
-        let mut buf = Vec::new();
-        let res: Result<Option<ControllerMsg>, _> = read_msg(&mut r, 10, &mut buf).await;
+        let res: Result<Option<ControllerMsg>, _> = take_msg(&mut r, 10);
         assert!(matches!(res, Err(FrameError::TooLarge(_))));
+    }
+
+    /// 服务器在认证之前就要解析的东西（版本握手、信令消息、会话头）：什么样的字节都不能让它崩溃、
+    /// 也不能让它按对方说的长度去分配。这里只是把每条合法消息的每一位翻一遍、每个位置截一遍的冒烟测试，
+    /// 正经的 fuzz 直接拿这几个函数当入口（它们都只吃字节，不碰 IO）
+    #[test]
+    fn hostile_bytes_never_panic() {
+        use crate::{MAX_SIGNAL_MSG, Role, SessionHeader, SessionLane};
+        let hello = ClientHello::new(Role::Host, "PC".into(), "Windows 11".into()).encode();
+        let mut signal = Vec::new();
+        for m in [
+            ClientMsg::Register {
+                reclaim: Some(Reclaim {
+                    code: 123_456,
+                    secret: [5; 16],
+                }),
+                keep: true,
+                rekey: false,
+            },
+            ClientMsg::Connect {
+                req_id: 4,
+                code: 123_456,
+                resume: Some([7; 16]),
+            },
+            ClientMsg::Rekey,
+            ClientMsg::Release,
+        ] {
+            signal.extend(encode(&m));
+        }
+        let header = SessionHeader::new(7, Role::Controller, SessionLane::Bulk).encode();
+
+        let try_all = |hello: &[u8], signal: &[u8], header: &[u8; SessionHeader::LEN]| {
+            let _ = ClientHello::decode(hello);
+            let mut r = signal;
+            while let Ok(Some(_)) = take_msg::<ClientMsg>(&mut r, MAX_SIGNAL_MSG) {}
+            let _ = SessionHeader::decode(header);
+        };
+        for cut in 0..=hello.len() {
+            try_all(&hello[..cut], &signal, &header);
+        }
+        for cut in 0..=signal.len() {
+            try_all(&hello, &signal[..cut], &header);
+        }
+        // 翻每一位，再把每个字节换成几个边界值（长度、标签、数组头最容易出事的取值）
+        type All = (Vec<u8>, Vec<u8>, [u8; SessionHeader::LEN]);
+        let mutate = |pick: fn(&mut All) -> &mut [u8]| {
+            let mut all = (hello.clone(), signal.clone(), header);
+            for i in 0..pick(&mut all).len() {
+                let original = pick(&mut all)[i];
+                let flips = (0..8).map(|bit| original ^ (1 << bit));
+                for b in flips.chain([0x00, 0x1f, 0x7f, 0x9f, 0xbf, 0xff]) {
+                    pick(&mut all)[i] = b;
+                    try_all(&all.0, &all.1, &all.2);
+                }
+                pick(&mut all)[i] = original;
+            }
+        };
+        mutate(|a| &mut a.0);
+        mutate(|a| &mut a.1);
+        mutate(|a| &mut a.2);
     }
 }

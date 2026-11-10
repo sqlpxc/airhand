@@ -7,22 +7,60 @@ license = "MIT"
 
 # 桌面客户端（client/src-tauri）、网页控制台（web/）和 Android（android/native）共用，不依赖任何 GUI 库。
 # 两者都是独立的 Cargo 工作区；这个库和 airhand-proto 一样属于根目录的工作区（在仓库根目录 cargo test）
+
+[features]
+default = ["client"]
+# 客户端的全部：QUIC 连接、端到端加密（Noise、SPAKE2）、会话、控制端和被控端。
+# 关掉它只剩 wire（从流里读写长度前缀帧）：中转服务器就是这样用的（见 server/Cargo.toml），
+# 不用为了读写几帧把 Noise、SPAKE2 这些它用不到的库也编译进去
+client = [
+    "dep:anyhow",
+    "dep:bytes",
+    "dep:curve25519-dalek",
+    "dep:quinn",
+    "dep:rand",
+    "dep:ring",
+    "dep:rustls",
+    "dep:serde",
+    "dep:sha2",
+    "dep:snow",
+    "dep:spake2",
+    "tokio/rt",
+    "tokio/macros",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/net",
+]
+
 [dependencies]
+# wire 用的（总是有）
 airhand-proto = { path = "../airhand-proto" }
-anyhow = "1"
-bytes = "1"
-curve25519-dalek = "4"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rand = "0.9"
-ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
-serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
-# risky-raw-split：取出 Noise 的两把密钥，再派生每条通道、每个方向各自的密钥（见 src/secure.rs）
-snow = { version = "0.10", features = ["risky-raw-split"] }
-spake2 = "0.4"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
 tracing = "0.1"
 
+# client 用的
+anyhow = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+curve25519-dalek = { version = "4", optional = true }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+rand = { version = "0.9", optional = true }
+ring = { version = "0.17", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = { version = "0.10", optional = true }
+# risky-raw-split：取出 Noise 的两把密钥，再派生每条通道、每个方向各自的密钥（见 src/secure.rs）
+snow = { version = "0.10", features = ["risky-raw-split"], optional = true }
+spake2 = { version = "0.4", optional = true }
+
 [dev-dependencies]
+# rt、macros：#[tokio::test]（只有 wire 的时候也要能跑它的测试）；test-util：测试里让时间跳着走
+# （等 60 秒的同意、30 秒的失联不用真的等）
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 serde_json = "1"
+
+# 三边共用的协议样例（界面命令、会话事件……）：只有客户端才有这些
+[[test]]
+name = "protocol"
+path = "tests/protocol.rs"
+required-features = ["client"]
