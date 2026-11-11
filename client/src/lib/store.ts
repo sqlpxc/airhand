@@ -45,6 +45,11 @@ interface State {
   devicesSaved: boolean;
   confirm: Confirm;
   server: ServerState;
+  /**
+   * 最近一次连不上服务器的原因。断开后会自动重试（状态在 disconnected 和 connecting 之间来回），
+   * 重试期间也保留它，界面就不会一会儿显示错误、一会儿又消失；连上后清除
+   */
+  serverProblem: Problem | null;
   app: AppInfo | null;
   decoders: Codec[];
   immersive: boolean;
@@ -90,6 +95,7 @@ let state: State = {
   devicesSaved: false,
   confirm: null,
   server: { state: "connecting" },
+  serverProblem: null,
   app: null,
   decoders: ["h264"],
   immersive: false,
@@ -115,6 +121,14 @@ function syncVisibility() {
 /** 多屏总览标签：两台以上才有意义；正在看的时候不消失 */
 export const showGrid = (st: State) => st.sessions.length >= 2 || (st.view === "grid" && st.sessions.length > 0);
 
+/**
+ * 给用户看的服务器状态：连不上之后在重试的，连上之前都算离线（不在「离线」和「连接中」之间来回跳）；
+ * 只有第一次连接（还没出过问题）时是连接中
+ */
+export type ServerStatus = "connected" | "connecting" | "offline";
+export const serverStatus = (st: State): ServerStatus =>
+  st.server.state === "connected" ? "connected" : st.serverProblem ? "offline" : "connecting";
+
 /** 标签栏从左到右的顺序 */
 export function tabOrder(st: State = state): View[] {
   return [...(showGrid(st) ? ["grid"] : []), ...st.sessions.map((s) => s.id), ...(st.draft ? ["new"] : [])];
@@ -128,7 +142,9 @@ export const store = {
   },
   setServer: (server: ServerState) => {
     const was = state.server.state;
-    set({ server });
+    const serverProblem =
+      server.state === "disconnected" ? server.reason : server.state === "connected" ? null : state.serverProblem;
+    set({ server, serverProblem });
     if (server.state === "connected" && was !== "connected") for (const s of state.sessions) s.serverConnected();
   },
   /** 在等的被控端重新上线了（见 RemoteSession.hostOnline） */

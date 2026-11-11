@@ -20,6 +20,7 @@ export function ConnectView() {
   const t = useT();
   const draft = useStore((s) => s.draft);
   const server = useStore((s) => s.server);
+  const serverProblem = useStore((s) => s.serverProblem);
   const decoders = useStore((s) => s.decoders);
   const devices = useStore((s) => s.devices);
   const inputs = useRef<(HTMLInputElement | null)[]>([]);
@@ -210,11 +211,15 @@ export function ConnectView() {
               <span>{problemText(error)}</span>
             </div>
           )}
-          {server.state === "disconnected" && (
-            <div className="error-box soft">
-              <span className="dot closed" />
+          {/* 连不上服务器：说明为什么连接按钮不能点（会自动重试，重试期间也留着） */}
+          {!online && serverProblem && (
+            <div className="error-box soft" role="status">
+              <span className={`dot ${server.state === "connecting" ? "connecting" : "closed"}`} />
               <span>
-                {t("server.disconnected")} · {problemText(server.reason)}
+                {problemText(serverProblem)}
+                <span className="muted small block">
+                  {t(server.state === "connecting" ? "server.retrying" : "server.retryLater")}
+                </span>
               </span>
             </div>
           )}

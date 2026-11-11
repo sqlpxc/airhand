@@ -1,18 +1,20 @@
 // 标签栏：也是无边框窗口的标题栏。
 //
-// [主菜单] [多屏总览] [会话标签…] [新建连接] [+]  ……空白（拖动窗口 / 双击最大化）……  [服务器状态] [— □ ×]
+// [Logo] [多屏总览] [会话标签…] [新建连接] [+]  ……空白（拖动窗口 / 双击最大化）……  [服务器状态] [设置] [— □ ×]
+//
+// macOS 上最左边是系统的红绿灯按钮（没有 Logo），右边没有窗口按钮。能点的按钮都在右边，不和红绿灯挤在一起。
 //
 // 和浏览器一样：按下就切换、拖动排序、中键关闭、关掉当前标签后显示右边的。
 // 空白处靠 Tauri 的 data-tauri-drag-region="deep" 拖动窗口：按钮、标签（role="tab"）不会触发拖动。
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api } from "../lib/api";
-import { closeTab, fmtCode, focusActive } from "../lib/actions";
+import { closeTab, fmtCode } from "../lib/actions";
 import { useT } from "../lib/i18n";
 import { sessionStateText } from "../lib/messages";
 import { NATIVE_WINDOW_BUTTONS } from "../lib/platform";
 import type { RemoteSession } from "../lib/session";
 import { showGrid, store, useSession, useSessionTitle, useStore } from "../lib/store";
-import { AppMenu, ServerIndicator } from "./AppMenu";
+import { ServerIndicator, SettingsButton } from "./AppMenu";
 import {
   IconClose,
   IconGrid,
@@ -27,23 +29,19 @@ import {
 import { Logo } from "./Logo";
 
 export function TitleBar() {
-  const t = useT();
-  const [menu, setMenu] = useState(false);
-  // 菜单关掉后键盘回到远程画面
-  const closeMenu = useCallback(() => {
-    setMenu(false);
-    focusActive();
-  }, []);
   return (
     <header className={`titlebar ${NATIVE_WINDOW_BUTTONS ? "native-buttons" : ""}`} data-tauri-drag-region="deep">
-      <div className="menu-anchor app-menu-anchor">
-        <button className={`app-btn ${menu ? "on" : ""}`} title={t("menu.title")} onClick={() => setMenu((m) => !m)}>
-          <Logo size={20} />
-        </button>
-        {menu && <AppMenu onClose={closeMenu} />}
-      </div>
+      {/* 只是标识，不能点（也是拖动窗口的地方）；macOS 这里是红绿灯 */}
+      {!NATIVE_WINDOW_BUTTONS && (
+        <div className="brand" aria-hidden>
+          <Logo size={18} />
+        </div>
+      )}
       <TabStrip />
-      <ServerIndicator onClick={() => setMenu(true)} />
+      <div className="title-actions">
+        <ServerIndicator />
+        <SettingsButton />
+      </div>
       {api.frame && !NATIVE_WINDOW_BUTTONS && <WindowButtons />}
     </header>
   );
