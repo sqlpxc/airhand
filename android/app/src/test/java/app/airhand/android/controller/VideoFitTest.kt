@@ -66,4 +66,37 @@ class VideoFitTest {
         assertEquals(720, VideoFit.stricter(1080, 720))
         assertEquals(0, VideoFit.stricter(0, 0))
     }
+
+    @Test
+    fun looser() {
+        assertEquals(0, VideoFit.looser(0, 720))
+        assertEquals(0, VideoFit.looser(720, 0))
+        assertEquals(1440, VideoFit.looser(1080, 1440))
+        assertEquals(1440, VideoFit.looser(1440, 1080))
+    }
+
+    @Test
+    fun zoomAsksForTheNextStepUpToNative() {
+        // 4K 桌面在 2400×1080 的手机上完整显示是 1920×1080：1080p 就够
+        assertEquals(1080, VideoFit.zoomMaxShort(3840, 2160, 1920f, 1080f))
+        // 只放大了一点点（不到 4%）：不要更高的一档
+        assertEquals(1080, VideoFit.zoomMaxShort(3840, 2160, 1920f * 1.03f, 1080f * 1.03f))
+        assertEquals(1440, VideoFit.zoomMaxShort(3840, 2160, 1920f * 1.2f, 1080f * 1.2f))
+        // 够到对方屏幕的短边：原始分辨率
+        assertEquals(0, VideoFit.zoomMaxShort(3840, 2160, 1920f * 1.5f, 1080f * 1.5f))
+        assertEquals(0, VideoFit.zoomMaxShort(2560, 1440, 3840f, 2160f))
+        assertEquals(720, VideoFit.zoomMaxShort(2560, 1440, 1280f, 720f))
+        // 竖屏手机放大两倍
+        assertEquals(0, VideoFit.zoomMaxShort(1080, 2400, 2070f, 4600f))
+        // 还不知道对方屏幕多大
+        assertEquals(0, VideoFit.zoomMaxShort(0, 0, 100f, 100f))
+    }
+
+    @Test
+    fun zoomNeverLowersTheChosenQuality() {
+        // 画质设置是原始分辨率（0）或者比放大需要的还高：照原样
+        assertEquals(0, VideoFit.looser(0, VideoFit.zoomMaxShort(3840, 2160, 2304f, 1296f)))
+        assertEquals(2160, VideoFit.looser(2160, VideoFit.zoomMaxShort(3840, 2160, 2304f, 1296f)))
+        assertEquals(1440, VideoFit.looser(1080, VideoFit.zoomMaxShort(3840, 2160, 2304f, 1296f)))
+    }
 }

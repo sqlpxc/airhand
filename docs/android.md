@@ -35,6 +35,8 @@ Two **touch input modes** (two big buttons in the menu switch any time, Settings
 
 When the remote phone runs Android 7 (no continuous multi-finger gestures), only one finger is passed through and pinching zooms the local view.
 
+After you pinch to zoom the local view, a moment after your fingers stop the app asks the remote side for a sharper picture (based on the zoomed size, rounded up to 720p / 1080p / 1440p / 4K, at most the remote screen's native resolution, a bit less if this device's decoder can't take it), and goes back to the quality setting's resolution when you zoom out. The bitrate cap stays the same: moving content may look a little softer than before, still content sharpens up within a few frames.
+
 - In trackpad mode the pointer is drawn locally (with the remote shape), so it moves without lag; in touch mode a fading circle shows where you tapped
 - **Keyboard**: the picture shrinks to stay fully visible above it, and a row of extra keys sits on top: Esc, Tab, Ctrl, Alt, Shift, Win (⌘ for Macs), arrows, Home / End, PgUp / PgDn, Del, F1–F12. Modifiers are sticky: tap once for the next key only, again to lock, again to release (tap Ctrl, then type c = Ctrl+C). While an IME composes (pinyin etc.) the text shows above the extra keys and is only sent once chosen
 - When controlling a phone, **Back / Home / Recents** keys sit below the picture (can be turned off in Settings), and the shortcut menu holds system actions: notifications, quick settings, screenshot, lock screen, power menu, volume (whichever the phone supports). For computers the shortcut menu lists shortcuts for the remote OS (Windows / macOS / Linux)

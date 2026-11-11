@@ -31,6 +31,7 @@ import androidx.core.view.WindowInsetsCompat
 import app.airhand.android.controller.CursorState
 import app.airhand.android.controller.Input
 import app.airhand.android.data.ScaleMode
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -49,6 +50,9 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
     interface Host {
         fun onSurface(surface: Surface?)
+
+        /** 画面放大了 / 缩回去了：整个画面现在显示多大（本机像素），用来向对方要更清楚的画面 */
+        fun onZoom(zoomed: Boolean, shownW: Float, shownH: Float)
         fun onInput(events: List<Any>, now: Boolean)
         fun onToggleKeyboard()
         val keyboard: KeyboardController
@@ -146,9 +150,14 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
     fun setVideoSize(w: Int, h: Int) {
         if (w == videoW && h == videoH) return
+        // 放大着、画面只是换了分辨率（放大之后向对方要了更清楚的画面，宽高比没变）：保持放大倍数和位置
+        val keep = zoomed && scaleMode == ScaleMode.FIT && w > 0 && h > 0 && videoW > 0 && videoH > 0 &&
+            content.width() > 0f && abs(w.toFloat() / h - videoW.toFloat() / videoH) < 0.02f * videoW / videoH
+        val cx = if (keep) (width / 2f - content.left) / content.width() else 0f
+        val cy = if (keep) (height / 2f - content.top) / content.height() else 0f
         videoW = w
         videoH = h
-        fit()
+        if (keep) zoomAround(cx, cy) else fit()
     }
 
     /**
@@ -194,12 +203,15 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             return
         }
         // 放大着（例如弹出键盘、旋转）：保持放大倍数，视图中心对着的还是原来那一点
-        val cx = (oldw / 2f - content.left) / content.width()
-        val cy = (oldh / 2f - content.top) / content.height()
+        zoomAround((oldw / 2f - content.left) / content.width(), (oldh / 2f - content.top) / content.height())
+    }
+
+    /** 保持放大倍数 [rel]，画面上的 (`cx`, `cy`)（相对位置）对着视图中心 */
+    private fun zoomAround(cx: Float, cy: Float) {
         val s = fitScale() * rel
         val cw = videoW * s
         val ch = videoH * s
-        content.set(w / 2f - cx * cw, h / 2f - cy * ch, w / 2f - cx * cw + cw, h / 2f - cy * ch + ch)
+        content.set(width / 2f - cx * cw, height / 2f - cy * ch, width / 2f - cx * cw + cw, height / 2f - cy * ch + ch)
         clamp()
         apply()
     }
@@ -266,6 +278,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         m.postTranslate(content.left, content.top)
         texture.setTransform(m)
         overlay.invalidate()
+        host.onZoom(zoomed, content.width(), content.height())
     }
 
     // ───────────────────────────── 指针 ─────────────────────────────

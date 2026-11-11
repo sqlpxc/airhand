@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import type { Codec, QualitySettings, VideoPriority } from "../lib/api";
 import { useT } from "../lib/i18n";
 import { CODEC_PRIORITY, codecUsable } from "../lib/codec";
+import { ENHANCE_LEVELS } from "../lib/enhance";
 import { CODEC_LABEL, PRESETS, codecHint, matchPreset, presetDesc, presetName, presetSettings } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
-import { useSession, useStore } from "../lib/store";
+import { store, useSession, useStore } from "../lib/store";
 import { Popover } from "./Popover";
 
 const FPS = [15, 24, 30, 60, 90, 120];
@@ -35,6 +36,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const t = useT();
   useSession(s);
   const decoders = useStore((st) => st.decoders);
+  const enhance = useStore((st) => st.enhance);
   const [draftKbps, setDraftKbps] = useState(s.settings.bitrateKbps);
   const timer = useRef<number | undefined>(undefined);
   const cur = s.settings;
@@ -97,6 +99,19 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
           ))}
         </div>
         <div className="muted small">{t(`quality.priority.${priority}.hint`)}</div>
+      </div>
+
+      {/* 本机显示的偏好，不发给对方；所有连接通用（见 enhance.ts） */}
+      <div className="field">
+        <label>{t("quality.enhance")}</label>
+        <div className="segmented">
+          {ENHANCE_LEVELS.map((l) => (
+            <button key={l} className={enhance === l ? "active" : ""} onClick={() => store.setEnhance(l)}>
+              {t(`quality.enhance.${l}`)}
+            </button>
+          ))}
+        </div>
+        <div className="muted small">{t("quality.enhance.hint")}</div>
       </div>
 
       <div className="field">

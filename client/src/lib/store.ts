@@ -1,8 +1,10 @@
 // 全局状态：标签（会话 / 新建连接 / 多屏总览）、我的设备、服务器状态等。
-// 只有"我的设备"保存下来（config.toml，见 actions.ts 的 saveDevices）；其余只在控制台打开期间有效。
+// "我的设备"保存在 config.toml 里（见 actions.ts 的 saveDevices）；画面增强是这台电脑自己显示的偏好，
+// 和对方无关，存在 WebView / 浏览器的 localStorage 里；其余只在控制台打开期间有效。
 import { useCallback, useSyncExternalStore } from "react";
 import type { AppInfo, Codec, Problem, QualitySettings, SavedDevice, ServerState } from "./api";
 import { fmtCode } from "./devices";
+import { ENHANCE_LEVELS, type EnhanceLevel } from "./enhance";
 import { DEFAULT_PRESET, type PresetId } from "./presets";
 import type { RemoteSession } from "./session";
 
@@ -46,9 +48,30 @@ interface State {
   app: AppInfo | null;
   decoders: Codec[];
   immersive: boolean;
+  /** 画面增强（所有会话通用，见 enhance.ts） */
+  enhance: EnhanceLevel;
 }
 
 const MAX_RECENT = 8;
+const ENHANCE_KEY = "airhand.enhance";
+
+/** 上次选的画面增强（读不到就是关） */
+export function loadEnhance(): EnhanceLevel {
+  try {
+    const v = globalThis.localStorage?.getItem(ENHANCE_KEY);
+    return ENHANCE_LEVELS.find((l) => l === v) ?? "off";
+  } catch {
+    return "off";
+  }
+}
+
+function saveEnhance(level: EnhanceLevel) {
+  try {
+    globalThis.localStorage?.setItem(ENHANCE_KEY, level);
+  } catch {
+    // 存不了（例如浏览器禁用了存储）：只在这次有效
+  }
+}
 
 export const emptyDraft = (): Draft => ({
   digits: Array(6).fill(""),
@@ -70,6 +93,7 @@ let state: State = {
   app: null,
   decoders: ["h264"],
   immersive: false,
+  enhance: loadEnhance(),
 };
 
 const listeners = new Set<() => void>();
@@ -118,6 +142,13 @@ export const store = {
     set({ view, immersive: view === "new" || view === "grid" ? false : state.immersive });
   },
   setImmersive: (immersive: boolean) => set({ immersive }),
+  /** 画面增强：记下来，所有会话马上按它重画 */
+  setEnhance: (enhance: EnhanceLevel) => {
+    if (enhance === state.enhance) return;
+    saveEnhance(enhance);
+    set({ enhance });
+    for (const s of state.sessions) s.refreshLayout();
+  },
 
   // ── 标签 ──
 

@@ -23,8 +23,10 @@ import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.optStringOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -160,6 +162,14 @@ class RemoteSession(
     /** 收到过本机解码器放不下的画面：按画面尺寸算出的短边上限（只对那种格式有效；对方换了屏幕 / 转了屏就作废） */
     @Volatile
     private var frameLimit: Pair<Codec, Int>? = null
+
+    /** 双指放大着：整个画面显示多大（本机像素），按它向对方要更清楚的画面（见 [setZoom]）；没放大时为 null */
+    @Volatile
+    private var zoomShown: Pair<Float, Float>? = null
+
+    /** 最近一次 [setZoom] 要的（等手指停下来才生效），只在主线程上用 */
+    private var zoomWanted: Pair<Float, Float>? = null
+    private var zoomJob: Job? = null
 
     /** 最近发给对方的画质设置 */
     @Volatile
@@ -492,12 +502,13 @@ class RemoteSession(
     /**
      * 本机解码器放得下的短边上限。电视的硬件解码器常常只到 1080p，或者不认竖着的尺寸，
      * 竖屏手机原样的 1080×2400 发过来就一直黑屏：按对方屏幕的尺寸（和收到过的放不下的画面）缩小一些。
-     * 界面上的画质选择不变。
+     * 双指放大着时先放宽到放大后需要的（见 [setZoom]，不会比画质设置里的低）。界面上的画质选择不变。
      */
     private fun decodableMaxShort(q: Quality): Int {
         var s = q.maxShort
-        displays.value.firstOrNull { it.index == currentDisplay.value }?.let {
-            s = VideoDecoder.fitMaxShort(q.codec, it.width, it.height, s)
+        displays.value.firstOrNull { it.index == currentDisplay.value }?.let { d ->
+            zoomShown?.let { (w, h) -> s = VideoFit.looser(s, VideoFit.zoomMaxShort(d.width, d.height, w, h)) }
+            s = VideoDecoder.fitMaxShort(q.codec, d.width, d.height, s)
         }
         frameLimit?.let { (c, limit) -> if (c == q.codec) s = VideoFit.stricter(s, limit) }
         return s
@@ -546,6 +557,23 @@ class RemoteSession(
     fun setQuality(q: Quality) {
         quality.value = q
         sendSettings()
+    }
+
+    /**
+     * 画面放大了 / 缩回去了（[RemoteView] 每次移动、缩放都会告诉这里，在主线程上）。
+     * 放大时向对方要放大后看得清的分辨率（按档位，最多到原始分辨率，还要本机解码器放得下；码率上限不变，
+     * 画面静止时几帧之内就补清楚），缩回去之后恢复画质设置里的。手指停下来一会儿才发，免得对方一直重建编码器
+     */
+    fun setZoom(zoomed: Boolean, shownW: Float, shownH: Float) {
+        val want = if (zoomed) shownW to shownH else null
+        if (want == zoomWanted) return
+        zoomWanted = want
+        zoomJob?.cancel()
+        zoomJob = scope.launch {
+            delay(ZOOM_SETTLE_MS)
+            zoomShown = want
+            refreshSettings()
+        }
     }
 
     /** 双方都支持的编码格式（对方能编码、本机能硬件解码），压缩率从高到低；还没连上时为空 */
@@ -678,6 +706,9 @@ class RemoteSession(
         private const val RETRY_MS = 800L
         private const val OFFLINE_RECHECK_MS = 60_000L
         private const val BACKGROUND_FPS = 2
+
+        /** 放大的手势停下来这么久才按新的大小要分辨率 */
+        private const val ZOOM_SETTLE_MS = 400L
 
         /** 光标形状：头后面的 RGBA（非预乘）→ Bitmap */
         fun cursorBitmap(b: ByteArray, w: Int, h: Int): Bitmap? {

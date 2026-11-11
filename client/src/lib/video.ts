@@ -1,8 +1,12 @@
 // 一个会话的画面（在 Worker 里，见 console-worker.ts）：WebCodecs 解码器、音画同步的推迟队列、绘制到 OffscreenCanvas。
 // 连接、重连和编码格式的协商在主线程的 RemoteSession 里。
+//
+// 平时 canvas 和画面一样大，由浏览器缩放到显示的大小；打开画面增强时 canvas 就是显示的大小，
+// 在显卡上放大、锐化之后画上去（见 enhance.ts）。最后一帧留着：显示区域变了、开关增强时画面静止也能马上重画。
 import type { Codec } from "./api";
 import type { AvSync } from "./avsync";
 import { annexBToAvc, avcC, codecString, h264NeedsAvc, markH264NeedsAvc } from "./codec.ts";
+import { enhance as enhanceFrame, renderPlan, type Area, type EnhanceLevel } from "./enhance.ts";
 import type { VideoHeader } from "./media.ts";
 
 interface PendingVideo {
@@ -22,7 +26,10 @@ interface VideoOptions {
   requestKeyframe(): void;
   unsupported(codec: Codec): void;
   recovered(): void;
-  resized(): void;
+  /** 画面的大小（像素）变了 */
+  resized(w: number, h: number): void;
+  /** 增强（默认用 enhance.ts 的；测试里换掉）：返回画好的 canvas，null 时照原来的方法画 */
+  enhance?: (frame: VideoFrame, w: number, h: number, level: EnhanceLevel) => OffscreenCanvas | null;
 }
 const MAX_QUEUED = 120;
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -41,6 +48,15 @@ export class VideoPlayer {
   private queue: PendingVideo[] = [];
   private queuedBytes = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  /** 最后画的一帧（重画用） */
+  private last: VideoFrame | null = null;
+  private frameW = 0;
+  private frameH = 0;
+  /** 显示区域（设备像素；null = 1:1 显示）和增强的强度，见 setLayout */
+  private area: Area | null = null;
+  private level: EnhanceLevel = "off";
+  /** 增强的结果画不上去（浏览器不支持把 WebGL 的 canvas 画到 2D canvas 上）：之后不再增强 */
+  private enhanceBroken = false;
 
   constructor(options: VideoOptions) { this.options = options; }
 
@@ -55,6 +71,24 @@ export class VideoPlayer {
     this.timer = undefined;
     this.queue = [];
     this.queuedBytes = 0;
+  }
+
+  /** 画面不要了：连最后一帧也放掉 */
+  dispose() {
+    this.reset();
+    this.last?.close();
+    this.last = null;
+  }
+
+  /**
+   * 画面怎么显示：显示区域 `area`（设备像素；null = 1:1 显示）、增强的强度（off = 不增强，由浏览器缩放）。
+   * 变了就用最后一帧马上重画（画面静止时被控端不再发新的帧）
+   */
+  setLayout(area: Area | null, level: EnhanceLevel) {
+    if (this.level === level && this.area?.w === area?.w && this.area?.h === area?.h) return;
+    this.area = area ? { w: area.w, h: area.h } : null;
+    this.level = level;
+    if (this.last) this.render(this.last);
   }
 
   /** 一个画面包：头 + 码流（见 media.ts） */
@@ -185,21 +219,57 @@ export class VideoPlayer {
   }
 
   private draw(frame: VideoFrame) {
-    try {
-      const t0 = this.pending.get(frame.timestamp);
-      if (t0 !== undefined) {
-        this.pending.delete(frame.timestamp);
-        const ms = performance.now() - t0;
-        this.decodeAvg = this.decodeAvg === 0 ? ms : this.decodeAvg * 0.9 + ms * 0.1;
-      }
-      if (this.pending.size > 32) this.pending.clear();
-      const { canvas, ctx } = this.options;
-      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-        canvas.width = frame.displayWidth;
-        canvas.height = frame.displayHeight;
-        this.options.resized();
-      }
+    const t0 = this.pending.get(frame.timestamp);
+    if (t0 !== undefined) {
+      this.pending.delete(frame.timestamp);
+      const ms = performance.now() - t0;
+      this.decodeAvg = this.decodeAvg === 0 ? ms : this.decodeAvg * 0.9 + ms * 0.1;
+    }
+    if (this.pending.size > 32) this.pending.clear();
+    const w = frame.displayWidth;
+    const h = frame.displayHeight;
+    if (w !== this.frameW || h !== this.frameH) {
+      this.frameW = w;
+      this.frameH = h;
+      this.options.resized(w, h);
+    }
+    this.last?.close();
+    this.last = frame;
+    this.render(frame);
+  }
+
+  private render(frame: VideoFrame) {
+    const { canvas, ctx } = this.options;
+    const fw = frame.displayWidth;
+    const fh = frame.displayHeight;
+    const plan = renderPlan(fw, fh, this.area, this.level);
+    // 先增强（失败了 canvas 还没动过）；改 canvas 的大小会清空它，所以紧接着就画
+    const enhanced = plan.enhance && !this.enhanceBroken
+      ? (this.options.enhance ?? enhanceFrame)(frame, plan.w, plan.h, this.level)
+      : null;
+    if (canvas.width !== plan.w || canvas.height !== plan.h) {
+      canvas.width = plan.w;
+      canvas.height = plan.h;
+    }
+    if (enhanced && this.drawEnhanced(enhanced)) return;
+    if (plan.w === fw && plan.h === fh) {
       ctx.drawImage(frame, 0, 0);
-    } finally { frame.close(); }
+    } else {
+      // 增强用不了：至少用浏览器的高质量缩放（不锐化）
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(frame, 0, 0, plan.w, plan.h);
+    }
+  }
+
+  private drawEnhanced(enhanced: OffscreenCanvas): boolean {
+    try {
+      this.options.ctx.drawImage(enhanced, 0, 0);
+      return true;
+    } catch (e) {
+      console.warn("can't draw the enhanced picture, using the browser's scaling", e);
+      this.enhanceBroken = true;
+      return false;
+    }
   }
 }

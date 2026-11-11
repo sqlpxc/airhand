@@ -4,8 +4,12 @@ import fs from "node:fs";
 import vm from "node:vm";
 import { stripTypeScriptTypes } from "node:module";
 import { ConnectionAttempt } from "../src/lib/connection-attempt.ts";
+import { renderPlan } from "../src/lib/enhance.ts";
 import { fitSize, stricter, viewMaxShort } from "../src/lib/fit.ts";
 import * as media from "../src/lib/media.ts";
+
+/** 沙箱里建的对象原型不同，按 JSON 比较 */
+const plain = (v: unknown) => JSON.parse(JSON.stringify(v));
 
 // Load the actual session class with browser/backend dependencies replaced by
 // small fakes. This tests delivery ordering without a WebView or network.
@@ -17,8 +21,10 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   let resolve: (value: any) => void = () => {};
   const calls: any[] = [];
   const timers: (() => void)[] = [];
+  const storeState: any = { enhance: "off", decoders: ["h264"] };
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
-    fitSize, stricter, viewMaxShort, media,
+    fitSize, stricter, viewMaxShort, renderPlan, media, devicePixelRatio: 1,
+    store: { get: () => storeState },
     toProblem: (e: any) => e,
     api: {
       connect: (c: any, o: any, _view: any, onEvent: any) => {
@@ -35,12 +41,12 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   Object.assign(session, {
     attempt: new ConnectionAttempt(), disposed: false, sid: null, state: "connecting", settings: {}, visible: true,
     viewLimit: 0, viewLimitAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
-    view: { setSync() {}, setAudio() {}, dispose() {} }, frame: { w: 16, h: 9 }, input: { reset() {} },
+    view: { setSync() {}, setAudio() {}, setLayout() {}, dispose() {} }, frame: { w: 16, h: 9 }, input: { reset() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
     onlineAt: -1, attemptAt: 0, retries: 0,
     emit() {}, syncAudio() {}, applySyncState() {}, onConnected() { calls.push("connected"); },
   });
-  return { session, calls, timers, event: (ev: any) => sink(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
+  return { session, calls, timers, store: storeState, event: (ev: any) => sink(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
 }
 
 test("文字分块保留 emoji 的代理对，每块都能独立编码成 UTF-8", () => {
@@ -103,6 +109,46 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
   s.viewLimitAt = -Infinity;
   s.updateViewLimit();
   assert.equal(sent().at(-1), 0);
+});
+
+test("画面增强：只给正在操作的会话，关着时不发显示区域；增强时和 1:1 一样对齐到设备像素", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  const layouts: any[] = [];
+  const style: any = {};
+  const area = (width: number, height: number) => ({ getBoundingClientRect: () => ({ width, height }) });
+  Object.assign(s, {
+    view: { setLayout: (a: any, l: string) => layouts.push([a, l]) },
+    hostEl: area(1920, 1080),
+    canvas: { style, getBoundingClientRect: () => ({ left: 10.3, top: 5.6 }) },
+    frame: { w: 1280, h: 720 }, scaleMode: "fit", interactive: true,
+    applyCursor() {}, updateViewLimit() {},
+  });
+  s.layout();
+  assert.deepEqual(plain(layouts), [[null, "off"]]);
+  assert.equal(style.width, "1920px");
+  assert.equal(style.left, "", "浏览器要放大，对齐也没用");
+  // 关着时窗口变了不用告诉 Worker
+  s.hostEl = area(1600, 900);
+  s.layout();
+  assert.equal(layouts.length, 1);
+
+  h.store.enhance = "medium";
+  s.refreshLayout();
+  assert.deepEqual(plain(layouts.at(-1)), [{ w: 1600, h: 900 }, "medium"]);
+  assert.equal(style.width, "1600px");
+  assert.notEqual(style.left, "", "canvas 就是显示的大小：对齐到设备像素");
+  s.layout();
+  assert.equal(layouts.length, 2, "没变不重发");
+
+  // 多屏总览的缩略图：不增强
+  s.interactive = false;
+  s.layout();
+  assert.deepEqual(plain(layouts.at(-1)), [null, "off"]);
+  // 原始大小（1:1）显示：没有显示区域
+  Object.assign(s, { interactive: true, scaleMode: "native" });
+  s.layout();
+  assert.deepEqual(plain(layouts.at(-1)), [null, "medium"]);
 });
 
 const granted = { sid: 7, resume: [9], hostName: "host", hostOs: "Windows", hostKey: "ab".repeat(32), safety: "123-456" };

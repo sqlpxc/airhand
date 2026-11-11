@@ -8,6 +8,7 @@
 // * 鼠标移动按 8ms 合并，按键/点击立即发送；
 // * 不可见的会话自动降到 5fps，节省带宽与对端 CPU；
 // * 画面只缩放一次：按画面在窗口里显示的大小请求分辨率，收到后按 1:1 显示（见 fit.ts）；
+// * 画面增强（可选）：要放大时在 Worker 里用显卡放大、锐化，canvas 就是显示的大小（见 enhance.ts）；
 // * 只有当前正在查看的会话播放声音，其余会话通知被控端停止采集声音；
 // * 音画同步（可选）：按采集时间把画面推迟到与声音对齐后再解码显示，见 avsync.ts（也在 Worker 里）。
 import {
@@ -35,6 +36,7 @@ import { RECOVERS, type SessionNotice } from "./messages";
 import { CODEC_LABEL } from "./presets";
 import { store } from "./store";
 import { fitSize, stricter, viewMaxShort } from "./fit";
+import { renderPlan, type Area, type EnhanceLevel } from "./enhance";
 
 /** waiting = 对方掉线了，等它重新上线（服务器会通知，见 hostOnline） */
 /** `approving`：连上了，在等对方的用户同意（之后收到 hello 才是 `live`） */
@@ -173,6 +175,8 @@ export class RemoteSession {
   private viewLimitTimer: number | undefined;
   /** 最近一次想改 viewLimit 的时刻（与 performance.now() 同一时基） */
   private viewLimitAt = -Infinity;
+  /** 最近告诉 Worker 的显示方式（见 sendLayout） */
+  private sentLayout = "";
 
   // 输入
   private interactive = false;
@@ -666,6 +670,16 @@ export class RemoteSession {
     this.emit();
   }
 
+  /** 画面增强的设置（store 的 enhance）变了 */
+  refreshLayout() {
+    this.layout();
+  }
+
+  /** 画面增强的强度：全局设置，只用在正在操作的会话上（多屏总览的缩略图不增强） */
+  private get enhanceLevel(): EnhanceLevel {
+    return this.interactive ? store.get().enhance : "off";
+  }
+
   private layout() {
     const host = this.hostEl;
     if (!host) return;
@@ -673,22 +687,36 @@ export class RemoteSession {
     const dpr = devicePixelRatio || 1;
     const r = host.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) this.viewport = { w: Math.floor(r.width * dpr), h: Math.floor(r.height * dpr) };
-    // 画面的显示大小（设备像素），以及是否 1:1
+    // 画面的显示区域（设备像素；原始大小显示时不按窗口缩放），画面的显示大小，以及是否 1:1
+    const area = this.nativeScale ? null : this.viewport;
     let size = { w: fw, h: fh, exact: true };
-    if (!this.nativeScale && this.viewport) size = fitSize(fw, fh, this.viewport.w, this.viewport.h);
+    if (area) size = fitSize(fw, fh, area.w, area.h);
+    // 画面增强时 canvas 就是显示的大小（Worker 按同样的算法放大好了），和 1:1 一样不能再让浏览器插值
+    const enhance = this.enhanceLevel;
+    const enhanced = renderPlan(fw, fh, area, enhance).enhance;
     const style = this.canvas.style;
     style.width = `${size.w / dpr}px`;
     style.height = `${size.h / dpr}px`;
     style.left = style.top = "";
-    if (size.exact && !this.nativeScale) {
+    if ((size.exact || enhanced) && !this.nativeScale) {
       // 1:1 显示时左上角要落在整数设备像素上：差半个像素浏览器也会插值，文字又糊了
       const c = this.canvas.getBoundingClientRect();
       const snap = (v: number) => (Math.round(v * dpr) - v * dpr) / dpr;
       style.left = `${snap(c.left)}px`;
       style.top = `${snap(c.top)}px`;
     }
+    this.sendLayout(area, enhance);
     this.applyCursor();
     this.updateViewLimit();
+  }
+
+  /** 告诉 Worker 画面怎么显示（变了才发）。不增强时显示区域用不上，不发：拖动窗口边框时不用每一下都重画 */
+  private sendLayout(area: Area | null, enhance: EnhanceLevel) {
+    const shown = enhance === "off" ? null : area;
+    const key = `${shown ? `${shown.w}x${shown.h}` : "-"}/${enhance}`;
+    if (key === this.sentLayout) return;
+    this.sentLayout = key;
+    this.view.setLayout(shown, enhance);
   }
 
   /** 原始大小（可滚动）显示 */

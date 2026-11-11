@@ -134,6 +134,10 @@ class SessionActivity : ComponentActivity(), RemoteView.Host {
         session?.setSurface(surface)
     }
 
+    override fun onZoom(zoomed: Boolean, shownW: Float, shownH: Float) {
+        session?.setZoom(zoomed, shownW, shownH)
+    }
+
     override fun onInput(events: List<Any>, now: Boolean) {
         session?.input(events, now)
     }

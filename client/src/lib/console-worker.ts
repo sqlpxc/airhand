@@ -7,6 +7,7 @@ import { AckCoalescer, ackMessage } from "./ack";
 import type { Codec } from "./api";
 import { AudioStream } from "./audio-decoder";
 import { AvSync, type AvSyncStats } from "./avsync";
+import type { Area, EnhanceLevel } from "./enhance";
 import * as media from "./media";
 import { VideoPlayer } from "./video";
 
@@ -23,6 +24,8 @@ export type ToWorker =
   /** 一个会话的画面：会话建立时交过来，之后一直在这里绘制 */
   | { t: "view"; id: number; canvas: OffscreenCanvas }
   | { t: "drop"; id: number }
+  /** 画面怎么显示：显示区域（设备像素；null = 1:1 显示）、画面增强的强度（见 enhance.ts） */
+  | { t: "layout"; id: number; area: Area | null; enhance: EnhanceLevel }
   /** 通道 ch（connect 时选的）的媒体包交给画面 id：这个画面之前的通道作废，解码器、缓冲从头开始 */
   | { t: "bind"; ch: number; id: number }
   /** ch 的会话 ID（connect 的回复）：现在可以确认画面了 */
@@ -90,7 +93,7 @@ class View {
       requestKeyframe: () => this.requestKeyframe(),
       unsupported: (codec) => post({ t: "undecodable", id, codec }),
       recovered: () => post({ t: "recovered", id }),
-      resized: () => post({ t: "size", id, w: canvas.width, h: canvas.height }),
+      resized: (w, h) => post({ t: "size", id, w, h }),
     });
   }
 
@@ -245,7 +248,7 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
   switch (m.t) {
     case "drop":
       if (view.chan) unbind(view.chan.ch);
-      view.video.reset();
+      view.video.dispose();
       view.audio.setPort(null);
       views.delete(m.id);
       return;
@@ -264,6 +267,9 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       return;
     case "keyframe":
       view.requestKeyframe();
+      return;
+    case "layout":
+      view.video.setLayout(m.area, m.enhance);
       return;
   }
 };

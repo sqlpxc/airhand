@@ -60,6 +60,8 @@ test("连接：先把 ch 绑到画面上再发 connect，回复之后告诉 Work
   assert.deepEqual(plain(h.posted.at(-1)), { t: "view", id: view.id, canvas: { offscreen: true } });
   h.fromWorker({ t: "size", id: view.id, w: 1920, h: 1080 });
   assert.deepEqual(out, [["size", 1920, 1080]]);
+  view.setLayout({ w: 1600, h: 900 }, "low");
+  assert.deepEqual(plain(h.posted.at(-1)), { t: "layout", id: view.id, area: { w: 1600, h: 900 }, enhance: "low" });
 
   const events: any[] = [];
   const connected = h.link.connect("123456", opts, view, (ev: any) => events.push(ev), true);
@@ -162,8 +164,12 @@ function workerHarness() {
       resets = 0;
       options: any;
       constructor(options: any) { this.options = options; players.push(this); }
+      layouts: unknown[] = [];
+      disposed = 0;
       push(h: { seq: number }) { this.pushed.push(h.seq); }
       reset() { this.resets++; }
+      dispose() { this.disposed++; }
+      setLayout(area: unknown, level: unknown) { this.layouts.push([area, level]); }
       flush() {}
     },
   };
@@ -279,6 +285,20 @@ test("Worker：关键帧不管是解码出错要的还是主线程要的，都�
   await new Promise((r) => setTimeout(r, 520));
   decoder();
   assert.equal(sent().length, 2);
+});
+
+test("Worker：显示方式交给画面；报给主线程的是画面的大小；画面不要了连最后一帧也放掉", () => {
+  const w = workerHarness();
+  w.toWorker({ t: "view", id: 1, canvas: { width: 16, height: 9, getContext: () => ({}) } });
+  const player = w.players[0];
+  w.toWorker({ t: "layout", id: 1, area: { w: 1920, h: 1080 }, enhance: "medium" });
+  assert.deepEqual(plain(player.layouts), [[{ w: 1920, h: 1080 }, "medium"]]);
+  player.options.resized(1280, 720);
+  assert.deepEqual(plain(w.posted.at(-1)!.m), { t: "size", id: 1, w: 1280, h: 720 });
+  w.toWorker({ t: "drop", id: 1 });
+  assert.equal(player.disposed, 1);
+  w.toWorker({ t: "layout", id: 1, area: null, enhance: "off" });
+  assert.equal(player.layouts.length, 1, "画面已经不在了");
 });
 
 test("Worker：发不出去的积压太多就断开", () => {
