@@ -8,6 +8,7 @@
 //! 任何一端的控制通道（0 号）结束，整个会话结束：其它通道随之断开、不再转发数据报、归还会话槽位。
 //! 两端的控制通道一直没都到的会话由 [`Broker::janitor`] 清掉。
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use airhand_proto::{Role, SessionHeader, SessionLane, datagram};
@@ -144,20 +145,32 @@ impl Broker {
     }
 
     /// 转发连接 `conn_id` 发来的数据报：开头的会话 ID 是这条连接所在的会话，就原样转给会话的另一端，否则丢掉。
-    /// 数据报本来就可能丢：另一端的发送缓冲满了、太大了，都直接丢掉
+    /// 数据报本来就可能丢：另一端的发送缓冲满了、太大了，都直接丢掉。
+    ///
+    /// 声音、画面确认、Ping 每个会话每秒几百个：这条连接自己记着它的会话的另一端（`peers`），
+    /// 不用每个数据报都拿一次全局的 `sessions` 锁。会话结束时 `ended` 变了（会话丢掉之后发送端也没了），
+    /// 记着的就作废；作废的记录在下一次查全局表时清掉
     pub(super) async fn relay_datagrams(self: Arc<Self>, conn: quinn::Connection, conn_id: u64) {
+        let mut peers: HashMap<u64, (quinn::Connection, watch::Receiver<bool>)> = HashMap::new();
+        let live = |ended: &watch::Receiver<bool>| matches!(ended.has_changed(), Ok(false));
         while let Ok(d) = conn.read_datagram().await {
             let Some(session_id) = datagram::session(&d) else {
                 continue;
             };
-            let to = self
-                .sessions
-                .lock()
-                .get(&session_id)
-                .and_then(|s| s.peer_of(conn_id))
-                .cloned();
-            if let Some(to) = to {
+            if let Some((to, ended)) = peers.get(&session_id)
+                && live(ended)
+            {
                 let _ = to.send_datagram(d);
+                continue;
+            }
+            peers.retain(|_, (_, ended)| live(ended));
+            let found = self.sessions.lock().get(&session_id).and_then(|s| {
+                let to = s.peer_of(conn_id)?.clone();
+                Some((to, s.ended.subscribe()))
+            });
+            if let Some((to, ended)) = found {
+                let _ = to.send_datagram(d);
+                peers.insert(session_id, (to, ended));
             }
         }
     }

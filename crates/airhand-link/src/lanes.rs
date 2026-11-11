@@ -283,7 +283,13 @@ impl Router {
                     Ok(d) => self.datagram(d),
                     Err(_) => break,
                 },
-                Some(Ok(Some((h, recv)))) = headers.join_next() => self.stream(h, recv),
+                // 只匹配 `Some(_)`：写成 `Some(Ok(Some(..)))` 的话，一条读不出会话头的流会让这个分支在这一轮 select
+                // 里停用，之后读好了会话头的流要等下一个数据报、下一条新流才处理
+                Some(r) = headers.join_next() => {
+                    if let Ok(Some((h, recv))) = r {
+                        self.stream(h, recv);
+                    }
+                }
             }
         }
     }
@@ -305,13 +311,43 @@ pub async fn accept_direct(conn: Connection, session_id: u64, feed: Feed) {
                 Ok(_) => {}
                 Err(_) => break,
             },
-            Some(Ok(Some((h, recv)))) = headers.join_next() => {
-                if h.session_id == session_id {
+            // 只匹配 `Some(_)`（见 Router::run）
+            Some(r) = headers.join_next() => match r {
+                Ok(Some((h, recv))) if h.session_id == session_id => {
                     feed.stream(h.lane, recv, Via::Direct);
-                } else {
-                    stop(recv);
                 }
-            }
+                Ok(Some((_, recv))) => stop(recv),
+                _ => {}
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一条读不出会话头的流（这里是读到一半被对方 reset 了）不能挡住之后的流：
+    /// 会话建立时还没有数据报，挡住了就要等到握手超时
+    #[tokio::test]
+    async fn a_broken_lane_does_not_hold_up_the_next_one() {
+        let (client, server) = crate::tests::quic_pair().await;
+        let (router, _task) = Router::start(&server);
+        let (mut inbox, _registration) = router.register(7);
+        let header = SessionHeader::new(7, SessionLane::Control).encode();
+        let mut broken = client.open_uni().await.unwrap();
+        broken.write_all(&header[..4]).await.unwrap();
+        let mut lane = client.open_uni().await.unwrap();
+        lane.write_all(&header[..8]).await.unwrap();
+        // 两条流都在等会话头的后半截；先断的那条先有结果
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        broken.reset(0u32.into()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        lane.write_all(&header[8..]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), inbox.control.recv()).await;
+        assert!(
+            matches!(got, Ok(Some((_, Via::Relay)))),
+            "the lane was held up"
+        );
     }
 }

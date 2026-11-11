@@ -23,6 +23,11 @@ const MODIFIERS = new Set(["ShiftLeft", "ShiftRight", "ControlLeft", "ControlRig
 const BUTTON_BITS: [number, MouseButton][] = [[1, "left"], [2, "right"], [4, "middle"], [8, "back"], [16, "forward"]];
 /** 被控端光标隐藏着、只是移动（没按键）时，持续这么久光标还是隐藏的才锁定（见文件开头） */
 const AUTO_LOCK_AFTER_MS = 300;
+/**
+ * 鼠标移动（不急的输入）两批之间至少隔这么久（毫秒）。前沿节流：离上一批已经超过这么久就马上发（同一个任务里的一起发），
+ * 否则等到那个时候再发合并好的。指针事件的频率不超过 1000 / MOVE_INTERVAL_MS 时每一下都不用等
+ */
+const MOVE_INTERVAL_MS = 8;
 
 /** 手动锁定 / 解锁鼠标的快捷键：Ctrl+Alt+Shift+M */
 export function isLockShortcut(e: KeyboardEvent): boolean {
@@ -39,6 +44,8 @@ export class RemoteInput {
   private queue: InputEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
   private scheduled = false;
+  /** 上一批发出去的时刻（performance.now()） */
+  private lastSent = -Infinity;
   private generation = 0;
   private wheel = { x: 0, y: 0 };
   private pressed = new Set<string>();
@@ -130,19 +137,25 @@ export class RemoteInput {
       // Bound even a synchronous sendText loop. Keyboard edges stay ordered.
       if (this.queue.length >= 64) this.flush();
     }
+    // 已经约好在这个任务结束时发了：一起发
+    if (this.scheduled || this.queue.length === 0) return;
     const gen = this.generation;
-    if (urgent && !this.scheduled) {
+    const wait = urgent ? 0 : this.lastSent + MOVE_INTERVAL_MS - performance.now();
+    if (wait <= 0) {
       this.scheduled = true;
       queueMicrotask(() => { if (gen === this.generation) this.flush(); });
-    } else if (!urgent && this.timer === undefined) {
-      this.timer = setTimeout(() => { if (gen === this.generation) this.flush(); }, 8);
+    } else if (this.timer === undefined) {
+      this.timer = setTimeout(() => { if (gen === this.generation) this.flush(); }, wait);
     }
   }
   private flush() {
     this.scheduled = false;
     clearTimeout(this.timer); this.timer = undefined;
     const batch = this.queue; this.queue = [];
-    if (batch.length && this.connected()) this.send(batch);
+    if (batch.length && this.connected()) {
+      this.lastSent = performance.now();
+      this.send(batch);
+    }
   }
 
   // ───────────────────────── 相对移动 / 锁定 ─────────────────────────

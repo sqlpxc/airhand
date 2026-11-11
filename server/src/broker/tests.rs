@@ -1278,6 +1278,13 @@ async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
         !broker.sessions.lock().contains_key(&sid)
     })
     .await;
+    // 两端的转发任务都记着这个会话的另一端（见 relay_datagrams）：会话结束之后照样不转
+    host.conn.send_datagram(dgram(sid, b"late")).unwrap();
+    ctrl.conn.send_datagram(dgram(sid, b"late")).unwrap();
+    for conn in [&host.conn, &ctrl.conn] {
+        let late = timeout(Duration::from_millis(300), conn.read_datagram()).await;
+        assert!(late.is_err(), "relayed a datagram after the session ended");
+    }
 }
 
 /// 被控端（airhand-link 的 HostStreams）的声音包走数据报，经服务器转发，控制端服务交给界面

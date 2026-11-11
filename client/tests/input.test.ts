@@ -42,6 +42,27 @@ test("mouse moves coalesce, ordered key edges stay in bounded batches", async ()
   input.dispose();
 });
 
+test("鼠标移动前沿节流：闲着之后的第一下马上发，紧跟着的合并到间隔到了再发", async () => {
+  const batches: any[][] = [];
+  const input = new RemoteInput({ addEventListener() {} } as any, () => true, events => batches.push(events));
+  input.enqueue([{ type: "mouseMove", x: 0.1, y: 0 }], false);
+  await Promise.resolve();
+  assert.deepEqual(batches, [[{ type: "mouseMove", x: 0.1, y: 0 }]]);
+  // 刚发过：等到间隔到了，只发最后一个位置
+  input.enqueue([{ type: "mouseMove", x: 0.2, y: 0 }], false);
+  input.enqueue([{ type: "mouseMove", x: 0.3, y: 0 }], false);
+  await Promise.resolve();
+  assert.equal(batches.length, 1);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(batches, [[{ type: "mouseMove", x: 0.1, y: 0 }], [{ type: "mouseMove", x: 0.3, y: 0 }]]);
+  // 点击不等：和排着的移动一起马上发
+  input.enqueue([{ type: "mouseMove", x: 0.4, y: 0 }], false);
+  input.enqueue([{ type: "mouseButton", button: "left", down: true }], true);
+  await Promise.resolve();
+  assert.deepEqual(batches[2], [{ type: "mouseMove", x: 0.4, y: 0 }, { type: "mouseButton", button: "left", down: true }]);
+  input.dispose();
+});
+
 test("相对移动加起来，不越过点击", async () => {
   const batches: any[][] = [];
   const input = new RemoteInput({ addEventListener() {} } as any, () => true, events => batches.push(events));
