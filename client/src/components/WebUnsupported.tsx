@@ -1,6 +1,7 @@
 // 网页版用不了时的说明页。
 //
-// 浏览器只在安全的页面（HTTPS 或 localhost）上提供 WebCodecs、AudioWorklet、剪贴板这些功能。
+// 浏览器只在安全的页面（HTTPS 或 localhost）上提供 WebCodecs、AudioWorklet、剪贴板这些功能；
+// 画面在 Worker 里解码、绘制，还要 OffscreenCanvas。
 // airhand-web 在同一个端口上同时支持 HTTP 和 HTTPS，所以只要把地址换成 https:// 就行。
 import { api } from "../lib/api";
 import { useT } from "../lib/i18n";
@@ -12,7 +13,7 @@ export type Unsupported = "insecure" | "noWebCodecs";
 export function webUnsupported(): Unsupported | null {
   if (api.kind !== "web") return null;
   if (!window.isSecureContext) return "insecure";
-  if (typeof VideoDecoder === "undefined") return "noWebCodecs";
+  if (typeof VideoDecoder === "undefined" || typeof OffscreenCanvas === "undefined") return "noWebCodecs";
   return null;
 }
 

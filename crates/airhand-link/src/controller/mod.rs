@@ -116,7 +116,7 @@ pub enum Frontend {
 pub type HostOnline = Arc<dyn Fn(u32) + Send + Sync>;
 
 /// 界面对一个会话的操作。JSON：`{"cmd": "input", "sid": 1, "events": [{"type": "releaseAll"}]}`，三种界面一样
-/// （桌面版经 Tauri 的 `ctrl` 命令，网页版经 WebSocket，Android 经 JNI）。
+/// （桌面版和网页版经 WebSocket，见 [`crate::console`]；Android 经 JNI）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Command {

@@ -8,6 +8,7 @@
 //! * [`direct`]：中转之外两端之间的直连（打洞、TLS 只认对方的证书指纹、画面走哪条路）；
 //! * [`controller`]：控制端服务与会话。与界面无关：界面的命令是 [`controller::Command`]，
 //!   画面和事件交给 [`controller::SessionUi`]；
+//! * [`console`]（feature `console`）：控制台和控制端服务之间的 WebSocket 协议，桌面版和网页版共用；
 //! * [`host`]：被控端与服务器的连接和会话（协议层的事在这里，采集、编码、注入输入由各平台实现 [`host::Platform`]）；
 //! * [`flow`]：被控端的在途控制（按字节）和码率控制（按排队时延和带宽估计）；
 //! * [`Problem`]：显示给用户的问题，以类型而不是文字的形式传给界面。
@@ -21,6 +22,8 @@
 
 #[cfg(feature = "client")]
 mod clock;
+#[cfg(feature = "console")]
+pub mod console;
 #[cfg(feature = "client")]
 pub mod controller;
 #[cfg(feature = "client")]

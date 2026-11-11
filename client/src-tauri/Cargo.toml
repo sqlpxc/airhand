@@ -18,12 +18,15 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 airhand-proto = { path = "../../crates/airhand-proto" }
-# 与中转服务器的连接、控制端会话（与网页控制台共用）
-airhand-link = { path = "../../crates/airhand-link" }
+# 与中转服务器的连接、控制端会话，控制台的 WebSocket 协议（与网页控制台共用）
+airhand-link = { path = "../../crates/airhand-link", features = ["console"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+# 控制台窗口连本机的 WebSocket（只监听 127.0.0.1，见 src/console.rs）
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # config.toml：修改时保留用户的注释和格式
 toml_edit = "0.25"
 base64 = "0.23"

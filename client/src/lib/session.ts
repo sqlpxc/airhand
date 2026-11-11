@@ -1,15 +1,15 @@
-// 远程会话：WebCodecs 硬件解码 + Canvas 渲染 + 输入采集 + 光标同步 + 自动重连。
+// 远程会话：输入采集 + 光标同步 + 自动重连；画面和声音在控制台的 Worker 里解码、绘制（见 console.ts）。
 //
 // 性能要点：
-// * 画面是被控端打好的媒体包，原样传到这里（桌面版是 Tauri Channel，网页版是 WebSocket，零 JSON），
-//   读一下头就把码流切片交给 VideoDecoder（见 media.ts）；
+// * 画面是被控端打好的媒体包，经 WebSocket 原样进到 Worker（桌面版和网页版一样，零 JSON），
+//   读一下头就把码流切片交给 VideoDecoder，画到 OffscreenCanvas 上：主线程忙的时候也不耽误；
 // * 被控端的光标隐藏时（游戏里转视角等）鼠标改发相对移动并锁定本机指针（见 input.ts）；
 // * 解码器 optimizeForLatency，帧解码后立即绘制到 desynchronized Canvas，不排队等 vsync；
 // * 鼠标移动按 8ms 合并，按键/点击立即发送；
 // * 不可见的会话自动降到 5fps，节省带宽与对端 CPU；
 // * 画面只缩放一次：按画面在窗口里显示的大小请求分辨率，收到后按 1:1 显示（见 fit.ts）；
 // * 只有当前正在查看的会话播放声音，其余会话通知被控端停止采集声音；
-// * 音画同步（可选）：按采集时间把画面推迟到与声音对齐后再解码显示，见 avsync.ts。
+// * 音画同步（可选）：按采集时间把画面推迟到与声音对齐后再解码显示，见 avsync.ts（也在 Worker 里）。
 import {
   api,
   toProblem,
@@ -25,13 +25,12 @@ import {
   type SystemAction,
 } from "./api";
 import * as media from "./media";
-import { AudioPlayer } from "./audio";
+import { AudioOutput } from "./audio";
 import { ConnectionAttempt } from "./connection-attempt";
 import { RemoteInput } from "./input";
-import { AvSync, type AvSyncStats } from "./avsync";
+import type { AvSyncStats } from "./avsync";
 import { bestCodec, codecUsable } from "./codec";
-import { VideoPlayer } from "./video";
-import { t } from "./i18n";
+import type { MediaView } from "./console";
 import { RECOVERS, type SessionNotice } from "./messages";
 import { CODEC_LABEL } from "./presets";
 import { store } from "./store";
@@ -75,7 +74,7 @@ const NO_SERVER_RETRY_MS = 5_000;
  * 端到端握手的问题要用户决定：对方的身份变了（信任新的身份？）、要配对码、版本不兼容
  */
 const GIVE_UP = new Set<Problem["kind"]>([
-  "codeNotFound", "rateLimited", "invalidCode", "notController", "kicked",
+  "codeNotFound", "rateLimited", "invalidCode", "kicked",
   "hostKeyChanged", "pairingRequired", "pairingFailed", "pairingUnavailable", "peerIncompatible",
 ]);
 /** 与服务器（网页版还有控制端服务）的连接断了：等重新连上再试，不计入重试次数 */
@@ -131,7 +130,13 @@ export class RemoteSession {
   version = 0;
   private listeners = new Set<() => void>();
 
-  private readonly video: VideoPlayer;
+  /** 画面和声音（在 Worker 里） */
+  private readonly view: MediaView;
+  /** 画面的大小（像素） */
+  private frame = { w: 16, h: 9 };
+  /** Worker 最近报告的平均解码耗时、音画同步状态（随下一次 stats 事件显示） */
+  private decodeMs = 0;
+  private videoSync: AvSyncStats = { skewMs: null, videoDelayMs: 0, extraMs: 0 };
   private readonly attempt = new ConnectionAttempt();
   private disposed = false;
   private retryTimer: number | undefined;
@@ -149,16 +154,14 @@ export class RemoteSession {
   private attemptAt = 0;
   private onlineAt = -1;
 
-  private lastKeyReq = 0;
 
-  // 声音
-  readonly audio = new AudioPlayer();
-  private readonly sync = new AvSync();
-  /** 最近一次画出的帧的采集时间（被控端时钟，微秒），调试用 */
-  get lastDrawnHostUs() { return this.video.lastDrawnHostUs; }
+  // 声音：解码在 Worker 里，解出来的直接交给音频线程
+  readonly audio = new AudioOutput((port) => this.view.setAudio(port));
   private foreground = false;
   /** 当前是否已让被控端发送声音 */
   private audioOn = false;
+  /** 音画同步是否生效 */
+  private syncOn = false;
 
   // 布局
   private hostEl: HTMLElement | null = null;
@@ -206,17 +209,21 @@ export class RemoteSession {
     this.canvas = document.createElement("canvas");
     this.canvas.className = "remote-canvas";
     this.canvas.tabIndex = 0;
-    this.canvas.width = 16;
-    this.canvas.height = 9;
-    const ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true });
-    if (!ctx) throw new Error(t("error.canvas"));
-    this.video = new VideoPlayer({
-      canvas: this.canvas, ctx, sync: this.sync,
-      requestKeyframe: () => this.requestKeyframe(),
-      unsupported: (codec) => this.onUndecodable(codec),
-      resized: () => this.layout(),
+    this.canvas.width = this.frame.w;
+    this.canvas.height = this.frame.h;
+    this.view = api.view(this.canvas, {
+      size: (w, h) => {
+        this.frame = { w, h };
+        this.layout();
+      },
+      cursor: (pkt) => this.onCursor(pkt),
+      undecodable: (codec) => this.onUndecodable(codec),
       recovered: () => {
         if (this.notice?.kind === "h264Undecodable") { this.notice = null; this.emit(); }
+      },
+      stats: (decodeMs, sync) => {
+        this.decodeMs = decodeMs;
+        this.videoSync = sync;
       },
     });
     this.input = new RemoteInput(this.canvas, () => this.sid !== null && !this.disposed, (events) => {
@@ -227,11 +234,7 @@ export class RemoteSession {
       this.applyCursor();
       this.emit();
     };
-    this.audio.onClock = (hostUs, localMs, appliedMs) => {
-      this.sync.onAudioClock(hostUs, localMs, appliedMs);
-      const extra = this.sync.update(performance.now());
-      if (extra !== null) this.audio.setExtraDelay(extra);
-    };
+    this.audio.onClock = (hostUs, localMs, appliedMs) => this.view.audioClock(hostUs, localMs, appliedMs);
     this.audio.onUnsupported = () => {
       this.notice = { kind: "noOpus" };
       this.emit();
@@ -256,18 +259,10 @@ export class RemoteSession {
   /** 建立连接。首次连接失败会抛出错误。 */
   async start(): Promise<void> {
     const gen = this.attempt.begin();
-    // 重连后旧连接的数据可能还会到达，按 gen 丢掉
-    const sink = {
-      packet: (data: Uint8Array) => {
-        if (this.attempt.accepts(gen)) this.onBinary(data);
-      },
-      event: (ev: SessionEvent) => {
-        if (this.attempt.accepts(gen)) this.onEvent(ev);
-      },
+    // 重连后旧连接的事件可能还会到达，按 gen 丢掉（画面、声音由 Worker 按连接分开：新的连接从头开始）
+    const onEvent = (ev: SessionEvent) => {
+      if (this.attempt.accepts(gen)) this.onEvent(ev);
     };
-    this.video.reset();
-    this.audio.reset();
-    this.sync.reset();
     // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
     this.cursorSlots.clear();
     // 在连接之前清掉旧提示：被控端紧跟在 Hello 后面发的提示可能比 connect 的返回值先到
@@ -282,7 +277,8 @@ export class RemoteSession {
       info = await api.connect(
         this.code,
         { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing, settings: sent, audio },
-        sink,
+        this.view,
+        onEvent,
         this.clipboardSync,
       );
     } catch (e) {
@@ -442,7 +438,7 @@ export class RemoteSession {
     this.attempt.invalidate();
     clearTimeout(this.retryTimer);
     this.input.dispose();
-    this.video.reset();
+    this.view.dispose();
     clearTimeout(this.viewLimitTimer);
     if (this.sid !== null) this.command({ cmd: "disconnect", sid: this.sid });
     this.sid = null;
@@ -484,10 +480,10 @@ export class RemoteSession {
           rttMs: ev.rttMs,
           width: ev.width,
           height: ev.height,
-          decodeMs: this.video.decodeAvg,
+          decodeMs: this.decodeMs,
           direct: ev.direct,
         };
-        this.syncStats = this.sync.stats();
+        this.syncStats = this.videoSync;
         break;
       case "encoder":
         this.encoder = { codec: ev.codec, name: ev.name, hardware: ev.hardware, width: ev.width, height: ev.height };
@@ -518,7 +514,6 @@ export class RemoteSession {
         this.attempt.invalidate();
         clearTimeout(this.retryTimer);
         this.input.reset();
-        this.video.reset();
         if (ev.retry) {
           this.scheduleRetry(ev.reason);
         } else {
@@ -537,37 +532,7 @@ export class RemoteSession {
     this.emit();
   }
 
-  /** 一个媒体包（可能是更大的缓冲区中的一段：网页版前面还有 4 字节的 ch） */
-  private onBinary(pkt: Uint8Array) {
-    const dv = new DataView(pkt.buffer, pkt.byteOffset, pkt.byteLength);
-    // 负载从头里写的长度处开始（以后的版本可能把头加长）
-    const data = media.payload(pkt, dv);
-    switch (media.kind(dv)) {
-      case media.VIDEO: {
-        // 编码格式不认识就丢掉（确认在后端收到时已经发了，见 backend/）
-        const h = media.videoHeader(dv);
-        if (h) this.video.push(h, data);
-        break;
-      }
-      case media.CURSOR:
-        this.onCursor(media.cursorHeader(dv), data);
-        break;
-      case media.AUDIO: {
-        const a = media.audioHeader(dv);
-        this.audio.push(a.start, a.captureUs, data);
-        break;
-      }
-    }
-  }
-
   // ───────────────────────── 解码 ─────────────────────────
-
-  private requestKeyframe() {
-    const now = performance.now();
-    if (this.sid === null || now - this.lastKeyReq < 500) return;
-    this.lastKeyReq = now;
-    this.command({ cmd: "keyframe", sid: this.sid });
-  }
 
   /** 对会话的操作（失败了也没关系：会话断了会另外收到 closed） */
   private command(c: Command) {
@@ -576,12 +541,13 @@ export class RemoteSession {
 
   /** 音画同步当前是否生效（开关打开且正在播放声音） */
   get syncActive(): boolean {
-    return this.sync.enabled;
+    return this.syncOn;
   }
 
   /**
    * 本机实际无法解码这种格式（探测时说支持，但一帧也解不出来）：
    * H.264 改用 AVC 格式重试；其它格式从可用列表里去掉，并让被控端按优先级改用下一个能用的格式。
+   * 关键帧 Worker 已经要了。
    */
   private onUndecodable(codec: Codec) {
     if (codec === "h264") {
@@ -599,12 +565,16 @@ export class RemoteSession {
     } else {
       console.warn(`can't decode ${codec} here`);
     }
-    this.requestKeyframe();
   }
 
   // ───────────────────────── 光标 ─────────────────────────
 
-  private onCursor(c: media.CursorHeader, rgba: Uint8Array) {
+  /** 光标包（可能是更大的缓冲区中的一段：前面还有 4 字节的 ch） */
+  private onCursor(pkt: Uint8Array) {
+    const dv = new DataView(pkt.buffer, pkt.byteOffset, pkt.byteLength);
+    const c = media.cursorHeader(dv);
+    // 负载从头里写的长度处开始（以后的版本可能把头加长）
+    const rgba = media.payload(pkt, dv);
     this.cursorVisible = c.visible;
     const s = c.shape;
     if (s && s.width > 0 && s.height > 0 && rgba.byteLength >= s.width * s.height * 4) {
@@ -640,8 +610,8 @@ export class RemoteSession {
       return;
     }
     const display = this.displays[this.currentDisplay];
-    const srcWidth = display?.width || this.canvas.width;
-    const cssWidth = this.canvas.getBoundingClientRect().width || this.canvas.width;
+    const srcWidth = display?.width || this.frame.w;
+    const cssWidth = this.canvas.getBoundingClientRect().width || this.frame.w;
     // 远端物理像素 → 本地 CSS 像素；限制在 Chromium 支持的 128px 以内
     let scale = cssWidth / srcWidth;
     scale = Math.min(Math.max(scale, 0.35), 2, 128 / Math.max(c.w, c.h));
@@ -699,8 +669,7 @@ export class RemoteSession {
   private layout() {
     const host = this.hostEl;
     if (!host) return;
-    const fw = this.canvas.width;
-    const fh = this.canvas.height;
+    const { w: fw, h: fh } = this.frame;
     const dpr = devicePixelRatio || 1;
     const r = host.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) this.viewport = { w: Math.floor(r.width * dpr), h: Math.floor(r.height * dpr) };
@@ -760,7 +729,7 @@ export class RemoteSession {
     if (this.visible === v) return;
     this.visible = v;
     this.pushSettings();
-    if (v) this.requestKeyframe();
+    if (v) this.view.requestKeyframe();
   }
 
   /** 是否为当前正在查看的会话（只有它播放声音） */
@@ -785,11 +754,8 @@ export class RemoteSession {
 
   /** 同步只在开关打开且正在播放声音时生效；不生效时排队的画面立即显示，声音也不再为画面额外等待 */
   private applySyncState() {
-    this.sync.enabled = this.avSync && this.audioOn;
-    if (!this.sync.enabled) this.video.flush();
-    const extra = this.sync.update(performance.now());
-    if (extra !== null) this.audio.setExtraDelay(extra);
-    this.syncStats = this.sync.stats();
+    this.syncOn = this.avSync && this.audioOn;
+    this.view.setSync(this.syncOn);
   }
 
   private syncAudio() {

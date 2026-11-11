@@ -9,7 +9,7 @@ license = "MIT"
 [workspace]
 
 [dependencies]
-airhand-link = { path = "../crates/airhand-link" }
+airhand-link = { path = "../crates/airhand-link", features = ["console"] }
 airhand-proto = { path = "../crates/airhand-proto" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }

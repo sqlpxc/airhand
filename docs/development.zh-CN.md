@@ -59,7 +59,7 @@ cargo test --lib e2e_reconnect -- --ignored --nocapture   # 服务器重启后�
 # client/：直接进入控制端的调试构建；AIRHAND_LOG 控制日志级别
 AIRHAND_DEV_CONTROLLER=1 AIRHAND_LOG=debug npm run tauri dev
 # client/：音画同步实测（被控端播放闪白 + 短音，用法见脚本开头）
-node scripts/measure-avsync.mjs <控制码>
+node scripts/measure-avsync.mjs <控制码> [配对码]
 
 # client/src-tauri/：无界面被控端，用来在同一台机器上调试控制端
 #（请在控制端静音，否则播放出的声音会被再次采集，形成回声）
@@ -92,7 +92,7 @@ cd web && cargo run
 # 修改界面时：在 client/ 里 npm run dev，浏览器打开 http://localhost:1420（/ws 会转给 8080 端口上的 airhand-web）
 ```
 
-`web/src/console.rs` 开头写了浏览器和服务之间的 WebSocket 协议。
+`crates/airhand-link/src/console.rs` 开头写了控制台和控制端服务之间的 WebSocket 协议（桌面版和浏览器一样）。
 
 ## Linux / WSL
 

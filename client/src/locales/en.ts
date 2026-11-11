@@ -229,7 +229,6 @@ const en: Record<MsgKey, Msg> = {
   "notice.noOpus": "This computer can't decode Opus, so remote sound can't be played",
   "notice.androidNoInput":
     "Remote control (Airhand's accessibility service) is off on the remote phone, so you can watch but not control it. The phone's owner can turn it on in Airhand → Share screen",
-  "error.canvas": "Couldn't create the canvas",
 
   "web.insecure.title": "Open this page over HTTPS",
   "web.insecure.body":
@@ -270,11 +269,10 @@ const en: Record<MsgKey, Msg> = {
   "problem.declined": "The remote user declined the connection",
   "problem.unanswered": "The remote user didn't answer the connection request",
   "problem.sessionEnded": "Session ended",
-  "problem.notController": "Not in controller mode",
   "problem.noSession": "Session not found",
   "problem.noClipboardText": "No text on the local clipboard",
   "problem.failed": "Error: {detail}",
-  "problem.consoleLost": "Lost connection to the Airhand web service",
+  "problem.consoleLost": "Lost connection to the Airhand controller service",
   "problem.clipboardBlocked":
     "The browser didn't allow reading the clipboard. Allow clipboard access in the site settings (address bar)",
 };

@@ -79,7 +79,7 @@ impl Feedback {
     }
 }
 
-/// 会话的画面和事件交给谁：桌面版是 Tauri 的 Channel，网页版是浏览器的 WebSocket，Android 是 Kotlin 取的队列。
+/// 会话的画面和事件交给谁：桌面版和网页版是控制台的 WebSocket（[`crate::console`]），Android 是 Kotlin 取的队列。
 ///
 /// 返回 `Err` 表示界面已经不在了（窗口关了、浏览器断开了），会话随之结束。
 pub trait SessionUi: Send + Sync + 'static {

@@ -49,7 +49,6 @@ object Messages {
         "declined" -> R.string.problem_declined
         "unanswered" -> R.string.problem_unanswered
         "sessionEnded" -> R.string.problem_session_ended
-        "notController" -> R.string.problem_not_controller
         "noSession" -> R.string.problem_no_session
         "noClipboardText" -> R.string.problem_no_clipboard_text
         "failed" -> R.string.problem_failed

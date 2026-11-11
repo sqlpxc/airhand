@@ -1,17 +1,12 @@
-// 远程声音：WebCodecs 解码 Opus → AudioWorklet 抖动缓冲 → 扬声器。
+// 远程声音的输出：Worker 解码 Opus（audio-decoder.ts）→ AudioWorklet 抖动缓冲（audio-worklet.ts）→ 扬声器。
 //
 // * 所有会话共用一个 AudioContext，每个正在播放的会话一个 AudioWorkletNode；
-// * 解码后的 PCM 以 Transferable 方式交给音频线程，主线程不做任何混音；
-// * 音频线程定期报告"正在播放的是被控端哪一刻的声音"，换算成本地时间后交给音画同步。
-import type { PlayerMessage, WorkletMessage } from "./audio-worklet";
+// * 解码后的 PCM 由 Worker 经 MessageChannel 直接交给音频线程，主线程不经手；
+// * 音频线程定期报告"正在播放的是被控端哪一刻的声音"，这里换算成本地时间后交给音画同步（在 Worker 里）。
+import type { ControlMessage, WorkletMessage } from "./audio-worklet";
 import workletUrl from "./audio-worklet?worker&url";
+import { CHANNELS, OPUS, SAMPLE_RATE } from "./audio-decoder";
 import type { JitterStats } from "./jitter";
-
-/** 与 airhand_proto::session::AUDIO_* 一致 */
-const SAMPLE_RATE = 48000;
-const CHANNELS = 2;
-const FRAME_SAMPLES = 960;
-const CONFIG: AudioDecoderConfig = { codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS };
 
 let shared: { ctx: AudioContext; ready: Promise<void> } | null = null;
 
@@ -42,7 +37,7 @@ export function opusSupported(): Promise<boolean> {
   support ??= (async () => {
     if (typeof AudioDecoder === "undefined") return false;
     try {
-      return (await AudioDecoder.isConfigSupported(CONFIG)).supported === true;
+      return (await AudioDecoder.isConfigSupported(OPUS)).supported === true;
     } catch {
       return false;
     }
@@ -50,7 +45,7 @@ export function opusSupported(): Promise<boolean> {
   return support;
 }
 
-export class AudioPlayer {
+export class AudioOutput {
   /** 最近一次统计（约每秒更新） */
   stats: JitterStats | null = null;
   onUnsupported: (() => void) | null = null;
@@ -61,13 +56,12 @@ export class AudioPlayer {
   private gen = 0;
   private node: AudioWorkletNode | null = null;
   private ctx: AudioContext | null = null;
-  private decoder: AudioDecoder | null = null;
-  private extraMs = 0;
-  /**
-   * 已送去解码、还没出结果的包（按顺序一一对应）。不用解码输出的时间戳：
-   * 浏览器可能按采样数自己推算输出时间戳，跳过静音段之后就对不上了。
-   */
-  private inflight: { hostUs: number; start: boolean }[] = [];
+  /** 把解码那边（Worker）接到音频线程的端口上；null = 停止播放 */
+  private readonly attach: (port: MessagePort | null) => void;
+
+  constructor(attach: (port: MessagePort | null) => void) {
+    this.attach = attach;
+  }
 
   enable() {
     if (this.enabled) return;
@@ -96,7 +90,9 @@ export class AudioPlayer {
       node.connect(ctx.destination);
       this.node = node;
       this.ctx = ctx;
-      if (this.extraMs > 0) this.post({ type: "extra", ms: this.extraMs });
+      const pipe = new MessageChannel();
+      this.post({ type: "port", port: pipe.port2 }, [pipe.port2]);
+      this.attach(pipe.port1);
     })();
   }
 
@@ -104,42 +100,13 @@ export class AudioPlayer {
     if (!this.enabled) return;
     this.enabled = false;
     this.gen++;
-    this.closeDecoder();
     if (this.node) {
+      this.attach(null);
       this.post({ type: "close" });
       this.node.disconnect();
       this.node = null;
     }
     this.stats = null;
-  }
-
-  /** 新的会话流：解码器与缓冲都从头开始 */
-  reset() {
-    this.closeDecoder();
-    this.post({ type: "reset" });
-  }
-
-  /** 音画同步：让声音额外缓冲（画面比声音慢时等画面） */
-  setExtraDelay(ms: number) {
-    this.extraMs = ms;
-    this.post({ type: "extra", ms });
-  }
-
-  push(start: boolean, hostUs: number, data: Uint8Array) {
-    if (!this.node) return;
-    if (!this.decoder || this.decoder.state === "closed") this.openDecoder();
-    const dec = this.decoder!;
-    if (dec.decodeQueueSize > 25) {
-      // 解码跟不上（几乎不会发生）：丢掉积压，重新开始
-      this.closeDecoder();
-      return;
-    }
-    this.inflight.push({ hostUs, start });
-    try {
-      dec.decode(new EncodedAudioChunk({ type: "key", timestamp: hostUs, data }));
-    } catch {
-      this.closeDecoder();
-    }
   }
 
   private onWorklet(m: WorkletMessage) {
@@ -153,47 +120,7 @@ export class AudioPlayer {
     }
   }
 
-  private post(m: PlayerMessage, transfer: Transferable[] = []) {
+  private post(m: ControlMessage, transfer: Transferable[] = []) {
     this.node?.port.postMessage(m, transfer);
-  }
-
-  private openDecoder() {
-    const decoder = new AudioDecoder({
-      output: (d) => this.output(d),
-      error: (e) => {
-        console.warn("audio decoder error", e);
-        if (this.decoder === decoder) {
-          this.decoder = null;
-          this.inflight = [];
-        }
-      },
-    });
-    decoder.configure(CONFIG);
-    this.decoder = decoder;
-  }
-
-  private closeDecoder() {
-    if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
-    this.decoder = null;
-    this.inflight = [];
-  }
-
-  private output(d: AudioData) {
-    const info = this.inflight.shift();
-    if (!this.node || !info) {
-      d.close();
-      return;
-    }
-    const n = d.numberOfFrames;
-    const planes: Float32Array[] = [];
-    for (let c = 0; c < Math.min(d.numberOfChannels, CHANNELS); c++) {
-      const p = new Float32Array(n);
-      d.copyTo(p, { planeIndex: c, format: "f32-planar" });
-      planes.push(p);
-    }
-    d.close();
-    // 解码器刚创建时会丢掉开头的编码器前瞻（输出比一包短）：丢的是包的前面部分
-    const hostUs = info.hostUs + (Math.max(0, FRAME_SAMPLES - n) / SAMPLE_RATE) * 1e6;
-    this.post({ type: "pcm", planes, start: info.start, hostUs }, planes.map((p) => p.buffer));
   }
 }

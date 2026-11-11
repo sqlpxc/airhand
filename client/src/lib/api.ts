@@ -1,8 +1,9 @@
 // 与 Rust 端的命令 / 数据结构一一对应。
 //
-// 控制台有两种运行方式，界面完全相同，只是和控制端服务（crates/airhand-link）之间的通道不同（见 Backend）：
-// * 桌面版：Tauri 窗口，命令走 invoke，媒体包走 Channel（backend/tauri.ts）；
-// * 网页版：浏览器打开 airhand-web（web/）的端口，都走一条 WebSocket（backend/web.ts）。
+// 控制台有两种运行方式，界面完全相同（见 Backend）。会话都走同一种 WebSocket（console.ts，协议见
+// crates/airhand-link/src/console.rs），只是连的地方不同：
+// * 桌面版：Tauri 窗口，连本程序只监听 127.0.0.1 的服务；窗口、我的设备这些走 invoke（backend/tauri.ts）；
+// * 网页版：浏览器打开 airhand-web（web/）的端口，连它的 `/ws`（backend/web.ts）。
 //
 // 对会话的操作是 Command（与 Rust 的 airhand_link::controller::Command 相同，Android 也一样），
 // 画面 / 光标 / 声音是媒体包（见 media.ts）。样例见 crates/airhand-link/tests/protocol.json。
@@ -12,6 +13,7 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { tauriBackend } from "./backend/tauri";
 import { webBackend } from "./backend/web";
+import type { MediaView, ViewOutput } from "./console";
 import type { Lang } from "./i18n";
 
 export type Codec = "h264" | "h265" | "av1";
@@ -84,12 +86,11 @@ export type Problem =
   | { kind: "unanswered" }
   | { kind: "sessionEnded" }
   // 其它
-  | { kind: "notController" }
   | { kind: "noSession" }
   | { kind: "noClipboardText" }
   | { kind: "failed"; detail: string }
-  // 只在网页版的浏览器里产生（Rust 端没有）
-  /** 与 airhand-web 服务的连接断了 */
+  // 只在控制台里产生（Rust 端没有）
+  /** 与控制端服务（桌面版：本程序；网页版：airhand-web）的连接断了 */
   | { kind: "consoleLost" }
   /** 浏览器不允许读取剪贴板 */
   | { kind: "clipboardBlocked" };
@@ -258,18 +259,11 @@ export type Command =
   | { cmd: "clipboard"; sid: number; text: string }
   /** 打开 / 关闭剪贴板同步 */
   | { cmd: "clipboardSync"; sid: number; enabled: boolean }
-  /** 收到了第 seq 帧画面（累积确认；由 Backend 自己发） */
+  /** 收到了第 seq 帧画面（累积确认；控制台的 Worker 收到画面时自己发，走二进制，见 ack.ts） */
   | { cmd: "ack"; sid: number; seq: number }
   | { cmd: "disconnect"; sid: number };
 
-/** 会话的输出 */
-export interface SessionSink {
-  /** 媒体包：画面 / 光标 / 声音（头 + 数据，见 media.ts） */
-  packet(data: Uint8Array): void;
-  event(ev: SessionEvent): void;
-}
-
-/** 控制台与控制端服务之间的通道 */
+/** 控制台与控制端服务之间的通道。会话的部分两种运行方式共用（console.ts 的 ConsoleLink） */
 export interface Backend {
   /** desktop = 桌面版（Tauri 窗口）；web = 网页版（浏览器） */
   readonly kind: "desktop" | "web";
@@ -277,11 +271,22 @@ export interface Backend {
   serverStatus(): Promise<ServerState>;
   /** 返回取消订阅的函数 */
   onServerStatus(cb: (s: ServerState) => void): () => void;
-  /** `opts`：重连凭证、记下的对方公钥、配对码、开始时的画质和声音（见 ConnectOptions） */
-  connect(code: string, opts: ConnectOptions, sink: SessionSink, clipboard: boolean): Promise<SessionInfo>;
+  /** 会话的画面：canvas 交给 Worker 绘制（之后主线程不能再画它），`out` 收它的消息 */
+  view(canvas: HTMLCanvasElement, out: ViewOutput): MediaView;
+  /**
+   * 连接。`opts`：重连凭证、记下的对方公钥、配对码、开始时的画质和声音（见 ConnectOptions）；
+   * `view`：画面和声音交给它；`onEvent`：会话事件；`clipboard`：开始时是否同步剪贴板
+   */
+  connect(
+    code: string,
+    opts: ConnectOptions,
+    view: MediaView,
+    onEvent: (ev: SessionEvent) => void,
+    clipboard: boolean,
+  ): Promise<SessionInfo>;
   /** 在等的被控端（connect 返回过 hostOffline）重新上线了，参数是控制码（数字）。返回取消订阅的函数 */
   onHostOnline(cb: (code: number) => void): () => void;
-  /** 对会话的操作（画面的确认由 Backend 在收到画面时自己发） */
+  /** 对会话的操作（画面的确认由 Worker 在收到画面时自己发） */
   command(c: Command): Promise<void>;
   /** 读取本机剪贴板文本（用于"作为按键输入"） */
   localClipboardText(): Promise<string>;

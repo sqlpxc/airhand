@@ -21,8 +21,8 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
     fitSize, stricter, viewMaxShort, media,
     toProblem: (e: any) => e,
     api: {
-      connect: (c: any, o: any, output: any) => {
-        sink = output;
+      connect: (c: any, o: any, _view: any, onEvent: any) => {
+        sink = onEvent;
         return connect ? connect(c, o.resume, o) : new Promise(res => { resolve = res; });
       },
       command: async (c: any) => { calls.push(c.cmd === "settings" ? [c.cmd, c.sid, c.settings] : [c.cmd, c.sid]); },
@@ -35,12 +35,12 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   Object.assign(session, {
     attempt: new ConnectionAttempt(), disposed: false, sid: null, state: "connecting", settings: {}, visible: true,
     viewLimit: 0, viewLimitAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
-    video: { reset() {} }, audio: { reset() {} }, sync: { reset() {} }, input: { reset() {} },
+    view: { setSync() {}, setAudio() {}, dispose() {} }, frame: { w: 16, h: 9 }, input: { reset() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
     onlineAt: -1, attemptAt: 0, retries: 0,
     emit() {}, syncAudio() {}, applySyncState() {}, onConnected() { calls.push("connected"); },
   });
-  return { session, calls, timers, event: (ev: any) => sink.event(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
+  return { session, calls, timers, event: (ev: any) => sink(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
 }
 
 test("文字分块保留 emoji 的代理对，每块都能独立编码成 UTF-8", () => {
@@ -118,7 +118,7 @@ test("开始时的画质和要不要声音在连接选项里（对方在握手�
   const settings = { fps: 60, bitrateKbps: 8000, maxShort: 1080, adaptive: true, codec: "h265" };
   Object.assign(s, {
     settings, audioEnabled: true, foreground: true, audioOn: false,
-    audio: { reset() {}, enable() { enabled++; }, disable() {} },
+    audio: { enable() { enabled++; }, disable() {} },
   });
   // 用真正的 syncAudio：连上之后声音已经开着，不用再发 audio 命令
   delete s.syncAudio;
@@ -229,7 +229,7 @@ test("光标形状按槽位缓存：只带槽位的包换成缓存里的形状�
     b.fill(slot, media.HEADER_LEN);
     return b;
   };
-  const push = (b: Uint8Array) => s.onBinary(b);
+  const push = (b: Uint8Array) => s.onCursor(b);
   push(header(1 | 2, 3, 2));
   const three = s.cursorRaw;
   assert.equal(three.w, 2);

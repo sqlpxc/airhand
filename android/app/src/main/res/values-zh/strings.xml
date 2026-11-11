@@ -321,7 +321,6 @@
     <string name="problem_declined">对方拒绝了连接请求</string>
     <string name="problem_unanswered">对方一直没有回应连接请求</string>
     <string name="problem_session_ended">会话已结束</string>
-    <string name="problem_not_controller">当前不是控制端模式</string>
     <string name="problem_no_session">会话不存在</string>
     <string name="problem_no_clipboard_text">本机剪贴板没有文本</string>
     <string name="problem_failed">出错了：%1$s</string>

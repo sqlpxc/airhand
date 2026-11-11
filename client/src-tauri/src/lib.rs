@@ -15,6 +15,7 @@
 mod i18n;
 mod clipboard;
 mod config;
+mod console;
 mod devices;
 #[cfg(test)]
 mod e2e;
@@ -33,17 +34,13 @@ mod uninstall;
 mod winsvc;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use airhand_link::controller::{
-    Command, ConnectOptions, ControllerService, Frontend, HostOnline, SessionEvent, SessionInfo,
-    SessionUi, UiClosed,
-};
+use airhand_link::secure::Identity;
 use airhand_link::{Problem, ServerState};
 use serde::Serialize;
-use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tracing::{info, warn};
 
@@ -62,12 +59,15 @@ pub struct AppState {
     webview_dirs: Mutex<Vec<PathBuf>>,
     /// Windows 安装版：被控端在系统服务里运行（托盘只负责显示和操作），切换模式不影响它
     service_mode: bool,
+    /// 控制台连过来的 WebSocket 地址（第一次要的时候开始监听，见 [`console`]）
+    console: tokio::sync::OnceCell<String>,
 }
 
 #[derive(Default)]
 struct Services {
     host: Option<Hosting>,
-    controller: Option<Arc<ControllerService>>,
+    /// 控制端模式：控制台的身份（端到端加密）。控制端服务每个控制台连接一个，在 [`console`] 里
+    controller: Option<Identity>,
 }
 
 /// 被控端在哪里运行
@@ -119,17 +119,6 @@ impl Hosting {
     }
 }
 
-impl AppState {
-    fn controller(&self) -> Result<Arc<ControllerService>, Problem> {
-        self.services
-            .lock()
-            .unwrap()
-            .controller
-            .clone()
-            .ok_or(Problem::NotController)
-    }
-}
-
 // ───────────────────────────── 模式切换 ─────────────────────────────
 
 /// 切换后台服务（不涉及窗口）。被控端在系统服务里运行时（Windows 安装版）只启停控制端。
@@ -160,23 +149,13 @@ fn switch_services(app: &AppHandle, mode: Mode) {
             }
             Mode::Host => {}
             Mode::Controller => {
-                // 在等的被控端上线了：告诉控制台，等它的会话马上重连
-                let handle = app.clone();
-                let host_online: HostOnline = Arc::new(move |code| {
-                    let _ = handle.emit_to(CONSOLE, "host-online", code);
-                });
-                // 控制台的身份（端到端加密）：第一次用时生成，记进 config.toml
+                // 控制台的身份（端到端加密）：第一次用时生成，记进 config.toml。
+                // 控制端服务在控制台连上来时启动（见 console）
                 let (identity, new_key) = config::controller_identity();
                 if let Some(key) = new_key {
                     save_controller_key(&sv, key);
                 }
-                sv.controller = Some(Arc::new(ControllerService::start(
-                    config::link(),
-                    tauri::async_runtime::handle().inner().clone(),
-                    status::controller_reporter(&state.hub),
-                    host_online,
-                    identity,
-                )))
+                sv.controller = Some(identity);
             }
         }
     }
@@ -431,6 +410,7 @@ pub(crate) fn on_tray_left_click(app: &AppHandle) {
 
 // ───────────────────────────── 前端命令 ─────────────────────────────
 
+/// 控制台的 `appInfo`（经 WebSocket，见 [`console`]）
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
@@ -443,7 +423,6 @@ struct AppInfo {
     config_path: Option<String>,
 }
 
-#[tauri::command]
 fn app_info() -> AppInfo {
     AppInfo {
         version: config::VERSION,
@@ -501,55 +480,15 @@ fn set_language(app: AppHandle, lang: Lang) {
     set_lang(&app, lang);
 }
 
+/// 控制台和控制端服务之间的 WebSocket 地址：会话、画面、声音都走它，不走 Tauri 的 IPC（见 [`console`]）
 #[tauri::command]
-fn server_status(state: tauri::State<'_, AppState>) -> ServerState {
-    state.hub.borrow().controller.clone()
-}
-
-/// 会话的媒体包和事件经 Tauri 的 Channel 交给控制台窗口（媒体包是原始字节，不经过 JSON）
-struct ConsoleUi {
-    video: Channel<InvokeResponseBody>,
-    events: Channel<SessionEvent>,
-}
-
-impl SessionUi for ConsoleUi {
-    fn packet(&self, packet: Vec<u8>) -> Result<(), UiClosed> {
-        self.video
-            .send(InvokeResponseBody::Raw(packet))
-            .map_err(|_| UiClosed)
-    }
-
-    fn event(&self, event: SessionEvent) -> Result<(), UiClosed> {
-        self.events.send(event).map_err(|_| UiClosed)
-    }
-}
-
-/// 连接被控端。`opts`：重连凭证、记下的对方公钥、配对码、开始时的画质和声音（见 [`ConnectOptions`]，三种界面一样）
-#[tauri::command]
-async fn ctrl_connect(
-    state: tauri::State<'_, AppState>,
-    code: String,
-    opts: ConnectOptions,
-    video: Channel<InvokeResponseBody>,
-    events: Channel<SessionEvent>,
-    clipboard: bool,
-) -> Result<SessionInfo, Problem> {
-    let svc = state.controller()?;
-    let ui = Arc::new(ConsoleUi { video, events });
-    let frontend = Frontend::Desktop {
-        clipboard: Box::new(clipboard::ClipSync::new()),
-        sync: clipboard,
-    };
-    svc.connect(&code, opts, ui, frontend).await
-}
-
-/// 对会话的操作（输入、画质、确认画面……），和网页版、Android 一样的 [`Command`]。
-///
-/// 同步命令：Tauri 在主线程上按到达的先后执行（`command` 只是排进队列，不等什么）。写成 `async` 的话每次调用
-/// 单独 spawn 成一个任务，接连到达的两批输入（按下、松开）谁先进命令队列就不一定了
-#[tauri::command]
-fn ctrl(state: tauri::State<'_, AppState>, command: Command) -> Result<(), Problem> {
-    state.controller()?.command(command)
+async fn console_url(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<String, Problem> {
+    state
+        .console
+        .get_or_try_init(|| console::listen(app.clone()))
+        .await
+        .cloned()
+        .map_err(Problem::failed)
 }
 
 /// 读取本机剪贴板文本（用于"粘贴到远端"）
@@ -615,13 +554,11 @@ pub fn run() {
             services: Mutex::default(),
             webview_dirs: Mutex::default(),
             service_mode,
+            console: Default::default(),
         })
         .invoke_handler(tauri::generate_handler![
-            app_info,
+            console_url,
             set_language,
-            server_status,
-            ctrl_connect,
-            ctrl,
             clipboard_text,
             set_fullscreen,
             switch_to_host,
@@ -665,9 +602,6 @@ pub fn run() {
                 loop {
                     let st = rx.borrow_and_update().clone();
                     tray::refresh(&handle, &st);
-                    if st.mode == Mode::Controller {
-                        let _ = handle.emit_to(CONSOLE, "server-status", &st.controller);
-                    }
                     let cur = i18n::current();
                     if lang.replace(cur) != Some(cur) {
                         if let Some(w) = handle.get_webview_window(CONSOLE) {

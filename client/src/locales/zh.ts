@@ -240,7 +240,6 @@ export default {
   "notice.codecFallback": "本机无法解码 {codec} 画面，已改用 {to}",
   "notice.noOpus": "本机不支持 Opus 解码，无法播放远程声音",
   "notice.androidNoInput": "对方手机没有开启 Airhand 的“远程操作”（无障碍服务），只能看不能操作。需要手机的主人在 Airhand 的“共享本机”页里开启",
-  "error.canvas": "无法创建 Canvas",
 
   // 网页版用不了时的说明
   "web.insecure.title": "请通过 HTTPS 打开",
@@ -280,10 +279,9 @@ export default {
   "problem.unanswered": "对方一直没有回应连接请求",
   "problem.sessionEnded": "会话已结束",
   // 其它
-  "problem.notController": "当前不是控制端模式",
   "problem.noSession": "会话不存在",
   "problem.noClipboardText": "本机剪贴板没有文本",
   "problem.failed": "出错了：{detail}",
-  "problem.consoleLost": "与 Airhand 网页服务的连接断开了",
+  "problem.consoleLost": "与 Airhand 控制端服务的连接断开了",
   "problem.clipboardBlocked": "浏览器不允许读取剪贴板，请在地址栏的网站设置里允许访问剪贴板",
 } satisfies Record<string, Msg>;

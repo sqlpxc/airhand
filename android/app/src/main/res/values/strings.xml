@@ -324,7 +324,6 @@
     <string name="problem_declined">The other side declined the connection</string>
     <string name="problem_unanswered">Nobody on the other side answered the connection request</string>
     <string name="problem_session_ended">The session ended</string>
-    <string name="problem_not_controller">Not in controller mode</string>
     <string name="problem_no_session">The session doesn\'t exist anymore</string>
     <string name="problem_no_clipboard_text">There\'s no text on the clipboard</string>
     <string name="problem_failed">Something went wrong: %1$s</string>

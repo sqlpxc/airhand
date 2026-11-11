@@ -1,5 +1,5 @@
-// Video-only state: WebCodecs lifecycle, bounded A/V delay queue and Canvas.
-// Session connection/retry and codec negotiation stay with RemoteSession.
+// 一个会话的画面（在 Worker 里，见 console-worker.ts）：WebCodecs 解码器、音画同步的推迟队列、绘制到 OffscreenCanvas。
+// 连接、重连和编码格式的协商在主线程的 RemoteSession 里。
 import type { Codec } from "./api";
 import type { AvSync } from "./avsync";
 import { annexBToAvc, avcC, codecString, h264NeedsAvc, markH264NeedsAvc } from "./codec.ts";
@@ -16,8 +16,8 @@ interface PendingVideo {
   due: number;
 }
 interface VideoOptions {
-  canvas: HTMLCanvasElement;
-  ctx: CanvasRenderingContext2D;
+  canvas: OffscreenCanvas;
+  ctx: OffscreenCanvasRenderingContext2D;
   sync: AvSync;
   requestKeyframe(): void;
   unsupported(codec: Codec): void;
@@ -28,7 +28,6 @@ const MAX_QUEUED = 120;
 const MAX_BYTES = 32 * 1024 * 1024;
 export class VideoPlayer {
   decodeAvg = 0;
-  lastDrawnHostUs = 0;
   private options: VideoOptions;
   private decoder: VideoDecoder | null = null;
   private configKey = "";
@@ -38,7 +37,7 @@ export class VideoPlayer {
   private chunks = 0;
   private decoded = 0;
   private configuredAt = 0;
-  private pending = new Map<number, { t0: number; hostUs: number }>();
+  private pending = new Map<number, number>();
   private queue: PendingVideo[] = [];
   private queuedBytes = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -139,7 +138,7 @@ export class VideoPlayer {
     if (this.avc && !v.key) data = annexBToAvc(data).data;
     this.chunks++;
     const timestamp = v.seq * 1000;
-    this.pending.set(timestamp, { t0: performance.now(), hostUs: v.hostUs });
+    this.pending.set(timestamp, performance.now());
     try {
       decoder.decode(new EncodedVideoChunk({ type: v.key ? "key" : "delta", timestamp, data }));
     } catch {
@@ -187,12 +186,11 @@ export class VideoPlayer {
 
   private draw(frame: VideoFrame) {
     try {
-      const pending = this.pending.get(frame.timestamp);
-      if (pending) {
+      const t0 = this.pending.get(frame.timestamp);
+      if (t0 !== undefined) {
         this.pending.delete(frame.timestamp);
-        const ms = performance.now() - pending.t0;
+        const ms = performance.now() - t0;
         this.decodeAvg = this.decodeAvg === 0 ? ms : this.decodeAvg * 0.9 + ms * 0.1;
-        this.lastDrawnHostUs = pending.hostUs;
       }
       if (this.pending.size > 32) this.pending.clear();
       const { canvas, ctx } = this.options;

@@ -1,4 +1,5 @@
 // AudioWorklet：在音频线程里从抖动缓冲取数据输出（由 audio.ts 通过 `?worker&url` 加载）。
+// 解码后的 PCM 由 Worker（audio-decoder.ts）直接发过来；时钟和统计报告给主线程（audio.ts）。
 import { JitterBuffer, type JitterStats } from "./jitter";
 
 // AudioWorkletGlobalScope 的全局对象（TypeScript 没有对应的 lib）
@@ -9,11 +10,14 @@ declare class AudioWorkletProcessor {
   readonly port: MessagePort;
 }
 
+/** 解码那边（Worker，见 audio-decoder.ts）→ 音频线程：经主线程用 `port` 交过来的端口直接发到这里 */
 export type PlayerMessage =
   | { type: "pcm"; planes: Float32Array[]; start: boolean; hostUs: number }
   | { type: "extra"; ms: number }
-  | { type: "reset" }
-  | { type: "close" };
+  | { type: "reset" };
+
+/** 主线程 → 音频线程 */
+export type ControlMessage = { type: "port"; port: MessagePort } | { type: "close" };
 
 /** 音频线程 → 主线程 */
 export type WorkletMessage =
@@ -30,6 +34,7 @@ const CLOCK_INTERVAL = 0.1;
 
 class AirhandAudio extends AudioWorkletProcessor {
   private readonly jb: JitterBuffer;
+  private player: MessagePort | null = null;
   private alive = true;
   private sinceStats = 0;
   private sinceClock = Infinity;
@@ -37,12 +42,21 @@ class AirhandAudio extends AudioWorkletProcessor {
   constructor(options: Options) {
     super();
     this.jb = new JitterBuffer(options.processorOptions?.inputRate ?? 48000, sampleRate, 2);
-    this.port.onmessage = (e: MessageEvent<PlayerMessage>) => {
+    this.port.onmessage = (e: MessageEvent<ControlMessage>) => {
       const m = e.data;
-      if (m.type === "pcm") this.jb.push(m.planes, m.start, m.hostUs);
-      else if (m.type === "extra") this.jb.setExtraMs(m.ms);
-      else if (m.type === "reset") this.jb.reset();
-      else if (m.type === "close") this.alive = false;
+      this.player?.close();
+      this.player = null;
+      if (m.type === "close") {
+        this.alive = false;
+        return;
+      }
+      this.player = m.port;
+      m.port.onmessage = (e: MessageEvent<PlayerMessage>) => {
+        const m = e.data;
+        if (m.type === "pcm") this.jb.push(m.planes, m.start, m.hostUs);
+        else if (m.type === "extra") this.jb.setExtraMs(m.ms);
+        else this.jb.reset();
+      };
     };
   }
 

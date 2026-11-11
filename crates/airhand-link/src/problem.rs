@@ -82,8 +82,6 @@ pub enum Problem {
     SessionEnded,
 
     // ── 其它 ──
-    /// 当前不是控制端模式
-    NotController,
     /// 会话不存在（已经结束）
     NoSession,
     /// 本机剪贴板没有文本
@@ -176,7 +174,6 @@ impl fmt::Display for Problem {
                 f.write_str("the user at the host didn't answer the connection request")
             }
             Problem::SessionEnded => f.write_str("session ended"),
-            Problem::NotController => f.write_str("not in controller mode"),
             Problem::NoSession => f.write_str("no such session"),
             Problem::NoClipboardText => f.write_str("no text on the local clipboard"),
             Problem::Failed { detail } => f.write_str(detail),

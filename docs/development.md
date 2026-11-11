@@ -59,7 +59,7 @@ cargo test --lib e2e_reconnect -- --ignored --nocapture   # getting the code bac
 # client/: debug build that starts straight in controller mode; AIRHAND_LOG sets the log level
 AIRHAND_DEV_CONTROLLER=1 AIRHAND_LOG=debug npm run tauri dev
 # client/: A/V sync measurement (the host plays a white flash + short beep; usage at the top of the script)
-node scripts/measure-avsync.mjs <control-code>
+node scripts/measure-avsync.mjs <control-code> [pairing-code]
 
 # client/src-tauri/: headless host, for testing the controller on the same machine
 # (mute the controller, otherwise the played-back audio is captured again and echoes)
@@ -92,7 +92,7 @@ cd web && cargo run
 # while working on the UI: npm run dev in client/ and open http://localhost:1420 (/ws is proxied to airhand-web on port 8080)
 ```
 
-The WebSocket protocol between the browser and the service is described at the top of `web/src/console.rs`.
+The WebSocket protocol between the console and the controller service (the same for the desktop console and the browser) is described at the top of `crates/airhand-link/src/console.rs`.
 
 ## Linux / WSL
 

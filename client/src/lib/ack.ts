@@ -3,13 +3,13 @@
 // 确认是累积的（确认第 n 帧 = 前面的都收到了），所以短时间里连着到的几帧只需要确认最后一帧：
 // 离上次确认已经超过 ACK_INTERVAL_MS 就马上发，否则等到那个时候再发最新的序号。
 // 帧率不超过 1000 / ACK_INTERVAL_MS 时和每帧确认一样；更高的帧率、或者一下子到了好几帧（网络抖了一下）时
-// 确认少发很多（桌面版每次确认是一次 IPC，网页版是一条 WebSocket 消息），被控端测到的往返最多多 ACK_INTERVAL_MS。
+// 确认少发很多（每次确认是一条 WebSocket 消息），被控端测到的往返最多多 ACK_INTERVAL_MS。
 
 /** 两次确认之间至少隔这么久（毫秒） */
 export const ACK_INTERVAL_MS = 8;
 
 /**
- * 网页版发给 airhand-web 的二进制确认：`1 | sid u32 LE | seq u32 LE`（web/src/console.rs 的 parse_ack），
+ * 发给控制端服务的二进制确认：`1 | sid u32 LE | seq u32 LE`（crates/airhand-link/src/console.rs 的 parse_ack），
  * 每帧都有的消息不走 JSON
  */
 export function ackMessage(sid: number, seq: number): ArrayBuffer {
