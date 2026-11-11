@@ -1,6 +1,9 @@
 //! 控制端的直连（见 [`super`] 的模块说明）：被控端发来一轮候选地址和它的证书指纹（`HostMsg::Direct`），回答本端的
 //! 地址和本端证书的指纹，从连中转的 endpoint 往它的每个地址发起 QUIC 连接（先连上的胜出，TLS 只认被控端给的指纹）；
 //! 通了之后控制通道也从直连发一份，直连上被控端发来的流、数据报交给会话，探测数据报原样（重新加密之后）弹回去。
+//!
+//! 好几个地址可能通到同一个被控端（同一台电脑的不同地址、局域网的 IPv4 和 IPv6……），两边都会连上好几条：
+//! 用哪一条由这边决定，选中之后马上在上面开控制通道、其余的关掉，被控端认的是先开了流的那一条（见 [`super::host`]）。
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -129,7 +132,7 @@ pub(crate) async fn run(s: Session) {
             };
             info!(session_id, peer = %conn.remote_address(), "direct path established");
             let mut tasks = JoinSet::new();
-            tasks.spawn(accept_direct(conn.clone(), session_id, feed.clone()));
+            tasks.spawn(accept_direct(conn.clone(), session_id, feed.clone(), None));
             match open_lane(&conn, session_id, SessionLane::Control).await {
                 Ok(send) => {
                     tasks.spawn(mirror.start(send, conn.clone()));
@@ -153,8 +156,8 @@ pub(crate) async fn run(s: Session) {
     tokio::join!(echo, direct);
 }
 
-/// 往被控端的每个地址发起直连，先连上的胜出（其余的随之取消）。TLS 握手完成时两边就确认了对方
-/// （见 [`super::tls`]）
+/// 往被控端的每个地址发起直连，先连上的胜出：其余的随之取消，已经连上的随之关掉（它们上面一条流也没开过，
+/// 被控端不会选它们）。TLS 握手完成时两边就确认了对方（见 [`super::tls`]）
 async fn connect(
     endpoint: &Endpoint,
     cert: &Cert,

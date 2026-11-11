@@ -295,9 +295,18 @@ impl Router {
     }
 }
 
-/// 一条直连上对方的流和数据报都交给会话 `session_id`（直连只属于一个会话）。直连断了就结束
-pub async fn accept_direct(conn: Connection, session_id: u64, feed: Feed) {
+/// 一条直连上对方的流和数据报都交给会话 `session_id`（直连只属于一个会话）。`first`：已经接受了的第一条流
+/// （被控端靠它认出控制端用的是哪一条直连，见 `direct::host`）。直连断了就结束
+pub async fn accept_direct(
+    conn: Connection,
+    session_id: u64,
+    feed: Feed,
+    first: Option<RecvStream>,
+) {
     let mut headers = JoinSet::new();
+    if let Some(recv) = first {
+        headers.spawn(header(recv));
+    }
     loop {
         tokio::select! {
             s = conn.accept_uni() => match s {

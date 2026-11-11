@@ -3,8 +3,8 @@
 //! * [`DirectHub`]：被控端和服务器的一条连接上一个。在连中转的 endpoint 上接受控制端连过来的直连，按控制端证书的指纹
 //!   交给那个会话（有会话在发候选地址时才接受：被控端不是一台随便能连的服务器）；
 //! * [`run`]：每个会话一个任务。会话开始之后发一轮候选地址（[`HostMsg::Direct`]，带着本端证书的指纹），等控制端回答
-//!   （带着它的指纹）、打洞、等它连过来；通了之后每 [`PROBE_EVERY`] 在两条路上各探测一次，按 [`Selector`] 换路；
-//!   断了过一会儿再来一轮。
+//!   （带着它的指纹）、打洞、等它连过来（它可能从好几个地址都连上了：用它开了流的那一条，见 [`chosen`]）；
+//!   通了之后每 [`PROBE_EVERY`] 在两条路上各探测一次，按 [`Selector`] 换路；断了过一会儿再来一轮。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,7 +15,7 @@ use airhand_proto::session::{DirectOffer, HostMsg};
 use airhand_proto::{SessionLane, datagram};
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint, RecvStream};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -212,38 +212,41 @@ pub(crate) async fn run(mut s: Session) {
         }
         let conn = establish(&mut s, round).await;
         drop(offering);
-        match conn {
-            Some(conn) => {
-                failures = 0;
+        let used = match conn {
+            Some((conn, first)) => {
                 info!(
                     session_id = s.session_id,
                     peer = %conn.remote_address(),
                     "direct path established"
                 );
-                serve(&mut s, conn).await;
-                tokio::time::sleep(RETRY_AFTER_LOSS).await;
+                serve(&mut s, conn, first).await
             }
-            None => {
-                let Some(wait) = RETRY_AFTER_FAILURE.get(failures) else {
-                    info!(
-                        session_id = s.session_id,
-                        "no direct path (symmetric NAT or a firewall?), staying on the relay"
-                    );
-                    return;
-                };
-                failures += 1;
-                debug!(
-                    session_id = s.session_id,
-                    round, "no direct path this round"
-                );
-                tokio::time::sleep(*wait).await;
-            }
+            None => false,
+        };
+        if used {
+            failures = 0;
+            tokio::time::sleep(RETRY_AFTER_LOSS).await;
+            continue;
         }
+        // 没连上，或者连上了却用不了：都算没打通，间隔越来越长（不能每轮都当成"通过又断了"，那样会一直重来）
+        let Some(wait) = RETRY_AFTER_FAILURE.get(failures) else {
+            info!(
+                session_id = s.session_id,
+                "no direct path (symmetric NAT or a firewall?), staying on the relay"
+            );
+            return;
+        };
+        failures += 1;
+        debug!(
+            session_id = s.session_id,
+            round, "no direct path this round"
+        );
+        tokio::time::sleep(*wait).await;
     }
 }
 
-/// 等控制端回答这一轮、打洞、等它连过来
-async fn establish(s: &mut Session, round: u32) -> Option<Connection> {
+/// 等控制端回答这一轮、打洞、等它连过来。返回它用的那条连接和它在上面开的第一条流（见 [`chosen`]）
+async fn establish(s: &mut Session, round: u32) -> Option<(Connection, RecvStream)> {
     let answer = tokio::time::timeout(ANSWER_TIMEOUT, async {
         loop {
             let a = s.answers.recv().await?;
@@ -272,7 +275,7 @@ async fn establish(s: &mut Session, round: u32) -> Option<Connection> {
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         tokio::select! {
             () = punch => None,
-            c = arrived.recv() => c,
+            c = chosen(&mut arrived) => c,
         }
     })
     .await
@@ -280,10 +283,43 @@ async fn establish(s: &mut Session, round: u32) -> Option<Connection> {
     .flatten()
 }
 
-/// 直连通着的时候：两条路上探测，按 [`Selector`] 换路，直到直连断了
-async fn serve(s: &mut Session, conn: Connection) {
+/// 控制端连过来的直连里它用的那一条，和它在上面开的第一条流。
+///
+/// 它往本端的每个地址都发起连接，好几个地址通到这里时（同一台电脑的不同地址、局域网的 IPv4 和 IPv6……）会连上好几条。
+/// 它用它那边先连上的那条，马上在上面开控制通道，其余的关掉；这边要是也拿先连上的那条，两边的"先"不一定是同一条：
+/// 这边用着它已经关掉的那条，它用着这边不要的那条，直连通了却用不上。所以这边等的是第一条开了流的连接。
+/// 其余的连接随之丢掉（关掉）。`arrived` 没有连接要来了时返回 `None`
+async fn chosen(arrived: &mut mpsc::Receiver<Connection>) -> Option<(Connection, RecvStream)> {
+    let mut opened = JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(conn) = arrived.recv() => {
+                opened.spawn(async move {
+                    let first = conn.accept_uni().await;
+                    (conn, first)
+                });
+            }
+            // 只匹配 `Some(_)`：没被选中、被关掉的连接不能让这个分支在这一轮 select 里停用（见 lanes 的 Router::run）
+            Some(r) = opened.join_next() => {
+                if let Ok((conn, Ok(first))) = r {
+                    return Some((conn, first));
+                }
+            }
+            else => return None,
+        }
+    }
+}
+
+/// 直连通着的时候：两条路上探测，按 [`Selector`] 换路，直到直连断了。`first`：控制端在它上面开的第一条流。
+/// 本端的通道开不了（直连没用上）时返回 false
+async fn serve(s: &mut Session, conn: Connection, first: RecvStream) -> bool {
     let mut tasks = JoinSet::new();
-    tasks.spawn(accept_direct(conn.clone(), s.session_id, s.feed.clone()));
+    tasks.spawn(accept_direct(
+        conn.clone(),
+        s.session_id,
+        s.feed.clone(),
+        Some(first),
+    ));
     match open_lane(&conn, s.session_id, SessionLane::Control).await {
         Ok(send) => {
             tasks.spawn(s.mirror.start(send, conn.clone()));
@@ -294,7 +330,7 @@ async fn serve(s: &mut Session, conn: Connection) {
                 "can't open the direct lanes: {e:#}"
             );
             conn.close(0u32.into(), b"lanes");
-            return;
+            return false;
         }
     }
     let mut sel = Selector::default();
@@ -352,6 +388,7 @@ async fn serve(s: &mut Session, conn: Connection) {
         );
     }
     conn.close(0u32.into(), b"closed");
+    true
 }
 
 /// 换路：告诉画面、声音的写任务，告诉平台的码率控制（新的路时延不一样；断了的话在途的帧不会确认了），
@@ -392,4 +429,47 @@ fn echo(s: &mut Session, via: Via, d: &[u8]) -> Option<f64> {
     s.probe.opener.open(&mut body).ok()?;
     let sent = probe_sent_at(&body, via)?;
     Some(now_us().saturating_sub(sent) as f64 / 1000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::quic_pair;
+
+    /// 控制端从两个地址都连上了：先到这边的那条它没选（还没来得及关），它在后到的那条上开了控制通道。
+    /// 这边要用后那条，而不是先连上的那条（那样两边用的不是同一条，直连通了却用不上）
+    #[tokio::test]
+    async fn the_host_uses_the_connection_the_controller_chose() {
+        let (_ignored, first) = quic_pair().await;
+        let (picked, second) = quic_pair().await;
+        let want = second.stable_id();
+        let (tx, mut arrived) = mpsc::channel(1);
+        tokio::spawn(async move {
+            tx.send(first).await.unwrap();
+            tx.send(second).await.unwrap();
+        });
+        let controller = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut lane = picked.open_uni().await.unwrap();
+            lane.write_all(b"lane").await.unwrap();
+            lane
+        };
+        let (got, _lane) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), chosen(&mut arrived)),
+            controller
+        );
+        let (conn, mut stream) = got.unwrap().unwrap();
+        assert_eq!(conn.stable_id(), want);
+        let mut b = [0u8; 4];
+        stream.read_exact(&mut b).await.unwrap();
+        assert_eq!(&b, b"lane");
+    }
+
+    /// 一条连接也没来、也不会再来了：不等
+    #[tokio::test]
+    async fn no_connection_no_choice() {
+        let (tx, mut arrived) = mpsc::channel::<Connection>(1);
+        drop(tx);
+        assert!(chosen(&mut arrived).await.is_none());
+    }
 }
