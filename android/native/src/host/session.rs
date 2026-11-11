@@ -35,9 +35,10 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
         video::QUEUE,
         audio::QUEUE,
         move |admitted, senders| {
-            // Confirm 验证之后才发布身份；pending/active 由下面的协议阶段更新。
-            sh.admitted(id, ip, admitted);
-            Phone::new(sh, id, admitted.key, senders)
+            // 控制端确认了握手才发布身份（Platform::confirmed）；pending/active 由下面的协议阶段更新。
+            let mut phone = Phone::new(sh, id, admitted.key, senders);
+            phone.publish = Some((ip, admitted.clone()));
+            phone
         },
     )
     .await
@@ -54,6 +55,8 @@ pub(crate) struct Phone {
     audio: mpsc::Sender<Bytes>,
     /// 发给所有会话的消息：会话开始之后才订阅（同意之前不转发，Hello 里带着那时的状态）
     broadcasts: Option<broadcast::Receiver<Encoded>>,
+    /// 控制端确认了握手时在列表里显示的（[`Platform::confirmed`]）
+    publish: Option<(std::net::IpAddr, Admitted)>,
 }
 
 impl Phone {
@@ -66,6 +69,7 @@ impl Phone {
             video: senders.video,
             audio: senders.audio,
             broadcasts: None,
+            publish: None,
         }
     }
 }
@@ -119,6 +123,16 @@ impl Platform for Phone {
     fn answered(&mut self, allowed: bool) {
         if allowed {
             self.shared.trust(self.key);
+        }
+    }
+
+    /// 控制端确认了握手：这时才在列表里显示它。不用同意的会话这时已经开始了（看得到画面）
+    fn confirmed(&mut self) {
+        if let Some((ip, admitted)) = self.publish.take() {
+            self.shared.admitted(self.id, ip, &admitted);
+            if self.broadcasts.is_some() {
+                self.shared.update_controller(self.id, |c| c.active = true);
+            }
         }
     }
 

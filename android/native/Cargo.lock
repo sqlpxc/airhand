@@ -80,6 +80,7 @@ dependencies = [
  "serde",
  "sha2",
  "snow",
+ "socket2",
  "spake2",
  "thiserror 2.0.21",
  "tokio",

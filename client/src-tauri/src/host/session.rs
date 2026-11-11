@@ -88,7 +88,7 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
     let session_id = inc.session_id;
     let ip = inc.peer.ip;
     // 端到端握手：没配对过、又没有配对码的控制端，在这里就被拒绝了（见 gate）。
-    // 进来的时候控制端已经确认过了（重放的握手消息走不到这里），这时才在托盘里显示它、开始采集
+    // 握手通过就开始采集（不等控制端的确认，省一个往返），确认了才在托盘里显示它（见 Platform::confirmed）
     serve(
         inc,
         &*gate,
@@ -108,7 +108,7 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
 /// 桌面版一个会话里的东西
 struct Desktop {
     session_id: u64,
-    /// 认证完成后暂存，只有 start 成功才发布为活动控制端。
+    /// 认证完成后暂存，控制端确认了握手（[`Platform::confirmed`]）才发布为活动控制端。
     identity: Option<(
         Arc<DesktopGate>,
         std::net::IpAddr,
@@ -252,10 +252,14 @@ impl Platform for Desktop {
         if start.audio {
             self.subscribe_audio()?;
         }
+        Ok(())
+    }
+
+    /// 控制端确认了握手：是真的在连（重放的握手消息走不到这里），这时才在托盘里显示它
+    fn confirmed(&mut self) {
         if let Some((gate, ip, admitted)) = self.identity.take() {
             gate.admitted(self.session_id, ip, &admitted);
         }
-        Ok(())
     }
 
     async fn request(&mut self, req: Request) -> Result<()> {

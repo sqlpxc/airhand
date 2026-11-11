@@ -132,7 +132,7 @@ pub(crate) async fn run(s: Session) {
             tasks.spawn(accept_direct(conn.clone(), session_id, feed.clone()));
             match open_lane(&conn, session_id, SessionLane::Control).await {
                 Ok(send) => {
-                    tasks.spawn(mirror.start(send));
+                    tasks.spawn(mirror.start(send, conn.clone()));
                 }
                 Err(e) => debug!(session_id, "can't open the direct lanes: {e:#}"),
             }

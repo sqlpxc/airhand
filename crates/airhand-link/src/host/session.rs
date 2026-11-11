@@ -4,14 +4,17 @@
 //! 慢慢就会不一样。现在它们只在这里：
 //!
 //! ```text
-//! 端到端握手 ─┬─ 不用同意（配对过的、同意过的、谁都能连）──────────────────────────┐
-//!            └─ NeedsApproval → AwaitingApproval，问本机用户（最多 60 秒）─┼─ 同意 → start：Hello、画面……
-//!                                                                    └─ 拒绝 / 没人理 → Bye
+//! 端到端握手 ─┬─ 不用同意（配对过的、同意过的、谁都能连）→ start：Hello、画面…… ─ 控制端确认了 → confirmed：显示它
+//!            └─ NeedsApproval ─ 控制端确认了 → AwaitingApproval，问本机用户（最多 60 秒）─┬─ 同意 → start
+//!                                                                                   └─ 拒绝 / 没人理 → Bye
 //! ```
 //!
-//! * 同时最多有 [`MAX_PENDING_APPROVALS`] 个请求在等本机用户回答，再来的不问、直接回绝（[`ApprovalSlots`]）；
+//! * 不用同意的会话不等控制端的确认就开始（省一个往返，编码器的初始化也和它重叠），确认了才显示它
+//!   （[`Platform::confirmed`]）；[`CONFIRM_TIMEOUT`] 等不到确认就结束（见 `airhand_proto::handshake` 的"确认"）；
+//! * 要同意的会话确认了才问本机用户：重放的握手消息不能弹出请求。同时最多有 [`MAX_PENDING_APPROVALS`] 个请求
+//!   在等本机用户回答，再来的不问、直接回绝（[`ApprovalSlots`]）；
 //! * 同意之前只回应 Ping、记下画质和声音设置（同意之后随 [`Start`] 一起生效），不发画面、不执行任何输入；
-//! * 一直回应 Ping（[`HostMsg::Pong`]），[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联。Ping 和画面确认在读任务里
+//! * 一直回应 Ping，[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联。Ping 和画面确认（控制数据报）在读任务里
 //!   就处理了（确认交给 [`Platform::acks`]），不等这里：这里可能正等着平台重建编码管线（见 [`super::HostStreams`]）；
 //! * 本机用户断开所有控制端（[`Incoming::kick`]）时发 [`HostMsg::Bye`]，然后结束；
 //! * 控制端的请求在会话的读任务里就换成了 [`Request`]（见 [`super::HostStreams`]）交给平台：画质设置做过范围校验，
@@ -37,7 +40,7 @@ use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 /// 画面确认交给谁（[`Platform::acks`]）：桌面版是会话的 [`crate::flow::Flow`]，Android 是画面分发。
 /// 在读任务里调用：要快，不能等什么
 pub trait Acks: Send + Sync + 'static {
-    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 `ControllerMsg::Ack`
+    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 `ControllerDatagram::Ack`
     fn ack(&self, seq: u32, arrived: u64);
 
     /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量。
@@ -60,6 +63,8 @@ use super::{Admission, Gate, Incoming};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+/// 这么久等不到控制端的确认（见 `airhand_proto::handshake` 的"确认"）就结束会话
+pub const CONFIRM_TIMEOUT: Duration = crate::secure::STEP_TIMEOUT;
 /// 本机用户这么久没有回应连接请求就当作没人理会（[`ByeReason::Unanswered`]）
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// 多久检查一次是不是失联了
@@ -148,6 +153,11 @@ pub trait Platform: Send {
         let _ = allowed;
     }
 
+    /// 控制端确认了握手（见 `airhand_proto::handshake` 的"确认"）：是真的在连，这时才在托盘、列表里显示它。
+    /// 不用同意的会话这时已经开始了（[`Platform::start`] 在确认之前：重放的握手消息看不到画面，只是让本机白编码一会儿）；
+    /// 要同意的会话接着就是 [`Platform::ask`]
+    fn confirmed(&mut self) {}
+
     /// 画面确认交给谁。会话一开始取一次；确认在读任务里就交给它，不经过 [`Platform::request`]
     fn acks(&self) -> Arc<dyn Acks>;
 
@@ -179,7 +189,7 @@ pub trait Platform: Send {
 ///
 /// * `gate`：让不让这个控制端进来（拒绝时返回错误，还没有调用 `platform`）；
 /// * `video_queue` / `audio_queue`：画面、声音的发送队列有多长（见 [`HostStreams::open`]）；
-/// * `platform`：控制端进来了（已经确认过：这时才在托盘、列表里显示它）之后建起这个会话的平台部分。
+/// * `platform`：握手通过之后建起这个会话的平台部分（控制端还没确认：确认了才调用 [`Platform::confirmed`]）。
 pub async fn serve<P, F>(
     inc: Incoming,
     gate: &dyn Gate,
@@ -233,6 +243,8 @@ where
 
 /// 会话处在哪一步
 enum Phase {
+    /// 要请本机用户同意，在等控制端的确认（确认之前不问）
+    Confirming,
     /// 在等本机用户回答
     Asking {
         answer: oneshot::Receiver<bool>,
@@ -260,7 +272,7 @@ async fn answer(phase: &mut Phase) -> Answer {
             Ok(_) => Answer::Declined,
             Err(_) => Answer::Unanswered,
         },
-        Phase::Open => std::future::pending().await,
+        Phase::Confirming | Phase::Open => std::future::pending().await,
     }
 }
 
@@ -289,30 +301,18 @@ async fn drive<P: Platform>(
         settings: admitted.settings,
         audio: admitted.audio,
     };
+    // 不用同意的：不等确认就开始（见模块说明）
     let mut phase = if admitted.admission == Admission::NeedsApproval {
-        // 在等本机用户回答的请求已经够多了：这一个不问（见 MAX_PENDING_APPROVALS）
-        let Some(slot) = approvals.take() else {
-            info!(
-                session_id,
-                "too many connection requests are waiting for the local user, turning this one away"
-            );
-            out.send(&HostMsg::Bye(ByeReason::TooManyRequests))?;
-            return Ok(());
-        };
-        let answer = platform.ask(admitted);
-        info!(session_id, safety = %admitted.safety, "asking the local user to allow the connection");
-        out.send(&HostMsg::AwaitingApproval)?;
-        Phase::Asking {
-            answer,
-            deadline: Instant::now() + APPROVAL_TIMEOUT,
-            _slot: slot,
-        }
+        Phase::Confirming
     } else {
         platform.start(start).await?;
         info!(session_id, "session started");
         started();
         Phase::Open
     };
+    let mut confirm = incoming.confirmation();
+    let mut confirmed = false;
+    let confirm_by = Instant::now() + CONFIRM_TIMEOUT;
     let mut watchdog = tokio::time::interval(WATCHDOG);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // 被控端服务还在（踢人的发送端还在）
@@ -325,6 +325,38 @@ async fn drive<P: Platform>(
         }
         let open = matches!(phase, Phase::Open);
         tokio::select! {
+            c = &mut confirm, if !confirmed => {
+                // 读任务没等到确认就结束了：会话的结果是读任务的错误（见 HostStreams::close）
+                if c.is_err() {
+                    return Ok(());
+                }
+                confirmed = true;
+                info!(session_id, "the controller confirmed the handshake");
+                platform.confirmed();
+                if !matches!(phase, Phase::Confirming) {
+                    continue;
+                }
+                // 在等本机用户回答的请求已经够多了：这一个不问（见 MAX_PENDING_APPROVALS）
+                let Some(slot) = approvals.take() else {
+                    info!(
+                        session_id,
+                        "too many connection requests are waiting for the local user, turning this one away"
+                    );
+                    out.send(&HostMsg::Bye(ByeReason::TooManyRequests))?;
+                    return Ok(());
+                };
+                let answer = platform.ask(admitted);
+                info!(session_id, safety = %admitted.safety, "asking the local user to allow the connection");
+                out.send(&HostMsg::AwaitingApproval)?;
+                phase = Phase::Asking {
+                    answer,
+                    deadline: Instant::now() + APPROVAL_TIMEOUT,
+                    _slot: slot,
+                };
+            }
+            () = tokio::time::sleep_until(confirm_by), if !confirmed => {
+                bail!("the controller didn't confirm the handshake");
+            }
             req = incoming.recv() => {
                 let Some(req) = req else { return Ok(()) };
                 match req {
@@ -389,16 +421,19 @@ async fn drive<P: Platform>(
 mod tests {
     use super::*;
     use crate::host::queue::{self, LaneReceiver};
-    use crate::host::streams::Express;
+    use crate::host::streams::{Express, request};
     use crate::tasks::OwnedTask;
     use airhand_proto::framing;
     use airhand_proto::handshake::Negotiated;
-    use airhand_proto::session::{Codec, ControllerMsg, MAX_CLIPBOARD_TEXT, MouseButton};
+    use airhand_proto::session::{
+        Codec, ControllerDatagram, ControllerMsg, MAX_CLIPBOARD_TEXT, MouseButton,
+    };
     use std::sync::{Arc, Mutex};
 
     /// 平台那边发生了什么
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
+        Confirmed,
         Ask,
         Answered(bool),
         Start(Start),
@@ -443,6 +478,9 @@ mod tests {
         fn answered(&mut self, allowed: bool) {
             self.log.push(Call::Answered(allowed));
         }
+        fn confirmed(&mut self) {
+            self.log.push(Call::Confirmed);
+        }
         async fn start(&mut self, start: Start) -> Result<()> {
             self.log.push(Call::Start(start));
             Ok(())
@@ -468,8 +506,12 @@ mod tests {
     struct Harness {
         log: Log,
         to_host: mpsc::Sender<Request>,
-        /// 读任务自己处理的消息（Ping、确认）在这里处理，和真的读任务一样
+        /// 读任务自己处理的事（Ping、确认）在这里处理，和真的读任务一样
         express: Express,
+        /// 回了哪些 Pong
+        pongs: Arc<Mutex<Vec<u64>>>,
+        /// 控制端的确认（`None`：已经确认了）
+        confirm: Option<oneshot::Sender<()>>,
         events: mpsc::Sender<u32>,
         kick: watch::Sender<ByeReason>,
         answer: Option<oneshot::Sender<bool>>,
@@ -493,20 +535,32 @@ mod tests {
         }
     }
 
+    /// 控制端一开始就确认了的会话（真的控制端收到决定马上确认）
     fn session(admission: Admission) -> Harness {
         session_with(admission, ApprovalSlots::default())
     }
 
     /// `approvals`：和别的会话共用的名额（同一个被控端服务的会话）
     fn session_with(admission: Admission, approvals: ApprovalSlots) -> Harness {
+        let mut h = unconfirmed(admission, approvals);
+        h.confirm();
+        h
+    }
+
+    /// 还没确认的会话（[`Harness::confirm`]）
+    fn unconfirmed(admission: Admission, approvals: ApprovalSlots) -> Harness {
         let log = Log::default();
         let (to_host, control_in) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(16);
         let (kick, mut kick_rx) = watch::channel(ByeReason::Kicked);
         let (answer_tx, answer) = oneshot::channel();
+        let (confirm_tx, confirm_rx) = oneshot::channel();
         let (out, control, _bulk) = queue::channel();
-        let express = Express::new(out.clone());
-        let mut incoming = ControllerReceiver::new(control_in, mpsc::channel(1).1, express.clone());
+        let pongs = Arc::new(Mutex::new(Vec::new()));
+        let p = pongs.clone();
+        let express = Express::new(move |t| p.lock().unwrap().push(t));
+        let mut incoming =
+            ControllerReceiver::new(control_in, mpsc::channel(1).1, confirm_rx, express.clone());
         let mut platform = Fake {
             log: log.clone(),
             answer: Some(answer),
@@ -532,6 +586,8 @@ mod tests {
             log,
             to_host,
             express,
+            pongs,
+            confirm: Some(confirm_tx),
             events: events_tx,
             kick,
             answer: Some(answer_tx),
@@ -541,15 +597,22 @@ mod tests {
     }
 
     impl Harness {
-        /// 和真的读任务一样：自己处理得了的就地处理，其它的换成请求交给会话
+        /// 控制端的确认到了（读任务解开了控制通道上的第一帧）
+        fn confirm(&mut self) {
+            let _ = self.confirm.take().unwrap().send(());
+        }
+
+        /// 和真的读任务一样：控制通道上的消息换成请求交给会话
         async fn send(&self, m: ControllerMsg) {
-            if let Some(r) = self
-                .express
-                .handle(m)
-                .and_then(super::super::streams::request)
-            {
+            self.express.heard();
+            if let Some(r) = request(m) {
                 self.to_host.send(r).await.unwrap();
             }
+        }
+
+        /// 控制数据报（Ping、确认）：读任务就地处理
+        fn datagram(&self, m: ControllerDatagram) {
+            self.express.datagram(m);
         }
 
         /// 让会话把手里的消息处理完
@@ -566,6 +629,15 @@ mod tests {
                 .map(|b| framing::decode_known(&b[framing::PREFIX..]).unwrap())
                 .collect()
         }
+    }
+
+    /// 从记录里拿掉 `c`（和别的谁先谁后不一定的），没有就失败
+    fn remove(log: &mut Vec<Call>, c: Call) {
+        let i = log
+            .iter()
+            .position(|x| *x == c)
+            .unwrap_or_else(|| panic!("{c:?} not in {log:?}"));
+        log.remove(i);
     }
 
     fn click() -> Vec<InputEvent> {
@@ -603,7 +675,7 @@ mod tests {
         let mut h = session(Admission::Paired);
         // 会话开始了才把确认交给平台
         h.settle().await;
-        h.send(ControllerMsg::Ping { t: 5 }).await;
+        h.datagram(ControllerDatagram::Ping { t: 5 });
         h.send(ControllerMsg::Input {
             t: 0,
             events: click(),
@@ -616,19 +688,19 @@ mod tests {
         })
         .await;
         h.send(ControllerMsg::Settings(fast())).await;
-        h.send(ControllerMsg::Ack { seq: 3, arrived: 9 }).await;
+        h.datagram(ControllerDatagram::Ack { seq: 3, arrived: 9 });
         h.send(ControllerMsg::Clipboard {
             text: "x".repeat(MAX_CLIPBOARD_TEXT + 1),
         })
         .await;
         h.send(ControllerMsg::Clipboard { text: "hi".into() }).await;
         h.events.send(9).await.unwrap();
-        assert!(matches!(h.received().await[..], [HostMsg::Pong { t: 5 }]));
+        assert!(h.received().await.is_empty());
+        assert_eq!(*h.pongs.lock().unwrap(), [5]);
         let mut log = h.log.take();
-        // 平台自己的事、读任务直接交给平台的确认，和控制端的其它消息谁先谁后不一定
-        for c in [Call::Event(9), Call::Ack(3, 9)] {
-            let i = log.iter().position(|x| *x == c).unwrap();
-            log.remove(i);
+        // 确认、平台自己的事、读任务直接交给平台的画面确认，和控制端的其它消息谁先谁后不一定
+        for c in [Call::Confirmed, Call::Event(9), Call::Ack(3, 9)] {
+            remove(&mut log, c);
         }
         assert_eq!(
             log,
@@ -647,6 +719,44 @@ mod tests {
         assert!((&mut h.task).await.unwrap().is_ok());
     }
 
+    /// 不用同意的会话不等确认就开始，确认了才显示控制端；要同意的确认了才问本机用户
+    #[tokio::test]
+    async fn the_session_starts_before_the_confirmation_but_asks_after_it() {
+        let mut h = unconfirmed(Admission::Known, ApprovalSlots::default());
+        h.settle().await;
+        assert!(matches!(h.log.take()[..], [Call::Start(_)]));
+        h.confirm();
+        h.settle().await;
+        assert_eq!(h.log.take(), [Call::Confirmed]);
+
+        let mut h = unconfirmed(Admission::NeedsApproval, ApprovalSlots::default());
+        h.datagram(ControllerDatagram::Ping { t: 1 });
+        assert!(h.received().await.is_empty());
+        assert!(h.log.take().is_empty());
+        assert_eq!(*h.pongs.lock().unwrap(), [1]);
+        h.confirm();
+        assert!(matches!(
+            h.received().await[..],
+            [HostMsg::AwaitingApproval]
+        ));
+        assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
+    }
+
+    /// 等不到确认（重放的握手消息）：会话结束，不显示、不问；读任务没等到确认就结束了也一样
+    #[tokio::test(start_paused = true)]
+    async fn no_confirmation_ends_the_session() {
+        for admission in [Admission::Known, Admission::NeedsApproval] {
+            let h = unconfirmed(admission, ApprovalSlots::default());
+            let err = h.task.await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("confirm"), "{err}");
+            assert!(!h.log.take().contains(&Call::Confirmed));
+        }
+        let mut h = unconfirmed(Admission::NeedsApproval, ApprovalSlots::default());
+        drop(h.confirm.take());
+        assert!((&mut h.task).await.unwrap().is_ok());
+        assert!(h.log.take().is_empty());
+    }
+
     /// 同意之前只回应 Ping、记下设置；同意之后带着记下的设置开始
     #[tokio::test]
     async fn nothing_happens_before_the_local_user_allows_it() {
@@ -659,14 +769,12 @@ mod tests {
         h.send(ControllerMsg::Settings(fast())).await;
         h.send(ControllerMsg::Audio { enabled: false }).await;
         h.send(ControllerMsg::Clipboard { text: "hi".into() }).await;
-        h.send(ControllerMsg::Ping { t: 1 }).await;
+        h.datagram(ControllerDatagram::Ping { t: 1 });
         h.events.send(1).await.unwrap();
         let got = h.received().await;
-        assert!(
-            matches!(got[..], [HostMsg::Pong { t: 1 }, HostMsg::AwaitingApproval]),
-            "{got:?}"
-        );
-        assert_eq!(h.log.take(), [Call::Ask]);
+        assert!(matches!(got[..], [HostMsg::AwaitingApproval]), "{got:?}");
+        assert_eq!(*h.pongs.lock().unwrap(), [1]);
+        assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
 
         h.answer.take().unwrap().send(true).unwrap();
         // 和回答同时到的消息算同意之前的（控制端收到 Hello 之前发的本来就是）：等会话开始了再发
@@ -703,7 +811,10 @@ mod tests {
             got[..],
             [HostMsg::AwaitingApproval, HostMsg::Bye(ByeReason::Declined)]
         ));
-        assert_eq!(h.log.take(), [Call::Ask, Call::Answered(false)]);
+        assert_eq!(
+            h.log.take(),
+            [Call::Confirmed, Call::Ask, Call::Answered(false)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -714,24 +825,22 @@ mod tests {
         let _pinger = OwnedTask(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                assert!(express.handle(ControllerMsg::Ping { t: 0 }).is_none());
+                express.datagram(ControllerDatagram::Ping { t: 0 });
             }
         }));
         assert!((&mut h.task).await.unwrap().is_ok());
-        // 最新的 Pong 在槽位里，排在最前面
         let got = h.received().await;
         assert!(
             matches!(
                 got[..],
                 [
-                    HostMsg::Pong { .. },
                     HostMsg::AwaitingApproval,
                     HostMsg::Bye(ByeReason::Unanswered)
                 ]
             ),
             "{got:?}"
         );
-        assert_eq!(h.log.take(), [Call::Ask]);
+        assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
     }
 
     /// 同时在等本机用户回答的请求有上限：再来的不问、直接回绝；有一个不再等了（回答了、走了）才问下一个
@@ -745,7 +854,7 @@ mod tests {
                 h.received().await[..],
                 [HostMsg::AwaitingApproval]
             ));
-            assert_eq!(h.log.take(), [Call::Ask]);
+            assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
             waiting.push(h);
         }
         // 再来一个：本机用户看不到它，会话马上结束
@@ -756,11 +865,14 @@ mod tests {
             matches!(got[..], [HostMsg::Bye(ByeReason::TooManyRequests)]),
             "{got:?}"
         );
-        assert!(extra.log.take().is_empty());
+        assert_eq!(extra.log.take(), [Call::Confirmed]);
         // 不用问的（同意过的、配对过的）不受影响
         let known = session_with(Admission::Known, slots.clone());
         known.settle().await;
-        assert!(matches!(known.log.take()[..], [Call::Start(_)]));
+        assert!(matches!(
+            known.log.take()[..],
+            [Call::Start(_), Call::Confirmed]
+        ));
 
         // 本机用户同意了一个：它不再占着名额，下一个请求又会问
         let mut allowed = waiting.pop().unwrap();
@@ -768,14 +880,14 @@ mod tests {
         allowed.settle().await;
         let next = session_with(Admission::NeedsApproval, slots.clone());
         next.settle().await;
-        assert_eq!(next.log.take(), [Call::Ask]);
+        assert_eq!(next.log.take(), [Call::Confirmed, Call::Ask]);
         // 控制端自己走了的也一样
         let gone = waiting.pop().unwrap();
         drop(gone.to_host);
         assert!(gone.task.await.unwrap().is_ok());
         let another = session_with(Admission::NeedsApproval, slots);
         another.settle().await;
-        assert_eq!(another.log.take(), [Call::Ask]);
+        assert_eq!(another.log.take(), [Call::Confirmed, Call::Ask]);
     }
 
     #[tokio::test]

@@ -239,17 +239,15 @@ async fn register_full(
     keep: bool,
     rekey: bool,
 ) -> (Signal, Reclaim) {
-    let mut sig = connect_signal(cfg, Role::Host).await.unwrap();
-    write_msg(
-        &mut sig.send,
-        &ClientMsg::Register {
-            reclaim,
-            keep,
-            rekey,
-        },
-    )
-    .await
-    .unwrap();
+    // 注册紧跟着版本握手发（和真正的被控端一样）
+    let register = ClientMsg::Register {
+        reclaim,
+        keep,
+        rekey,
+    };
+    let mut sig = connect_signal(cfg, Role::Host, Some(&register))
+        .await
+        .unwrap();
     match next(&mut sig).await {
         ServerMsg::Registered { code, secret } => (sig, Reclaim { code, secret }),
         other => panic!("{other:?}"),
@@ -313,10 +311,10 @@ fn waiter_count(broker: &Broker) -> usize {
 async fn blocked_video_lane_does_not_block_control_or_audio() {
     use airhand_link::lanes::first_stream;
     use airhand_link::transport::FromHost;
-    use airhand_proto::session::HostMsg;
+    use airhand_proto::session::{HostMsg, Notice};
     let (_broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let (ctrl_router, _ctrl_router) = Router::start(&ctrl.conn);
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
@@ -339,9 +337,12 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
         !stalled.is_finished(),
         "video must be blocked by the unread lane"
     );
-    write_msg(&mut host_control, &HostMsg::Pong { t: 77 })
-        .await
-        .unwrap();
+    write_msg(
+        &mut host_control,
+        &HostMsg::Notice(Some(Notice::NoDisplays)),
+    )
+    .await
+    .unwrap();
     let mut ctrl_control = first_stream(&mut inbox.control, Duration::from_secs(2))
         .await
         .unwrap();
@@ -354,7 +355,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     .unwrap()
     .unwrap()
     .unwrap();
-    assert!(matches!(msg, HostMsg::Pong { t: 77 }));
+    assert!(matches!(msg, HostMsg::Notice(Some(Notice::NoDisplays))));
     let d = [&sid.to_le_bytes()[..], &[datagram::AUDIO], b"opus"].concat();
     host.conn.send_datagram(d.into()).unwrap();
     let got = timeout(Duration::from_secs(2), inbox.audio.recv())
@@ -402,11 +403,11 @@ async fn resume_and_wait_for_the_host() {
     let (host, id) = register(&cfg, None).await;
     let code = id.code;
     let other = if code == CODE_MAX { CODE_MIN } else { code + 1 };
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let token = ask(&mut ctrl, 1, code, None).await.unwrap().resume;
 
     // 不是为这个控制码发的凭证：不管控制码在不在线、存不存在都是同一个回答，不算猜错，也不等
-    let mut stranger = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut stranger = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     for (req, c, t) in [(1, code, [0; 16]), (2, other, [0; 16]), (3, other, token)] {
         assert_eq!(
             ask(&mut stranger, req, c, Some(t)).await.unwrap_err(),
@@ -661,13 +662,13 @@ async fn resume_survives_a_server_restart() {
     let (dir, file) = temp_db();
     let (old, cfg) = start_with(Some(file.clone())).await;
     let (host, id) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     old.flush_bindings().await;
     drop((host, ctrl, old));
 
     let (_new, cfg) = start_with(Some(file)).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     assert_eq!(
         ask(&mut ctrl, 1, id.code, Some(token)).await.unwrap_err(),
         ConnectError::Offline
@@ -722,7 +723,7 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         let (_broker, cfg) = start().await;
         let (mut host, id) = register(&cfg, None).await;
         let (host_router, _host_router) = Router::start(&host.conn);
-        let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+        let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
         let (ctrl_router, _ctrl_router) = Router::start(&ctrl.conn);
         let (initiator, init) = initiate(id.code);
         let grant = ask_with(&mut ctrl, 1, id.code, None, init).await.unwrap();
@@ -746,9 +747,9 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         assert!(matches!(req, Request::Clipboard(ref t) if *t == text));
         if wrong_lane {
             // 已知消息发到错误通道，即使密文认证成功也应拒绝。
-            let ping = ControllerMsg::Ping { t: 1 };
-            assert_eq!(ping.lane(), SessionLane::Control);
-            let mut frame = framing::encode(&ping);
+            let keyframe = ControllerMsg::RequestKeyframe { after: 1 };
+            assert_eq!(keyframe.lane(), SessionLane::Control);
+            let mut frame = framing::encode(&keyframe);
             link.bulk.1.seal_frame(&mut frame).unwrap();
             link.bulk.0.write_all(&frame).await.unwrap();
         } else {
@@ -777,7 +778,7 @@ async fn rekey_voids_tokens_and_keeps_the_code() {
     let (dir, file) = temp_db();
     let (broker, cfg) = start_with(Some(file.clone())).await;
     let (mut host, id) = register_with(&cfg, None, true).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let old_token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
 
@@ -912,7 +913,7 @@ async fn host_service_rekeys_on_kick_all() {
     };
     let (first, changed) = next_saved(&mut saved).await;
     assert!(changed);
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let token = ask(&mut ctrl, 1, first.code, None).await.unwrap().resume;
 
     cmd_tx.send(HostCmd::KickAll).unwrap();
@@ -1059,7 +1060,7 @@ async fn rekey_on_register_survives_a_lost_answer_and_a_restart() {
     let (dir, file) = temp_db();
     let (old, cfg) = start_with(Some(file.clone())).await;
     let (host, id) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let token = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     old.flush_bindings().await;
     drop((host, ctrl, old));
@@ -1068,7 +1069,7 @@ async fn rekey_on_register_survives_a_lost_answer_and_a_restart() {
     let (h1, again) = register_full(&cfg, Some(id), false, true).await;
     assert_eq!(again.code, id.code);
     assert_ne!(again.secret, id.secret);
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     assert_eq!(
         ask(&mut ctrl, 1, id.code, Some(token)).await.unwrap_err(),
         ConnectError::Revoked
@@ -1093,7 +1094,7 @@ async fn stale_tokens_are_revoked_and_never_count_as_guesses() {
     let (broker, cfg) = start().await;
     let ip = limiter_key("127.0.0.1".parse().unwrap());
     let (mut host, id) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let stale = ask(&mut ctrl, 1, id.code, None).await.unwrap().resume;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
     write_msg(&mut host.send, &ClientMsg::Rekey { secret: id.secret })
@@ -1144,7 +1145,7 @@ async fn a_host_that_isnt_ready_is_answered_like_an_unknown_code() {
     let unknown = (CODE_MIN..=CODE_MAX)
         .find(|c| !broker.hosts.lock().contains_key(c))
         .unwrap();
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     for (req, code) in [(1, id.code), (2, unknown)] {
         let t = Instant::now();
         assert_eq!(
@@ -1163,7 +1164,7 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
     use airhand_proto::SessionHeader;
     let (broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
     let lane = async |conn: &quinn::Connection, lane: u8| {
@@ -1239,7 +1240,7 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
 async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
     let (broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
     let dgram = |sid: u64, body: &[u8]| {
@@ -1260,7 +1261,7 @@ async fn datagrams_are_relayed_between_the_two_ends_of_a_session() {
     ctrl.conn.send_datagram(dgram(sid, b"back")).unwrap();
     assert_eq!(recv(&host.conn).await, b"back");
     // 别的连接冒用这个会话、会话 ID 不对：都不转（接着收到的是后面那个）
-    let other = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let other = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     other.conn.send_datagram(dgram(sid, b"intruder")).unwrap();
     host.conn.send_datagram(dgram(sid ^ 1, b"lost")).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1378,7 +1379,7 @@ async fn new_codes_are_limited_per_network() {
     .await;
     let (_a, a) = register(&cfg, None).await;
     let (_b, _) = register(&cfg, None).await;
-    let mut sig = connect_signal(&cfg, Role::Host).await.unwrap();
+    let mut sig = connect_signal(&cfg, Role::Host, None).await.unwrap();
     write_msg(
         &mut sig.send,
         &ClientMsg::Register {
@@ -1414,7 +1415,7 @@ async fn sessions_are_limited_per_source_and_code() {
     let ip = limiter_key("127.0.0.1".parse().unwrap());
     let (mut host, id) = register(&cfg, None).await;
     let (mut other_host, other) = register(&cfg, None).await;
-    let mut ctrl = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let mut token = None;
     for req in 0..3 {
         let grant = ask(&mut ctrl, req, id.code, token).await.unwrap();
@@ -1429,7 +1430,7 @@ async fn sessions_are_limited_per_source_and_code() {
             ConnectError::RateLimited
         );
     }
-    let mut second = connect_signal(&cfg, Role::Controller).await.unwrap();
+    let mut second = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     assert_eq!(
         ask(&mut second, 1, id.code, None).await.unwrap_err(),
         ConnectError::RateLimited
@@ -1470,16 +1471,16 @@ async fn connections_are_limited_per_network() {
         ..test_config(None)
     })
     .await;
-    let a = connect_signal(&cfg, Role::Controller).await.unwrap();
-    let _b = connect_signal(&cfg, Role::Controller).await.unwrap();
-    assert!(connect_signal(&cfg, Role::Controller).await.is_err());
+    let a = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    let _b = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    assert!(connect_signal(&cfg, Role::Controller, None).await.is_err());
     a.conn.close(VarInt::from_u32(0), b"");
     drop(a);
     wait_until("a connection slot is free", || {
         broker.conns.lock().values().sum::<usize>() < 2
     })
     .await;
-    assert!(connect_signal(&cfg, Role::Controller).await.is_ok());
+    assert!(connect_signal(&cfg, Role::Controller, None).await.is_ok());
 }
 
 /// 固定的控制码：服务器重启（只剩数据库里的绑定）之后，只有原来的被控端能取回，别人拿不走；

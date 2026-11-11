@@ -27,6 +27,8 @@ pub struct Established {
     pub control: (SendStream, Sealer),
     /// 本端的大块通道
     pub bulk: (SendStream, Sealer),
+    /// 控制数据报（Ping、确认）的加密端：交给 [`crate::transport::DatagramSender`]
+    pub datagrams: Sealer,
     /// 被控端发来的东西
     pub receiver: HostReceiver,
     /// 直连用的：探测数据报的密钥、中转和直连上来的探测数据报
@@ -73,8 +75,8 @@ pub async fn establish(
             secured.video.opener,
             inbox.video,
         ),
-        inbox.audio,
-        secured.audio.opener,
+        (inbox.audio, secured.audio.opener),
+        (inbox.datagrams, secured.datagrams.opener),
     );
     Ok(Established {
         session_id,
@@ -83,6 +85,7 @@ pub async fn establish(
         negotiated: done.negotiated,
         control: (control, done.sealer),
         bulk: (bulk, secured.bulk.sealer),
+        datagrams: secured.datagrams.sealer,
         receiver,
         probe: secured.probe,
         probes: inbox.probes,

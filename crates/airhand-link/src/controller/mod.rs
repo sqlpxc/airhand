@@ -61,6 +61,7 @@ use crate::direct::{self, Mirror};
 use crate::lanes::Router;
 use crate::secure::{self, Identity, InitiatorParams};
 use crate::tasks::OwnedTask;
+use crate::transport::DatagramSender;
 use crate::wire::{read_msg, write_msg};
 use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
@@ -226,6 +227,8 @@ struct SessionHandle {
     clipboard: Option<Arc<AtomicBool>>,
     /// 画面帧什么时候到的：确认时带上（见 [`session::Arrivals`]）
     arrivals: Arc<Mutex<session::Arrivals>>,
+    /// 画面确认（控制数据报）
+    feedback: Arc<session::Feedback>,
 }
 
 struct Inner {
@@ -376,6 +379,13 @@ impl ControllerService {
         let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
         // 直连：等被控端发来候选地址
         let mirror = Mirror::default();
+        // Ping、画面确认：控制数据报，中转上发、直连通着时直连上也发
+        let feedback = Arc::new(session::Feedback::new(DatagramSender::new(
+            grant.session_id,
+            live.conn.clone(),
+            mirror.clone(),
+            link.datagrams,
+        )));
         let (offers_tx, offers) = mpsc::channel(4);
         let answer = tx.clone();
         let direct = direct::controller::run(direct::controller::Session {
@@ -412,6 +422,7 @@ impl ControllerService {
             mode,
             negotiated: link.negotiated,
             arrivals: arrivals.clone(),
+            feedback: feedback.clone(),
             mirror,
             direct: session::Direct {
                 offers: offers_tx,
@@ -438,6 +449,7 @@ impl ControllerService {
                 task: handle.abort_handle(),
                 clipboard,
                 arrivals,
+                feedback,
             },
         );
         info!(sid, code, host = %grant.host_name, %safety, "session established");
@@ -498,7 +510,7 @@ impl ControllerService {
     }
 
     /// 界面收到了这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的，
-    /// 带着这一帧开始从网络上到达的时刻（见 `ControllerMsg::Ack`）
+    /// 带着这一帧开始从网络上到达的时刻，发成控制数据报（见 `ControllerDatagram::Ack`）
     pub fn ack(&self, sid: u32, seq: u32) -> Result<(), Problem> {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
@@ -507,7 +519,8 @@ impl ControllerService {
             debug!(sid, seq, "ignoring an acknowledgement for an unknown frame");
             return Ok(());
         };
-        s.tx.send(ControllerMsg::Ack { seq, arrived })
+        s.feedback.ack(seq, arrived);
+        Ok(())
     }
 
     /// 断开会话（[`Command::Disconnect`]）
@@ -569,7 +582,7 @@ async fn run(inner: Arc<Inner>, report: Report) {
 }
 
 async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
-    let sig = net::connect_signal(&inner.cfg, Role::Controller).await?;
+    let sig = net::connect_signal(&inner.cfg, Role::Controller, None).await?;
     let (tx, mut rx) = mpsc::channel::<ClientMsg>(64);
     let pending: Pending = Arc::default();
     // 被控端的通道、数据报按会话 ID 交给会话（见模块说明的"通道和数据报"）

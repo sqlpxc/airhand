@@ -175,8 +175,8 @@ pub(crate) struct Session {
     pub answers: mpsc::Receiver<DirectOffer>,
     pub mirror: Mirror,
     pub route: watch::Sender<Route>,
-    /// 往直连上写画面失败了（画面的写任务通知）
-    pub broken: Arc<Notify>,
+    /// 往哪条直连上写画面失败了（画面的写任务报告）：只认现在这条的，别的（之前那条的、换路之前的）不算
+    pub broken: watch::Receiver<Option<Connection>>,
     /// 画面的确认交给谁（平台的，会话开始时才有）：换路时告诉它
     pub acks: Arc<OnceLock<Arc<dyn Acks>>>,
     /// 直连断了要一个关键帧：交给会话
@@ -286,7 +286,7 @@ async fn serve(s: &mut Session, conn: Connection) {
     tasks.spawn(accept_direct(conn.clone(), s.session_id, s.feed.clone()));
     match open_lane(&conn, s.session_id, SessionLane::Control).await {
         Ok(send) => {
-            tasks.spawn(s.mirror.start(send));
+            tasks.spawn(s.mirror.start(send, conn.clone()));
         }
         Err(e) => {
             warn!(
@@ -298,6 +298,8 @@ async fn serve(s: &mut Session, conn: Connection) {
         }
     }
     let mut sel = Selector::default();
+    // 之前报告的都是别的直连的
+    s.broken.mark_unchanged();
     let mut tick = tokio::time::interval(PROBE_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -313,7 +315,14 @@ async fn serve(s: &mut Session, conn: Connection) {
                 }
                 None
             }
-            () = s.broken.notified() => Some(sel.broken(Instant::now())),
+            r = s.broken.changed() => {
+                // 写任务不在了：会话在结束
+                if r.is_err() {
+                    break;
+                }
+                let this = s.broken.borrow_and_update().as_ref().is_some_and(|c| c.stable_id() == conn.stable_id());
+                this.then(|| sel.broken(Instant::now()))
+            }
             e = conn.closed() => {
                 info!(session_id = s.session_id, "direct path closed: {e}");
                 break;

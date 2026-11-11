@@ -543,9 +543,12 @@ async fn ctrl_connect(
     svc.connect(&code, opts, ui, frontend).await
 }
 
-/// 对会话的操作（输入、画质、确认画面……），和网页版、Android 一样的 [`Command`]
+/// 对会话的操作（输入、画质、确认画面……），和网页版、Android 一样的 [`Command`]。
+///
+/// 同步命令：Tauri 在主线程上按到达的先后执行（`command` 只是排进队列，不等什么）。写成 `async` 的话每次调用
+/// 单独 spawn 成一个任务，接连到达的两批输入（按下、松开）谁先进命令队列就不一定了
 #[tauri::command]
-async fn ctrl(state: tauri::State<'_, AppState>, command: Command) -> Result<(), Problem> {
+fn ctrl(state: tauri::State<'_, AppState>, command: Command) -> Result<(), Problem> {
     state.controller()?.command(command)
 }
 

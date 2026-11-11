@@ -1,8 +1,11 @@
 //! 连中转用的 UDP socket：quinn 照常用它收发；打洞时从**同一个** socket 发几个字节（同一个本地端口，
 //! 也就是服务器看到的那个 NAT 映射），对方的 NAT 才认得出来、放行之后的直连。
+//!
+//! socket 是双栈的（IPv6，同时收发 IPv4）：中转走哪种地址都行，直连也能两种地址都试（见 [`super::candidates`]）。
+//! 系统不让开双栈的（关掉了 IPv6）退回按中转的地址族开。
 
 use std::io::{self, IoSliceMut};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -34,7 +37,7 @@ impl AsyncUdpSocket for PunchSocket {
             .only_to
             .lock()
             .unwrap()
-            .is_some_and(|a| a != transmit.destination)
+            .is_some_and(|a| super::canonical(a) != super::canonical(transmit.destination))
         {
             return Ok(());
         }
@@ -74,6 +77,13 @@ pub struct Punch(Arc<PunchSocket>);
 impl Punch {
     /// 往 `to` 发一个打洞包（打开本端 NAT 上通往它的映射）。发不出去就算了：过一会儿还会再发
     pub(crate) fn send(&self, to: SocketAddr) {
+        // 双栈的 socket 只认 IPv6 的地址（IPv4 写成映射地址），quinn 自己发的包也是这样
+        let to = match (to, self.0.local_addr()) {
+            (SocketAddr::V4(v4), Ok(SocketAddr::V6(_))) => {
+                SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
+            }
+            _ => to,
+        };
         let _ = self.0.try_send(&Transmit {
             destination: to,
             ecn: None,
@@ -94,15 +104,32 @@ impl Punch {
 /// [`bind`] 的结果：交给 quinn 的 socket、打洞用的句柄、quinn 的运行时
 pub(crate) type Bound = (Arc<dyn AsyncUdpSocket>, Punch, Arc<dyn Runtime>);
 
-/// 绑定一个 UDP socket（`addr` 通常是 `0.0.0.0:0` / `[::]:0`），给 quinn 用、也能打洞
-pub(crate) fn bind(addr: SocketAddr) -> io::Result<Bound> {
+/// 绑定一个给 quinn 用、也能打洞的 UDP socket：双栈的；开不了双栈时按 `peer`（要连的服务器）的地址族开
+pub(crate) fn bind(peer: SocketAddr) -> io::Result<Bound> {
     let runtime =
         quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
-    let socket = std::net::UdpSocket::bind(addr)?;
+    let socket = udp((Ipv6Addr::UNSPECIFIED, 0).into(), true).or_else(|_| {
+        let any: SocketAddr = if peer.is_ipv6() {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        };
+        udp(any, false)
+    })?;
     let socket = Arc::new(PunchSocket {
         inner: runtime.wrap_udp_socket(socket)?,
         #[cfg(feature = "test-hooks")]
         only_to: Default::default(),
     });
     Ok((socket.clone(), Punch(socket), runtime))
+}
+
+fn udp(addr: SocketAddr, dual: bool) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if dual {
+        s.set_only_v6(false)?;
+    }
+    s.bind(&addr.into())?;
+    Ok(s.into())
 }

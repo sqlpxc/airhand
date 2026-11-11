@@ -137,7 +137,7 @@ fn u64_at(b: &[u8], i: usize) -> u64 {
 /// 画面包的头
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoHeader {
-    /// 会话内的帧序号，控制端收到后确认（[`ControllerMsg::Ack`](crate::session::ControllerMsg::Ack)）
+    /// 会话内的帧序号，控制端收到后确认（[`ControllerDatagram::Ack`](crate::session::ControllerDatagram::Ack)）
     pub seq: u32,
     pub key: bool,
     pub codec: Codec,

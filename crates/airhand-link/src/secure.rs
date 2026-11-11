@@ -2,9 +2,10 @@
 //!
 //! * [`Identity`]：一台设备的长期 X25519 密钥（Noise 的静态密钥），由各端自己保存；
 //! * [`initiate`] / [`Initiator::finish`]：控制端开始握手（第一条消息放进发起会话的请求里），之后在控制通道上做完
-//!   （最后是控制端的确认）；[`respond`]：被控端回答。两边都得到 [`Secured`] 和双方协商好的 [`Negotiated`]；
-//! * [`Secured`]：握手一次性派生的通道密钥：每条通道每个方向一个 [`Sealer`] / [`Opener`]，声音数据报一对，
-//!   探测两条路的往返时延用的一对（[`Secured::probe`]）。
+//!   （最后是控制端的确认）；[`respond`]：被控端回答（发出决定就返回，确认由会话的读任务解开）。
+//!   两边都得到 [`Secured`] 和双方协商好的 [`Negotiated`]；
+//! * [`Secured`]：握手一次性派生的通道密钥：每条通道每个方向一个 [`Sealer`] / [`Opener`]，声音数据报、
+//!   控制数据报各一对，探测两条路的往返时延用的一对（[`Secured::probe`]）。
 //!
 //! 加解密都是原地做的：发送的帧预留了标签和计数的位置（`airhand_proto::framing::encode_with_spare`、
 //! `airhand_proto::media::frame`），收到的帧解密之后截掉尾巴，画面包照样原样交给界面，不多拷贝。
@@ -275,6 +276,9 @@ pub struct Secured {
     pub bulk: LaneKeys,
     /// 声音数据报。乱序可以、重放不行
     pub audio: LaneKeys,
+    /// 控制数据报（Ping、Pong、画面确认，`airhand_proto::datagram::CONTROL`）。乱序可以、重放不行：
+    /// 直连通着时同一个数据报两条路各发一份，后到的那份就是重放
+    pub datagrams: LaneKeys,
     /// 探测数据报（`airhand_proto::datagram::PROBE`）：量中转、直连两条路的往返时延。乱序可以、重放不行
     pub probe: LaneKeys,
 }
@@ -342,6 +346,7 @@ impl KeyMaterial {
                 video: self.keys(label(SessionLane::Video), window()),
                 bulk: self.keys(label(SessionLane::Bulk), Order::Next(0)),
                 audio: self.keys(b"airhand audio", window()),
+                datagrams: self.keys(b"airhand control datagram", window()),
                 probe: self.keys(b"airhand probe", window()),
             },
             self.keys(label(SessionLane::Control), Order::Next(0)),
@@ -718,12 +723,13 @@ pub enum Admission {
     NeedsApproval,
 }
 
-/// 被控端握手的结果：控制端已经确认过了（见 `airhand_proto::handshake` 的"确认"），是真的在连
+/// 被控端握手的结果。控制端还没确认（见 `airhand_proto::handshake` 的"确认"）：`opener` 解开的第一帧必须是
+/// [`Confirm`]，在那之前不能显示"谁在连"、不能请本机用户同意
 pub struct Responded {
     pub secured: Secured,
     /// 控制通道上被控端 → 控制端的发送端（已经发出了决定，计数接着往下数）
     pub sealer: Sealer,
-    /// 控制通道上控制端 → 被控端的接收端（已经解开了确认，计数接着往下数）
+    /// 控制通道上控制端 → 被控端的接收端（下一帧是确认，计数 0）
     pub opener: Opener,
     pub intro: ControllerIntro,
     pub admission: Admission,
@@ -739,16 +745,16 @@ pub struct ResponderParams<'a> {
 
 /// 被控端：回答控制端的握手（`init` 是 `ServerMsg::Incoming::init`，见 `airhand_proto::handshake`）。
 /// 回答写进 `send`（本端的控制通道）；控制端之后的消息从 `recv` 来（控制端的控制通道，要等它开过来：
-/// 第一次用到时才等）。让不让进来由 [`Gate`] 决定；拒绝时已经把原因告诉了控制端，返回错误。
+/// 用到时才等）。让不让进来由 [`Gate`] 决定；拒绝时已经把原因告诉了控制端，返回错误。
 ///
-/// 收到控制端的确认才返回（连同 `recv` 等到的流）：在那之前不能显示"谁在连"、不能开始采集
-/// （`Noise_IK` 的第 1 条消息可以被重放）
+/// 发出决定就返回，不等控制端的确认（见 [`Responded`]）。用到了 `recv` 的话（`Noise_XX` 要读第 3 条）连同它等到的流
+/// 一起返回，`Noise_IK` 用不着它，是 `None`
 pub async fn respond<W, R, F>(
     init: &[u8],
     send: &mut W,
     recv: F,
     p: ResponderParams<'_>,
-) -> Result<(Responded, R)>
+) -> Result<(Responded, Option<R>)>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -831,14 +837,13 @@ where
     let m = hs.write_message(&[], &mut msg)?;
     reply.noise = Some(msg[..m].to_vec());
 
-    let mut recv = Some(recv);
-    let mut buf = Vec::new();
-    let (intro_bytes, mut stream) = if pattern == Pattern::Known {
+    let (intro_bytes, stream) = if pattern == Pattern::Known {
         (payload[..n].to_vec(), None)
     } else {
         send_step(send, &reply).await?;
         reply = HandshakeReply::default();
-        let mut r = recv.take().expect("not awaited yet").await?;
+        let mut r = recv.await?;
+        let mut buf = Vec::new();
         read_step(&mut r, &mut buf).await?;
         let finish: HandshakeFinish = framing::decode_known(&buf)?;
         match hs.read_message(&finish.noise, &mut payload) {
@@ -862,13 +867,7 @@ where
             return Err(e.into());
         }
     };
-    let (
-        secured,
-        LaneKeys {
-            mut opener,
-            mut sealer,
-        },
-    ) = KeyMaterial::new(Role::Host, &mut hs)?.split();
+    let (secured, LaneKeys { opener, mut sealer }) = KeyMaterial::new(Role::Host, &mut hs)?.split();
 
     // 决定：版本，然后是让不让进来
     let version = intro.max.min(SESSION_VERSION);
@@ -892,6 +891,15 @@ where
     } else {
         None
     };
+    // 配对：解开了第 3 条，配对码就是对的、这次握手也是新鲜的（第 3 条离不开本端这次的临时密钥）：现在就记住它。
+    // 配对码可能在这期间换掉了：本机在自己的锁里检查，换掉了就不认（见 airhand_proto::handshake 的"配对"）
+    if let (None, Some(attempt)) = (refused, pairing) {
+        if !attempt.complete(secured.peer, &intro.name) {
+            fail(send, HandshakeError::PairingUnavailable).await;
+            bail!("pairing was revoked during the handshake");
+        }
+        info!(name = %intro.name, key = %hex(&secured.peer), "a controller paired with this host");
+    }
     let verdict = HostVerdict {
         version: refused.is_none().then_some(version),
         features: airhand_proto::features::session::SUPPORTED,
@@ -904,29 +912,6 @@ where
     if let Some(r) = refused {
         bail!("refused the controller: {r:?}");
     }
-    let admission = admission.expect("checked above");
-
-    // 等控制端的确认（见 airhand_proto::handshake 的"确认"）：解得开它才算这个控制端真的在连。
-    // 重放的第 1 条消息走不到这里（重放的一方算不出会话密钥），在这之前什么也不记、什么也不显示
-    let mut r = match stream.take() {
-        Some(r) => r,
-        None => recv.take().expect("not awaited yet").await?,
-    };
-    read_step(&mut r, &mut buf)
-        .await
-        .context("waiting for the controller to confirm the handshake")?;
-    opener
-        .open(&mut buf)
-        .context("the controller's confirmation failed authentication")?;
-    let _: Confirm = framing::decode_known(&buf)?;
-
-    if let Some(attempt) = pairing {
-        anyhow::ensure!(
-            attempt.complete(secured.peer, &intro.name),
-            "pairing was revoked during the handshake"
-        );
-        info!(name = %intro.name, key = %hex(&secured.peer), "a controller paired with this host");
-    }
     Ok((
         Responded {
             negotiated,
@@ -934,9 +919,9 @@ where
             sealer,
             opener,
             intro,
-            admission,
+            admission: admission.expect("checked above"),
         },
-        r,
+        stream,
     ))
 }
 
@@ -1071,22 +1056,28 @@ mod tests {
         }
     }
 
-    /// 握手一次（第一条消息直接交给被控端，之后的走一对管道）。返回控制端和被控端各自的结果
+    /// 握手一次（第一条消息直接交给被控端，之后的走一对管道），被控端再解开控制端的确认。
+    /// 返回控制端和被控端各自的结果
     async fn run(
         gate: &TestGate,
         me: &Identity,
         host_key: Option<PublicKey>,
         pairing: Option<&str>,
     ) -> (Result<Initiated>, Result<Responded>) {
-        let ((mut cr, mut cw), (hr, mut hw)) = pipes();
+        let ((mut cr, mut cw), (mut hr, mut hw)) = pipes();
         let intro = test_intro();
         let (initiator, init) = initiate(params(me, host_key, pairing, &intro)).unwrap();
         // 各自拿着自己那一端：一边结束（失败）时连接随之关闭，另一边马上知道
         let c = async move { initiator.finish(&mut cr, &mut cw).await };
         let h = async move {
-            respond(&init, &mut hw, async { Ok(hr) }, responder(gate))
-                .await
-                .map(|(r, _)| r)
+            let (mut r, _) =
+                respond(&init, &mut hw, async { Ok(&mut hr) }, responder(gate)).await?;
+            // 确认是控制端在控制通道上发的第一帧密文
+            let mut buf = Vec::new();
+            read_frame(&mut hr, 1 << 16, &mut buf).await?;
+            r.opener.open(&mut buf)?;
+            let _: Confirm = framing::decode_known(&buf)?;
+            Ok(r)
         };
         tokio::join!(c, h)
     }
@@ -1141,12 +1132,13 @@ mod tests {
         assert_eq!(&payload[24..], b"hello");
         // 控制通道：被控端的发送端接着决定往下数，控制端的发送端接着确认往下数
         let (mut h_send, mut c_recv) = (h.sealer, c.opener);
-        let mut f = framing::encode(&airhand_proto::session::HostMsg::Pong { t: 1 });
+        let mut f = framing::encode(&airhand_proto::session::HostMsg::AwaitingApproval);
         h_send.seal_frame(&mut f).unwrap();
         let mut p = f[4..].to_vec();
         c_recv.open(&mut p).unwrap();
         let (mut c_send, mut h_recv) = (c.sealer, h.opener);
-        let mut f = framing::encode(&airhand_proto::session::ControllerMsg::Ping { t: 1 });
+        let mut f =
+            framing::encode(&airhand_proto::session::ControllerMsg::RequestKeyframe { after: 1 });
         c_send.seal_frame(&mut f).unwrap();
         let mut p = f[4..].to_vec();
         h_recv.open(&mut p).unwrap();
@@ -1204,10 +1196,10 @@ mod tests {
         assert_eq!(problem(c), Problem::PairingUnavailable);
     }
 
-    /// 中转把录下来的 IK 第 1 条消息重放给被控端：被控端照样回答（它分不出来），但等不到确认，
-    /// 不会当成那个配对过的控制端进来了（不显示、不采集）
+    /// 中转把录下来的 IK 第 1 条消息重放给被控端：被控端照样回答（它分不出来），但重放的一方拿不出确认，
+    /// 被控端不会当成那个配对过的控制端进来了（不显示、不请本机用户同意）
     #[tokio::test]
-    async fn a_replayed_first_message_is_not_admitted() {
+    async fn a_replayed_first_message_cannot_confirm() {
         let gate = TestGate::new(Access::Pairing, None);
         let me = Identity::generate();
         gate.known.lock().unwrap().insert(*me.public());
@@ -1223,22 +1215,20 @@ mod tests {
         assert!(c.is_ok());
         assert_eq!(h.unwrap().0.admission, Admission::Known);
 
-        // 重放：被控端回答了，但重放的一方拿不出确认（随便发一帧、或者干脆不发）
-        let ((mut fake_r, mut fake_w), (hr, mut hw)) = pipes();
-        let host = respond(&first, &mut hw, async { Ok(hr) }, responder(&gate));
-        let replay = async move {
-            let mut buf = Vec::new();
-            read_frame(&mut fake_r, 1 << 16, &mut buf).await.unwrap();
-            let reply: HandshakeReply = framing::decode_known(&buf).unwrap();
-            assert!(reply.verdict.is_some() && reply.error.is_none());
-            write_frame(&mut fake_w, &[0u8; 40]).await.unwrap();
-        };
-        let (h, ()) =
-            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(host, replay) })
-                .await
-                .unwrap();
-        let e = h.err().expect("a replayed handshake must not be admitted");
-        assert!(format!("{e:#}").contains("confirmation"), "{e:#}");
+        // 重放：被控端回答了（它分不出来），但重放的一方算不出会话密钥，随便发一帧都解不开
+        let ((mut fake_r, mut fake_w), (mut hr, mut hw)) = pipes();
+        let (r, _) = respond(&first, &mut hw, async { Ok(&mut hr) }, responder(&gate))
+            .await
+            .unwrap();
+        assert_eq!(r.admission, Admission::Known);
+        let mut buf = Vec::new();
+        read_frame(&mut fake_r, 1 << 16, &mut buf).await.unwrap();
+        let reply: HandshakeReply = framing::decode_known(&buf).unwrap();
+        assert!(reply.verdict.is_some() && reply.error.is_none());
+        write_frame(&mut fake_w, &[0u8; 40]).await.unwrap();
+        read_frame(&mut hr, 1 << 16, &mut buf).await.unwrap();
+        let mut opener = r.opener;
+        assert!(opener.open(&mut buf).is_err());
     }
 
     /// 被控端不会控制端用的模式（以后的版本加的）：回答它会哪些，控制端据此判断该更新哪一边
@@ -1362,10 +1352,7 @@ mod tests {
             (0..3u8)
                 .map(|k| {
                     let mut f = framing::encode_with_spare(
-                        &airhand_proto::session::ControllerMsg::Ack {
-                            seq: k as u32,
-                            arrived: 0,
-                        },
+                        &airhand_proto::session::ControllerMsg::RequestKeyframe { after: k as u32 },
                         SEAL_OVERHEAD,
                     );
                     let cap = f.capacity();
@@ -1431,10 +1418,17 @@ mod tests {
         assert!(open(&mut o, bad).is_err());
         assert_eq!(open(&mut o, body(&d[3])).unwrap(), [3; 10]);
         assert_eq!(open(&mut o, body(&d[2])).unwrap(), [2; 10]);
-        // 探测和声音的密钥不一样
+        // 探测、控制数据报和声音的密钥都不一样
         let mut p = host_keys.probe.sealer;
         let probe = p.seal(&[1]).unwrap();
         assert!(open(&mut o, probe).is_err());
+        let mut c = host_keys.datagrams.sealer;
+        let control = c.seal(&[1]).unwrap();
+        assert!(open(&mut o, control.clone()).is_err());
+        let mut o = ctl_keys.datagrams.opener;
+        assert_eq!(open(&mut o, control.clone()).unwrap(), [1]);
+        // 直连通着时同一个数据报两条路各来一份：后到的是重放
+        assert!(open(&mut o, control).is_err());
     }
 
     #[test]

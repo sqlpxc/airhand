@@ -53,7 +53,7 @@ pub fn transport_config() -> TransportConfig {
     // 窗口就是服务器肯替一条连接缓存多少：不读数据的一方（或者故意这样做的攻击者）最多让服务器缓存
     // 接收 16 MiB + 发送 16 MiB，而不是几百 MiB。在途的画面由应用层 ACK 控制，不靠这里的窗口：
     // 每个会话最多 码率 × (RTT + 50 ms)、不超过 4 MiB（airhand_link::flow），画面占不满发送窗口，
-    // 同一连接上的 Pong、Bye 还写得进去
+    // 同一连接上的 Bye 还写得进去
     t.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
     t.receive_window(VarInt::from_u32(16 * 1024 * 1024));
     t.send_window(16 * 1024 * 1024);

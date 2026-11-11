@@ -2,7 +2,7 @@
 //!
 //! * **走哪条通道由消息决定**（[`HostMsg::lane`]）：发的一方只管 [`Outbox::send`]，不用自己挑控制通道还是大块通道。
 //!   大的消息（剪贴板、光标形状）在大块通道上排队，挡不住控制消息；
-//! * **只关心最新值的状态不排队**：Pong、显示器列表、光标状态（控制通道）各占一个槽位、只留最新的一个，
+//! * **只关心最新值的状态不排队**：显示器列表、光标状态（控制通道）各占一个槽位、只留最新的一个，
 //!   写任务先发它们，再按顺序发排着队的；
 //! * 其它消息按顺序排队，有上限。满了怎么办由发的一方决定（[`SendError::Full`]）：控制消息排满了说明对方早就不收了，
 //!   会话结束；剪贴板丢掉这一次；光标图像下一轮再发那时最新的。
@@ -42,10 +42,9 @@ const LIMITS: [Limit; 2] = [
     },
 ];
 /// 控制通道上只留最新值的槽位（写任务按这个先后发）
-const PONG: usize = 0;
-const DISPLAYS: usize = 1;
-const CURSOR: usize = 2;
-const SLOTS: usize = 3;
+const DISPLAYS: usize = 0;
+const CURSOR: usize = 1;
+const SLOTS: usize = 2;
 
 /// 一条消息在队列里怎么放
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +64,6 @@ impl Place {
         };
         let queued = |before| Place::Queued { lane, before };
         match msg {
-            HostMsg::Pong { .. } => Place::Latest(PONG),
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
             HostMsg::Hello(_) => queued(Some(DISPLAYS)),
             HostMsg::Cursor { .. } => Place::Latest(CURSOR),
@@ -339,7 +337,6 @@ mod tests {
     #[test]
     fn messages_go_to_their_lane() {
         for (msg, lane) in [
-            (HostMsg::Pong { t: 1 }, SessionLane::Control),
             (displays("a"), SessionLane::Control),
             (hello("a"), SessionLane::Control),
             (notice(), SessionLane::Control),
@@ -362,20 +359,20 @@ mod tests {
         }
     }
 
-    /// 写任务先发 Pong、显示器列表（各只留最新的），再按顺序发排着的
+    /// 写任务先发显示器列表、光标状态（各只留最新的），再按顺序发排着的
     #[test]
     fn states_go_first_and_keep_only_the_latest() {
         let (tx, mut control, _bulk) = channel();
         tx.send(&notice()).unwrap();
-        tx.send(&HostMsg::Pong { t: 1 }).unwrap();
+        tx.send(&cursor(true, 1)).unwrap();
         tx.send(&displays("old")).unwrap();
         tx.send(&HostMsg::Bye(ByeReason::Kicked)).unwrap();
-        tx.send(&HostMsg::Pong { t: 2 }).unwrap();
+        tx.send(&cursor(false, 2)).unwrap();
         tx.send(&displays("new")).unwrap();
         let out = drain(&mut control);
         assert_eq!(out.len(), 4, "{out:?}");
-        assert!(matches!(out[0], HostMsg::Pong { t: 2 }));
-        assert_eq!(shown(&out[1]), "new");
+        assert_eq!(shown(&out[0]), "new");
+        assert!(matches!(out[1], HostMsg::Cursor { visible: false, .. }));
         assert!(matches!(out[2], HostMsg::Notice(_)));
         assert!(matches!(out[3], HostMsg::Bye(ByeReason::Kicked)));
         // 槽位不占队列的位置：排满了它们照样放得进去
@@ -384,7 +381,7 @@ mod tests {
         }
         assert_eq!(tx.send(&notice()), Err(SendError::Full));
         for t in 0..1000 {
-            tx.send(&HostMsg::Pong { t }).unwrap();
+            tx.send(&cursor(t % 2 == 0, 1)).unwrap();
             tx.send(&displays("x")).unwrap();
         }
         assert_eq!(drain(&mut control).len(), CONTROL_MESSAGES + 2);
@@ -397,10 +394,10 @@ mod tests {
         tx.send(&notice()).unwrap();
         tx.send(&hello("at start")).unwrap();
         tx.send(&displays("changed")).unwrap();
-        tx.send(&HostMsg::Pong { t: 7 }).unwrap();
+        tx.send(&cursor(true, 7)).unwrap();
         let out = drain(&mut control);
-        // Pong 不受影响，照样最先
-        assert!(matches!(out[0], HostMsg::Pong { t: 7 }));
+        // 光标状态不受影响，照样最先
+        assert!(matches!(out[0], HostMsg::Cursor { .. }));
         assert!(matches!(out[1], HostMsg::Notice(_)));
         assert_eq!(shown(&out[2]), "at start");
         assert_eq!(shown(&out[3]), "changed");
@@ -474,13 +471,13 @@ mod tests {
     async fn closing() {
         let (tx, mut control, mut bulk) = channel();
         let tx2 = tx.clone();
-        tx.send(&HostMsg::Pong { t: 1 }).unwrap();
+        tx.send(&cursor(true, 1)).unwrap();
         tx.send(&HostMsg::Bye(ByeReason::Kicked)).unwrap();
         drop(tx);
         // 还有一个发送端：不结束
         assert!(matches!(
             decode(&control.recv().await.unwrap()),
-            HostMsg::Pong { t: 1 }
+            HostMsg::Cursor { .. }
         ));
         assert!(matches!(
             decode(&control.recv().await.unwrap()),
@@ -504,7 +501,7 @@ mod tests {
         tx.send(&notice()).unwrap();
         drop(control);
         assert_eq!(tx.send(&notice()), Err(SendError::Closed));
-        assert_eq!(tx.send(&HostMsg::Pong { t: 1 }), Err(SendError::Closed));
+        assert_eq!(tx.send(&cursor(true, 1)), Err(SendError::Closed));
         // 另一条通道的写任务还在
         tx.send(&clipboard(1)).unwrap();
         assert!(bulk.try_recv().is_some());
@@ -516,10 +513,7 @@ mod tests {
         let (tx, mut control, _bulk) = channel();
         let writer = tokio::spawn(async move { control.recv().await.map(|b| decode(&b)) });
         tokio::time::sleep(Duration::from_millis(10)).await;
-        tx.send(&HostMsg::Pong { t: 5 }).unwrap();
-        assert!(matches!(
-            writer.await.unwrap(),
-            Some(HostMsg::Pong { t: 5 })
-        ));
+        tx.send(&notice()).unwrap();
+        assert!(matches!(writer.await.unwrap(), Some(HostMsg::Notice(_))));
     }
 }

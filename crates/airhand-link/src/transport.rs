@@ -1,27 +1,29 @@
 //! 会话的写任务和控制端的接收端（两端共用的部分在 [`crate::lanes`]、[`crate::merge`]）。
 //!
 //! * 双方：[`write_lane`] 把排好队的帧加密后写进本端的一条通道（控制通道在直连通着时也从直连发一份）；
+//!   [`DatagramSender`] 发控制数据报（Ping、Pong、画面确认）；
 //! * 被控端：[`write_video`] 把画面写进现在走的那条路，[`write_audio`] 把声音包加密后发成数据报（同样走现在的那条路）；
-//! * 控制端：[`HostReceiver`] 收被控端的控制、大块、画面通道和声音数据报，解密之后交出来。
+//! * 控制端：[`HostReceiver`] 收被控端的控制、大块、画面通道和声音、控制数据报，解密之后交出来。
 //!
-//! 每条通道一条 QUIC 流，有自己的流量控制和丢包重传：画面堵住不影响控制消息，1 MiB 的剪贴板也不挡输入和确认
-//! （整条连接的拥塞控制还是共用的）。声音走 QUIC 数据报：不重传，也不排在丢了的包后面等重传，在 QUIC 包里排在所有流的前面。
+//! 每条通道一条 QUIC 流，有自己的流量控制和丢包重传：画面堵住不影响控制消息，1 MiB 的剪贴板也不挡输入
+//! （整条连接的拥塞控制还是共用的）。声音和控制数据报走 QUIC 数据报：不重传，也不排在丢了的包、流里别的消息后面等，
+//! 在 QUIC 包里排在所有流的前面。
 use crate::direct::{Mirror, Route};
 use crate::lanes::open_lane;
 use crate::merge::{Frame, Merge};
 use airhand_proto::framing::{self, Decoded};
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, Kind};
-use airhand_proto::session::HostMsg;
+use airhand_proto::minicbor::{Decode, Encode};
+use airhand_proto::session::{HostDatagram, HostMsg};
 use airhand_proto::{SessionLane, datagram};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use quinn::{Connection, SendDatagramError, SendStream};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, watch};
 use tracing::debug;
 
 use crate::secure::{Opener, Sealer};
@@ -76,20 +78,72 @@ pub async fn write_lane(
     Ok(())
 }
 
+/// 发控制数据报（`airhand_proto::datagram::CONTROL`：Ping、Pong、画面确认）。中转上发一份，直连通着时直连上也发
+/// **同一份**（同一个计数，对方的重放窗口挡掉后到的那份，见 [`Mirror`]）：总是走更快的那条路。丢了就丢了
+#[derive(Clone)]
+pub struct DatagramSender(Arc<Datagrams>);
+
+struct Datagrams {
+    session_id: u64,
+    relay: Connection,
+    mirror: Mirror,
+    sealer: Mutex<Sealer>,
+}
+
+impl DatagramSender {
+    /// `relay`：中转连接；`mirror`：这个会话在直连上的那一份；`sealer`：`Secured::datagrams` 的发送端
+    pub fn new(session_id: u64, relay: Connection, mirror: Mirror, sealer: Sealer) -> Self {
+        Self(Arc::new(Datagrams {
+            session_id,
+            relay,
+            mirror,
+            sealer: Mutex::new(sealer),
+        }))
+    }
+
+    pub fn send<T: Encode<()>>(&self, msg: &T) {
+        let d = &self.0;
+        let sealed = d.sealer.lock().unwrap().seal_datagram(
+            d.session_id,
+            datagram::CONTROL,
+            &framing::to_vec(msg),
+        );
+        let sealed = match sealed {
+            Ok(s) => Bytes::from(s),
+            Err(e) => return debug!("can't seal a control datagram: {e:#}"),
+        };
+        d.mirror.datagram(&sealed);
+        if let Err(e) = d.relay.send_datagram(sealed) {
+            debug!("dropped a control datagram: {e}");
+        }
+    }
+}
+
+/// 解开一个数据报（整个数据报：会话 ID、种类、密封单元）里的消息。解不开（被改过、重放的、另一条路上后到的那一份）、
+/// 不认识（对方版本新增的）的都是 `None`：数据报本来就会丢
+pub(crate) fn open_datagram<T: for<'b> Decode<'b, ()>>(opener: &mut Opener, d: &[u8]) -> Option<T> {
+    let mut body = d.get(datagram::HEADER..)?.to_vec();
+    opener.open(&mut body).ok()?;
+    match framing::decode(&body) {
+        Ok(Decoded::Msg(m)) => Some(m),
+        _ => None,
+    }
+}
+
 /// 直连上一帧画面这么久写不进去，就当它断了（这一帧改从中转发）
 const DIRECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 被控端的画面：`rx` 里排好队的画面包加密后写进现在走的那条路（`route`，由直连任务按两条路的时延决定）。
 /// 换路只在两帧之间生效，写到一半的帧照样写完：直连上已经写进去的帧照样送到，接收端按计数排好（见 [`crate::merge`]）。
-/// 往直连上写不进去（断了、堵死了）就放弃直连上的这条流（流里还没送到的帧随之丢了），这一帧改写进中转，并通知
-/// `broken`：直连任务当它断了（要关键帧、码率控制不再等那些帧）。中转上写不进去是错误：会话结束
+/// 往直连上写不进去（断了、堵死了）就放弃直连上的这条流（流里还没送到的帧随之丢了），这一帧改写进中转，并在
+/// `broken` 里报告是哪条直连：直连任务当它断了（要关键帧、码率控制不再等那些帧）。中转上写不进去是错误：会话结束
 pub async fn write_video(
     mut relay: SendStream,
     mut rx: mpsc::Receiver<Bytes>,
     mut sealer: Sealer,
     session_id: u64,
     mut route: watch::Receiver<Route>,
-    broken: Arc<Notify>,
+    broken: watch::Sender<Option<Connection>>,
 ) -> Result<()> {
     // 直连上画面的流：哪条连接上的（`stable_id`）
     let mut direct: Option<(usize, SendStream)> = None;
@@ -104,7 +158,7 @@ pub async fn write_video(
                     if let Some((_, mut s)) = direct.take() {
                         let _ = s.reset(0u32.into());
                     }
-                    broken.notify_one();
+                    broken.send_replace(Some(conn));
                 }
             }
         }
@@ -174,8 +228,10 @@ pub async fn write_audio(
 pub enum FromHost {
     /// 控制通道、大块通道上的消息
     Control(HostMsg),
+    /// 控制数据报（Pong）
+    Datagram(HostDatagram),
     /// 画面包（[`media`] 格式：头 + 码流），原样交给界面。`arrived`：开始从网络上到达的时刻
-    /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerMsg::Ack`）。
+    /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerDatagram::Ack`）。
     /// `direct`：从直连来的；`gap`：前面有帧没等到（断在了直连上），要一个关键帧（见 [`crate::merge`]）
     Video {
         packet: Vec<u8>,
@@ -187,67 +243,101 @@ pub enum FromHost {
     Audio(Vec<u8>),
 }
 
-/// 控制端收被控端的三条通道和声音数据报。
+/// 一种数据报（声音、控制）的信箱和它的解密端
+pub type DatagramInbox = (mpsc::Receiver<Bytes>, Opener);
+
+/// 控制端收被控端的三条通道、声音数据报和控制数据报。
 ///
-/// 每条通道一个读任务，读任务活到通道结束：`select!` / 超时只会取消信箱上的接收，不会切断半帧。
-/// 几个有界的信箱互相独立，画面、剪贴板再多也挡不住 Pong 和 Bye
+/// 每条通道的流由 [`Merge`] 的读任务读（读任务活到流结束，取消 [`HostReceiver::recv`] 不会切断半帧），
+/// 这里只从几个互相独立的信箱里取：画面、剪贴板再多也挡不住控制消息和 Pong
 pub struct HostReceiver {
-    control: mpsc::Receiver<Result<FromHost>>,
-    bulk: mpsc::Receiver<Result<FromHost>>,
-    video: mpsc::Receiver<Result<FromHost>>,
-    audio: mpsc::Receiver<Vec<u8>>,
+    control: Merge,
+    bulk: Merge,
+    video: Merge,
+    audio: DatagramInbox,
+    datagrams: DatagramInbox,
     bulk_open: bool,
     video_open: bool,
     audio_open: bool,
+    datagrams_open: bool,
     audio_order: AudioOrder,
-    _tasks: JoinSet<()>,
 }
 
 impl HostReceiver {
-    /// `control` / `bulk` / `video`：三条通道的接收端；`audio`：发给这个会话的声音数据报（整个数据报，还是密文）
-    /// 和它们的解密端
+    /// `control` / `bulk` / `video`：三条通道的接收端；`audio` / `datagrams`：发给这个会话的声音、控制数据报
+    /// （整个数据报，还是密文）和它们的解密端
     pub fn new(
         control: Merge,
         bulk: Merge,
         video: Merge,
-        audio: mpsc::Receiver<Bytes>,
-        audio_opener: Opener,
+        audio: DatagramInbox,
+        datagrams: DatagramInbox,
     ) -> Self {
-        let mut tasks = JoinSet::new();
         Self {
-            control: message_reader(&mut tasks, control, SessionLane::Control),
-            bulk: message_reader(&mut tasks, bulk, SessionLane::Bulk),
-            video: video_reader(&mut tasks, video),
-            audio: datagram_reader(&mut tasks, audio, audio_opener),
+            control,
+            bulk,
+            video,
+            audio,
+            datagrams,
             bulk_open: true,
             video_open: true,
             audio_open: true,
+            datagrams_open: true,
             audio_order: AudioOrder::default(),
-            _tasks: tasks,
         }
     }
 
-    /// 下一样东西。控制消息优先；控制通道结束了就是会话结束了（其它通道先结束不算）
+    /// 下一样东西。控制消息优先；控制通道结束了就是会话结束了（其它通道先结束不算）。可以放在 `select!` 里
     pub async fn recv(&mut self) -> Result<FromHost> {
         loop {
             tokio::select! {
                 biased;
-                m = self.control.recv() => return m.context("control stream ended")?,
-                m = self.bulk.recv(), if self.bulk_open => match m {
-                    Some(m) => return m,
+                m = next_msg::<HostMsg>(&mut self.control, SessionLane::Control) => {
+                    return Ok(FromHost::Control(m?.context("control stream ended")?));
+                }
+                d = self.datagrams.0.recv(), if self.datagrams_open => match d {
+                    Some(d) => {
+                        if let Some(m) = open_datagram(&mut self.datagrams.1, &d) {
+                            return Ok(FromHost::Datagram(m));
+                        }
+                    }
+                    None => self.datagrams_open = false,
+                },
+                m = next_msg::<HostMsg>(&mut self.bulk, SessionLane::Bulk), if self.bulk_open => match m? {
+                    Some(m) => return Ok(FromHost::Control(m)),
                     None => self.bulk_open = false,
                 },
-                p = self.audio.recv(), if self.audio_open => match p {
-                    Some(p) if self.audio_order.accept(&p) => return Ok(FromHost::Audio(p)),
-                    Some(_) => {}
+                d = self.audio.0.recv(), if self.audio_open => match d {
+                    Some(d) => {
+                        if let Some(p) = self.open_audio(&d) {
+                            return Ok(FromHost::Audio(p));
+                        }
+                    }
                     None => self.audio_open = false,
                 },
-                m = self.video.recv(), if self.video_open => match m {
-                    Some(m) => return m,
+                f = self.video.next(), if self.video_open => match f? {
+                    Some(f) => {
+                        return Ok(FromHost::Video {
+                            packet: f.data,
+                            arrived: f.arrived,
+                            direct: f.direct,
+                            gap: f.gap,
+                        });
+                    }
                     None => self.video_open = false,
                 },
             }
         }
+    }
+
+    /// 声音数据报：解开、检查是声音包、不是迟到的。解不开的（被篡改、重放的）、迟到的都丢掉这一包
+    fn open_audio(&mut self, d: &[u8]) -> Option<Vec<u8>> {
+        let mut p = d.get(datagram::HEADER..)?.to_vec();
+        if let Err(e) = self.audio.1.open(&mut p) {
+            debug!("dropped an audio packet: {e:#}");
+            return None;
+        }
+        (Kind::of(&p) == Some(Kind::Audio) && self.audio_order.accept(&p)).then_some(p)
     }
 }
 
@@ -274,22 +364,11 @@ impl AudioOrder {
     }
 }
 
-/// 把读到的东西放进信箱。返回 false 表示这条通道读完了（结束、出错，或者没人要了）
-async fn forward<T>(tx: &mpsc::Sender<Result<T>>, r: Result<Option<T>>) -> bool {
-    let r = match r {
-        Ok(Some(m)) => Ok(m),
-        Ok(None) => return false,
-        Err(e) => Err(e),
-    };
-    let more = r.is_ok();
-    tx.send(r).await.is_ok() && more
-}
-
 /// 一条消息通道（控制、大块）上的消息：解码、检查通道；对方版本新增的消息跳过。通道结束时为 `None`。
-/// 被控端和控制端共用（`M` 是对方发来的消息）
+/// 被控端和控制端共用（`M` 是对方发来的消息）。可以放在 `select!` 里（取消不丢消息）
 pub(crate) async fn next_msg<M>(merge: &mut Merge, lane: SessionLane) -> Result<Option<M>>
 where
-    M: for<'b> airhand_proto::minicbor::Decode<'b, ()> + LaneOf,
+    M: for<'b> Decode<'b, ()> + LaneOf,
 {
     loop {
         let Some(Frame { data, .. }) = merge.next().await? else {
@@ -320,73 +399,6 @@ impl LaneOf for airhand_proto::session::ControllerMsg {
     fn lane(&self) -> SessionLane {
         airhand_proto::session::ControllerMsg::lane(self)
     }
-}
-
-/// 读一条消息通道（控制、大块）
-fn message_reader(
-    tasks: &mut JoinSet<()>,
-    mut merge: Merge,
-    lane: SessionLane,
-) -> mpsc::Receiver<Result<FromHost>> {
-    let capacity = (4 * 1024 * 1024 / lane.max_frame_size()).min(16);
-    let (tx, rx) = mpsc::channel(capacity);
-    tasks.spawn(async move {
-        loop {
-            let r = next_msg::<HostMsg>(&mut merge, lane)
-                .await
-                .map(|m| m.map(FromHost::Control));
-            if !forward(&tx, r).await {
-                break;
-            }
-        }
-    });
-    rx
-}
-
-/// 声音数据报：解开、检查是声音包。解不开的（被篡改、重放的）、信箱满了（界面跟不上）都丢掉这一包，不等
-fn datagram_reader(
-    tasks: &mut JoinSet<()>,
-    mut rx: mpsc::Receiver<Bytes>,
-    mut opener: Opener,
-) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, out) = mpsc::channel(16);
-    tasks.spawn(async move {
-        while let Some(d) = rx.recv().await {
-            let mut p = d.get(datagram::HEADER..).unwrap_or_default().to_vec();
-            if let Err(e) = opener.open(&mut p) {
-                debug!("dropped an audio packet: {e:#}");
-                continue;
-            }
-            if Kind::of(&p) != Some(Kind::Audio) {
-                continue;
-            }
-            if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(p) {
-                break;
-            }
-        }
-    });
-    out
-}
-
-/// 画面：解不开、不是画面包都是错误（流是可靠的）。中转和直连上的帧按计数排好（见 [`crate::merge`]）
-fn video_reader(tasks: &mut JoinSet<()>, mut merge: Merge) -> mpsc::Receiver<Result<FromHost>> {
-    let (tx, rx) = mpsc::channel(2);
-    tasks.spawn(async move {
-        loop {
-            let r = merge.next().await.map(|f| {
-                f.map(|f| FromHost::Video {
-                    packet: f.data,
-                    arrived: f.arrived,
-                    direct: f.direct,
-                    gap: f.gap,
-                })
-            });
-            if !forward(&tx, r).await {
-                break;
-            }
-        }
-    });
-    rx
 }
 
 #[cfg(test)]

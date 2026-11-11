@@ -25,6 +25,7 @@ client = [
     "dep:serde",
     "dep:sha2",
     "dep:snow",
+    "dep:socket2",
     "dep:spake2",
     "tokio/rt",
     "tokio/macros",
@@ -56,6 +57,8 @@ serde = { version = "1", features = ["derive"], optional = true }
 sha2 = { version = "0.10", optional = true }
 # risky-raw-split：取出 Noise 的两把密钥，再派生每条通道、每个方向各自的密钥（见 src/secure.rs）
 snow = { version = "0.10", features = ["risky-raw-split"], optional = true }
+# 连中转的 socket 开成双栈的（绑定之前关掉 IPV6_V6ONLY，见 src/direct/socket.rs）
+socket2 = { version = "0.6", optional = true }
 spake2 = { version = "0.4", optional = true }
 
 [dev-dependencies]

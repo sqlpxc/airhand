@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::wire::{read_frame, write_frame};
+use crate::wire::read_frame;
 use airhand_proto::framing;
-use airhand_proto::signal::{ClientHello, ServerHello};
+use airhand_proto::signal::{ClientHello, ClientMsg, ServerHello};
 use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -309,14 +309,9 @@ async fn attempt(
     expected: Option<[u8; 32]>,
     mismatch: Arc<AtomicBool>,
 ) -> Result<Attempt> {
-    let bind: SocketAddr = if addr.is_ipv6() {
-        "[::]:0".parse()?
-    } else {
-        "0.0.0.0:0".parse()?
-    };
     let seen = Arc::new(Seen::default());
     let (socket, punch, runtime) =
-        crate::direct::bind(bind).context("can't create a UDP socket")?;
+        crate::direct::bind(addr).context("can't create a UDP socket")?;
     let mut endpoint =
         Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
             .context("can't create a QUIC endpoint")?;
@@ -390,27 +385,45 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 连接服务器并完成 Hello 握手。
 ///
+/// `first`：紧跟着 Hello 发的第一条消息（被控端的 `Register`），不等服务器回答 Hello，省一个往返。
+/// 服务器按顺序读；版本不兼容时它回答完就关掉，这条消息也就没人看了。
+///
 /// 失败时返回的 [`Problem`]：证书指纹不符 → `CertMismatch`，版本不一致 → `Incompatible`，
 /// 其它（解析地址、网络、超时……）→ `ServerUnreachable`。
-pub async fn connect_signal(cfg: &LinkConfig, role: Role) -> std::result::Result<Signal, Problem> {
+pub async fn connect_signal(
+    cfg: &LinkConfig,
+    role: Role,
+    first: Option<&ClientMsg>,
+) -> std::result::Result<Signal, Problem> {
     let mismatch = Arc::new(AtomicBool::new(false));
-    handshake(cfg, role, mismatch.clone()).await.map_err(|e| {
-        if mismatch.load(Ordering::Relaxed) {
-            Problem::CertMismatch
-        } else {
-            Problem::from_error(e, |detail| Problem::ServerUnreachable { detail })
-        }
-    })
+    handshake(cfg, role, first, mismatch.clone())
+        .await
+        .map_err(|e| {
+            if mismatch.load(Ordering::Relaxed) {
+                Problem::CertMismatch
+            } else {
+                Problem::from_error(e, |detail| Problem::ServerUnreachable { detail })
+            }
+        })
 }
 
-async fn handshake(cfg: &LinkConfig, role: Role, mismatch: Arc<AtomicBool>) -> Result<Signal> {
+async fn handshake(
+    cfg: &LinkConfig,
+    role: Role,
+    first: Option<&ClientMsg>,
+    mismatch: Arc<AtomicBool>,
+) -> Result<Signal> {
     let (addrs, sni) = resolve(&cfg.server).await?;
     let expected = cfg.expected();
     let (endpoint, punch, conn, fp) =
         connect_any(&cfg.server, addrs, sni, expected, mismatch).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientHello::new(role, cfg.name.clone(), cfg.os.clone());
-    write_frame(&mut send, &framing::to_vec(&hello)).await?;
+    let mut out = framing::frame(&framing::to_vec(&hello));
+    if let Some(m) = first {
+        out.extend(framing::encode(m));
+    }
+    send.write_all(&out).await?;
     let mut buf = Vec::new();
     let got = tokio::time::timeout(
         Duration::from_secs(8),

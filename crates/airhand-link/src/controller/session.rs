@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use crate::direct::Mirror;
 use crate::secure::{Negotiated, Sealer};
-use crate::transport::{FromHost, HostReceiver, write_lane};
+use crate::transport::{DatagramSender, FromHost, HostReceiver, write_lane};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
-    ByeReason, Codec, ControllerMsg, DirectOffer, DisplayInfo, HostMsg, Notice, Platform,
-    SystemAction,
+    ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostDatagram,
+    HostMsg, Notice, Platform, SystemAction,
 };
 use anyhow::Result;
 use bytes::Bytes;
@@ -27,6 +27,57 @@ use crate::clock::now_us;
 /// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
 /// 网络卡一下不断开：卡住期间排着的输入由命令队列丢掉（见 [`super::queue`]）
 const HOST_TIMEOUT: Duration = Duration::from_secs(20);
+/// 没有新的画面确认时，最近的一个隔这么久重发一次、一共重发这么多次（见 [`Feedback`]）
+const ACK_REPEAT: Duration = Duration::from_millis(30);
+const ACK_REPEATS: u8 = 3;
+
+/// 发给被控端的控制数据报：每秒的 Ping、画面确认（`ControllerDatagram`）。
+///
+/// 确认走数据报，会丢。丢的要是最后一个（画面停了，或者被控端的在途帧满了、正等着它），被控端就一直等：
+/// 所以没有新的确认时，最近的一个每隔 [`ACK_REPEAT`] 重发一次、共 [`ACK_REPEATS`] 次，之后随每秒的 Ping 再发一次。
+/// 确认是累积的，被控端收到重复的什么也不做
+pub(super) struct Feedback {
+    out: DatagramSender,
+    /// 最近的确认，还要重发几次
+    last: std::sync::Mutex<Option<(ControllerDatagram, u8)>>,
+}
+
+impl Feedback {
+    pub fn new(out: DatagramSender) -> Self {
+        Self {
+            out,
+            last: Default::default(),
+        }
+    }
+
+    /// 界面收到了第 `seq` 帧，它开始到达的时刻是 `arrived`
+    pub fn ack(&self, seq: u32, arrived: u64) {
+        let m = ControllerDatagram::Ack { seq, arrived };
+        *self.last.lock().unwrap() = Some((m, ACK_REPEATS));
+        self.out.send(&m);
+    }
+
+    /// 每隔 [`ACK_REPEAT`]：还没重发够的确认再发一次
+    fn repeat(&self) {
+        let m = match &mut *self.last.lock().unwrap() {
+            Some((m, left)) if *left > 0 => {
+                *left -= 1;
+                *m
+            }
+            _ => return,
+        };
+        self.out.send(&m);
+    }
+
+    /// 每秒一次：Ping（也是保活），再带一次最近的确认
+    fn ping(&self) {
+        self.out.send(&ControllerDatagram::Ping { t: now_us() });
+        let last = self.last.lock().unwrap().map(|(m, _)| m);
+        if let Some(m) = last {
+            self.out.send(&m);
+        }
+    }
+}
 
 /// 会话的画面和事件交给谁：桌面版是 Tauri 的 Channel，网页版是浏览器的 WebSocket，Android 是 Kotlin 取的队列。
 ///
@@ -166,7 +217,7 @@ impl Default for Stats {
 }
 
 /// 交给了界面、还没确认的画面帧是什么时候开始从网络上到达的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
-/// （`ControllerMsg::Ack::arrived`）。确认是累积的：确认了一帧，它和它前面的都不用记了。
+/// （`ControllerDatagram::Ack::arrived`）。确认是累积的：确认了一帧，它和它前面的都不用记了。
 /// 在途的帧不超过 `flow::MAX_WINDOW` 个，最多记 [`Arrivals::MAX`] 个就够了
 #[derive(Default)]
 pub(super) struct Arrivals {
@@ -212,6 +263,8 @@ pub(super) struct SessionIo {
     /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
     pub negotiated: Negotiated,
     pub arrivals: Arc<std::sync::Mutex<Arrivals>>,
+    /// Ping、画面确认（控制数据报）
+    pub feedback: Arc<Feedback>,
     /// 控制通道在直连上的那一份（直连没通时什么也不做）
     pub mirror: Mirror,
     /// 直连任务
@@ -250,6 +303,7 @@ pub(super) async fn run(
         mode,
         negotiated,
         arrivals,
+        feedback,
         mirror,
         direct: Direct {
             offers,
@@ -325,6 +379,16 @@ pub(super) async fn run(
                     out.packet(p).map_err(|_| ui_closed())?;
                     continue;
                 }
+                FromHost::Datagram(HostDatagram::Pong { t }) => {
+                    let sample = now_us().saturating_sub(t) as f32 / 1000.0;
+                    let mut s = st.lock().unwrap();
+                    s.last_msg = Instant::now();
+                    s.rtt = Some(match s.rtt {
+                        Some(r) => r * 0.7 + sample * 0.3,
+                        None => sample,
+                    });
+                    continue;
+                }
                 FromHost::Control(m) => m,
             };
             st.lock().unwrap().last_msg = Instant::now();
@@ -348,14 +412,6 @@ pub(super) async fn run(
                 }
                 HostMsg::Displays { displays, current } => {
                     let _ = out.event(SessionEvent::Displays { displays, current });
-                }
-                HostMsg::Pong { t } => {
-                    let sample = now_us().saturating_sub(t) as f32 / 1000.0;
-                    let mut s = st.lock().unwrap();
-                    s.rtt = Some(match s.rtt {
-                        Some(r) => r * 0.7 + sample * 0.3,
-                        None => sample,
-                    });
                 }
                 HostMsg::Notice(Some(n)) => {
                     let _ = out.event(SessionEvent::Notice { notice: n.into() });
@@ -413,7 +469,7 @@ pub(super) async fn run(
     };
 
     let out = ui.clone();
-    let ping_tx = tx.clone();
+    let pinger = feedback.clone();
     let ticker = async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -442,10 +498,19 @@ pub(super) async fn run(
             };
             out.event(event).map_err(|_| ui_closed())?;
             // 也是保活：被控端很久收不到控制端的消息就会结束会话
-            ping_tx.send(ControllerMsg::Ping { t: now_us() })?;
+            pinger.ping();
         }
         #[allow(unreachable_code)]
         anyhow::Ok(())
+    };
+    // 丢了的确认（见 Feedback）
+    let repeater = async move {
+        let mut tick = tokio::time::interval(ACK_REPEAT);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            feedback.repeat();
+        }
     };
 
     let clipper = async move {
@@ -475,6 +540,7 @@ pub(super) async fn run(
     let result: Result<()> = tokio::select! {
         r = reader => r,
         r = ticker => r,
+        _ = repeater => Ok(()),
         () = clipper => Ok(()),
         () = direct => Ok(()),
         r = writer => r.and(Err(Problem::SessionEnded.into())),

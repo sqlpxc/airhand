@@ -6,7 +6,7 @@
 //! 直连上由 [`accept_direct`] 做（一条直连只属于一个会话）。数据报也一样按会话 ID 和种类分发。
 //!
 //! 一个会话在收的一端是一个 [`Inbox`]：每条通道一个信箱（中转、直连上来的流都放进来，交给 [`crate::merge::Merge`]
-//! 合并），声音数据报、探测数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
+//! 合并），声音、探测、控制数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,8 @@ pub type LaneStreams = mpsc::UnboundedReceiver<(RecvStream, Via)>;
 
 /// 每个会话最多排着这么多个还没交出去的数据报（声音、探测各自的）。再多就丢：本来就可能丢
 const DATAGRAM_QUEUE: usize = 16;
+/// 控制数据报（确认每秒可能有上百个，直连通着时每个来两份）
+const CONTROL_QUEUE: usize = 64;
 /// 读会话头最多等这么久
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// 会话还没登记就先到了的流（中转转过来的时候，本端还没处理完服务器的回答）：最多留这么多条、这么久
@@ -47,6 +49,7 @@ pub struct Feed {
     lanes: [mpsc::UnboundedSender<(RecvStream, Via)>; SessionLane::ALL.len()],
     audio: mpsc::Sender<Bytes>,
     probes: mpsc::Sender<(Via, Bytes)>,
+    control: mpsc::Sender<Bytes>,
 }
 
 /// 一个会话收的一端（见模块说明）
@@ -58,6 +61,8 @@ pub struct Inbox {
     pub audio: mpsc::Receiver<Bytes>,
     /// 探测数据报（同上）和它从哪条路来
     pub probes: mpsc::Receiver<(Via, Bytes)>,
+    /// 控制数据报（Ping、Pong、确认，同上）。直连通着时同一个数据报两条路各来一份，后到的那份解密时被当成重放丢掉
+    pub datagrams: mpsc::Receiver<Bytes>,
     /// 直连上来的流、数据报也放进来
     pub feed: Feed,
 }
@@ -69,16 +74,19 @@ impl Inbox {
         let (bulk_tx, bulk) = mpsc::unbounded_channel();
         let (audio_tx, audio) = mpsc::channel(DATAGRAM_QUEUE);
         let (probes_tx, probes) = mpsc::channel(DATAGRAM_QUEUE);
+        let (datagrams_tx, datagrams) = mpsc::channel(CONTROL_QUEUE);
         Self {
             control,
             video,
             bulk,
             audio,
             probes,
+            datagrams,
             feed: Feed {
                 lanes: [control_tx, video_tx, bulk_tx],
                 audio: audio_tx,
                 probes: probes_tx,
+                control: datagrams_tx,
             },
         }
     }
@@ -111,6 +119,9 @@ impl Feed {
             }
             Some(datagram::PROBE) => {
                 let _ = self.probes.try_send((via, d));
+            }
+            Some(datagram::CONTROL) => {
+                let _ = self.control.try_send(d);
             }
             _ => {}
         }

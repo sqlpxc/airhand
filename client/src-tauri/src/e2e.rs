@@ -9,14 +9,16 @@
 use std::time::{Duration, Instant};
 
 use airhand_link::controller::establish;
+use airhand_link::direct::Mirror;
 use airhand_link::host::Router;
 use airhand_link::secure::{self, Identity, InitiatorParams, Sealer};
-use airhand_link::transport::FromHost;
+use airhand_link::transport::{DatagramSender, FromHost};
 use airhand_link::wire::{read_msg, write_msg};
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
-    ByeReason, Codec, ControllerMsg, HostMsg, InputEvent, Notice, QualitySettings,
+    ByeReason, Codec, ControllerDatagram, ControllerMsg, HostDatagram, HostMsg, InputEvent, Notice,
+    QualitySettings,
 };
 use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg, connect_outcome};
 use airhand_proto::{MAX_SIGNAL_MSG, Role};
@@ -100,7 +102,7 @@ async fn e2e_roundtrip() {
     println!("被控端控制码: {code}，配对码: {pairing:?}");
 
     // 控制端：连接服务器
-    let mut sig = airhand_link::net::connect_signal(&crate::config::link(), Role::Controller)
+    let mut sig = airhand_link::net::connect_signal(&crate::config::link(), Role::Controller, None)
         .await
         .expect("控制端连接服务器");
     // 被控端开过来的通道、发来的数据报按会话交给会话
@@ -194,6 +196,13 @@ async fn e2e_roundtrip() {
         send: link.bulk.0,
         sealer: link.bulk.1,
     };
+    // Ping、画面确认是控制数据报（这个协议级的控制端不建直连：只在中转上发）
+    let datagrams = DatagramSender::new(
+        grant.session_id,
+        sig.conn.clone(),
+        Mirror::default(),
+        link.datagrams,
+    );
     let mut recv = link.receiver;
     let _registration = link.registration;
     ctl.send(&ControllerMsg::Input {
@@ -256,7 +265,7 @@ async fn e2e_roundtrip() {
     while started.elapsed() < Duration::from_secs(8) {
         if last_ping.elapsed() > Duration::from_millis(500) {
             last_ping = Instant::now();
-            ctl.send(&ControllerMsg::Ping { t: 1 }).await;
+            datagrams.send(&ControllerDatagram::Ping { t: 1 });
         }
         if !clip_written && started.elapsed() > Duration::from_secs(1) {
             let now = crate::clipboard::get_text().unwrap_or_default();
@@ -302,11 +311,10 @@ async fn e2e_roundtrip() {
                 if v.codec == Codec::H264 && matches!(decoder.decode(data), Ok(Some(_))) {
                     rep.decoded += 1;
                 }
-                ctl.send(&ControllerMsg::Ack {
+                datagrams.send(&ControllerDatagram::Ack {
                     seq: v.seq,
                     arrived,
-                })
-                .await;
+                });
                 continue;
             }
             FromHost::Audio(p) => {
@@ -332,6 +340,10 @@ async fn e2e_roundtrip() {
                 }
                 continue;
             }
+            FromHost::Datagram(HostDatagram::Pong { .. }) => {
+                rep.pongs += 1;
+                continue;
+            }
             FromHost::Control(m) => m,
         };
         match msg {
@@ -355,7 +367,6 @@ async fn e2e_roundtrip() {
                 );
                 rep.encoders.push((e.codec, e.name, e.hardware));
             }
-            HostMsg::Pong { .. } => rep.pongs += 1,
             HostMsg::Cursor { .. } => rep.cursor += 1,
             HostMsg::CursorImage { .. } => {}
             HostMsg::Clipboard { text } => {

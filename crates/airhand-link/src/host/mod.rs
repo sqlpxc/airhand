@@ -9,10 +9,11 @@
 //!   [`ApprovalSlots`]）、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
 //! * [`HostStreams`]：会话的链路。先回答端到端握手（[`crate::secure::respond`]，控制端的第一条消息在
 //!   [`Incoming::init`] 里）：让不让这个控制端进来由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），
-//!   控制端确认了才算进来（重放的握手消息走不到这一步）。过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
-//!   Ping 也在读任务里回 Pong，画面确认在读任务里交给平台的 [`Acks`]，不等会话的主循环；
+//!   发出决定就开始，控制端确认了才显示它、才请本机用户同意（重放的握手消息走不到这一步）。
+//!   过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
+//!   Ping（控制数据报）在读任务里回 Pong，画面确认在读任务里交给平台的 [`Acks`]，不等会话的主循环；
 //! * [`Outbox`]（[`queue`]）：发给控制端的消息。按消息挑通道（大的走大块通道），只关心最新值的状态
-//!   （Pong、显示器列表、光标可见性）只留最新的一个、排在前面；
+//!   （显示器列表、光标可见性）只留最新的一个、排在前面；
 //! * [`CursorCache`]：控制端缓存了哪些光标形状；
 //! * 每条服务器连接一个 [`Router`]（控制端的通道、数据报按会话 ID 交给会话）和一个 [`DirectHub`]
 //!   （接受控制端连过来的直连），每个会话一个直连任务（在 [`HostStreams`] 里，见 [`crate::direct`]）。
@@ -172,17 +173,14 @@ where
     S: Fn(Incoming) -> F,
     F: Future<Output = ()> + Send + 'static,
 {
-    let mut sig = net::connect_signal(link, Role::Host).await?;
+    // 注册紧跟着版本握手发出去，不等服务器回答 Hello（省一个往返）
+    let register = ClientMsg::Register {
+        reclaim: id.reclaim,
+        keep,
+        rekey: id.rekey && id.reclaim.is_some(),
+    };
+    let mut sig = net::connect_signal(link, Role::Host, Some(&register)).await?;
     let reclaim = &mut id.reclaim;
-    write_msg(
-        &mut sig.send,
-        &ClientMsg::Register {
-            reclaim: *reclaim,
-            keep,
-            rekey: id.rekey && reclaim.is_some(),
-        },
-    )
-    .await?;
 
     // 独立的读任务，保证 select 中的接收是取消安全的
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(16);

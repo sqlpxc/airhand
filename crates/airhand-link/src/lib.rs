@@ -49,5 +49,24 @@ pub mod wire;
 
 #[cfg(feature = "client")]
 pub use net::{LinkConfig, ServerState};
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    /// 进程内的一对 QUIC 连接（本机回环，直连那套只认证书指纹的 TLS）：要真的 QUIC 流的测试用
+    pub(crate) async fn quic_pair() -> (quinn::Connection, quinn::Connection) {
+        use crate::direct::tls::{Cert, SERVER_NAME, client_config, server_config};
+        let (server_cert, client_cert) = (Cert::generate().unwrap(), Cert::generate().unwrap());
+        let localhost = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let server =
+            quinn::Endpoint::server(server_config(&server_cert).unwrap(), localhost).unwrap();
+        let client = quinn::Endpoint::client(localhost).unwrap();
+        let config = client_config(&client_cert, server_cert.fingerprint).unwrap();
+        let connecting = client
+            .connect_with(config, server.local_addr().unwrap(), SERVER_NAME)
+            .unwrap();
+        let (c, s) = tokio::join!(connecting, async { server.accept().await.unwrap().await });
+        (c.unwrap(), s.unwrap())
+    }
+}
 #[cfg(feature = "client")]
 pub use problem::Problem;

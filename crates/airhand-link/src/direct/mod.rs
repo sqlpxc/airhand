@@ -5,7 +5,9 @@
 //!   （`DirectOffer::cert`），TLS 双向认证只认它：握手完成时就知道对面是谁，中间人冒充不了任何一边
 //!   （和 WebRTC 把 DTLS 证书的指纹放进信令里一样）；
 //! * 直连上对方的流和数据报由 [`crate::lanes::accept_direct`] 交给会话，和中转上来的放在一起合并（`crate::merge`）；
-//! * 控制通道每一帧在中转上写一份，直连通着的话再从直连写一份（[`Mirror`]）；
+//! * 控制通道每一帧、每个控制数据报在中转上发一份，直连通着的话再从直连发一份（[`Mirror`]）；
+//! * 候选地址两种地址族都给（[`candidates`]）：连中转的 socket 是双栈的（`socket::bind`），中转走 IPv4 时
+//!   两端也能用公网 IPv6 直连：IPv6 一般没有 NAT，打洞只是让两边的防火墙放行，IPv4 打不通（对称 NAT、运营商级 NAT）时往往通；
 //! * 画面、声音走哪条路由被控端决定（[`Route`]，`select` 里的规则），控制端只管把探测数据报弹回去；
 //! * [`host`]：被控端这边（[`DirectHub`]：一条服务器连接上接受直连；每个会话一个任务：发候选地址、打洞、换路）；
 //!   [`controller`]：控制端这边（回答候选地址、发起连接、弹回探测）。
@@ -19,7 +21,7 @@ pub mod select;
 mod socket;
 pub(crate) mod tls;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use airhand_proto::session::MAX_DIRECT_ADDRS;
@@ -32,9 +34,15 @@ pub use host::{DirectHub, HostLink};
 pub use socket::Punch;
 pub(crate) use socket::bind;
 
-/// 控制通道在直连上的那一份：每一帧也从这里发（见模块说明）。直连没通时什么也不做
+/// 控制通道、控制数据报在直连上的那一份：每一帧、每个数据报也从这里发（见模块说明）。直连没通时什么也不做
 #[derive(Clone, Default)]
-pub struct Mirror(Arc<Mutex<Option<mpsc::Sender<Bytes>>>>);
+pub struct Mirror(Arc<Mutex<Option<MirrorTo>>>);
+
+struct MirrorTo {
+    /// 本端在直连上开的控制通道（的写任务）
+    frames: mpsc::Sender<Bytes>,
+    conn: Connection,
+}
 
 /// 直连上最多排着这么多帧没写出去，再多就不写了（中转上还有一份）
 const MIRROR_QUEUE: usize = 64;
@@ -42,18 +50,30 @@ const MIRROR_QUEUE: usize = 64;
 impl Mirror {
     /// 写任务每加密一帧就调用一次（`sealed`：带长度前缀的密文）
     pub(crate) fn offer(&self, sealed: &Bytes) {
-        let mut tx = self.0.lock().unwrap();
-        if let Some(t) = &*tx
-            && let Err(mpsc::error::TrySendError::Closed(_)) = t.try_send(sealed.clone())
+        let mut to = self.0.lock().unwrap();
+        if let Some(t) = &*to
+            && let Err(mpsc::error::TrySendError::Closed(_)) = t.frames.try_send(sealed.clone())
         {
-            *tx = None;
+            *to = None;
         }
     }
 
-    /// 从现在起每一帧也写进直连上的 `send`（本端在直连上开的控制通道）。返回写的任务（直连断了、[`Mirror::stop`] 之后结束）
-    pub(crate) fn start(&self, mut send: SendStream) -> impl Future<Output = ()> + Send + 'static {
+    /// 一个控制数据报（加密好的）也从直连发
+    pub(crate) fn datagram(&self, d: &Bytes) {
+        if let Some(t) = &*self.0.lock().unwrap() {
+            let _ = t.conn.send_datagram(d.clone());
+        }
+    }
+
+    /// 从现在起每一帧也写进直连 `conn` 上的 `send`（本端在直连上开的控制通道），每个控制数据报也从 `conn` 发。
+    /// 返回写的任务（直连断了、[`Mirror::stop`] 之后结束）
+    pub(crate) fn start(
+        &self,
+        mut send: SendStream,
+        conn: Connection,
+    ) -> impl Future<Output = ()> + Send + 'static {
         let (tx, mut rx) = mpsc::channel::<Bytes>(MIRROR_QUEUE);
-        *self.0.lock().unwrap() = Some(tx);
+        *self.0.lock().unwrap() = Some(MirrorTo { frames: tx, conn });
         async move {
             while let Some(b) = rx.recv().await {
                 if send.write_chunk(b).await.is_err() {
@@ -76,40 +96,64 @@ pub struct Route {
     pub media: Option<Connection>,
 }
 
-/// 本端的候选地址：服务器看到的公网地址（`observed`），和这台机器往中转去时用的局域网地址（端口都是连中转的那个）
+/// 问路由用的公网地址（[`route_ip`]：UDP 的 connect 不发包，哪个公网地址都行）
+const PUBLIC_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+const PUBLIC_V6: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    53,
+);
+
+/// 本端的候选地址（端口都是连中转的那个）：服务器看到的公网地址（`observed`），往中转去时用的地址（中转在局域网里
+/// 的话是局域网地址），和往公网去时用的 IPv4（多半是局域网地址）、IPv6 地址（多半就是公网地址，没有 NAT）。
+/// socket 只能说 IPv4 时不给 IPv6 的
 pub(crate) fn candidates(
     endpoint: &Endpoint,
     relay: &Connection,
     observed: SocketAddr,
 ) -> Vec<SocketAddr> {
     let mut out = vec![canonical(observed)];
-    if let (Ok(local), Some(ip)) = (endpoint.local_addr(), route_ip(relay.remote_address())) {
-        out.push(SocketAddr::new(ip, local.port()));
+    let Ok(local) = endpoint.local_addr() else {
+        return out;
+    };
+    for to in [canonical(relay.remote_address()), PUBLIC_V4, PUBLIC_V6] {
+        if to.is_ipv6() && local.is_ipv4() {
+            continue;
+        }
+        if let Some(ip) = route_ip(to) {
+            let a = SocketAddr::new(ip, local.port());
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
     }
-    out.dedup();
     out.truncate(MAX_DIRECT_ADDRS);
     out
 }
 
-/// 往 `to` 去时本机用哪个地址：UDP 的 connect 不发包，只是选好路由（局域网地址，或者没有 NAT 时的公网地址）
+/// 往 `to` 去时本机用哪个地址：UDP 的 connect 不发包，只是选好路由。没有路由、只有链路本地地址时为 `None`
 fn route_ip(to: SocketAddr) -> Option<IpAddr> {
     let bind: SocketAddr = if to.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
+        (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
-        "[::]:0".parse().unwrap()
+        (Ipv6Addr::UNSPECIFIED, 0).into()
     };
     let s = std::net::UdpSocket::bind(bind).ok()?;
     s.connect(to).ok()?;
     let ip = s.local_addr().ok()?.ip();
-    (!ip.is_unspecified()).then_some(ip)
+    let usable = match ip {
+        IpAddr::V4(ip) => !ip.is_unspecified(),
+        IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_unicast_link_local()),
+    };
+    usable.then_some(ip)
 }
 
-/// IPv4 映射的 IPv6 地址（双栈的服务器看到的 IPv4 客户端）写成 IPv4
-fn canonical(a: SocketAddr) -> SocketAddr {
+/// IPv4 映射的 IPv6 地址（双栈的 socket 看到的 IPv4 对端）写成 IPv4
+pub(crate) fn canonical(a: SocketAddr) -> SocketAddr {
     SocketAddr::new(a.ip().to_canonical(), a.port())
 }
 
-/// 对方的候选地址里本端用得上的：和本端的 socket 同一种地址，不是 0.0.0.0、组播、广播，最多 [`MAX_DIRECT_ADDRS`] 个
+/// 对方的候选地址里本端用得上的：本端的 socket 说得了的地址族（双栈的两种都行，只有 IPv4 的只要 IPv4），
+/// 不是 0.0.0.0、组播、广播，最多 [`MAX_DIRECT_ADDRS`] 个
 pub(crate) fn usable(theirs: &[SocketAddr], endpoint: &Endpoint) -> Vec<SocketAddr> {
     let Ok(local) = endpoint.local_addr() else {
         return Vec::new();
@@ -118,7 +162,7 @@ pub(crate) fn usable(theirs: &[SocketAddr], endpoint: &Endpoint) -> Vec<SocketAd
         .iter()
         .take(MAX_DIRECT_ADDRS)
         .map(|a| canonical(*a))
-        .filter(|a| a.is_ipv4() == local.is_ipv4() && a.port() != 0)
+        .filter(|a| (a.is_ipv4() || local.is_ipv6()) && a.port() != 0)
         .filter(|a| match a.ip() {
             IpAddr::V4(ip) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()),
             IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_multicast()),

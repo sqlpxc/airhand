@@ -79,7 +79,15 @@ fn signal_messages_keep_their_wire_encoding() {
 
 #[test]
 fn session_messages_keep_their_wire_encoding() {
-    golden(HostMsg::Pong { t: 99 }, "8203811863");
+    golden(HostDatagram::Pong { t: 99 }, "8200811863");
+    golden(ControllerDatagram::Ping { t: 5 }, "82008105");
+    golden(
+        ControllerDatagram::Ack {
+            seq: 99,
+            arrived: 1000,
+        },
+        "82018218631903e8",
+    );
     golden(HostMsg::Bye(ByeReason::Kicked), "82098100");
     golden(HostMsg::Clipboard { text: "hi".into() }, "820881626869");
     golden(
@@ -121,13 +129,6 @@ fn session_messages_keep_their_wire_encoding() {
             events: vec![InputEvent::ReleaseAll],
         },
         "8201820581820680",
-    );
-    golden(
-        ControllerMsg::Ack {
-            seq: 99,
-            arrived: 1000,
-        },
-        "82028218631903e8",
     );
     golden(ControllerMsg::RequestKeyframe { after: 5 }, "82048105");
     golden(

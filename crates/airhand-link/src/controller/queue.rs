@@ -1,8 +1,7 @@
 //! 控制端发给被控端的命令队列（有界），建在 [`crate::queue`] 上（和被控端的 `Outbox` 一样）。
 //!
-//! * 只关心最新值的状态不排队：画面确认（累积确认）、Ping、画质设置各占一个槽位，只留最新的一个，
-//!   写任务**先发它们**，再按顺序发排着队的输入和其它命令。确认因此不会被排在一串输入后面、
-//!   把被控端测到的往返时延拉长；也不会夹在两个鼠标移动中间，让移动合并不起来；
+//! * 只关心最新值的画质设置不排队：它占一个槽位，只留最新的一个，写任务**先发它**，再按顺序发排着队的
+//!   输入和其它命令。Ping、画面确认不在这里：它们是控制数据报（见 `super::session::Feedback`），不排在输入后面；
 //! * 连续的绝对移动只留最后一个，连续的相对移动加起来；移动只和紧挨着的移动合并，
 //!   不会越过点击、按键（松开按键不会被合并掉）；
 //! * 排着的输入太旧了（网络卡了一阵子，[`INPUT_MAX_AGE`]），或者队列满了：丢掉排着的输入、
@@ -61,14 +60,9 @@ struct Meta {
     t: u64,
 }
 
-/// 只留最新值的槽位，按发送的先后排列
-#[derive(Clone, Copy)]
-enum Slot {
-    Ack = 0,
-    Ping = 1,
-    Settings = 2,
-}
-const SLOTS: usize = 3;
+/// 只留最新值的槽位：画质设置
+const SETTINGS: usize = 0;
+const SLOTS: usize = 1;
 
 struct Shared {
     mail: Mailbox<Meta>,
@@ -216,12 +210,7 @@ impl Sender {
     }
 
     fn send_one(&self, msg: ControllerMsg) -> Result<(), Problem> {
-        let slot = match &msg {
-            ControllerMsg::Ack { .. } => Some(Slot::Ack),
-            ControllerMsg::Ping { .. } => Some(Slot::Ping),
-            ControllerMsg::Settings(_) => Some(Slot::Settings),
-            _ => None,
-        };
+        let slot = matches!(msg, ControllerMsg::Settings(_)).then_some(SETTINGS);
         let (kind, delta, t) = match &msg {
             ControllerMsg::Input { t, events } => match events[..] {
                 [InputEvent::MouseMove { .. }] => (Kind::Move, (0, 0), *t),
@@ -237,7 +226,7 @@ impl Sender {
             return Err(Problem::SessionEnded);
         }
         if let Some(slot) = slot {
-            m.set(slot as usize, bytes);
+            m.set(slot, bytes);
             drop(m);
             mail.wake();
             return Ok(());
@@ -349,8 +338,11 @@ mod tests {
         events(m) == [InputEvent::ReleaseAll]
     }
 
-    fn ack(seq: u32) -> ControllerMsg {
-        ControllerMsg::Ack { seq, arrived: 0 }
+    fn settings(fps: u8) -> ControllerMsg {
+        ControllerMsg::Settings(QualitySettings {
+            fps,
+            ..QualitySettings::default()
+        })
     }
 
     const KEYFRAME: ControllerMsg = ControllerMsg::RequestKeyframe { after: 0 };
@@ -418,32 +410,31 @@ mod tests {
         assert_eq!(queued(&tx).len(), 3);
     }
 
-    /// 确认、Ping 夹在鼠标移动中间：移动照样合并，确认只留最新的一个
+    /// 画质设置夹在鼠标移动中间：移动照样合并，设置只留最新的一个
     #[test]
-    fn acks_do_not_break_movement_coalescing() {
+    fn settings_do_not_break_movement_coalescing() {
         let (tx, _rx) = channel();
-        for seq in 0..50 {
+        for fps in 0..50 {
             tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
                 .unwrap();
-            tx.send(ack(seq)).unwrap();
-            tx.send(ControllerMsg::Ping { t: seq as u64 }).unwrap();
+            tx.send(settings(fps)).unwrap();
             tx.send(input(vec![InputEvent::MouseDelta { dx: 1, dy: 0 }]))
                 .unwrap();
         }
-        // 绝对移动和相对移动交替，各不合并；但确认和 Ping 不在队列里
+        // 绝对移动和相对移动交替，各不合并；但设置不在队列里
         assert_eq!(queued(&tx).len(), 100);
         let (tx, _rx) = channel();
-        for seq in 0..50 {
+        for fps in 0..50 {
             tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
                 .unwrap();
-            tx.send(ack(seq)).unwrap();
+            tx.send(settings(fps)).unwrap();
         }
         assert_eq!(queued(&tx).len(), 1);
     }
 
-    /// 写任务先发确认、Ping、画质设置（各只留最新的），再按顺序发排着的输入
+    /// 写任务先发画质设置（只留最新的），再按顺序发排着的输入和命令
     #[tokio::test]
-    async fn states_go_first_and_keep_only_the_latest() {
+    async fn settings_go_first_and_keep_only_the_latest() {
         let (tx, mut rx) = channel();
         let click = InputEvent::MouseButton {
             button: MouseButton::Left,
@@ -451,20 +442,15 @@ mod tests {
         };
         tx.send(input(vec![click.clone()])).unwrap();
         tx.send(KEYFRAME).unwrap();
-        tx.send(ack(1)).unwrap();
-        tx.send(ControllerMsg::Settings(QualitySettings::default()))
-            .unwrap();
-        tx.send(ControllerMsg::Ping { t: 7 }).unwrap();
-        tx.send(ack(9)).unwrap();
+        tx.send(settings(30)).unwrap();
+        tx.send(settings(60)).unwrap();
         let mut out = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..3 {
             out.push(decode(&rx.recv().await.unwrap()));
         }
-        assert!(matches!(out[0], ControllerMsg::Ack { seq: 9, .. }));
-        assert!(matches!(out[1], ControllerMsg::Ping { t: 7 }));
-        assert!(matches!(out[2], ControllerMsg::Settings(_)));
-        assert_eq!(events(&out[3]), [click]);
-        assert!(matches!(out[4], ControllerMsg::RequestKeyframe { .. }));
+        assert!(matches!(out[0], ControllerMsg::Settings(s) if s.fps == 60));
+        assert_eq!(events(&out[1]), [click]);
+        assert!(matches!(out[2], ControllerMsg::RequestKeyframe { .. }));
         assert!(
             tokio::time::timeout(Duration::from_millis(10), rx.recv())
                 .await
@@ -585,6 +571,6 @@ mod tests {
         assert!(tx.send(KEYFRAME).is_err());
         assert!(tx.failed());
         assert!(rx.recv().await.is_none());
-        assert!(tx.send(ack(1)).is_err());
+        assert!(tx.send(settings(1)).is_err());
     }
 }

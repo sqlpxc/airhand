@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let msgs = vec![
-            HostMsg::Pong { t: 99 },
+            HostMsg::AwaitingApproval,
             HostMsg::Notice(Some(Notice::CaptureFailed {
                 detail: "AcquireNextFrame: 0x887A0026".into(),
             })),
@@ -224,11 +224,12 @@ mod tests {
         assert_eq!(payload_len([0, 1, 0, 0], 256).unwrap(), 256);
 
         // 取消息：停在不完整的那一帧开头
-        let mut wire = encode(&HostMsg::Pong { t: 1 });
+        let clip = |t: &str| HostMsg::Clipboard { text: t.into() };
+        let mut wire = encode(&clip("a"));
         let whole = wire.len();
-        wire.extend(encode(&HostMsg::Pong { t: 2 }));
+        wire.extend(encode(&clip("b")));
         let mut r = &wire[..wire.len() - 1];
-        assert!(matches!(next(&mut r), HostMsg::Pong { t: 1 }));
+        assert!(matches!(next(&mut r), HostMsg::Clipboard { text } if text == "a"));
         assert!(take_msg::<HostMsg>(&mut r, 1 << 20).unwrap().is_none());
         assert_eq!(r.len(), wire.len() - 1 - whole);
     }
@@ -259,12 +260,12 @@ mod tests {
         }
         let mut wire = encode(&Future::Hologram { depth: 3 });
         wire.extend(encode(&FutureNotice::Notice(Smell::Burnt { how: 1 })));
-        wire.extend(encode(&HostMsg::Pong { t: 5 }));
+        wire.extend(encode(&HostMsg::Bye(ByeReason::Declined)));
         let mut r = &wire[..];
         let m: HostMsg = next(&mut r);
         assert!(matches!(m, HostMsg::Notice(None)), "{m:?}");
         let m: HostMsg = next(&mut r);
-        assert!(matches!(m, HostMsg::Pong { t: 5 }));
+        assert!(matches!(m, HostMsg::Bye(ByeReason::Declined)));
         let Decoded::<HostMsg>::Unknown(v) =
             decode(&to_vec(&Future::Hologram { depth: 3 })).unwrap()
         else {
@@ -272,16 +273,16 @@ mod tests {
         };
         assert_eq!(v, 200);
 
-        // Pong 的必填字段是个字符串：认识的消息解不出来，是错误
+        // 剪贴板的必填字段成了数字：认识的消息解不出来，是错误
         #[derive(minicbor::Encode)]
         enum Broken {
-            #[n(3)]
-            Pong {
+            #[n(8)]
+            Clipboard {
                 #[n(0)]
-                t: String,
+                text: u32,
             },
         }
-        let wire = encode(&Broken::Pong { t: "x".into() });
+        let wire = encode(&Broken::Clipboard { text: 7 });
         let r: Result<Option<HostMsg>, _> = take_msg(&mut &wire[..], 1 << 20);
         assert!(matches!(r, Err(FrameError::Decode(_))));
     }
@@ -464,6 +465,34 @@ mod tests {
         };
         assert_eq!(t, 1 << 40);
         assert_eq!(got, events);
+    }
+
+    /// 控制数据报：一个数据报一条消息（没有长度前缀），对方版本新增的跳过
+    #[test]
+    fn control_datagrams_roundtrip() {
+        for m in [
+            ControllerDatagram::Ping { t: 1 << 40 },
+            ControllerDatagram::Ack {
+                seq: 9,
+                arrived: 77,
+            },
+        ] {
+            let Decoded::Msg(back) = decode::<ControllerDatagram>(&to_vec(&m)).unwrap() else {
+                panic!()
+            };
+            assert_eq!(back, m);
+        }
+        let pong = HostDatagram::Pong { t: 5 };
+        assert!(matches!(decode::<HostDatagram>(&to_vec(&pong)), Ok(Decoded::Msg(p)) if p == pong));
+        #[derive(minicbor::Encode)]
+        enum Future {
+            #[n(40)]
+            Loss(#[n(0)] u32),
+        }
+        assert!(matches!(
+            decode::<HostDatagram>(&to_vec(&Future::Loss(3))),
+            Ok(Decoded::Unknown(40))
+        ));
     }
 
     /// 直连的候选地址：两个方向都在控制通道上，IPv4 / IPv6 都行

@@ -4,9 +4,12 @@
 //!
 //! # 走哪条通道
 //!
-//! 消息走两条通道（[`crate::SessionLane`]），编码一样、各自有序：
+//! 消息走两条通道（[`crate::SessionLane`]）和控制数据报，编码一样：
 //!
-//! * **控制**：输入、确认、Ping / Pong、设置、提示……都很小，要快；
+//! * **控制数据报**（[`ControllerDatagram`] / [`HostDatagram`]，`crate::datagram::CONTROL`）：Ping / Pong、画面确认。
+//!   只看最新值、丢了也不要紧，不用排在流里别的消息后面、也不会被丢了的包挡住（被控端的码率控制、控制端测的往返时延
+//!   都靠它们）。丢了的确认由控制端重发（见 [`ControllerDatagram::Ack`]）；
+//! * **控制**：输入、设置、提示……都很小，要快，不能丢、不能乱序；
 //! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标图像
 //!   （[`HostMsg::CursorImage`]，几十 KB）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
 //!   会把后面的消息挡住大约 1.7 秒：确认迟到，被控端的在途帧窗口停住、测到的往返时延变大，自适应码率误判为拥塞；
@@ -42,7 +45,7 @@
 //!
 //! 网络卡住的时候，输入会积在路上：控制端的命令队列里、QUIC 的发送缓冲里（断网时往里写不会阻塞）、服务器上。
 //! 网络恢复后把它们补发出去，就是在对方电脑上重放一串几秒、几分钟之前的操作。所以每批输入都带着控制端
-//! 收到它的时刻（[`ControllerMsg::Input::t`]，和 [`ControllerMsg::Ping`] 是同一个时钟），比平时晚到超过
+//! 收到它的时刻（[`ControllerMsg::Input::t`]，和 [`ControllerDatagram::Ping`] 是同一个时钟），比平时晚到超过
 //! [`INPUT_MAX_AGE`] 的输入被控端不执行，改成释放所有按键（丢掉的里面可能有松开按键）。
 //! 两边的时钟不需要同步，见 `airhand_link::host` 的 `InputClock`。
 //!
@@ -77,12 +80,6 @@ pub enum HostMsg {
     /// 正在等被控端的用户同意这次连接（见模块说明）
     #[n(2)]
     AwaitingApproval,
-    /// 回应 [`ControllerMsg::Ping`]，用于测量端到端往返时延。
-    #[n(3)]
-    Pong {
-        #[n(0)]
-        t: u64,
-    },
     /// 显示器列表或当前显示器变化。
     #[n(4)]
     Displays {
@@ -154,7 +151,6 @@ impl HostMsg {
             HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => SessionLane::Bulk,
             HostMsg::Hello(_)
             | HostMsg::AwaitingApproval
-            | HostMsg::Pong { .. }
             | HostMsg::Displays { .. }
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
@@ -380,13 +376,12 @@ impl Codec {
     }
 }
 
-/// 控制端 → 被控端。变体的编号是线上的类型，不能改、不能复用（v9 之前的 0 号是 `Hello`，
-/// 现在由端到端握手代替）。走哪条通道见模块说明
+/// 控制端 → 被控端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ControllerMsg {
     /// 批量输入事件（鼠标移动会被合并）。不认识的事件（对方版本新增的）被控端跳过，同一批里的其它照常执行。
     ///
-    /// `t`：控制端收到这批输入的时刻（微秒，和 [`ControllerMsg::Ping::t`] 同一个时钟）。
+    /// `t`：控制端收到这批输入的时刻（微秒，和 [`ControllerDatagram::Ping::t`] 同一个时钟）。
     /// 被控端据此丢掉晚到太久的输入（见模块说明的"过时的输入"）
     #[n(1)]
     Input {
@@ -394,19 +389,6 @@ pub enum ControllerMsg {
         t: u64,
         #[cbor(n(1), with = "crate::cbor::open_vec")]
         events: Vec<InputEvent>,
-    },
-    /// 界面收到了第 `seq` 帧（累积确认），用于被控端的在途控制和码率控制（防止延迟堆积）。
-    ///
-    /// `arrived`：这一帧开始从网络上到达的时刻（读到它的长度前缀时，控制端的时钟，微秒，和
-    /// [`ControllerMsg::Ping::t`] 同一个时钟）。确认要等界面收到才发，往返时延里混着
-    /// 界面那一段；到达时刻只算网络：被控端拿它减去自己的发送时刻，两边时钟之差是常数，变化的部分就是路上的排队
-    /// （用开始到达的时刻，这一帧自己要传多久不算在里面），两次到达之间收到的字节数就是交付速率
-    #[n(2)]
-    Ack {
-        #[n(0)]
-        seq: u32,
-        #[n(1)]
-        arrived: u64,
     },
     /// 画质设置变了（开始时的设置在握手里，见 [`crate::handshake::ControllerIntro`]）
     #[n(3)]
@@ -422,12 +404,6 @@ pub enum ControllerMsg {
     SelectDisplay {
         #[n(0)]
         index: u8,
-    },
-    /// 每秒一次，被控端回 [`HostMsg::Pong`]。`t` 是控制端的时钟（微秒），被控端也用它估算输入晚到了多久
-    #[n(6)]
-    Ping {
-        #[n(0)]
-        t: u64,
     },
     /// 控制端剪贴板文本变化。走大块通道
     #[n(7)]
@@ -451,15 +427,51 @@ impl ControllerMsg {
         match self {
             Self::Clipboard { .. } => SessionLane::Bulk,
             Self::Input { .. }
-            | Self::Ack { .. }
             | Self::Settings(_)
             | Self::RequestKeyframe { .. }
             | Self::SelectDisplay { .. }
-            | Self::Ping { .. }
             | Self::Audio { .. }
             | Self::Direct(_) => SessionLane::Control,
         }
     }
+}
+
+/// 控制端 → 被控端的控制数据报（见模块说明的"走哪条通道"）。变体的编号不能改、不能复用
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerDatagram {
+    /// 每秒一次，被控端回 [`HostDatagram::Pong`]（也是保活）。`t` 是控制端的时钟（微秒），被控端也用它估算输入晚到了多久
+    #[n(0)]
+    Ping {
+        #[n(0)]
+        t: u64,
+    },
+    /// 界面收到了第 `seq` 帧（累积确认），用于被控端的在途控制和码率控制（防止延迟堆积）。
+    ///
+    /// `arrived`：这一帧开始从网络上到达的时刻（读到它的长度前缀时，控制端的时钟，微秒，和
+    /// [`ControllerDatagram::Ping::t`] 同一个时钟）。确认要等界面收到才发，往返时延里混着
+    /// 界面那一段；到达时刻只算网络：被控端拿它减去自己的发送时刻，两边时钟之差是常数，变化的部分就是路上的排队
+    /// （用开始到达的时刻，这一帧自己要传多久不算在里面），两次到达之间收到的字节数就是交付速率。
+    ///
+    /// 数据报会丢：丢的要是最后一个（画面停了，或者被控端的在途帧满了、正等着它），被控端就一直等。所以控制端在没有
+    /// 新的确认时把最近的一个重发几次，之后随每次 Ping 再发一次；被控端收到重复的确认什么也不做
+    #[n(1)]
+    Ack {
+        #[n(0)]
+        seq: u32,
+        #[n(1)]
+        arrived: u64,
+    },
+}
+
+/// 被控端 → 控制端的控制数据报（见模块说明的"走哪条通道"）。变体的编号不能改、不能复用
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDatagram {
+    /// 回应 [`ControllerDatagram::Ping`]，用于测量端到端往返时延。
+    #[n(0)]
+    Pong {
+        #[n(0)]
+        t: u64,
+    },
 }
 
 /// 剪贴板同步的文本上限
