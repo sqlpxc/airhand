@@ -1,5 +1,6 @@
 package app.airhand.android.host
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Point
 import android.graphics.SurfaceTexture
@@ -7,6 +8,17 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel41
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel42
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel5
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel51
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel52
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel6
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel61
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel62
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+import android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileMain
+import android.media.MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
@@ -321,13 +333,15 @@ class ScreenCapture(
         private val drain: Thread
 
         init {
+            val caps = info.getCapabilitiesForType(codec.mime)
             fun basic() = MediaFormat.createVideoFormat(codec.mime, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, kbps * 1000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60)
             }
-            val full = basic().apply {
+            /** 低延迟的设置；`tuned`：再加上省码率的档次和码率模式（见 [tune]） */
+            fun full(tuned: Boolean) = basic().apply {
                 // 超长 GOP：只在需要时（新的控制端、解码出错）要关键帧
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3600)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -336,20 +350,28 @@ class ScreenCapture(
                     setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setInteger(MediaFormat.KEY_LATENCY, 1)
+                if (tuned) tune(codec, caps, width, height, fps)
             }
-            try {
-                mc.configure(full, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            } catch (e: Exception) {
-                // 有的编码器不接受某个可选参数：只留必需的再试一次
-                Log.w(TAG, "${info.name} rejected the format, retrying with the basics: $e")
-                mc.reset()
-                mc.configure(basic(), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            // 有的编码器不接受某个可选参数：去掉一些再试，最后只留必需的
+            val formats = listOf("tuned" to full(true), "low latency" to full(false), "basic" to basic())
+            var used = ""
+            for ((i, attempt) in formats.withIndex()) {
+                val (name, format) = attempt
+                try {
+                    mc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    used = name
+                    break
+                } catch (e: Exception) {
+                    if (i == formats.lastIndex) throw e
+                    Log.w(TAG, "${info.name} rejected the $name format, retrying with fewer options: $e")
+                    mc.reset()
+                }
             }
             inputSurface = mc.createInputSurface()
             mc.start()
             eglSurface = egl.windowSurface(inputSurface)
             drain = Thread({ drainLoop() }, "airhand-encode-out").apply { start() }
-            Log.i(TAG, "encoder ${info.name} started: ${codec.label} ${width}x$height ${fps}fps ${kbps}kbps")
+            Log.i(TAG, "encoder ${info.name} started ($used): ${codec.label} ${width}x$height ${fps}fps ${kbps}kbps")
         }
 
         fun setBitrate(kbps: Int) = runCatching {
@@ -438,6 +460,55 @@ class ScreenCapture(
         /** 手机能编码的格式（HEVC / AV1 只算硬件编码器） */
         val encodable: List<Codec> by lazy {
             Codec.entries.filter { pickEncoder(it) != null }.ifEmpty { listOf(Codec.H264) }
+        }
+
+        /**
+         * H.264 的级别（标准的表 A-1）：`级别, 每秒最多多少宏块, 每帧最多多少宏块`。从 4.1 开始：更低的级别 High 档次的
+         * 码率上限只有 25 Mbps，而码率是自适应的、会一直涨到画质设置的上限，有的编码器会按级别把码率截住
+         */
+        @SuppressLint("InlinedApi") // 6.x 是 Android 10 才有的常量（编译时内联）：更早的设备报告不出这几级，用不到
+        private val AVC_LEVELS = arrayOf(
+            intArrayOf(AVCLevel41, 245_760, 8_192),
+            intArrayOf(AVCLevel42, 522_240, 8_704),
+            intArrayOf(AVCLevel5, 589_824, 22_080),
+            intArrayOf(AVCLevel51, 983_040, 36_864),
+            intArrayOf(AVCLevel52, 2_073_600, 36_864),
+            intArrayOf(AVCLevel6, 4_177_920, 139_264),
+            intArrayOf(AVCLevel61, 8_355_840, 139_264),
+            intArrayOf(AVCLevel62, 16_711_680, 139_264),
+        )
+
+        /**
+         * 编码 `w`×`h`、每秒 `fps` 帧要的 H.264 级别（至少 4.1，见 [AVC_LEVELS]），不超过编码器能做的 `max`。
+         * 级别的常量是按顺序的二进制位，大小就是高低
+         */
+        @SuppressLint("InlinedApi")
+        fun avcLevel(w: Int, h: Int, fps: Int, max: Int): Int {
+            val frame = ((w + 15) / 16) * ((h + 15) / 16)
+            val perSecond = frame.toLong() * fps
+            val need = AVC_LEVELS.firstOrNull { perSecond <= it[1] && frame <= it[2] }?.get(0) ?: AVCLevel62
+            return min(need, max)
+        }
+
+        /**
+         * 省码率的设置，设备报告支持才设：
+         * * H.264 用 High 档次（没有就用 Main）：有 CABAC，同画质比 Baseline 省一成左右的码率。不设档次时很多编码器默认
+         *   Baseline（Android 9 以前的 OMX 编码器一定是）。设了档次就要设级别：OMX 编码器缺了级别直接拒绝，
+         *   给的级别也原样用，所以按分辨率和帧率算（[avcLevel]）。HEVC、AV1 的默认档次就是 Main，不用设；
+         * * 码率模式用 VBR：画面简单时少用、复杂时多用。有的编码器默认 CBR，画面没什么变化也要用满码率
+         */
+        private fun MediaFormat.tune(codec: Codec, caps: MediaCodecInfo.CodecCapabilities, w: Int, h: Int, fps: Int) {
+            if (codec == Codec.H264) {
+                for (profile in intArrayOf(AVCProfileHigh, AVCProfileMain)) {
+                    val max = caps.profileLevels.filter { it.profile == profile }.maxOfOrNull { it.level } ?: continue
+                    setInteger(MediaFormat.KEY_PROFILE, profile)
+                    setInteger(MediaFormat.KEY_LEVEL, avcLevel(w, h, fps, max))
+                    break
+                }
+            }
+            if (caps.encoderCapabilities?.isBitrateModeSupported(BITRATE_MODE_VBR) == true) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE, BITRATE_MODE_VBR)
+            }
         }
 
         /** 编码尺寸：短边不超过 `maxShort`（0 = 不限），满足编码器的限制，宽高都是 16 的倍数 */

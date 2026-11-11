@@ -193,6 +193,11 @@ impl MfEncoder {
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps as u32 * 600));
                 // 偏向速度（0=速度 100=质量）
                 set(&CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(60u32));
+                // H.264 High 档次用 CABAC（比 CAVLC 省约一成码率）：大多数硬件编码器默认就开，但不保证，显式打开。
+                // 不支持这个属性的编码器忽略即可
+                if codec == Codec::H264 {
+                    set(&CODECAPI_AVEncH264CABACEnable, VARIANT::from(true));
+                }
             }
 
             // 编码器必须先设置输出类型
