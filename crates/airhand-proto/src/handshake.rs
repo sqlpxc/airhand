@@ -1,4 +1,5 @@
-//! 端到端握手：控制通道上的头几条消息（明文 CBOR）。握手之后，会话每条通道上的每一帧、每个声音数据报都是密文。
+//! 端到端握手：控制端的第一条消息随发起会话的请求经服务器交给被控端（[`crate::signal::ClientMsg::Connect`] 的 `init`），
+//! 之后几条在控制通道上（明文 CBOR）。握手之后，会话每条通道上的每一帧、每个声音数据报都是密文。
 //!
 //! # 为什么要有这一层
 //!
@@ -25,8 +26,8 @@
 //!
 //! ```text
 //! 控制端                                                  被控端
-//! HandshakeInit { pattern, pake?, noise: 第 1 条 }  ──▶
-//!                                ◀──  HandshakeReply { pake?, noise: 第 2 条, verdict? }
+//! HandshakeInit { pattern, pake?, noise: 第 1 条 }  ──▶  （在 Connect / Incoming 里，经信令流）
+//!                                ◀──  HandshakeReply { pake?, noise: 第 2 条, verdict? }（控制通道，下同）
 //! （First / Pairing）HandshakeFinish { noise: 第 3 条 } ──▶
 //!                                ◀──  HandshakeReply { verdict }
 //! 加密的 Confirm（控制通道上控制端 → 被控端的第一帧）  ──▶
@@ -44,8 +45,9 @@
 //! 模式是开放枚举，被控端不认识控制端用的模式时回答 [`HandshakeError::Unsupported`]，
 //! 并在 [`HandshakeReply::patterns`] 里列出自己会的模式（据此判断该更新哪一边，以后也可以换一个双方都会的模式重试）。
 //!
-//! Noise 的 prologue 是 [`prologue`]：把握手绑定到这个会话（会话 ID）和这条 [`HandshakeInit`]
-//! （模式、SPAKE2 消息），服务器改了其中任何一样，握手都会失败。
+//! Noise 的 prologue 是 [`prologue`]：把握手绑定到这条 [`HandshakeInit`]（模式、SPAKE2 消息），服务器改了其中任何一样，
+//! 握手都会失败。会话 ID 不在里面：第一条消息在服务器分配会话 ID 之前就发出了，而会话 ID 本来就是服务器定的，
+//! 绑上它也挡不住服务器把一次握手挪到另一个会话里（那样它也只是换了个编号转发同一个控制端）。
 //!
 //! 控制端的介绍（[`ControllerIntro`]：会话版本、能力位、名称，开始时的画质和要不要声音）放在它最后一条
 //! Noise 消息的负载里，是加密、认证过的。被控端的决定（[`HostVerdict`]：选定的会话版本、能力位，或者拒绝的原因）
@@ -54,8 +56,7 @@
 //!
 //! # 确认：挡住重放
 //!
-//! `Noise_IK` 的第 1 条消息没有新鲜性：会话 ID 是服务器定的，恶意的中转可以把录下来的旧 [`HandshakeInit`]
-//! 原样再发一次，被控端照样解得开、照样回答。重放的一方解不开回答（没有控制端的私钥），数据泄露不了；
+//! `Noise_IK` 的第 1 条消息没有新鲜性：恶意的中转可以把录下来的旧 [`HandshakeInit`] 原样再发一次，被控端照样解得开、照样回答。重放的一方解不开回答（没有控制端的私钥），数据泄露不了；
 //! 可要是被控端这时就认为配对过的控制端进来了，它会显示"谁在连"、开始采集——"谁在连"就被伪造了。
 //!
 //! 所以控制端收到决定之后，马上在控制通道上发第一帧密文 [`Confirm`]（控制端 → 被控端，计数器 0）。
@@ -70,7 +71,7 @@
 //! * 双方用 SPAKE2（Ed25519 群）把配对码变成一个 32 字节的强密钥，当作 Noise 的 PSK：
 //!   配对码只有几位数字，**不能直接当 PSK**，否则中间人拿到一次握手的记录就能离线把它试出来；
 //!   用 SPAKE2 时每次握手只能猜一次；
-//! * SPAKE2 的密码是 [`pake_password`]（带上会话 ID 和控制码），身份是 [`PAKE_CONTROLLER`] / [`PAKE_HOST`]；
+//! * SPAKE2 的密码是 [`pake_password`]（带上控制码），身份是 [`PAKE_CONTROLLER`] / [`PAKE_HOST`]；
 //! * 本机在握手开始时原子地预留一次配对名额，失败次数和在途尝试一起计入预算。配对码不对，
 //!   被控端解不开第 3 条，回答 [`HandshakeError::PairingFailed`]；中断或超时也消耗这次尝试。
 //!   预算用完之后暂停配对（[`HandshakeError::PairingUnavailable`]），要本机用户换一个配对码才恢复。
@@ -85,13 +86,13 @@
 //! # 之后的每一帧
 //!
 //! 密钥从 Noise 的结果派生（HKDF-SHA256，salt 是握手的哈希），每条通道、每个方向一把（见 `airhand_link::secure`）。
-//! AEAD 是 ChaCha20-Poly1305。加密的单位是**密封单元**：`密文 | 16 字节标签 | u64 LE 计数`（[`SEAL_OVERHEAD`]），
+//! AEAD 是 AES-256-GCM（x86 和 ARMv8 都有硬件 AES，几 MiB 的关键帧也只要零点几毫秒）。加密的单位是**密封单元**：`密文 | 16 字节标签 | u64 LE 计数`（[`SEAL_OVERHEAD`]），
 //! nonce 就是后面的计数（这条通道这个方向从 0 开始递增）。计数写在线上，每个单元自己就能解开：
 //!
 //! * 流上一帧是 `u32 LE 长度 | 密封单元`；数据报是 `会话 ID | 密封单元`（会话 ID 给服务器转发用）；
 //! * 控制、大块通道的计数必须一个接一个：丢掉、重排、重放、从别的通道搬过来的消息都解不开（中转删不掉一个"松开按键"）；
-//! * 画面、声音通道只要求没收过（128 个计数的滑动窗口挡掉重放）：声音的数据报和声音流共用一把密钥、一串计数，
-//!   以后画面也可以分成几条流、丢掉过时的帧，不用再改加密格式。
+//! * 画面、声音只要求没收过（128 个计数的滑动窗口挡掉重放）：声音数据报本来就会丢、会乱序；画面在两条路之间换路时
+//!   接收端按计数排好，以后画面也可以分成几条流、丢掉过时的帧，不用再改加密格式。
 //!
 //! 计数放在最后而不是最前面：收到一帧之后原地解密、截掉尾巴，媒体包照样从缓冲区开头原样交给界面，不用挪动几 MiB 的数据。
 
@@ -109,6 +110,8 @@ pub const NONCE_LEN: usize = 8;
 pub const SEAL_OVERHEAD: usize = TAG_LEN + NONCE_LEN;
 /// 公钥（X25519）
 pub type PublicKey = [u8; 32];
+/// 握手的每条消息（包括 [`crate::signal::ClientMsg::Connect::init`]）最多这么大
+pub const MAX_MSG: usize = 16 * 1024;
 
 /// 三种 Noise 握手的名字
 pub const NOISE_KNOWN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -148,7 +151,7 @@ impl Pattern {
     }
 }
 
-/// 控制端 → 被控端：控制通道上的第一条消息。以后的模式也从这条消息开始：只能加字段
+/// 控制端 → 被控端：握手的第一条消息（经服务器转交，见模块说明）。以后的模式也从这条消息开始：只能加字段
 #[derive(Encode, Decode, Debug, Clone)]
 #[cbor(map)]
 pub struct HandshakeInit {
@@ -292,10 +295,9 @@ impl Negotiated {
     }
 }
 
-/// Noise 的 prologue：把握手绑定到这个会话和这条 [`HandshakeInit`]（除了 Noise 消息本身）
-pub fn prologue(session_id: u64, init: &HandshakeInit) -> Vec<u8> {
-    let mut p = b"airhand e2e".to_vec();
-    p.extend_from_slice(&session_id.to_le_bytes());
+/// Noise 的 prologue：把握手绑定到这条 [`HandshakeInit`]（除了 Noise 消息本身）
+pub fn prologue(init: &HandshakeInit) -> Vec<u8> {
+    let mut p = b"airhand e2e 9".to_vec();
     p.extend_from_slice(&init.pattern.code().to_le_bytes());
     if let Some(pake) = &init.pake {
         p.extend_from_slice(&(pake.len() as u32).to_le_bytes());
@@ -304,10 +306,9 @@ pub fn prologue(session_id: u64, init: &HandshakeInit) -> Vec<u8> {
     p
 }
 
-/// SPAKE2 的密码：配对码，加上会话 ID 和控制码（同一个配对码在别的会话、别的控制码上算出来的不一样）
-pub fn pake_password(session_id: u64, code: u32, pairing: &str) -> Vec<u8> {
-    let mut p = b"airhand pairing v1".to_vec();
-    p.extend_from_slice(&session_id.to_le_bytes());
+/// SPAKE2 的密码：配对码，加上控制码（同一个配对码在别的控制码上算出来的不一样）
+pub fn pake_password(code: u32, pairing: &str) -> Vec<u8> {
+    let mut p = b"airhand pairing 9".to_vec();
     p.extend_from_slice(&code.to_le_bytes());
     p.extend_from_slice(pairing.as_bytes());
     p
@@ -330,29 +331,28 @@ mod tests {
             pake: Some(vec![1, 2, 3]),
             noise: vec![9; 32],
         };
-        let p = prologue(7, &init);
+        let p = prologue(&init);
         let other_noise = HandshakeInit {
             noise: vec![8; 32],
             ..init.clone()
         };
-        assert_eq!(prologue(7, &other_noise), p);
-        assert_ne!(prologue(8, &init), p);
+        assert_eq!(prologue(&other_noise), p);
         let other_pake = HandshakeInit {
             pake: Some(vec![1, 2, 4]),
             ..init.clone()
         };
-        assert_ne!(prologue(7, &other_pake), p);
+        assert_ne!(prologue(&other_pake), p);
         let other_pattern = HandshakeInit {
             pattern: Pattern::First,
             pake: None,
             ..init
         };
-        assert_ne!(prologue(7, &other_pattern), p);
+        assert_ne!(prologue(&other_pattern), p);
         let no_pake = HandshakeInit {
             pake: None,
             ..other_pattern.clone()
         };
-        assert_eq!(prologue(7, &no_pake), prologue(7, &other_pattern));
+        assert_eq!(prologue(&no_pake), prologue(&other_pattern));
     }
 
     #[test]

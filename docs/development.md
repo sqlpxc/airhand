@@ -127,7 +127,7 @@ Before changing the protocol, look for a compatible way; if there is one, don't 
 - New variants of enums with fields: they can only be skipped as a whole message, in an `Option` field marked `crate::cbor::opt`, or as a list element marked `crate::cbor::open_vec`. Anywhere else an unknown variant is a decoding error, on purpose. Never put an enum with fields inside a plain derived `Option<…>` (also not inside a struct that sits in an `Option`): minicbor's derive treats any unknown variant inside as `None` and skips from the wrong position (see the notes in `cbor.rs`)
 - Numbers can't be changed or reused once released; bump the version only when there's no other way (e.g. removing a required field)
 
-The start of the version handshake (the postcard part of `ClientHello` / `ServerHello`) and the ALPN must **never** change, otherwise different versions can't even tell each other that they differ. The `version_handshake_prefix_is_frozen` test guards this. The `airhand-proto` tests include examples of a newer peer sending new messages, fields and enum values; write one like them when adding a compatibility rule.
+The version range in the version handshake (keys 0 and 1 of the `ClientHello` / `ServerHello` CBOR maps, `signal::Versions`) and the ALPN must **never** change, otherwise different versions can't even tell each other that they differ. The `version_handshake_is_frozen` test guards this. The `airhand-proto` tests include examples of a newer peer sending new messages, fields and enum values; write one like them when adding a compatibility rule.
 
 ### One protocol, three implementations
 

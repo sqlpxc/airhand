@@ -88,8 +88,8 @@ struct VideoAcks {
 }
 
 impl Acks for VideoAcks {
-    fn ack(&self, seq: u32, arrived: Option<u64>) {
-        self.shared.video.ack(self.id, seq, arrived);
+    fn ack(&self, seq: u32, arrived: u64) {
+        self.shared.video.ack(self.id, seq, Some(arrived));
     }
 
     /// 画面换了路（中转 ⇄ 直连）：这个会话的码率控制从头量时延；直连断了的话从关键帧重新加入
@@ -175,7 +175,7 @@ impl Platform for Phone {
             // 晚到太久的输入已经换成了"释放所有按键"
             Request::Input(events) => sh.event(json!({ "type": "input", "events": events })),
             Request::Settings(s) => sh.video.set_settings(self.id, s),
-            Request::Keyframe => sh.video.request_keyframe(),
+            Request::Keyframe(after) => sh.video.request_keyframe(self.id, after),
             // 手机只有一块屏幕
             Request::SelectDisplay(_) => {}
             Request::Clipboard(text) => sh.event(json!({ "type": "clipboard", "text": text })),

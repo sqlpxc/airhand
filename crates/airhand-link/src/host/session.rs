@@ -14,19 +14,17 @@
 //! * 一直回应 Ping（[`HostMsg::Pong`]），[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联。Ping 和画面确认在读任务里
 //!   就处理了（确认交给 [`Platform::acks`]），不等这里：这里可能正等着平台重建编码管线（见 [`super::HostStreams`]）；
 //! * 本机用户断开所有控制端（[`Incoming::kick`]）时发 [`HostMsg::Bye`]，然后结束；
-//! * 控制端的请求换成 [`Request`] 交给平台：画质设置做过范围校验，过时的输入已经换成了"释放所有按键"
-//!   （见 [`super::HostStreams`]），对方版本新增的输入事件已经去掉了。
+//! * 控制端的请求在会话的读任务里就换成了 [`Request`]（见 [`super::HostStreams`]）交给平台：画质设置做过范围校验，
+//!   过时的输入已经换成了"释放所有按键"，对方版本新增的输入事件已经去掉了。
 //!
-//! 协议加了新的控制端消息，这里的 `match` 编译不过：在这里决定它是什么 [`Request`]（或者协议层自己处理），
+//! 协议加了新的控制端消息，读任务里的 `match` 编译不过：在那里决定它是什么 [`Request`]（或者协议层自己处理），
 //! 各平台跟着实现，不会一边做了、一边忘了。
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use airhand_proto::session::{
-    ByeReason, ControllerMsg, HostMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings,
-};
+use airhand_proto::session::{ByeReason, HostMsg, InputEvent, QualitySettings};
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -39,8 +37,8 @@ use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 /// 画面确认交给谁（[`Platform::acks`]）：桌面版是会话的 [`crate::flow::Flow`]，Android 是画面分发。
 /// 在读任务里调用：要快，不能等什么
 pub trait Acks: Send + Sync + 'static {
-    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 [`ControllerMsg::Ack`]
-    fn ack(&self, seq: u32, arrived: Option<u64>);
+    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 `ControllerMsg::Ack`
+    fn ack(&self, seq: u32, arrived: u64);
 
     /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量。
     /// `lost`：旧路（直连）断了，在途的帧不会确认了，不要再等它们（会话随即要一个关键帧）
@@ -50,8 +48,8 @@ pub trait Acks: Send + Sync + 'static {
 }
 
 impl Acks for crate::flow::Flow {
-    fn ack(&self, seq: u32, arrived: Option<u64>) {
-        crate::flow::Flow::ack(self, seq, arrived);
+    fn ack(&self, seq: u32, arrived: u64) {
+        crate::flow::Flow::ack(self, seq, Some(arrived));
     }
 
     fn path_changed(&self, lost: bool) {
@@ -98,11 +96,12 @@ pub enum Request {
     Input(Vec<InputEvent>),
     /// 画质设置变了（做过范围校验）
     Settings(QualitySettings),
-    /// 控制端要一个关键帧（例如解码器重置了）
-    Keyframe,
+    /// 要一个关键帧：控制端要的（例如解码器重置了）带着它收到的最后一帧的序号，在那之后发过关键帧就不用再编了
+    /// （见 `airhand_proto::session` 的"关键帧"）；`None`：被控端自己要的（直连断了，断在上面的帧接收端等不到了），一定要编
+    Keyframe(Option<u32>),
     /// 改看另一个显示器（序号没检查过）
     SelectDisplay(u8),
-    /// 控制端复制了文本（不会超过 [`MAX_CLIPBOARD_TEXT`]）
+    /// 控制端复制了文本（不会超过 [`airhand_proto::session::MAX_CLIPBOARD_TEXT`]）
     Clipboard(String),
     /// 打开 / 关闭声音
     Audio(bool),
@@ -326,23 +325,8 @@ async fn drive<P: Platform>(
         }
         let open = matches!(phase, Phase::Open);
         tokio::select! {
-            msg = incoming.recv() => {
-                let Some(msg) = msg else { return Ok(()) };
-                let req = match msg {
-                    // 读任务已经处理了（见模块说明、crate::direct），不会到这里
-                    ControllerMsg::Ping { .. } | ControllerMsg::Ack { .. } | ControllerMsg::Direct(_) => continue,
-                    ControllerMsg::Input { events, .. } if events.is_empty() => continue,
-                    ControllerMsg::Input { events, .. } => Request::Input(events),
-                    ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
-                    ControllerMsg::RequestKeyframe => Request::Keyframe,
-                    ControllerMsg::SelectDisplay { index } => Request::SelectDisplay(index),
-                    ControllerMsg::Clipboard { text } if text.len() > MAX_CLIPBOARD_TEXT => {
-                        warn!(session_id, len = text.len(), "ignoring an oversized clipboard text");
-                        continue;
-                    }
-                    ControllerMsg::Clipboard { text } => Request::Clipboard(text),
-                    ControllerMsg::Audio { enabled } => Request::Audio(enabled),
-                };
+            req = incoming.recv() => {
+                let Some(req) = req else { return Ok(()) };
                 match req {
                     req if open => platform.request(req).await?,
                     // 同意之前：记下画质和声音设置，同意之后一起生效；别的（输入、剪贴板……）都不执行
@@ -409,7 +393,7 @@ mod tests {
     use crate::tasks::OwnedTask;
     use airhand_proto::framing;
     use airhand_proto::handshake::Negotiated;
-    use airhand_proto::session::{Codec, MouseButton};
+    use airhand_proto::session::{Codec, ControllerMsg, MAX_CLIPBOARD_TEXT, MouseButton};
     use std::sync::{Arc, Mutex};
 
     /// 平台那边发生了什么
@@ -420,7 +404,7 @@ mod tests {
         Start(Start),
         Request(Request),
         Event(u32),
-        Ack(u32, Option<u64>),
+        Ack(u32, u64),
     }
 
     #[derive(Clone, Default)]
@@ -442,7 +426,7 @@ mod tests {
     }
 
     impl Acks for Log {
-        fn ack(&self, seq: u32, arrived: Option<u64>) {
+        fn ack(&self, seq: u32, arrived: u64) {
             self.push(Call::Ack(seq, arrived));
         }
     }
@@ -483,7 +467,7 @@ mod tests {
     /// 一个跑着的会话：往里发控制端的消息、踢人，看平台和控制端收到了什么
     struct Harness {
         log: Log,
-        to_host: mpsc::Sender<ControllerMsg>,
+        to_host: mpsc::Sender<Request>,
         /// 读任务自己处理的消息（Ping、确认）在这里处理，和真的读任务一样
         express: Express,
         events: mpsc::Sender<u32>,
@@ -557,9 +541,14 @@ mod tests {
     }
 
     impl Harness {
+        /// 和真的读任务一样：自己处理得了的就地处理，其它的换成请求交给会话
         async fn send(&self, m: ControllerMsg) {
-            if let Some(m) = self.express.handle(m) {
-                self.to_host.send(m).await.unwrap();
+            if let Some(r) = self
+                .express
+                .handle(m)
+                .and_then(super::super::streams::request)
+            {
+                self.to_host.send(r).await.unwrap();
             }
         }
 
@@ -627,11 +616,7 @@ mod tests {
         })
         .await;
         h.send(ControllerMsg::Settings(fast())).await;
-        h.send(ControllerMsg::Ack {
-            seq: 3,
-            arrived: Some(9),
-        })
-        .await;
+        h.send(ControllerMsg::Ack { seq: 3, arrived: 9 }).await;
         h.send(ControllerMsg::Clipboard {
             text: "x".repeat(MAX_CLIPBOARD_TEXT + 1),
         })
@@ -641,7 +626,7 @@ mod tests {
         assert!(matches!(h.received().await[..], [HostMsg::Pong { t: 5 }]));
         let mut log = h.log.take();
         // 平台自己的事、读任务直接交给平台的确认，和控制端的其它消息谁先谁后不一定
-        for c in [Call::Event(9), Call::Ack(3, Some(9))] {
+        for c in [Call::Event(9), Call::Ack(3, 9)] {
             let i = log.iter().position(|x| *x == c).unwrap();
             log.remove(i);
         }

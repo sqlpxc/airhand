@@ -1,19 +1,21 @@
-//! 被控端一个会话的四条流：打开、端到端握手、读写任务、结束。会话里收发什么、什么时候发，见 [`super::session`]。
+//! 被控端一个会话的链路：回答端到端握手、开本端的通道、读写任务、直连任务、结束。会话里收发什么、什么时候发，
+//! 见 [`super::session`]。
 //!
 //! Ping 和画面确认在读任务里就处理掉（[`Express`]），不排进会话的主循环：主循环可能正等着平台做一件慢事
 //! （换显示器时要等编码线程退出、建硬件编码器），这期间 Pong 和确认都晚了，控制端测到的往返时延、
-//! 被控端的码率控制都会把它当成网络变慢。
+//! 被控端的码率控制都会把它当成网络变慢。控制端的其它消息在读任务里就换成了 [`Request`]。
 //!
-//! 两端都支持直连时（见 [`crate::direct`]），会话开始之后还有一个直连任务：控制、大块通道每一帧也从直连发一份，
-//! 直连上控制端发来的控制、大块通道和中转上的合并（[`crate::merge`]），画面、声音走哪条路由它决定。
+//! 有直连（[`Incoming::direct`]）时会话开始之后还有一个直连任务：控制通道每一帧也从直连发一份，直连上控制端发来的
+//! 控制通道和中转上的合并（[`crate::merge`]），画面、声音走哪条路由它决定。
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use airhand_proto::features;
+use airhand_proto::SessionLane;
 use airhand_proto::handshake::{Negotiated, PublicKey};
-use airhand_proto::session::{ControllerMsg, HostMsg, InputEvent, QualitySettings};
-use airhand_proto::{Role, SessionLane};
+use airhand_proto::session::{
+    ControllerMsg, HostMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings,
+};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, watch};
@@ -22,23 +24,22 @@ use tracing::{info, warn};
 use super::Incoming;
 use super::clock::InputClock;
 use super::queue::{self, Outbox};
-use super::session::Acks;
-use crate::direct::{self, Attach, Mirrors, Route};
+use super::session::{Acks, Request};
+use crate::direct::{self, Mirror, Route};
+use crate::lanes::{Via, first_stream, open_lane};
 use crate::merge::{Merge, Policy};
-use crate::secure::{self, Admission, Gate, ResponderParams};
+use crate::secure::{self, Admission, Gate, ResponderParams, STEP_TIMEOUT};
 use crate::tasks::OwnedTask;
-use crate::transport::{
-    SessionStreams, next_msg, open_session, write_audio, write_lane, write_video,
-};
+use crate::transport::{next_msg, write_audio, write_lane, write_video};
 
-/// 被控端一个会话的四条流。
+/// 被控端一个会话的链路。
 ///
 /// 控制消息、大块消息（剪贴板、光标）排进 [`Outbox`]（它按消息挑通道，见 [`super::queue`]），画面包、声音包
-/// 各排进一个有界队列，各自的写任务把它们加密后写进流（声音包优先发成数据报）。控制端的消息由读任务解密后交给
-/// [`HostStreams::incoming`]，过时的输入在这里就换成了"释放所有按键"（见 [`InputClock`]）。
+/// 各排进一个有界队列，各自的写任务把它们加密后写出去（声音发成数据报）。控制端的消息由读任务解密、换成 [`Request`]
+/// 交给 [`HostStreams::incoming`]，过时的输入在这里就换成了"释放所有按键"（见 [`InputClock`]）。
 ///
 /// 结束时调用 [`HostStreams::close`]：在那之前要先停掉还拿着 `out` / `video` / `audio` 的东西
-/// （编码管线、声音订阅），写任务才能把队列里剩下的（例如 Bye）发完、正常结束流。
+/// （编码管线、声音订阅），写任务才能把队列里剩下的（例如 Bye）发完、正常结束通道。
 pub struct HostStreams {
     /// 控制消息（控制通道、大块通道）
     pub out: Outbox,
@@ -46,29 +47,31 @@ pub struct HostStreams {
     pub video: mpsc::Sender<Bytes>,
     /// 声音包（同上）
     pub audio: mpsc::Sender<Bytes>,
-    /// 控制端发来的消息
+    /// 控制端的请求
     pub incoming: ControllerReceiver,
-    /// 写任务（四条流一起）：意外结束就是连接出了问题
+    /// 写任务：意外结束就是连接出了问题
     pub writer: Writer,
     reader: OwnedTask<Result<()>>,
-    /// 直连任务（两端都支持直连时才有，见 [`crate::direct::host`]）：会话开始之后（[`HostStreams::started`]）才开始
+    /// 直连任务（有直连时才有，见 [`crate::direct::host`]）：会话开始之后（[`HostStreams::started`]）才开始
     direct: Option<OwnedTask<()>>,
     started: Arc<Notify>,
+    /// 在中转连接上的登记：会话结束时注销
+    _registration: crate::lanes::Registration,
 }
 
-/// 控制端发来的消息，交给会话的主循环（Ping、确认已经在读任务里处理掉了，见模块说明）。
+/// 控制端的请求，交给会话的主循环（Ping、确认已经在读任务里处理掉了，见模块说明）。
 /// 控制和大块消息使用独立信箱，批量剪贴板不能占满输入的接收位置。
 pub struct ControllerReceiver {
-    control: mpsc::Receiver<ControllerMsg>,
-    bulk: mpsc::Receiver<ControllerMsg>,
+    control: mpsc::Receiver<Request>,
+    bulk: mpsc::Receiver<Request>,
     bulk_open: bool,
     express: Express,
 }
 
 impl ControllerReceiver {
     pub(crate) fn new(
-        control: mpsc::Receiver<ControllerMsg>,
-        bulk: mpsc::Receiver<ControllerMsg>,
+        control: mpsc::Receiver<Request>,
+        bulk: mpsc::Receiver<Request>,
         express: Express,
     ) -> Self {
         Self {
@@ -79,7 +82,7 @@ impl ControllerReceiver {
         }
     }
 
-    pub async fn recv(&mut self) -> Option<ControllerMsg> {
+    pub async fn recv(&mut self) -> Option<Request> {
         loop {
             tokio::select! {
                 biased;
@@ -125,7 +128,7 @@ impl Express {
         }
     }
 
-    /// 处理得了的就地处理、返回 `None`；其它的原样返回，交给会话
+    /// 处理得了的就地处理、返回 `None`；其它的原样返回
     pub(crate) fn handle(&self, m: ControllerMsg) -> Option<ControllerMsg> {
         *self.heard.lock().unwrap() = tokio::time::Instant::now();
         match m {
@@ -145,7 +148,33 @@ impl Express {
     }
 }
 
-/// 四条流的写任务
+/// 控制端的一条消息交给会话时是什么请求（[`Express`] 处理掉的、直连的回答不在这里）。没什么可做的是 `None`
+pub(crate) fn request(m: ControllerMsg) -> Option<Request> {
+    Some(match m {
+        ControllerMsg::Input { mut events, .. } => {
+            // 对方版本新增的按钮、系统操作……：不执行
+            events.retain(InputEvent::understood);
+            if events.is_empty() {
+                return None;
+            }
+            Request::Input(events)
+        }
+        ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
+        ControllerMsg::RequestKeyframe { after } => Request::Keyframe(Some(after)),
+        ControllerMsg::SelectDisplay { index } => Request::SelectDisplay(index),
+        ControllerMsg::Clipboard { text } if text.len() > MAX_CLIPBOARD_TEXT => {
+            warn!(len = text.len(), "ignoring an oversized clipboard text");
+            return None;
+        }
+        ControllerMsg::Clipboard { text } => Request::Clipboard(text),
+        ControllerMsg::Audio { enabled } => Request::Audio(enabled),
+        ControllerMsg::Ping { .. } | ControllerMsg::Ack { .. } | ControllerMsg::Direct(_) => {
+            return None;
+        }
+    })
+}
+
+/// 写任务（几条通道一起）
 pub struct Writer(pub(super) OwnedTask<Result<((), (), (), ())>>);
 
 impl Writer {
@@ -180,7 +209,7 @@ pub struct Admitted {
 }
 
 impl HostStreams {
-    /// 打开会话的四条流，在控制流上做端到端握手（让不让这个控制端进来由 `gate` 决定，拒绝时返回错误）。
+    /// 回答控制端的端到端握手（让不让这个控制端进来由 `gate` 决定，拒绝时返回错误），开好本端的通道。
     /// 控制端确认了才返回（见 `airhand_proto::handshake` 的"确认"）：返回之前不要显示它、不要开始采集。
     /// `video_queue` / `audio_queue`：画面、声音的发送队列有多长（满了由发送方决定丢弃还是等待）
     pub async fn open(
@@ -190,17 +219,15 @@ impl HostStreams {
         gate: &dyn Gate,
     ) -> Result<(Self, Admitted)> {
         let session_id = inc.session_id;
-        let SessionStreams {
-            control: (mut send, mut recv),
-            video: (video_send, _),
-            audio: (audio_send, _),
-            bulk: (bulk_send, bulk_recv),
-        } = open_session(&inc.conn, session_id, Role::Host).await?;
-        let r = secure::respond(
-            &mut recv,
+        let conn = &inc.conn;
+        let (mut inbox, registration) = inc.router.register(session_id);
+        // 握手的回答写进本端的控制通道；控制端要等收到回答才开它的，用到时再等
+        let mut send = open_lane(conn, session_id, SessionLane::Control).await?;
+        let (r, control_in) = secure::respond(
+            &inc.init,
             &mut send,
+            first_stream(&mut inbox.control, STEP_TIMEOUT),
             ResponderParams {
-                session_id,
                 code: inc.code,
                 gate,
             },
@@ -224,136 +251,66 @@ impl HostStreams {
             negotiated = ?admitted.negotiated,
             "end-to-end session established"
         );
-        let (video_sealer, audio_sealer, bulk_sealer) = (
-            r.secured.video.sealer,
-            r.secured.audio.sealer,
-            r.secured.bulk.sealer,
-        );
-        let control_sealer = r.sealer;
+        let secured = r.secured;
+        let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
+        let video_send = open_lane(conn, session_id, SessionLane::Video).await?;
         let (out, ctl_rx, bulk_rx) = queue::channel();
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
-        let conn = inc.conn.clone();
-        // 画面、声音走哪条路（直连任务决定，没有直连时一直是中转）；控制、大块通道在直连上的那一份
+        // 画面、声音走哪条路（直连任务决定，没有直连时一直是中转）；控制通道在直连上的那一份
         let (route_tx, route) = watch::channel(Route::default());
-        let mirrors = Mirrors::default();
+        let mirror = Mirror::default();
         let broken = Arc::new(Notify::new());
-        let writer = {
-            let (mirrors, broken, route2) = (mirrors.clone(), broken.clone(), route.clone());
-            OwnedTask(tokio::spawn(async move {
-                tokio::try_join!(
-                    write_lane(send, ctl_rx, control_sealer, mirrors.control),
-                    write_lane(bulk_send, bulk_rx, bulk_sealer, mirrors.bulk),
-                    write_video(video_send, video_rx, video_sealer, route2, broken),
-                    write_audio(conn, session_id, audio_send, audio_rx, audio_sealer, route)
-                )
-            }))
-        };
-        // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过通道交给会话。
-        // Ping、画面确认在这里就处理掉（见模块说明）；直连的回答交给直连任务
-        let (mut control, attach_control) =
-            Merge::new(SessionLane::Control, Policy::Complete, r.opener, recv);
-        let (mut bulk, attach_bulk) = Merge::new(
+        let writer = OwnedTask(tokio::spawn(write_all(Writers {
+            conn: conn.clone(),
+            session_id,
+            control: (send, ctl_rx, r.sealer, mirror.clone()),
+            bulk: (bulk_send, bulk_rx, secured.bulk.sealer),
+            video: (video_send, video_rx, secured.video.sealer, broken.clone()),
+            audio: (audio_rx, secured.audio.sealer),
+            route,
+        })));
+        // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过信箱交给会话
+        let mut control = Merge::new(
+            SessionLane::Control,
+            Policy::Complete,
+            r.opener,
+            inbox.control,
+        );
+        control.add(control_in, Via::Relay)?;
+        let bulk = Merge::new(
             SessionLane::Bulk,
             Policy::Complete,
-            r.secured.bulk.opener,
-            bulk_recv,
+            secured.bulk.opener,
+            inbox.bulk,
         );
         let capacity = 4 * 1024 * 1024 / SessionLane::Control.max_frame_size();
-        let (in_tx, control_in) = mpsc::channel(capacity);
-        let (bulk_in, bulk_rx) = mpsc::channel(2);
+        let (control_tx, control_rx) = mpsc::channel(capacity);
+        let (bulk_tx, bulk_rx) = mpsc::channel(2);
         let express = Express::new(out.clone());
-        let incoming = ControllerReceiver::new(control_in, bulk_rx, express.clone());
+        let incoming = ControllerReceiver::new(control_rx, bulk_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
         let started = Arc::new(Notify::new());
-        let direct = match &inc.direct {
-            Some(link) if admitted.negotiated.has(features::session::DIRECT) => Some(OwnedTask(
-                tokio::spawn(direct::host::run(direct::host::Session {
-                    link: link.clone(),
-                    session_id,
-                    key: r.secured.direct,
-                    probe: r.secured.probe,
-                    out: out.clone(),
-                    answers,
-                    attach: Attach {
-                        control: Some(attach_control),
-                        bulk: Some(attach_bulk),
-                        video: None,
-                    },
-                    mirrors,
-                    route: route_tx,
-                    broken,
-                    acks: express.acks.clone(),
-                    keyframe: in_tx.downgrade(),
-                    started: started.clone(),
-                })),
-            )),
-            _ => None,
-        };
-        let reader = OwnedTask(tokio::spawn(async move {
-            let bulk_express = express.clone();
-            // 大块通道（剪贴板）：结束了不算会话结束，控制流结束才是
-            let bulk = async move {
-                while let Some(m) = next_msg::<ControllerMsg>(&mut bulk, SessionLane::Bulk).await? {
-                    let Some(m) = bulk_express.handle(m) else {
-                        continue;
-                    };
-                    if bulk_in.send(m).await.is_err() {
-                        break;
-                    }
-                }
-                std::future::pending::<Result<()>>().await
-            };
-            let control = async move {
-                let mut clock = InputClock::default();
-                // 这一串过时的输入已经换成了一个"释放所有按键"
-                let mut released = false;
-                while let Some(m) =
-                    next_msg::<ControllerMsg>(&mut control, SessionLane::Control).await?
-                {
-                    if let &ControllerMsg::Ping { t } = &m {
-                        clock.stale(t, Instant::now());
-                    }
-                    let Some(m) = express.handle(m) else {
-                        continue;
-                    };
-                    let m = match m {
-                        // 直连任务的事（会话不支持直连时没人收，丢掉就是了）
-                        ControllerMsg::Direct(offer) => {
-                            let _ = answers_tx.try_send(offer);
-                            continue;
-                        }
-                        ControllerMsg::Input { t, mut events } => {
-                            // 对方版本新增的按钮、系统操作……：不执行
-                            events.retain(InputEvent::understood);
-                            if !clock.stale(t, Instant::now()) {
-                                released = false;
-                                ControllerMsg::Input { t, events }
-                            } else if released {
-                                continue;
-                            } else {
-                                // 不在网络恢复后重放过时的操作；丢掉的里面可能有松开按键，所以松开所有按键
-                                warn!(session_id, "dropping input that arrived too late");
-                                released = true;
-                                ControllerMsg::Input {
-                                    t,
-                                    events: vec![InputEvent::ReleaseAll],
-                                }
-                            }
-                        }
-                        m => m,
-                    };
-                    if in_tx.send(m).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(())
-            };
-            tokio::select! {
-                r = control => r,
-                r = bulk => r,
-            }
-        }));
+        let direct = inc.direct.as_ref().map(|link| {
+            OwnedTask(tokio::spawn(direct::host::run(direct::host::Session {
+                link: link.clone(),
+                session_id,
+                probe: secured.probe,
+                probes: inbox.probes,
+                feed: inbox.feed.clone(),
+                out: out.clone(),
+                answers,
+                mirror,
+                route: route_tx,
+                broken,
+                acks: express.acks.clone(),
+                keyframe: control_tx.downgrade(),
+                started: started.clone(),
+            })))
+        });
+        let reader = OwnedTask(tokio::spawn(read_all(
+            session_id, control, bulk, express, control_tx, bulk_tx, answers_tx,
+        )));
         Ok((
             Self {
                 out,
@@ -364,6 +321,7 @@ impl HostStreams {
                 reader,
                 direct,
                 started,
+                _registration: registration,
             },
             admitted,
         ))
@@ -386,6 +344,7 @@ impl HostStreams {
             mut reader,
             direct,
             started: _,
+            _registration,
         } = self;
         // 直连任务手里也有一个 Outbox（发候选地址）：先停掉它，写任务才知道没有人再发了
         if let Some(mut d) = direct {
@@ -414,6 +373,121 @@ impl HostStreams {
     }
 }
 
+/// 本端各条通道的写任务要的东西
+struct Writers {
+    conn: quinn::Connection,
+    session_id: u64,
+    control: (
+        quinn::SendStream,
+        queue::LaneReceiver,
+        secure::Sealer,
+        Mirror,
+    ),
+    bulk: (quinn::SendStream, queue::LaneReceiver, secure::Sealer),
+    video: (
+        quinn::SendStream,
+        mpsc::Receiver<Bytes>,
+        secure::Sealer,
+        Arc<Notify>,
+    ),
+    audio: (mpsc::Receiver<Bytes>, secure::Sealer),
+    route: watch::Receiver<Route>,
+}
+
+async fn write_all(w: Writers) -> Result<((), (), (), ())> {
+    let Writers {
+        conn,
+        session_id,
+        control: (control, ctl_rx, ctl_sealer, mirror),
+        bulk: (bulk, bulk_rx, bulk_sealer),
+        video: (video, video_rx, video_sealer, broken),
+        audio: (audio_rx, audio_sealer),
+        route,
+    } = w;
+    tokio::try_join!(
+        write_lane(control, ctl_rx, ctl_sealer, Some(mirror)),
+        write_lane(bulk, bulk_rx, bulk_sealer, None),
+        write_video(
+            video,
+            video_rx,
+            video_sealer,
+            session_id,
+            route.clone(),
+            broken
+        ),
+        write_audio(conn, session_id, audio_rx, audio_sealer, route)
+    )
+}
+
+/// 读控制端的控制、大块通道：Ping、确认就地处理（[`Express`]），直连的回答交给直连任务，其它的换成请求交给会话
+async fn read_all(
+    session_id: u64,
+    mut control: Merge,
+    mut bulk: Merge,
+    express: Express,
+    control_tx: mpsc::Sender<Request>,
+    bulk_tx: mpsc::Sender<Request>,
+    answers: mpsc::Sender<airhand_proto::session::DirectOffer>,
+) -> Result<()> {
+    let bulk_express = express.clone();
+    // 大块通道（剪贴板）：结束了不算会话结束，控制通道结束才是
+    let bulk = async move {
+        while let Some(m) = next_msg::<ControllerMsg>(&mut bulk, SessionLane::Bulk).await? {
+            let Some(r) = bulk_express.handle(m).and_then(request) else {
+                continue;
+            };
+            if bulk_tx.send(r).await.is_err() {
+                break;
+            }
+        }
+        std::future::pending::<Result<()>>().await
+    };
+    let control = async move {
+        let mut clock = InputClock::default();
+        // 这一串过时的输入已经换成了一个"释放所有按键"
+        let mut released = false;
+        while let Some(m) = next_msg::<ControllerMsg>(&mut control, SessionLane::Control).await? {
+            if let &ControllerMsg::Ping { t } = &m {
+                clock.stale(t, Instant::now());
+            }
+            let m = match express.handle(m) {
+                // 直连任务的事（没有直连时没人收，丢掉就是了）
+                Some(ControllerMsg::Direct(offer)) => {
+                    let _ = answers.try_send(offer);
+                    continue;
+                }
+                Some(ControllerMsg::Input { t, events }) => {
+                    if !clock.stale(t, Instant::now()) {
+                        released = false;
+                        ControllerMsg::Input { t, events }
+                    } else if released {
+                        continue;
+                    } else {
+                        // 不在网络恢复后重放过时的操作；丢掉的里面可能有松开按键，所以松开所有按键
+                        warn!(session_id, "dropping input that arrived too late");
+                        released = true;
+                        ControllerMsg::Input {
+                            t,
+                            events: vec![InputEvent::ReleaseAll],
+                        }
+                    }
+                }
+                Some(m) => m,
+                None => continue,
+            };
+            let Some(r) = request(m) else { continue };
+            if control_tx.send(r).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    };
+    tokio::select! {
+        r = control => r,
+        r = bulk => r,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,42 +500,72 @@ mod tests {
         let (out, _control, _bulk) = queue::channel();
         let mut incoming = ControllerReceiver::new(control_rx, bulk_rx, Express::new(out));
         for _ in 0..2 {
-            bulk.try_send(ControllerMsg::Clipboard {
-                text: "x".repeat(1 << 20),
-            })
-            .unwrap();
+            bulk.try_send(Request::Clipboard("x".repeat(1 << 20)))
+                .unwrap();
         }
-        assert!(
-            bulk.try_send(ControllerMsg::Clipboard {
-                text: "more".into()
-            })
-            .is_err()
-        );
-        control
-            .send(ControllerMsg::SelectDisplay { index: 7 })
-            .await
-            .unwrap();
+        assert!(bulk.try_send(Request::Clipboard("more".into())).is_err());
+        control.send(Request::SelectDisplay(7)).await.unwrap();
         assert!(matches!(
             incoming.recv().await,
-            Some(ControllerMsg::SelectDisplay { index: 7 })
+            Some(Request::SelectDisplay(7))
         ));
         control
-            .send(ControllerMsg::Settings(QualitySettings::default()))
+            .send(Request::Settings(QualitySettings::default()))
             .await
             .unwrap();
-        assert!(matches!(
-            incoming.recv().await,
-            Some(ControllerMsg::Settings(_))
-        ));
+        assert!(matches!(incoming.recv().await, Some(Request::Settings(_))));
         drop(control);
         assert!(incoming.recv().await.is_none());
     }
 
+    /// 控制端的消息变成什么请求：不认识的输入事件去掉，空了就不交；太大的剪贴板不交；要关键帧带着序号
+    #[test]
+    fn controller_messages_become_requests() {
+        use airhand_proto::session::{MouseButton, QualitySettings};
+        let unknown = InputEvent::MouseButton {
+            button: MouseButton::Unknown(9),
+            down: true,
+        };
+        assert_eq!(
+            request(ControllerMsg::Input {
+                t: 0,
+                events: vec![unknown.clone(), InputEvent::ReleaseAll],
+            }),
+            Some(Request::Input(vec![InputEvent::ReleaseAll]))
+        );
+        assert_eq!(
+            request(ControllerMsg::Input {
+                t: 0,
+                events: vec![unknown]
+            }),
+            None
+        );
+        assert_eq!(
+            request(ControllerMsg::Clipboard {
+                text: "x".repeat(MAX_CLIPBOARD_TEXT + 1)
+            }),
+            None
+        );
+        assert_eq!(
+            request(ControllerMsg::RequestKeyframe { after: 7 }),
+            Some(Request::Keyframe(Some(7)))
+        );
+        let wild = QualitySettings {
+            fps: 0,
+            ..QualitySettings::default()
+        };
+        assert_eq!(
+            request(ControllerMsg::Settings(wild)),
+            Some(Request::Settings(wild.sanitized()))
+        );
+        assert_eq!(request(ControllerMsg::Ping { t: 1 }), None);
+    }
+
     #[derive(Default)]
-    struct Log(Mutex<Vec<(u32, Option<u64>)>>);
+    struct Log(Mutex<Vec<(u32, u64)>>);
 
     impl Acks for Log {
-        fn ack(&self, seq: u32, arrived: Option<u64>) {
+        fn ack(&self, seq: u32, arrived: u64) {
             self.0.lock().unwrap().push((seq, arrived));
         }
     }
@@ -474,15 +578,12 @@ mod tests {
         let (_tx, rx) = mpsc::channel(1);
         let incoming = ControllerReceiver::new(rx, mpsc::channel(1).1, Express::new(out));
         let express = incoming.express.clone();
-        let ack = |seq| ControllerMsg::Ack {
-            seq,
-            arrived: Some(9),
-        };
+        let ack = |seq| ControllerMsg::Ack { seq, arrived: 9 };
         assert!(express.handle(ack(1)).is_none());
         let log = Arc::new(Log::default());
         incoming.set_acks(log.clone());
         assert!(express.handle(ack(2)).is_none());
-        assert_eq!(*log.0.lock().unwrap(), [(2, Some(9))]);
+        assert_eq!(*log.0.lock().unwrap(), [(2, 9)]);
 
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(incoming.silent_for(), Duration::from_secs(10));
@@ -492,8 +593,8 @@ mod tests {
         assert!(matches!(pong, HostMsg::Pong { t: 5 }));
 
         tokio::time::advance(Duration::from_secs(10)).await;
-        let m = express.handle(ControllerMsg::RequestKeyframe);
-        assert!(matches!(m, Some(ControllerMsg::RequestKeyframe)));
+        let m = express.handle(ControllerMsg::RequestKeyframe { after: 0 });
+        assert!(matches!(m, Some(ControllerMsg::RequestKeyframe { .. })));
         assert_eq!(incoming.silent_for(), Duration::ZERO);
     }
 }

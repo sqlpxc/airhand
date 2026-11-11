@@ -1,24 +1,21 @@
 //! 信令流（客户端 ⇄ 服务器）的消息。
 //!
-//! 服务器发给客户端的都是类型（例如 [`ConnectError`]、[`ServerHello::Incompatible`]），不是文字：
-//! 客户端按自己的界面语言显示。
+//! 服务器发给客户端的都是类型（例如 [`ConnectError`]），不是文字：客户端按自己的界面语言显示。
 //!
 //! # 版本握手
 //!
-//! 连接后客户端先发 [`ClientHello`]，服务器回 [`ServerHello`]。为了让**任何版本**的客户端和服务器都能互相告知
-//! "版本不一致"，这两条消息的开头永远不变：它们是 v9 之前 postcard 编码的 `ClientMsg::Hello`（变体 0：
-//! `version | role | name | os`）和 `ServerMsg::Welcome` / `ServerMsg::Incompatible`（变体 0 / 1：一个版本号）。
-//!
-//! 新的东西跟在这个开头后面，是 CBOR（[`HelloExt`] / [`WelcomeExt`] / [`IncompatibleExt`]，以后还能加字段）：
-//! postcard 解码时不管后面多出来的字节，所以旧的服务器 / 客户端照样读得出开头、照样能报"版本不一致"；
-//! 新的一方读完开头之后，后面还有字节就按 CBOR 读。
-//!
-//! 服务器不要求版本相等：双方各自能说一个区间的版本（[`crate::SIGNAL_MIN`]..=[`crate::SIGNAL_VERSION`]），
-//! 取两边都能说的最高版本；没有交集才不兼容。[`ServerHello::Incompatible`] 带着服务器的区间，客户端据此判断该更新哪一边。
-//! 握手里还交换信令层的能力位（[`crate::features::signal`]）。
+//! 连接后客户端先发 [`ClientHello`]，服务器回 [`ServerHello`]。两条都是 CBOR map，**0、1 号键永远是版本区间**
+//! （[`Versions`]），这是信令协议里唯一冻结的部分：服务器先只读这两个键（map 里别的键不管）、算出双方都能说的最高版本，
+//! 没有交集就回答 `version: None` 和自己的区间，客户端据此提示该更新哪一边。所以任何两个版本之间都能互相告知"不兼容"，
+//! 而握手里的其它字段照样可以按 [`crate::framing`] 的规则增减。
 //!
 //! 握手之后的消息（[`ClientMsg`] / [`ServerMsg`]）是带编号的 CBOR，不认识的跳过（见 [`crate::framing`]）。
-//! `framing` 和这里的测试锁定了握手的编码。
+//!
+//! # 发起会话
+//!
+//! 控制端的 [`ClientMsg::Connect`] 带着端到端握手的第一条消息（[`crate::handshake::HandshakeInit`]，对服务器是不透明的字节），
+//! 服务器批准之后在 [`ServerMsg::Incoming`] 里原样交给被控端：被控端收到通知时就能回答握手，不用等控制端先拿到批准、
+//! 再开流、再发第一条消息（省一个往返）。
 //!
 //! # 重连凭证（resume tokens）
 //!
@@ -31,7 +28,7 @@
 //!
 //! 被控端掉线后，控制端带着凭证重连（[`ClientMsg::Connect::resume`]），服务器的回答：
 //!
-//! * 前一半不是本服务器为这个控制码签的（伪造的、旧版本的、别的服务器发的）：[`ConnectError::Revoked`]。
+//! * 前一半不是本服务器为这个控制码签的（伪造的、别的服务器发的）：[`ConnectError::Revoked`]。
 //!   这个回答只取决于凭证本身，和控制码在不在、有没有人用都无关，所以凭证不能用来猜码；
 //! * 被控端在线、凭证有效：照常建立会话；
 //! * 被控端在线、后一半对不上（被控端换过密钥、控制码换了主人）：[`ConnectError::Revoked`]；
@@ -63,15 +60,13 @@
 //! [`ClientMsg::Register::keep`]：服务器把这个控制码**绑定**到这台被控端（只记密钥的哈希，存在服务器的 SQLite 数据库里），
 //! 被控端离线多久、服务器重启多少次，都不会把它分给别人，被控端上线时总能取回。很久（见服务器的
 //! `BINDING_TTL`）没有上线的绑定才会被清理。被控端更换控制码时先发 [`ClientMsg::Release`] 解除绑定。
-//! 不保存控制码的被控端（`keep = false`）和以前一样：掉线后控制码只保留一小段时间。
+//! 不保存控制码的被控端（`keep = false`）掉线后控制码只保留一小段时间。
 //!
 //! # 公网地址
 //!
-//! 两端都支持 [`crate::features::signal::OBSERVED_ADDR`] 时，服务器在会话开始时告诉每一端**它自己**的公网地址
-//! （服务器看到的这条连接的来源地址，[`ServerMsg::Incoming::observed`]、[`SessionGrant::observed`]）：
-//! 两端打洞直连要用（见 crate 说明的"直连"）。服务器不把一端的地址告诉另一端：两端在会话开始之后
-//! （被控端的用户同意了、端到端握手确认了对方）才在加密的控制通道上交换地址，被控端不会把自己的地址
-//! 交给一个只知道控制码的人。
+//! 服务器在会话开始时告诉每一端**它自己**的公网地址（服务器看到的这条连接的来源地址，[`ServerMsg::Incoming::observed`]、
+//! [`SessionGrant::observed`]）：两端打洞直连要用（见 crate 说明的"直连"）。服务器不把一端的地址告诉另一端：
+//! 两端在会话开始之后（被控端的用户同意了、端到端握手确认了对方）才在加密的控制通道上交换地址。
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -79,196 +74,105 @@ use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::open_enum;
-use crate::framing::FrameError;
 use crate::{Features, Role};
 
 // ───────────────────────────── 版本握手 ─────────────────────────────
 
+/// 版本握手里冻结的部分：[`ClientHello`] / [`ServerHello`] 的 0、1 号键（见模块说明的"版本握手"）
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
+#[cbor(map)]
+pub struct Versions {
+    /// 能说的最老的版本
+    #[n(0)]
+    pub min: u16,
+    /// 能说的最新的版本
+    #[n(1)]
+    pub max: u16,
+}
+
+impl Versions {
+    /// 本端能说的信令版本
+    pub const SIGNAL: Versions = Versions {
+        min: crate::SIGNAL_MIN,
+        max: crate::SIGNAL_VERSION,
+    };
+
+    /// 双方都能说的最高版本；没有交集时为 `None`
+    pub fn common(self, other: Versions) -> Option<u16> {
+        let v = self.max.min(other.max);
+        (v >= self.min.max(other.min)).then_some(v)
+    }
+}
+
 /// 客户端连上之后的第一条消息（见模块说明的"版本握手"）。
 ///
 /// `name` 为空表示不知道本机名称，由显示的一方按自己的语言显示"未知设备"。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientHello {
-    /// 本端能说的最高信令版本（旧服务器拿它和自己的版本比）
-    pub version: u16,
-    pub role: Role,
-    pub name: String,
-    pub os: String,
-    /// 本端能说的最老的版本（v9 之前的客户端没有，等于 `version`）
-    pub min_version: u16,
-    /// 信令层的能力位（[`crate::features::signal`]）
-    pub features: Features,
-}
-
-/// [`ClientHello`] 跟在冻结的开头后面的部分
-#[derive(Encode, Decode, Debug, Default)]
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
 #[cbor(map)]
-pub struct HelloExt {
+pub struct ClientHello {
     #[n(0)]
-    pub min_version: Option<u16>,
+    pub min: u16,
     #[n(1)]
-    pub features: Option<Features>,
-}
-
-/// v9 之前的 `ClientMsg`：只用它的变体 0（编码永远不变）
-#[derive(Serialize, Deserialize)]
-enum FrozenClient {
-    Hello {
-        version: u16,
-        role: Role,
-        name: String,
-        os: String,
-    },
-}
-
-/// v9 之前的 `ServerMsg`：只用它的变体 0 和 1（编码永远不变）
-#[derive(Serialize, Deserialize)]
-enum FrozenServer {
-    Welcome { version: u16 },
-    Incompatible { server_version: u16 },
+    pub max: u16,
+    #[n(2)]
+    pub role: Role,
+    #[n(3)]
+    pub name: String,
+    #[n(4)]
+    pub os: String,
+    /// 信令层的能力位（[`crate::features::signal`]）
+    #[cbor(n(5), default)]
+    pub features: Features,
 }
 
 impl ClientHello {
     /// 本端的握手
     pub fn new(role: Role, name: String, os: String) -> Self {
         Self {
-            version: crate::SIGNAL_VERSION,
+            min: Versions::SIGNAL.min,
+            max: Versions::SIGNAL.max,
             role,
             name,
             os,
-            min_version: crate::SIGNAL_MIN,
             features: crate::features::signal::SUPPORTED,
         }
     }
 
-    /// 负载（不带长度前缀）：冻结的开头 + CBOR 的 [`HelloExt`]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = postcard::to_stdvec(&FrozenClient::Hello {
-            version: self.version,
-            role: self.role,
-            name: self.name.clone(),
-            os: self.os.clone(),
-        })
-        .expect("Hello always encodes");
-        minicbor::encode(
-            HelloExt {
-                min_version: Some(self.min_version),
-                features: Some(self.features),
-            },
-            &mut out,
-        )
-        .expect("writing to a Vec can't fail");
-        out
-    }
-
-    pub fn decode(payload: &[u8]) -> Result<Self, FrameError> {
-        let (
-            FrozenClient::Hello {
-                version,
-                role,
-                name,
-                os,
-            },
-            rest,
-        ) = postcard::take_from_bytes(payload)?;
-        let ext = if rest.is_empty() {
-            HelloExt::default()
-        } else {
-            minicbor::decode(rest)?
-        };
-        Ok(Self {
-            version,
-            role,
-            name,
-            os,
-            min_version: ext.min_version.unwrap_or(version).min(version),
-            features: ext.features.unwrap_or_default(),
-        })
-    }
-
-    /// 服务器怎么回答：双方都能说的最高版本，没有交集就是不兼容
-    pub fn negotiate(&self, min: u16, max: u16, features: Features) -> ServerHello {
-        let version = self.version.min(max);
-        if version < self.min_version.max(min) {
-            ServerHello::Incompatible { min, max }
-        } else {
-            ServerHello::Welcome { version, features }
+    pub fn versions(&self) -> Versions {
+        Versions {
+            min: self.min,
+            max: self.max,
         }
     }
 }
 
 /// 服务器对 [`ClientHello`] 的回答（见模块说明的"版本握手"）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerHello {
-    /// 握手成功。之后按 `version` 说话；`features` 是服务器的信令能力位
-    Welcome { version: u16, features: Features },
-    /// 没有双方都能说的版本：服务器能说 `min..=max`。客户端应停止重试，并据此提示用户更新客户端还是服务器
-    Incompatible { min: u16, max: u16 },
-}
-
-#[derive(Encode, Decode, Debug, Default)]
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
 #[cbor(map)]
-pub struct WelcomeExt {
+pub struct ServerHello {
+    /// 服务器能说的信令版本
     #[n(0)]
-    pub features: Option<Features>,
-}
-
-#[derive(Encode, Decode, Debug, Default)]
-#[cbor(map)]
-pub struct IncompatibleExt {
-    #[n(0)]
-    pub min: Option<u16>,
+    pub min: u16,
+    #[n(1)]
+    pub max: u16,
+    /// 之后按这个版本说话；`None`：没有双方都能说的版本，客户端应停止重试，按 `min..=max` 提示用户更新哪一边
+    #[n(2)]
+    pub version: Option<u16>,
+    /// 服务器的信令能力位
+    #[cbor(n(3), default)]
+    pub features: Features,
 }
 
 impl ServerHello {
-    /// 负载（不带长度前缀）：冻结的开头 + CBOR 的扩展
-    pub fn encode(&self) -> Vec<u8> {
-        let (frozen, ext) = match *self {
-            ServerHello::Welcome { version, features } => (
-                FrozenServer::Welcome { version },
-                minicbor::to_vec(WelcomeExt {
-                    features: Some(features),
-                }),
-            ),
-            // 旧客户端只看这个号：比它自己的大就提示更新客户端
-            ServerHello::Incompatible { min, max } => (
-                FrozenServer::Incompatible {
-                    server_version: max,
-                },
-                minicbor::to_vec(IncompatibleExt { min: Some(min) }),
-            ),
-        };
-        let mut out = postcard::to_stdvec(&frozen).expect("ServerHello always encodes");
-        out.extend(ext.expect("writing to a Vec can't fail"));
-        out
-    }
-
-    pub fn decode(payload: &[u8]) -> Result<Self, FrameError> {
-        let (frozen, rest): (FrozenServer, _) = postcard::take_from_bytes(payload)?;
-        Ok(match frozen {
-            FrozenServer::Welcome { version } => {
-                let ext: WelcomeExt = if rest.is_empty() {
-                    WelcomeExt::default()
-                } else {
-                    minicbor::decode(rest)?
-                };
-                ServerHello::Welcome {
-                    version,
-                    features: ext.features.unwrap_or_default(),
-                }
-            }
-            FrozenServer::Incompatible { server_version } => {
-                let ext: IncompatibleExt = if rest.is_empty() {
-                    IncompatibleExt::default()
-                } else {
-                    minicbor::decode(rest)?
-                };
-                ServerHello::Incompatible {
-                    min: ext.min.unwrap_or(server_version).min(server_version),
-                    max: server_version,
-                }
-            }
-        })
+    /// 服务器怎么回答能说 `client` 的客户端：双方都能说的最高版本
+    pub fn answer(client: Versions, features: Features) -> Self {
+        let ours = Versions::SIGNAL;
+        Self {
+            min: ours.min,
+            max: ours.max,
+            version: ours.common(client),
+            features,
+        }
     }
 }
 
@@ -295,6 +199,7 @@ pub enum ClientMsg {
     /// 控制端请求连接某个控制码对应的被控端。
     ///
     /// `resume`：之前连上这个控制码时得到的重连凭证（见模块说明的"重连凭证"），第一次连接时为 `None`。
+    /// `init`：端到端握手的第一条消息（见模块说明的"发起会话"），最多 [`crate::handshake::MAX_MSG`] 字节
     #[n(2)]
     Connect {
         #[n(0)]
@@ -303,6 +208,8 @@ pub enum ClientMsg {
         code: u32,
         #[cbor(n(2), with = "minicbor::bytes")]
         resume: Option<ResumeToken>,
+        #[cbor(n(3), with = "minicbor::bytes")]
+        init: Vec<u8>,
     },
     /// 被控端放弃当前的控制码（托盘"更换控制码"）：解除绑定，之后断开连接、不带 `reclaim` 重新注册。
     #[n(3)]
@@ -351,9 +258,8 @@ pub enum ServerMsg {
         #[n(2)]
         error: Option<ConnectError>,
     },
-    /// 通知被控端：有控制端发起会话，请打开会话流。
-    ///
-    /// `observed`：服务器看到的被控端自己的地址（见模块说明的"公网地址"）
+    /// 通知被控端：有控制端发起会话。`init` 是控制端的端到端握手的第一条消息（[`ClientMsg::Connect::init`]），
+    /// 被控端在会话的控制通道上回答它；`observed`：服务器看到的被控端自己的地址（见模块说明的"公网地址"）
     #[n(3)]
     Incoming {
         #[n(0)]
@@ -361,7 +267,9 @@ pub enum ServerMsg {
         #[n(1)]
         peer: Peer,
         #[n(2)]
-        observed: Option<SocketAddr>,
+        observed: SocketAddr,
+        #[cbor(n(3), with = "minicbor::bytes")]
+        init: Vec<u8>,
     },
     /// 通知控制端：它在等的被控端（收到过 [`ConnectError::Offline`]）重新上线了，可以重连
     ///（凭证仍然有效的话就连上了，否则回答 [`ConnectError::Revoked`]）。
@@ -427,7 +335,7 @@ pub struct SessionGrant {
     pub resume: ResumeToken,
     /// 服务器看到的控制端自己的地址（见模块说明的"公网地址"）
     #[n(4)]
-    pub observed: Option<SocketAddr>,
+    pub observed: SocketAddr,
 }
 
 open_enum! {
@@ -450,143 +358,92 @@ open_enum! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Role;
 
-    /// 版本握手的开头永远不能变（见模块说明）。这个测试锁定它们的编码：
-    /// 如果它失败了，说明改动会让其它版本的客户端 / 服务器连"版本不一致"都无法得知。
+    /// 版本握手冻结的部分：两条消息都是 map，0、1 号键是版本区间。这个测试守着它：
+    /// 如果它失败了，说明改动会让其它版本的客户端 / 服务器连"版本不一致"都无法得知
     #[test]
-    fn version_handshake_prefix_is_frozen() {
+    fn version_handshake_is_frozen() {
         let hello = ClientHello {
-            version: 7,
+            min: 9,
+            max: 11,
             role: Role::Controller,
             name: "A".into(),
             os: "B".into(),
-            min_version: 7,
             features: Features::NONE,
         };
-        // 变体 0 | version=7 | Role::Controller=1 | "A" | "B"，后面是扩展
-        let wire = hello.encode();
-        assert_eq!(wire[..7], [0, 7, 1, 1, b'A', 1, b'B']);
-        let host = ClientHello {
-            role: Role::Host,
-            name: String::new(),
-            os: String::new(),
-            ..hello.clone()
-        };
-        assert_eq!(host.encode()[..5], [0, 7, 0, 0, 0]);
-        let welcome = ServerHello::Welcome {
-            version: 7,
-            features: Features::NONE,
-        };
-        assert_eq!(welcome.encode()[..2], [0, 7]);
+        let wire = minicbor::to_vec(&hello).unwrap();
+        // map(6) | 0: 9 | 1: 11 | ...
+        assert_eq!(wire[..5], [0xa6, 0x00, 0x09, 0x01, 0x0b]);
         assert_eq!(
-            ServerHello::Incompatible { min: 5, max: 7 }.encode()[..2],
-            [1, 7]
+            minicbor::decode::<Versions>(&wire).unwrap(),
+            Versions { min: 9, max: 11 }
         );
+        let answer = ServerHello::answer(hello.versions(), Features::NONE);
+        let wire = minicbor::to_vec(&answer).unwrap();
+        assert_eq!(wire[..5], [0xa4, 0x00, 0x09, 0x01, 0x09]);
+        assert_eq!(answer.version, Some(9));
         assert_eq!(crate::ALPN, b"airhand/1");
     }
 
-    /// 旧版本（只认开头）读得懂新的握手；新版本读得懂旧的（没有扩展）
+    /// 以后的版本在握手里加了字段、换了别的东西：照样读得出版本区间，照样能回答"不兼容"
     #[test]
-    fn old_and_new_handshakes_understand_each_other() {
-        // v8 的服务器 / 客户端解码时用的就是冻结的枚举，后面多出来的字节不管
-        let new = ClientHello {
-            version: 10,
-            role: Role::Host,
-            name: "PC".into(),
-            os: "Windows".into(),
-            min_version: 9,
-            features: Features::from_bits(0b101),
-        };
-        let wire = new.encode();
-        let old: FrozenClient = postcard::from_bytes(&wire).unwrap();
-        assert!(matches!(
-            old,
-            FrozenClient::Hello {
-                version: 10,
-                role: Role::Host,
-                ..
-            }
-        ));
-        assert_eq!(ClientHello::decode(&wire).unwrap(), new);
-
-        // v8 的客户端发来的：没有扩展
-        let old = postcard::to_stdvec(&FrozenClient::Hello {
-            version: 8,
-            role: Role::Controller,
-            name: "x".into(),
-            os: "y".into(),
+    fn any_version_can_be_told_it_is_incompatible() {
+        #[derive(Encode)]
+        #[cbor(map)]
+        struct FutureHello {
+            #[n(0)]
+            min: u16,
+            #[n(1)]
+            max: u16,
+            #[n(2)]
+            role: String,
+            #[n(9)]
+            hologram: Vec<u8>,
+        }
+        let wire = minicbor::to_vec(FutureHello {
+            min: 12,
+            max: 14,
+            role: "quantum".into(),
+            hologram: vec![1, 2],
         })
         .unwrap();
-        let h = ClientHello::decode(&old).unwrap();
+        let v: Versions = minicbor::decode(&wire).unwrap();
+        assert!(minicbor::decode::<ClientHello>(&wire).is_err());
+        let answer = ServerHello::answer(v, Features::NONE);
+        assert_eq!(answer.version, None);
         assert_eq!(
-            (h.version, h.min_version, h.features),
-            (8, 8, Features::NONE)
+            (answer.min, answer.max),
+            (Versions::SIGNAL.min, Versions::SIGNAL.max)
         );
-
-        for s in [
-            ServerHello::Welcome {
-                version: 9,
-                features: Features::from_bits(1),
-            },
-            ServerHello::Incompatible { min: 9, max: 11 },
-        ] {
-            let wire = s.encode();
-            assert_eq!(ServerHello::decode(&wire).unwrap(), s);
-            // v8 的客户端照样认得出
-            let old: FrozenServer = postcard::from_bytes(&wire).unwrap();
-            match (old, s) {
-                (FrozenServer::Welcome { version }, ServerHello::Welcome { .. }) => {
-                    assert_eq!(version, 9)
-                }
-                (
-                    FrozenServer::Incompatible { server_version },
-                    ServerHello::Incompatible { .. },
-                ) => {
-                    assert_eq!(server_version, 11)
-                }
-                _ => panic!(),
-            }
+        // 将来的服务器少发了能力位：照样读得懂
+        #[derive(Encode)]
+        #[cbor(map)]
+        struct OldServer {
+            #[n(0)]
+            min: u16,
+            #[n(1)]
+            max: u16,
+            #[n(2)]
+            version: Option<u16>,
         }
-        // v8 的服务器回的：没有扩展
-        let old = postcard::to_stdvec(&FrozenServer::Incompatible { server_version: 8 }).unwrap();
-        assert_eq!(
-            ServerHello::decode(&old).unwrap(),
-            ServerHello::Incompatible { min: 8, max: 8 }
-        );
+        let wire = minicbor::to_vec(OldServer {
+            min: 9,
+            max: 9,
+            version: Some(9),
+        })
+        .unwrap();
+        let s: ServerHello = minicbor::decode(&wire).unwrap();
+        assert_eq!((s.version, s.features), (Some(9), Features::NONE));
     }
 
     #[test]
     fn negotiation_picks_the_highest_common_version() {
-        let hello = |min, max| ClientHello {
-            version: max,
-            min_version: min,
-            ..ClientHello::new(Role::Host, String::new(), String::new())
-        };
-        let f = Features::from_bits(3);
-        assert_eq!(
-            hello(9, 11).negotiate(9, 10, f),
-            ServerHello::Welcome {
-                version: 10,
-                features: f
-            }
-        );
-        assert_eq!(
-            hello(9, 9).negotiate(9, 12, f),
-            ServerHello::Welcome {
-                version: 9,
-                features: f
-            }
-        );
-        // 客户端太旧 / 太新
-        assert_eq!(
-            hello(8, 8).negotiate(9, 10, f),
-            ServerHello::Incompatible { min: 9, max: 10 }
-        );
-        assert_eq!(
-            hello(11, 12).negotiate(9, 10, f),
-            ServerHello::Incompatible { min: 9, max: 10 }
-        );
+        let v = |min, max| Versions { min, max };
+        assert_eq!(v(9, 11).common(v(9, 10)), Some(10));
+        assert_eq!(v(9, 9).common(v(9, 12)), Some(9));
+        // 一边太旧 / 太新
+        assert_eq!(v(8, 8).common(v(9, 10)), None);
+        assert_eq!(v(11, 12).common(v(9, 10)), None);
     }
 
     #[test]

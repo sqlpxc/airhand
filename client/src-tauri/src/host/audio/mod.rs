@@ -91,7 +91,8 @@ impl Packetizer {
             pcm: Vec::with_capacity(FRAME_SAMPLES * CHANNELS * 4),
             t0: None,
             frame: vec![0.0; FRAME_SAMPLES * CHANNELS],
-            out: vec![0; 1500],
+            // 编码器保证每包不超过这么大：加密之后正好放得进一个数据报（见 airhand_proto::media）
+            out: vec![0; media::MAX_OPUS_PACKET],
             quiet: 0,
             active: false,
         })

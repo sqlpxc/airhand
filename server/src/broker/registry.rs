@@ -1,7 +1,7 @@
 //! 控制码登记：被控端注册（分配或者取回控制码）、换密钥、放弃控制码；控制端按控制码发起会话、等被控端上线。
 //!
 //! 被控端掉线后控制码保留一段时间（[`RESERVE_TTL`]），固定的控制码（[`crate::codes`]）一直保留。
-//! 控制端发起的会话登记到 [`super::relay`]，两端的流到了之后由它配对、转发。
+//! 控制端发起的会话登记到 [`super::relay`]，由它转发两端的通道和数据报。
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -10,17 +10,18 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use airhand_link::wire::read_msg;
+use airhand_proto::handshake::MAX_MSG;
 use airhand_proto::signal::{
     ClientMsg, ConnectError, Peer, Reclaim, ResumeToken, ServerMsg, SessionGrant,
 };
 use airhand_proto::{CODE_MAX, CODE_MIN, MAX_SIGNAL_MSG};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use quinn::{RecvStream, VarInt};
 use rand::Rng;
 use tracing::{debug, info, warn};
 
 use super::limits::{FAIL_LIMIT, SlotGuard, limiter_key, registration_key};
-use super::relay::Pending;
+use super::relay::Session;
 use super::tokens::{Secrets, ct_eq};
 use super::{Broker, SignalTx, close};
 use crate::codes::{Barrier, Owner};
@@ -43,8 +44,6 @@ pub(super) struct HostEntry {
     tx: SignalTx,
     conn: quinn::Connection,
     sessions: Arc<AtomicUsize>,
-    /// 会话开始时告诉它自己的公网地址（它支持 `OBSERVED_ADDR`）
-    observe: bool,
 }
 
 pub(super) struct Reserved {
@@ -68,8 +67,6 @@ struct Ctrl<'a> {
     peer: SocketAddr,
     name: &'a str,
     tx: &'a SignalTx,
-    /// 会话开始时告诉它自己的公网地址（它支持 `OBSERVED_ADDR`）
-    observe: bool,
 }
 
 /// 服务器看到的这条连接的来源地址（IPv4 映射的 IPv6 地址写成 IPv4）。会话开始时才取：
@@ -147,8 +144,6 @@ pub(super) struct HostConn<'a> {
     pub(super) name: &'a str,
     pub(super) os: &'a str,
     pub(super) tx: &'a SignalTx,
-    /// 它支持 `OBSERVED_ADDR`（见 [`HostEntry::observe`]）
-    pub(super) observe: bool,
 }
 
 impl Broker {
@@ -309,7 +304,6 @@ impl Broker {
                 tx: host.tx.clone(),
                 conn: host.conn.clone(),
                 sessions: Arc::new(AtomicUsize::new(0)),
-                observe: host.observe,
             },
         );
         Ok((code, barrier))
@@ -431,7 +425,6 @@ impl Broker {
         peer: SocketAddr,
         name: String,
         tx: SignalTx,
-        observe: bool,
         mut recv: RecvStream,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
@@ -441,7 +434,6 @@ impl Broker {
             peer,
             name: &name,
             tx: &tx,
-            observe,
         };
         // 这条连接在等哪些被控端上线（最早的在前面）
         let mut waiting: Vec<u32> = Vec::new();
@@ -451,12 +443,17 @@ impl Broker {
                     req_id,
                     code,
                     resume,
+                    init,
                 } = msg
                 else {
                     warn!(%peer, "invalid message from controller");
                     continue;
                 };
-                let result = self.connect(&ctrl, code, resume, &mut waiting);
+                // 握手的第一条消息原样交给被控端：太大的话被控端读不了通知（我们的客户端不会发这么大的）
+                if init.len() > MAX_MSG {
+                    bail!("an oversized handshake message");
+                }
+                let result = self.connect(&ctrl, code, resume, init, &mut waiting);
                 if let Err(denied) = result {
                     if denied == Denied::Unknown {
                         self.record_failure(ctrl.ip);
@@ -479,11 +476,13 @@ impl Broker {
     }
 
     /// `resume` 是控制端带来的重连凭证（见 [`Broker::resume_token`]）。
+    /// `init`：控制端的端到端握手的第一条消息，原样交给被控端
     fn connect(
         &self,
         ctrl: &Ctrl,
         code: u32,
         resume: Option<ResumeToken>,
+        init: Vec<u8>,
         waiting: &mut Vec<u32>,
     ) -> Result<SessionGrant, Denied> {
         let hosts = self.hosts.lock();
@@ -534,7 +533,7 @@ impl Broker {
             return Err(Denied::Busy);
         }
         let label = format!("{}@{} -> {code}", ctrl.name, ctrl.peer);
-        let session_id = self.add_session(Pending::new(
+        let session_id = self.add_session(Session::new(
             (host.conn_id, host.conn.clone()),
             (ctrl.conn_id, ctrl.tx.conn.clone()),
             slot,
@@ -546,11 +545,12 @@ impl Broker {
                 name: ctrl.name.to_string(),
                 ip: ctrl.peer.ip(),
             },
-            observed: host.observe.then(|| observed(&host.conn)),
+            observed: observed(&host.conn),
+            init,
         };
         if host.tx.send(incoming).is_err() {
             // 被控端正在断开（槽位随着会话的登记一起归还）
-            self.remove_session(session_id);
+            self.end_session(session_id);
             return Err(match resume {
                 Some(_) => {
                     self.wait(ctrl, code, waiting);
@@ -566,7 +566,7 @@ impl Broker {
             host_name: host.name.clone(),
             host_os: host.os.clone(),
             resume: self.resume_token(code, &host.secrets.cur),
-            observed: ctrl.observe.then(|| observed(&ctrl.tx.conn)),
+            observed: observed(&ctrl.tx.conn),
         })
     }
 

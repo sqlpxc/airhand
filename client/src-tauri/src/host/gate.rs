@@ -284,25 +284,22 @@ mod tests {
         let intro = controller_intro("unverified", "test", Default::default(), false);
         let (a, b) = tokio::io::duplex(65536);
         let (mut ar, mut aw) = tokio::io::split(a);
-        let (mut br, mut bw) = tokio::io::split(b);
+        let (br, mut bw) = tokio::io::split(b);
+        let (initiator, init) = initiate(InitiatorParams {
+            code: 123456,
+            me: &me,
+            host_key: None,
+            pairing: Some(&code),
+            intro: &intro,
+        })
+        .unwrap();
         let (controller, host) = tokio::join!(
-            initiate(
-                &mut ar,
-                &mut aw,
-                InitiatorParams {
-                    session_id: 1,
-                    code: 123456,
-                    me: &me,
-                    host_key: None,
-                    pairing: Some(&code),
-                    intro: &intro
-                }
-            ),
+            initiator.finish(&mut ar, &mut aw),
             respond(
-                &mut br,
+                &init,
                 &mut bw,
+                async { Ok(br) },
                 ResponderParams {
-                    session_id: 1,
                     code: 123456,
                     gate: &*gate
                 }

@@ -1,10 +1,11 @@
-//! 媒体包：画面流和声音流上的数据，以及控制端交给界面的光标。
+//! 媒体包：画面通道上的帧、声音数据报里的包，以及控制端交给界面的光标。
 //!
 //! 控制消息不多，用 CBOR 编码（见 [`crate::framing`]）；画面和声音量大、格式固定，
 //! 用一个头加原始数据，**同一份字节**从被控端一路传到控制端的界面：
 //!
 //! ```text
-//! 线上（画面流 / 声音流）：长度 u32 LE | 头（现在 24 字节）| 负载
+//! 线上（画面通道）：长度 u32 LE | 头（现在 24 字节）| 负载
+//! 线上（声音数据报）：会话 ID | 种类 |（加密的）头 | 负载
 //! 交给界面（WebView / 浏览器 / Android）：  头（现在 24 字节）| 负载
 //! ```
 //!
@@ -15,8 +16,10 @@
 //! 光标（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor) / [`HostMsg::CursorImage`](crate::session::HostMsg::CursorImage)）
 //! 由控制端合并成同样格式的光标包（[`cursor_packet`]）交给界面。
 //!
-//! 声音包平时不走声音流，而是一包一个 QUIC 数据报（[`crate::datagram`]，不带长度前缀）：丢了的不重传，
-//! 后面的包也不用等它。放不进一个数据报的（很少见）才走声音流。数据报可能乱序，控制端按采集时刻（相同时按序号）丢掉迟到的包。
+//! 声音包一包一个 QUIC 数据报（[`crate::datagram`]，不带长度前缀）：丢了的不重传，后面的包也不用等它。
+//! 一个包最多 [`MAX_AUDIO_PACKET`]（放得进一个数据报），被控端的 Opus 编码器按 [`MAX_OPUS_PACKET`] 限长，
+//! 放不下的（只可能来自不能限长的编码器）丢掉，由解码器的丢包补偿盖过去。
+//! 数据报可能乱序，控制端按采集时刻（相同时按序号）丢掉迟到的包。
 //!
 //! 头（小端）：
 //!
@@ -60,8 +63,11 @@ use crate::session::{Codec, CursorShape};
 pub const HEADER_LEN: usize = 24;
 /// 画面包上限（一个 4K 关键帧也远小于这个值）
 pub const MAX_VIDEO_PACKET: usize = 32 * 1024 * 1024;
-/// 声音包上限
-pub const MAX_AUDIO_PACKET: usize = 64 * 1024;
+/// 声音包（头 + Opus 包）上限：加密之后正好放得进一个数据报（[`crate::datagram::MAX`]）
+pub const MAX_AUDIO_PACKET: usize =
+    crate::datagram::MAX - crate::datagram::HEADER - crate::handshake::SEAL_OVERHEAD;
+/// 一个 Opus 包最多这么大（被控端的编码器按它限长，见模块说明）
+pub const MAX_OPUS_PACKET: usize = MAX_AUDIO_PACKET - HEADER_LEN;
 
 /// 声音格式固定为 Opus 48 kHz 立体声，每包 20 ms。
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -252,7 +258,8 @@ pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
 }
 
 /// 线上的一个媒体包（加密之前）：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
-/// 多留了加密开销（标签和计数）的容量：原地加密时不用重新分配（画面包可能有几 MiB）
+/// 多留了加密开销（标签和计数）的容量：原地加密时不用重新分配（画面包可能有几 MiB）。
+/// 声音包也用它（发成数据报时去掉长度前缀），发送队列里画面、声音是同一种东西
 pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
     let len = HEADER_LEN + payload.iter().map(|p| p.len()).sum::<usize>();
     let mut buf = Vec::with_capacity(4 + len + crate::handshake::SEAL_OVERHEAD);

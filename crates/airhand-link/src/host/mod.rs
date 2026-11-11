@@ -7,15 +7,15 @@
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
 //! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：同意流程（同时在等本机用户回答的请求有上限，
 //!   [`ApprovalSlots`]）、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
-//! * [`HostStreams`]：会话的四条流。先在控制流上做端到端握手（[`crate::secure::respond`]）：让不让这个控制端进来
-//!   由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），控制端确认了才算进来
-//!   （重放的握手消息走不到这一步）。过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
+//! * [`HostStreams`]：会话的链路。先回答端到端握手（[`crate::secure::respond`]，控制端的第一条消息在
+//!   [`Incoming::init`] 里）：让不让这个控制端进来由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），
+//!   控制端确认了才算进来（重放的握手消息走不到这一步）。过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
 //!   Ping 也在读任务里回 Pong，画面确认在读任务里交给平台的 [`Acks`]，不等会话的主循环；
 //! * [`Outbox`]（[`queue`]）：发给控制端的消息。按消息挑通道（大的走大块通道），只关心最新值的状态
 //!   （Pong、显示器列表、光标可见性）只留最新的一个、排在前面；
 //! * [`CursorCache`]：控制端缓存了哪些光标形状；
-//! * 直连（[`crate::direct`]）：每条服务器连接一个 [`DirectHub`]（接受控制端连过来的直连），每个会话一个直连任务
-//!   （在 [`HostStreams`] 里）。
+//! * 每条服务器连接一个 [`Router`]（控制端的通道、数据报按会话 ID 交给会话）和一个 [`DirectHub`]
+//!   （接受控制端连过来的直连），每个会话一个直连任务（在 [`HostStreams`] 里，见 [`crate::direct`]）。
 
 mod clock;
 mod cursor;
@@ -39,6 +39,7 @@ use tracing::{info, warn};
 
 use crate::ServerState;
 pub use crate::direct::{DirectHub, HostLink};
+pub use crate::lanes::Router;
 use crate::net::{self, LinkConfig, Reconnect, Report};
 use crate::tasks::OwnedTask;
 use crate::wire::{read_msg, write_msg};
@@ -92,7 +93,11 @@ pub trait HostEvents: Send + Sync + 'static {
 /// 有控制端要连进来（交给 `run` 的 `session`）
 pub struct Incoming {
     pub conn: Connection,
+    /// 这条服务器连接上的会话的通道、数据报从这里来
+    pub router: Arc<Router>,
     pub session_id: u64,
+    /// 控制端的端到端握手的第一条消息（`ServerMsg::Incoming::init`）
+    pub init: Vec<u8>,
     /// 本机现在的控制码（配对时要用）
     pub code: u32,
     /// 服务器看到的控制端（名称是控制端自己报的，IP 是服务器看到的）
@@ -226,9 +231,11 @@ where
     events.registered(got, changed).await;
     info!(code, "host connected to the server");
     events.server(ServerState::Connected);
-    // 控制端连过来的直连、中转转来的探测数据报（见 crate::direct）。服务器不告诉本机公网地址的话，
-    // 局域网里照样连得上
-    let (hub, _hub_tasks) = DirectHub::start(&sig.endpoint, &sig.punch, &sig.conn);
+    // 控制端的通道和数据报按会话交给会话；控制端连过来的直连（见 crate::direct），建不了就只走中转
+    let (router, _router) = Router::start(&sig.conn);
+    let direct = DirectHub::start(&sig.endpoint, &sig.punch, &sig.conn)
+        .inspect_err(|e| warn!("direct paths are unavailable: {e:#}"))
+        .ok();
 
     let mut sessions: JoinSet<u64> = JoinSet::new();
     // 每次发送都会让所有会话向控制端发送 Bye（带上这个原因）并结束
@@ -238,16 +245,18 @@ where
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Some(ServerMsg::Incoming { session_id, peer, observed }) => {
+                Some(ServerMsg::Incoming { session_id, peer, observed, init }) => {
                     info!(session_id, name = %peer.name, ip = %peer.ip, "controller wants to connect");
                     let run = session(Incoming {
                         conn: sig.conn.clone(),
+                        router: router.clone(),
                         session_id,
+                        init,
                         code,
                         peer,
                         kick: kick_tx.subscribe(),
                         approvals: approvals.clone(),
-                        direct: Some(HostLink {
+                        direct: direct.as_ref().map(|(hub, _)| HostLink {
                             hub: hub.clone(),
                             observed,
                         }),

@@ -1,6 +1,6 @@
 //! v9 的固定线上字节。发布之后不要随协议实现重新生成：兼容改动必须继续读写这些消息，新增消息另加样例。
 use airhand_proto::{
-    Features, framing,
+    Features, Role, framing,
     handshake::*,
     minicbor::{Decode, Encode},
     session::*,
@@ -26,6 +26,35 @@ fn golden<T: Encode<()> + for<'b> Decode<'b, ()>>(value: T, hex: &str) {
 #[test]
 fn signal_messages_keep_their_wire_encoding() {
     golden(
+        ClientHello {
+            min: 9,
+            max: 9,
+            role: Role::Host,
+            name: "PC".into(),
+            os: "W".into(),
+            features: Features::NONE,
+        },
+        "a6000901090200036250430461570500",
+    );
+    golden(
+        ServerHello {
+            min: 9,
+            max: 9,
+            version: Some(9),
+            features: Features::NONE,
+        },
+        "a40009010902090300",
+    );
+    golden(
+        ServerHello {
+            min: 9,
+            max: 9,
+            version: None,
+            features: Features::NONE,
+        },
+        "a3000901090300",
+    );
+    golden(
         ClientMsg::Register {
             reclaim: None,
             keep: true,
@@ -38,8 +67,9 @@ fn signal_messages_keep_their_wire_encoding() {
             req_id: 7,
             code: 123456,
             resume: None,
+            init: vec![1, 2],
         },
-        "820282071a0001e240",
+        "820284071a0001e240f6420102",
     );
     golden(
         ClientMsg::Rekey { secret: [7; 16] },
@@ -95,17 +125,11 @@ fn session_messages_keep_their_wire_encoding() {
     golden(
         ControllerMsg::Ack {
             seq: 99,
-            arrived: Some(1000),
+            arrived: 1000,
         },
         "82028218631903e8",
     );
-    golden(
-        ControllerMsg::Ack {
-            seq: 5,
-            arrived: None,
-        },
-        "82028105",
-    );
+    golden(ControllerMsg::RequestKeyframe { after: 5 }, "82048105");
     golden(
         ControllerMsg::Settings(QualitySettings::default()),
         "82038185181e190fa0190438f500",

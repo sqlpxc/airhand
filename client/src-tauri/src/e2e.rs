@@ -8,8 +8,10 @@
 
 use std::time::{Duration, Instant};
 
+use airhand_link::controller::establish;
+use airhand_link::host::Router;
 use airhand_link::secure::{self, Identity, InitiatorParams, Sealer};
-use airhand_link::transport::{FromHost, HostReceiver, Openers, open_session, session_datagrams};
+use airhand_link::transport::FromHost;
 use airhand_link::wire::{read_msg, write_msg};
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
@@ -24,7 +26,7 @@ use airhand_link::ServerState;
 use crate::host::HostService;
 use crate::status;
 
-/// 控制流（或者大块通道）的发送端：加密之后写进去
+/// 控制通道（或者大块通道）的发送端：加密之后写进去
 struct Ctl {
     send: quinn::SendStream,
     sealer: Sealer,
@@ -101,6 +103,8 @@ async fn e2e_roundtrip() {
     let mut sig = airhand_link::net::connect_signal(&crate::config::link(), Role::Controller)
         .await
         .expect("控制端连接服务器");
+    // 被控端开过来的通道、发来的数据报按会话交给会话
+    let (router, _router) = Router::start(&sig.conn);
     let mut buf = Vec::new();
 
     // 错误控制码
@@ -111,6 +115,7 @@ async fn e2e_roundtrip() {
             req_id: 1,
             code: wrong,
             resume: None,
+            init: Vec::new(),
         },
     )
     .await
@@ -131,13 +136,30 @@ async fn e2e_roundtrip() {
         "{r:?}"
     );
 
-    // 正确控制码
+    // 正确控制码。端到端握手的第一条消息随请求一起发：第一次连，用配对码（测试里的被控端默认要配对码）。
+    // 和真正的控制端一样：开始时的画质和声音在握手里（被控端一开始就按它建编码器、采集声音）
+    let me = Identity::generate();
+    let settings = QualitySettings {
+        codec: Codec::H264,
+        fps: 30,
+        ..Default::default()
+    };
+    let intro = secure::controller_intro("e2e", "test", settings, true);
+    let (initiator, init) = secure::initiate(InitiatorParams {
+        code,
+        me: &me,
+        host_key: None,
+        pairing: pairing.as_deref(),
+        intro: &intro,
+    })
+    .unwrap();
     write_msg(
         &mut sig.send,
         &ClientMsg::Connect {
             req_id: 2,
             code,
             resume: None,
+            init,
         },
     )
     .await
@@ -157,61 +179,23 @@ async fn e2e_roundtrip() {
     let grant = connect_outcome(grant, error).expect("服务器批准了连接");
     println!("会话已授权: {} ({})", grant.host_name, grant.host_os);
 
-    let streams = open_session(&sig.conn, grant.session_id, Role::Controller)
+    // 在被控端开过来的控制通道上做完握手
+    let link = establish(&router, &sig.conn, grant.session_id, initiator)
         .await
-        .unwrap();
-    let (send, mut recv) = streams.control;
-    let mut send = send;
-    // 端到端握手：第一次连，用配对码（测试里的被控端默认要配对码）
-    let me = Identity::generate();
-    // 和真正的控制端一样：开始时的画质和声音在握手里（被控端一开始就按它建编码器、采集声音）
-    let settings = QualitySettings {
-        codec: Codec::H264,
-        fps: 30,
-        ..Default::default()
-    };
-    let intro = secure::controller_intro("e2e", "test", settings, true);
-    let init = secure::initiate(
-        &mut recv,
-        &mut send,
-        InitiatorParams {
-            session_id: grant.session_id,
-            code,
-            me: &me,
-            host_key: None,
-            pairing: pairing.as_deref(),
-            intro: &intro,
-        },
-    )
-    .await
-    .expect("端到端握手");
-    println!("端到端握手完成，安全码 {}", init.secured.safety);
-    // 声音走数据报（放不进一个数据报的才走声音流）
-    let datagrams = session_datagrams(&sig.conn, grant.session_id);
-    // 控制流的发送端接着握手里的确认往下数
+        .expect("端到端握手");
+    println!("端到端握手完成，安全码 {}", link.safety);
+    // 控制通道的发送端接着握手里的确认往下数
     let mut ctl = Ctl {
-        send,
-        sealer: init.sealer,
+        send: link.control.0,
+        sealer: link.control.1,
     };
-    let (bulk_send, bulk_recv) = streams.bulk;
     // 剪贴板走大块通道
     let mut bulk = Ctl {
-        send: bulk_send,
-        sealer: init.secured.bulk.sealer,
+        send: link.bulk.0,
+        sealer: link.bulk.1,
     };
-    let mut recv = HostReceiver::new(
-        recv,
-        bulk_recv,
-        streams.video,
-        streams.audio,
-        Some(datagrams),
-        Openers {
-            bulk: init.secured.bulk.opener,
-            video: init.secured.video.opener,
-            audio: init.secured.audio.opener,
-            control: init.opener,
-        },
-    );
+    let mut recv = link.receiver;
+    let _registration = link.registration;
     ctl.send(&ControllerMsg::Input {
         t: 1,
         events: vec![InputEvent::ReleaseAll],
@@ -320,7 +304,7 @@ async fn e2e_roundtrip() {
                 }
                 ctl.send(&ControllerMsg::Ack {
                     seq: v.seq,
-                    arrived: Some(arrived),
+                    arrived,
                 })
                 .await;
                 continue;

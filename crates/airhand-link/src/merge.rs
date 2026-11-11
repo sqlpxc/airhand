@@ -1,4 +1,5 @@
 //! 一条通道从几条路（中转上的流、直连上的流）收到的帧，按计数排好再解密、交出去（见 `airhand_proto` 的"直连"）。
+//! 只有中转一条路的通道（大块通道）也用它：解密、按通道的上限读帧，和别的通道是同一段代码。
 //!
 //! 每个密封单元末尾的计数是明文（[`crate::secure::counter_of`]），每条路自己是有序的，发送端的计数一个接一个，
 //! 所以接收端看计数就知道该交哪一帧、哪一帧是重复的：
@@ -11,7 +12,8 @@
 //!   直连突然断了，断在上面的帧再也等不到：**关键帧不用等前面的帧**（被控端换路时编一个），
 //!   另外等了 [`VIDEO_WAIT`] 还等不到也不等了，交出去的帧标上 [`Frame::gap`]，控制端据此要一个关键帧。
 //!
-//! 每条路一个读任务，把读到的帧放进同一个信箱；直连通了之后，它的流经 [`Attach`] 加进来。
+//! 每条路一个读任务，把读到的帧放进同一个信箱。对方的流（中转上的那条、每次直连通了之后直连上的那条）从这条通道的
+//! 信箱（[`crate::lanes::Inbox`]）来。
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -25,7 +27,8 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::debug;
 
-use crate::controller::now_us;
+use crate::clock::now_us;
+use crate::lanes::{LaneStreams, Via};
 use crate::secure::{Opener, counter_of};
 use crate::wire::read_packet_timed;
 
@@ -212,8 +215,14 @@ enum Event {
     },
 }
 
-/// 往一条通道加一条路（直连上对方开的这条通道的流）
-pub type Attach = mpsc::UnboundedSender<RecvStream>;
+/// 中转上的那条流
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relay {
+    /// 对方还没开过来
+    Waiting,
+    Open,
+    Ended,
+}
 
 /// 一条通道的接收端：几条路上的帧合并成一串（见模块说明）。读任务随它一起结束
 pub struct Merge {
@@ -221,38 +230,45 @@ pub struct Merge {
     core: Core,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
-    attach: mpsc::UnboundedReceiver<RecvStream>,
-    attach_open: bool,
-    relay_open: bool,
+    streams: LaneStreams,
+    streams_open: bool,
+    relay: Relay,
     /// 还开着的直连的流
     direct: usize,
     readers: JoinSet<()>,
 }
 
 impl Merge {
-    /// `relay`：中转上这条通道的流；返回的 [`Attach`] 用来加直连上的流
-    pub fn new(
-        lane: SessionLane,
-        policy: Policy,
-        opener: Opener,
-        relay: RecvStream,
-    ) -> (Self, Attach) {
+    /// `streams`：对方在这条通道上开的流（[`crate::lanes::Inbox`] 里这条通道的信箱）
+    pub fn new(lane: SessionLane, policy: Policy, opener: Opener, streams: LaneStreams) -> Self {
         let capacity = (4 * 1024 * 1024 / lane.max_frame_size()).clamp(2, 16);
         let (tx, rx) = mpsc::channel(capacity);
-        let (attach_tx, attach) = mpsc::unbounded_channel();
-        let mut m = Self {
+        Self {
             lane,
             core: Core::new(policy, opener),
             tx,
             rx,
-            attach,
-            attach_open: true,
-            relay_open: true,
+            streams,
+            streams_open: true,
+            relay: Relay::Waiting,
             direct: 0,
             readers: JoinSet::new(),
-        };
-        m.read(relay, false);
-        (m, attach_tx)
+        }
+    }
+
+    /// 加一条已经拿到的流（握手时在控制通道上读过的那条）
+    pub fn add(&mut self, recv: RecvStream, via: Via) -> Result<()> {
+        let direct = via == Via::Direct;
+        if !direct {
+            anyhow::ensure!(
+                self.relay == Relay::Waiting,
+                "the relay opened {:?} twice",
+                self.lane
+            );
+            self.relay = Relay::Open;
+        }
+        self.read(recv, direct);
+        Ok(())
     }
 
     fn read(&mut self, mut recv: RecvStream, direct: bool) {
@@ -293,10 +309,16 @@ impl Merge {
             if let Some(f) = self.core.pop(Instant::now())? {
                 return Ok(Some(f));
             }
+            let relay_done = match self.relay {
+                Relay::Ended => true,
+                // 会话结束了，对方再也开不过来了
+                Relay::Waiting => !self.streams_open,
+                Relay::Open => false,
+            };
             let ended = match self.core.policy {
                 // 中转上的是完整的一份：它结束了，手里剩下的也补不齐了
-                Policy::Complete => !self.relay_open,
-                Policy::Video => !self.relay_open && self.direct == 0 && self.core.held.is_empty(),
+                Policy::Complete => relay_done,
+                Policy::Video => relay_done && self.direct == 0 && self.core.held.is_empty(),
             };
             if ended {
                 return Ok(None);
@@ -310,7 +332,7 @@ impl Merge {
                         if let Some(e) = error {
                             return Err(e);
                         }
-                        self.relay_open = false;
+                        self.relay = Relay::Ended;
                     }
                     Event::End { direct: true, error } => {
                         self.direct -= 1;
@@ -319,9 +341,9 @@ impl Merge {
                         }
                     }
                 },
-                recv = self.attach.recv(), if self.attach_open => match recv {
-                    Some(recv) => self.read(recv, true),
-                    None => self.attach_open = false,
+                s = self.streams.recv(), if self.streams_open => match s {
+                    Some((recv, via)) => self.add(recv, via)?,
+                    None => self.streams_open = false,
                 },
                 () = sleep_until(deadline) => {}
             }

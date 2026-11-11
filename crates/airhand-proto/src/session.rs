@@ -48,10 +48,16 @@
 //!
 //! # 直连
 //!
-//! 两端都支持 [`crate::features::session::DIRECT`] 时，会话开始之后（被控端发了 [`HostMsg::Hello`] 之后）
-//! 被控端发 [`HostMsg::Direct`]（本端的候选地址），控制端回 [`ControllerMsg::Direct`]（它的候选地址），
-//! 然后两端打洞、建直连（见 crate 说明的"直连"）。地址在加密的控制通道上，中转看不到局域网地址。
-//! 直连断了被控端可以再发一轮（`round` 加 1），控制端按最新的一轮回答。
+//! 会话开始之后（被控端发了 [`HostMsg::Hello`] 之后）被控端发 [`HostMsg::Direct`]（本端的候选地址和直连证书的指纹），
+//! 控制端回 [`ControllerMsg::Direct`]（它的），然后两端打洞、建直连（见 crate 说明的"直连"）。这些都在加密的控制通道上：
+//! 中转看不到局域网地址，也换不掉证书的指纹。直连断了被控端可以再发一轮（`round` 加 1），控制端按最新的一轮回答。
+//! 不想建直连的一端不发（被控端）/ 不回答（控制端）就是了。
+//!
+//! # 关键帧
+//!
+//! 控制端要关键帧时带着它收到的最后一帧的序号（[`ControllerMsg::RequestKeyframe::after`]）：被控端在那之后已经发过
+//! 关键帧（正在路上）就不再编一个。控制端的几个地方（解码出错、换路时缺了帧、界面刚切回来）各自要、在一个往返里
+//! 连着要，被控端也只编一个：关键帧是最大的帧，偏偏又是在网络最差的时候要。
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -124,7 +130,7 @@ pub enum HostMsg {
     Direct(#[n(0)] DirectOffer),
 }
 
-/// 一端的直连候选地址（见模块说明的"直连"）
+/// 一端的直连候选地址和证书（见模块说明的"直连"）
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
 pub struct DirectOffer {
     /// 第几轮（被控端发起，从 1 开始；控制端回答时照抄）
@@ -133,6 +139,9 @@ pub struct DirectOffer {
     /// 本端的地址：服务器看到的公网地址、局域网地址……（最多 [`MAX_DIRECT_ADDRS`] 个）
     #[n(1)]
     pub addrs: Vec<SocketAddr>,
+    /// 本端直连用的 TLS 证书（临时生成的、自签名的）的 SHA-256：对面只认它
+    #[cbor(n(2), with = "minicbor::bytes")]
+    pub cert: [u8; 32],
 }
 
 /// [`DirectOffer`] 里最多这么多个地址（多出来的不用）
@@ -389,7 +398,7 @@ pub enum ControllerMsg {
     /// 界面收到了第 `seq` 帧（累积确认），用于被控端的在途控制和码率控制（防止延迟堆积）。
     ///
     /// `arrived`：这一帧开始从网络上到达的时刻（读到它的长度前缀时，控制端的时钟，微秒，和
-    /// [`ControllerMsg::Ping::t`] 同一个时钟；控制端不知道时为 `None`）。确认要等界面收到才发，往返时延里混着
+    /// [`ControllerMsg::Ping::t`] 同一个时钟）。确认要等界面收到才发，往返时延里混着
     /// 界面那一段；到达时刻只算网络：被控端拿它减去自己的发送时刻，两边时钟之差是常数，变化的部分就是路上的排队
     /// （用开始到达的时刻，这一帧自己要传多久不算在里面），两次到达之间收到的字节数就是交付速率
     #[n(2)]
@@ -397,13 +406,18 @@ pub enum ControllerMsg {
         #[n(0)]
         seq: u32,
         #[n(1)]
-        arrived: Option<u64>,
+        arrived: u64,
     },
     /// 画质设置变了（开始时的设置在握手里，见 [`crate::handshake::ControllerIntro`]）
     #[n(3)]
     Settings(#[n(0)] QualitySettings),
+    /// 要一个关键帧。`after`：控制端收到的最后一帧的序号（还没收到过时为 0），被控端在这之后发过关键帧就不再编
+    /// （见模块说明的"关键帧"）
     #[n(4)]
-    RequestKeyframe,
+    RequestKeyframe {
+        #[n(0)]
+        after: u32,
+    },
     #[n(5)]
     SelectDisplay {
         #[n(0)]
@@ -439,7 +453,7 @@ impl ControllerMsg {
             Self::Input { .. }
             | Self::Ack { .. }
             | Self::Settings(_)
-            | Self::RequestKeyframe
+            | Self::RequestKeyframe { .. }
             | Self::SelectDisplay { .. }
             | Self::Ping { .. }
             | Self::Audio { .. }

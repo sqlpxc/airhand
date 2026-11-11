@@ -1,12 +1,13 @@
 //! 控制端的单个会话：把画面、声音原样转交给界面（界面自己解码），转发输入与设置。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::direct::Mirrors;
+use crate::direct::Mirror;
 use crate::secure::{Negotiated, Sealer};
-use crate::transport::{self, FromHost, HostReceiver};
+use crate::transport::{FromHost, HostReceiver, write_lane};
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerMsg, DirectOffer, DisplayInfo, HostMsg, Notice, Platform,
@@ -19,8 +20,9 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::{CLIPBOARD_POLL, ClipboardSync, now_us, send_clipboard};
+use super::{CLIPBOARD_POLL, ClipboardSync, send_clipboard};
 use crate::Problem;
+use crate::clock::now_us;
 
 /// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
 /// 网络卡一下不断开：卡住期间排着的输入由命令队列丢掉（见 [`super::queue`]）
@@ -163,32 +165,43 @@ impl Default for Stats {
     }
 }
 
-/// 最近收到的画面帧是什么时候开始从网络上到达的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
-/// （`ControllerMsg::Ack::arrived`）。在途的帧不超过 `flow::MAX_WINDOW` 个，记最近 64 个就够了
-pub(super) struct Arrivals([Option<(u32, u64)>; 64]);
-
-impl Default for Arrivals {
-    fn default() -> Self {
-        Self([None; 64])
-    }
+/// 交给了界面、还没确认的画面帧是什么时候开始从网络上到达的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
+/// （`ControllerMsg::Ack::arrived`）。确认是累积的：确认了一帧，它和它前面的都不用记了。
+/// 在途的帧不超过 `flow::MAX_WINDOW` 个，最多记 [`Arrivals::MAX`] 个就够了
+#[derive(Default)]
+pub(super) struct Arrivals {
+    pending: VecDeque<(u32, u64)>,
+    /// 交给界面的最后一帧
+    last: u32,
 }
 
 impl Arrivals {
+    const MAX: usize = 128;
+
     fn record(&mut self, seq: u32, at: u64) {
-        self.0[seq as usize % self.0.len()] = Some((seq, at));
+        if self.pending.len() == Self::MAX {
+            self.pending.pop_front();
+        }
+        self.pending.push_back((seq, at));
+        self.last = seq;
     }
 
-    pub(super) fn get(&self, seq: u32) -> Option<u64> {
-        self.0[seq as usize % self.0.len()]
-            .filter(|&(s, _)| s == seq)
-            .map(|(_, at)| at)
+    /// 界面确认了第 `seq` 帧：它开始到达的时刻（不是交给过界面的帧、已经确认过的为 `None`）
+    pub(super) fn take(&mut self, seq: u32) -> Option<u64> {
+        let at = self.pending.iter().find(|(s, _)| *s == seq)?.1;
+        self.pending.retain(|(s, _)| s.wrapping_sub(seq) as i32 > 0);
+        Some(at)
+    }
+
+    /// 交给界面的最后一帧的序号（还没有时为 0）：要关键帧时告诉被控端（见 `ControllerMsg::RequestKeyframe`）
+    pub(super) fn last(&self) -> u32 {
+        self.last
     }
 }
 
 pub(super) struct SessionIo {
-    pub send: SendStream,
-    /// 控制流上控制端 → 被控端的加密（已经发过确认，计数接着往下数）
-    pub sealer: Sealer,
+    /// 控制通道：发送的一半、加密（已经发过确认，计数接着往下数）
+    pub control: (SendStream, Sealer),
     /// 大块通道（剪贴板）：发送的一半、排着队的消息（编码好的）、加密
     pub bulk: (SendStream, mpsc::Receiver<Bytes>, Sealer),
     /// 往大块通道排消息（桌面版自己同步剪贴板时用）
@@ -199,10 +212,10 @@ pub(super) struct SessionIo {
     /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
     pub negotiated: Negotiated,
     pub arrivals: Arc<std::sync::Mutex<Arrivals>>,
-    /// 控制、大块通道在直连上的那一份（直连没通时什么也不做）
-    pub mirrors: Mirrors,
-    /// 直连任务（两端都支持直连时才有）
-    pub direct: Option<Direct>,
+    /// 控制通道在直连上的那一份（直连没通时什么也不做）
+    pub mirror: Mirror,
+    /// 直连任务
+    pub direct: Direct,
 }
 
 /// 会话的直连任务（[`crate::direct::controller`]）：被控端发来的候选地址交给它
@@ -226,11 +239,10 @@ pub(super) async fn run(
     sid: u32,
     io: SessionIo,
     tx: super::queue::Sender,
-    mut rx: super::queue::Receiver,
+    rx: super::queue::Receiver,
 ) {
     let SessionIo {
-        mut send,
-        mut sealer,
+        control: (send, sealer),
         bulk: (bulk_send, bulk_rx, bulk_sealer),
         bulk_tx,
         mut recv,
@@ -238,33 +250,28 @@ pub(super) async fn run(
         mode,
         negotiated,
         arrivals,
-        mirrors,
-        direct,
+        mirror,
+        direct: Direct {
+            offers,
+            task: direct_task,
+        },
     } = io;
     info!(sid, ?negotiated, "session started");
-    let (offers, direct_task) = match direct {
-        Some(d) => (Some(d.offers), Some(d.task)),
-        None => (None, None),
-    };
     let local_clip = match mode {
         Mode::Desktop { clip, enabled } => Some((clip, enabled)),
         Mode::Browser => None,
     };
-    // Every frontend acknowledges after its last IPC/network hop, not here.
-    // 每一帧写进中转（完整的一份），直连通着的话也从直连发一份（见 crate::direct）
-    let control_mirror = mirrors.control;
+    // 控制通道：每一帧写进中转（完整的一份），直连通着的话也从直连发一份（见 crate::direct）。
+    // 队列失败了（排满了不能丢的命令）写任务就结束
+    let overflow = tx.clone();
     let writer = async move {
-        loop {
-            let bytes = transport::seal(rx.recv().await?, &mut sealer)?;
-            control_mirror.offer(&bytes);
-            tokio::time::timeout(HOST_TIMEOUT, send.write_chunk(bytes)).await??;
-        }
-        #[allow(unreachable_code)]
+        write_lane(send, rx, sealer, Some(mirror)).await?;
+        anyhow::ensure!(!overflow.failed(), "controller command queue overflow");
         anyhow::Ok(())
     };
     // 大块通道（剪贴板）：和画面一样的优先级，慢了不挡控制消息
     let bulk_writer = async move {
-        transport::write_lane(bulk_send, bulk_rx, bulk_sealer, mirrors.bulk).await?;
+        write_lane(bulk_send, bulk_rx, bulk_sealer, None).await?;
         // 只有会话结束时才会关闭（发送端在会话手里）
         std::future::pending::<()>().await;
         anyhow::Ok(())
@@ -288,13 +295,13 @@ pub(super) async fn run(
                     direct,
                     gap,
                 } => {
-                    // 前面有帧断在了直连上：解码器要从关键帧重新开始
-                    if gap {
-                        keyframe_tx.send(ControllerMsg::RequestKeyframe)?;
-                    }
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
+                    // 前面有帧断在了直连上：解码器要从关键帧重新开始（被控端在这一帧之后发过关键帧就不用了）
+                    if gap {
+                        keyframe_tx.send(ControllerMsg::RequestKeyframe { after: h.seq })?;
+                    }
                     arrivals.lock().unwrap().record(h.seq, arrived);
                     {
                         let mut s = st.lock().unwrap();
@@ -395,11 +402,9 @@ pub(super) async fn run(
                         height: e.height,
                     });
                 }
-                // 直连的候选地址：交给直连任务（不支持直连时被控端不会发）
+                // 直连的候选地址：交给直连任务
                 HostMsg::Direct(offer) => {
-                    if let Some(o) = &offers {
-                        let _ = o.try_send(offer);
-                    }
+                    let _ = offers.try_send(offer);
                 }
             }
         }
@@ -462,11 +467,9 @@ pub(super) async fn run(
         }
     };
 
-    // 直连任务一直跑到会话结束（不支持直连、或者它不再试了：一直等着）
+    // 直连任务一直跑到会话结束（它不再试了：一直等着）
     let direct = async move {
-        if let Some(task) = direct_task {
-            task.await;
-        }
+        direct_task.await;
         std::future::pending::<()>().await
     };
     let result: Result<()> = tokio::select! {

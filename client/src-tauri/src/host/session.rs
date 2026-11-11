@@ -276,9 +276,9 @@ impl Platform for Desktop {
                     p.update_settings(s);
                 }
             }
-            Request::Keyframe => {
+            Request::Keyframe(after) => {
                 if let Some(p) = &self.pipeline {
-                    p.request_keyframe();
+                    p.request_keyframe(after);
                 }
             }
             Request::SelectDisplay(index) => {

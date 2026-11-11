@@ -55,6 +55,8 @@ struct Out {
     settings: QualitySettings,
     /// 还没收到过关键帧（刚加入，或者队列满了丢过帧）：非关键帧不发给它
     need_key: bool,
+    /// 最近发给它的关键帧的序号（0：还没有）：它要的关键帧已经在路上了就不再编（见 [`VideoHub::request_keyframe`]）
+    last_key: u32,
 }
 
 /// [`VideoHub::tick`] 的结果
@@ -106,6 +108,7 @@ impl VideoHub {
                 flow: Flow::default(),
                 settings: settings.sanitized(),
                 need_key: true,
+                last_key: 0,
             },
         );
         st.merge_settings();
@@ -183,8 +186,18 @@ impl VideoHub {
         self.cv.notify_all();
     }
 
-    pub fn request_keyframe(&self) {
-        self.st.lock().unwrap().force_key = true;
+    /// 会话 `id` 要一个关键帧。`after`：控制端收到的最后一帧：在那之后已经发给它关键帧了（还在路上）就不再编，
+    /// 一个往返里的几次请求只编一个；`None`：一定要编（见 `airhand_link::host::Request::Keyframe`）
+    pub fn request_keyframe(&self, id: u64, after: Option<u32>) {
+        let mut st = self.st.lock().unwrap();
+        let sent = st.sessions.get(&id).map_or(0, |o| o.last_key);
+        if let Some(after) = after
+            && sent != 0
+            && sent.wrapping_sub(after) as i32 > 0
+        {
+            return;
+        }
+        st.force_key = true;
     }
 
     /// 渲染线程每一轮调用：需要 Kotlin 做点什么（设置变了、码率变了、要关键帧）时返回 [`Tick`]
@@ -288,6 +301,9 @@ impl VideoHub {
             match o.tx.try_send(bytes.clone()) {
                 Ok(()) => {
                     o.need_key = false;
+                    if key {
+                        o.last_key = seq;
+                    }
                     o.flow.on_sent(seq, bytes.len() - 4);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -507,6 +523,23 @@ mod tests {
         assert!(rx.try_recv().is_err(), "delta frames after a lost path");
         hub.push(&[2], true, false, 0, Codec::AV1, 8, 8);
         assert!(decode(&rx.try_recv().unwrap()).key);
+    }
+
+    /// 控制端在收到关键帧之前又要了（一个往返里的几次请求）：不再编；收到之后再要、被控端自己要的：编
+    #[test]
+    fn keyframe_requests_already_answered_are_ignored() {
+        let (hub, _) = hub();
+        let (tx, mut rx) = mpsc::channel(QUEUE);
+        hub.add(1, tx);
+        let _ = hub.tick();
+        hub.push(&[1], true, false, 0, Codec::AV1, 8, 8);
+        let k = decode(&rx.try_recv().unwrap()).seq;
+        hub.request_keyframe(1, Some(k.wrapping_sub(1)));
+        assert!(hub.tick().is_none());
+        hub.request_keyframe(1, Some(k));
+        assert!(hub.tick().unwrap().key);
+        hub.request_keyframe(1, None);
+        assert!(hub.tick().unwrap().key);
     }
 
     #[test]

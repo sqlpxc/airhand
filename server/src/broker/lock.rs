@@ -1,7 +1,7 @@
 //! broker 的锁：每把锁有一个等级（[`Rank`]），同时拿几把的时候只能从低往高拿。
 //!
 //! 两处代码按相反的顺序拿同样两把锁，就可能死锁；光靠注释记着顺序，加代码的时候很容易漏掉一把
-//! （以前的注释只写了 hosts → reserved → bindings → waiters，`connect` 却在拿着 hosts 的时候去拿 pending）。
+//! （以前的注释只写了 hosts → reserved → bindings → waiters，`connect` 却在拿着 hosts 的时候去拿 pending（现在的 sessions））。
 //! 所以调试构建（包括所有测试）里每次加锁都检查：这个线程手里不能已经有等级不低于它的锁，违反了直接 panic，
 //! 测试里就能发现。发布构建里没有任何检查，就是普通的 [`std::sync::Mutex`]。
 //!
@@ -13,19 +13,17 @@ use std::sync::{Mutex, MutexGuard};
 /// 锁的等级，从低到高：同时拿几把的时候按这个顺序（见模块说明）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Rank {
-    /// 在线的被控端（[`super::registry`]）。`connect` 拿着它去拿 pending、waiters、failures、connects：
+    /// 在线的被控端（[`super::registry`]）。`connect` 拿着它去拿 sessions、waiters、failures、connects：
     /// 拿着它检查控制码、预占会话槽位、登记会话、登记等待上线，中间不会有被控端上线或者下线
     Hosts,
     /// 掉线后保留着的控制码
     Reserved,
-    /// 等两端的通道配对的会话（[`super::relay`]）
-    Pending,
+    /// 会话（[`super::relay`]）：转发通道和数据报
+    Sessions,
     /// 固定控制码的绑定表（[`crate::codes`]）
     Bindings,
     /// 等被控端上线的控制端
     Waiters,
-    /// 建立了的会话，转发数据报用
-    Routes,
     /// 猜错控制码的计数（[`super::limits`]）
     Failures,
     /// 每个来源向每台被控端发起会话的计数
@@ -38,13 +36,12 @@ pub(super) enum Rank {
 
 impl Rank {
     #[cfg(debug_assertions)]
-    const ALL: [Rank; 10] = [
+    const ALL: [Rank; 9] = [
         Rank::Hosts,
         Rank::Reserved,
-        Rank::Pending,
+        Rank::Sessions,
         Rank::Bindings,
         Rank::Waiters,
-        Rank::Routes,
         Rank::Failures,
         Rank::Connects,
         Rank::NewCodes,
@@ -155,7 +152,7 @@ mod tests {
     #[test]
     fn locks_in_order_are_fine() {
         let a = Ranked::new(Rank::Hosts, 1);
-        let b = Ranked::new(Rank::Pending, 2);
+        let b = Ranked::new(Rank::Sessions, 2);
         let c = Ranked::new(Rank::Conns, 3);
         {
             let _a = a.lock();
@@ -175,7 +172,7 @@ mod tests {
     #[should_panic(expected = "lock order violated")]
     fn reverse_order_panics() {
         let hosts = Ranked::new(Rank::Hosts, ());
-        let pending = Ranked::new(Rank::Pending, ());
+        let pending = Ranked::new(Rank::Sessions, ());
         let _p = pending.lock();
         let _h = hosts.lock();
     }
@@ -183,8 +180,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violated")]
     fn the_same_rank_twice_panics() {
-        let a = Ranked::new(Rank::Routes, ());
-        let b = Ranked::new(Rank::Routes, ());
+        let a = Ranked::new(Rank::Connects, ());
+        let b = Ranked::new(Rank::Connects, ());
         let _a = a.lock();
         let _b = b.lock();
     }
@@ -193,7 +190,7 @@ mod tests {
     #[test]
     fn a_panic_releases_the_rank() {
         let hosts = Ranked::new(Rank::Hosts, ());
-        let pending = Ranked::new(Rank::Pending, ());
+        let pending = Ranked::new(Rank::Sessions, ());
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _p = pending.lock();
             panic!("boom");

@@ -127,7 +127,7 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 - 带字段的枚举加变体：只有三个地方能跳过：整条消息、标了 `crate::cbor::opt` 的 `Option` 字段、标了 `crate::cbor::open_vec` 的列表元素。别的地方遇到不认识的变体故意是解码错误。不要把带字段的枚举直接放进派生的 `Option<…>`（也不要放进结构体、结构体再放进 `Option`）：minicbor 派生会把里面任何深度的不认识的变体当成 `None`，再从错的位置跳过（见 `cbor.rs` 的说明）
 - 编号一旦发布就不能改、不能复用；只有改不下去（例如要删掉必填字段）才加版本号
 
-版本握手的开头（`ClientHello` / `ServerHello` 的 postcard 部分）和 ALPN **永远不能改**，否则不同版本之间连“版本不一致”都无法告诉对方；`version_handshake_prefix_is_frozen` 测试守着这一点。`airhand-proto` 的测试里有“新版本的对方”发来新消息、新字段、新枚举值的例子，加兼容规则时照着写一个。
+版本握手里的版本区间（`ClientHello` / `ServerHello` 这两个 CBOR map 的 0、1 号键，`signal::Versions`）和 ALPN **永远不能改**，否则不同版本之间连“版本不一致”都无法告诉对方；`version_handshake_is_frozen` 测试守着这一点。`airhand-proto` 的测试里有“新版本的对方”发来新消息、新字段、新枚举值的例子，加兼容规则时照着写一个。
 
 ### 一份协议，三份实现
 

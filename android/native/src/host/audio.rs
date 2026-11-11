@@ -1,7 +1,7 @@
 //! 被控端的声音分发：Kotlin 采集手机正在播放的声音（AudioPlaybackCapture，Android 10+）并编成 Opus，
 //! 每包 20 ms，交给开着声音的会话。和桌面版一样，没有声音时不发包（Kotlin 那边跳过静音），
 //! 停顿之后的第一包带 `start`，控制端据此区分"声音停了"和"网络抖动"。
-//! 采集不了声音时，开着声音的会话在控制流上收到提示（`Notice::AudioFailed` / `AudioRecovered`）。
+//! 采集不了声音时，开着声音的会话在控制通道上收到提示（`Notice::AudioFailed` / `AudioRecovered`）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ struct State {
 }
 
 struct Sub {
-    /// 声音流
+    /// 声音包（写任务发成数据报）
     tx: mpsc::Sender<Bytes>,
     /// 控制消息（提示）
     ctl: Outbox,
@@ -174,7 +174,7 @@ mod tests {
         assert!(matches!(notice(&mut ctl2_rx), Notice::AudioFailed { .. }));
         hub.set_failure(None);
         assert!(matches!(notice(&mut ctl_rx), Notice::AudioRecovered));
-        // 提示不走声音流
+        // 提示不走声音的发送队列
         assert!(rx.try_recv().is_err());
 
         hub.unsubscribe(1);

@@ -3,12 +3,13 @@
 //! 服务器只做三件事：
 //! 1. 为被控端分配 6 位控制码（断线重连可取回原控制码；保存了控制码的被控端一直为它保留，见 [`crate::codes`]）；
 //! 2. 控制端按控制码发起会话时通知被控端；
-//! 3. 把双方的会话流按 `(会话 ID, 通道)` 配对后，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音，见
-//!    `airhand_proto::datagram`）按开头的会话 ID 在两端之间原样转发（[`Route`]）。
+//! 3. 把一端开过来的通道（单向流）转给另一端，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音、探测，见
+//!    `airhand_proto::datagram`）按开头的会话 ID 在两端之间原样转发（见 [`relay`]）。
 //!
 //! 服务器从不解析会话内容：会话是端到端加密的（见 `airhand_proto::handshake`），服务器只看会话头里的会话 ID、
-//! 通道编号和优先级。会话有几条通道、每条是什么，服务器都不管（只限制数量，`airhand_proto::MAX_LANES`）：
-//! 控制通道（0 号）两端都到了，会话就开始；它结束了，整个会话结束。所以会话层加通道、改格式都不用升级服务器。
+//! 通道编号和优先级，发起会话时控制端带来的握手消息也原样交给被控端。会话有几条通道、每条是什么，服务器都不管
+//! （只限制数量，`airhand_proto::MAX_LANES`）；任何一端的控制通道（0 号）结束了，整个会话结束。所以会话层加通道、
+//! 改格式都不用升级服务器。
 //!
 //! 版本握手见 `airhand_proto::signal` 的"版本握手"：服务器接受一个区间的信令版本，不要求相等。
 //!
@@ -18,7 +19,7 @@
 //! 控制码，这些请求不算猜错、不受猜码限速的影响，被控端不在线时服务器记下它们（[`Waiter`]），被控端重新上线时通知它们重连。
 //!
 //! 控制码对了的请求也限速：每批准一个，被控端就要开一个会话（先请本机用户同意的被控端还要问一次），并且占着它的
-//! 一个会话槽位——控制端一直不开流的话，占到配对超时（[`relay`]）为止。不限速的话，知道控制码的人反复发起连接，
+//! 一个会话槽位——控制端一直不开控制通道的话，占到超时（[`relay`]）为止。不限速的话，知道控制码的人反复发起连接，
 //! 就能一直占满它的会话槽位、让它不停地弹出请求。所以同一个来源（[`limiter_key`]）一分钟内向同一台被控端发起的会话
 //! 最多 [`Config::connects_per_minute`] 个，再多回答 `RateLimited`。带凭证的请求也算：凭证只说明它不是在猜码。
 //! 只数批准了的请求，被限速的来源本来就连上过这个控制码，这个回答不透露控制码存不存在。
@@ -33,7 +34,7 @@
 //! # 分成几块
 //!
 //! * [`registry`]（控制码登记）：被控端注册、取回控制码、换密钥、放弃控制码；控制端按控制码发起会话、等被控端上线；
-//! * [`relay`]（会话中转）：两端的会话流按 `(会话 ID, 通道)` 配对后透传，数据报按会话 ID 转发；
+//! * [`relay`]（会话中转）：一端的通道转给另一端，数据报按会话 ID 转发；
 //! * [`limits`]（限速）：每个来源的连接数、猜错控制码的次数、新分配的控制码、向同一台被控端发起的会话，
 //!   每台被控端的会话数；
 //! * [`tokens`]（凭证）：控制码的密钥、重连凭证（服务器签名、常数时间比较）。
@@ -45,11 +46,11 @@
 //! 状态都在 [`Broker`] 的几把同步锁里，拿着锁从不 `await`。同时拿几把的时候按 [`lock::Rank`] 的顺序：
 //!
 //! ```text
-//! hosts → reserved → pending → bindings → waiters → routes → failures → connects → new_codes → conns
+//! hosts → reserved → sessions → bindings → waiters → failures → connects → new_codes → conns
 //! ```
 //!
 //! 实际会同时拿的：`register` 拿着 hosts、reserved、bindings 去数 new_codes；`connect` 拿着 hosts 去拿 failures、
-//! connects、pending、waiters（拿着 hosts 才不会错过同时发生的上线）；`announce` 拿着 hosts 去拿 waiters；
+//! connects、sessions、waiters（拿着 hosts 才不会错过同时发生的上线）；`announce` 拿着 hosts 去拿 waiters；
 //! 清理绑定表时拿着 hosts 去拿 bindings。别的都只拿一把。调试构建（包括测试）里每次加锁都会检查这个顺序
 //! （见 [`lock`]），按相反的顺序拿会直接 panic，而不是偶尔死锁。
 
@@ -60,8 +61,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use airhand_link::wire::{read_frame, write_frame, write_msg};
-use airhand_proto::signal::{ClientHello, ServerHello, ServerMsg};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION, features};
+use airhand_proto::framing;
+use airhand_proto::signal::{ClientHello, ServerHello, ServerMsg, Versions};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, features};
 use anyhow::{Context, Result, bail};
 use quinn::{SendStream, VarInt};
 use tokio::sync::mpsc;
@@ -81,7 +83,7 @@ mod tokens;
 use limits::{Limiter, limiter_key};
 use lock::{Rank, Ranked};
 use registry::{HostConn, HostEntry, Reserved, Waiter};
-use relay::{Pending, Route};
+use relay::Session;
 
 /// 握手、等第一条消息、等会话头最多等这么久
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -145,14 +147,12 @@ pub struct Broker {
     hosts: Ranked<HashMap<u32, HostEntry>>,
     /// 掉线后保留着的控制码
     reserved: Ranked<HashMap<u32, Reserved>>,
-    /// 会话（会话 ID → 等配对的通道），从服务器批准到控制通道结束
-    pending: Ranked<HashMap<u64, Pending>>,
+    /// 会话（会话 ID → 两端），从服务器批准到控制通道结束：转发通道和数据报用
+    sessions: Ranked<HashMap<u64, Session>>,
     /// 固定的控制码
     bindings: Ranked<Bindings>,
     /// 控制码 → 等它上线的控制端
     waiters: Ranked<HashMap<u32, Vec<Waiter>>>,
-    /// 建立了的会话（会话 ID → 两端），转发数据报用
-    routes: Ranked<HashMap<u64, Route>>,
     /// 猜错控制码（按 [`limiter_key`]）
     failures: Limiter,
     /// 批准了的连接请求（按 [`limiter_key`] 和控制码）
@@ -180,10 +180,9 @@ impl Broker {
             key: bindings.server_key(),
             hosts: Ranked::default_with(Rank::Hosts),
             reserved: Ranked::default_with(Rank::Reserved),
-            pending: Ranked::default_with(Rank::Pending),
+            sessions: Ranked::default_with(Rank::Sessions),
             bindings: Ranked::new(Rank::Bindings, bindings),
             waiters: Ranked::default_with(Rank::Waiters),
-            routes: Ranked::default_with(Rank::Routes),
             failures: Limiter::new(Rank::Failures, limits::FAIL_WINDOW),
             connects: Limiter::new(Rank::Connects, limits::CONNECT_WINDOW),
             new_codes: Limiter::new(Rank::NewCodes, limits::NEW_CODE_WINDOW),
@@ -200,7 +199,7 @@ impl Broker {
             tick.tick().await;
             let now = Instant::now();
             self.expire_reserved(now);
-            self.expire_pending(now);
+            self.expire_sessions(now);
             self.failures.cleanup();
             self.connects.cleanup();
             self.new_codes.cleanup();
@@ -226,13 +225,13 @@ impl Broker {
         self.persisted(barrier).await;
     }
 
-    /// (在线的被控端, 等待配对的会话, 固定的控制码)
+    /// (在线的被控端, 会话, 固定的控制码)
     pub fn stats(&self) -> (usize, usize, usize) {
         // 一把一把地拿（写在一个元组表达式里的话，三把锁的守卫会一直活到表达式结束，同时拿着三把）
         let hosts = self.hosts.lock().len();
-        let pending = self.pending.lock().len();
+        let sessions = self.sessions.lock().len();
         let fixed = self.bindings.lock().len();
-        (hosts, pending, fixed)
+        (hosts, sessions, fixed)
     }
 
     pub async fn handle_incoming(self: Arc<Self>, incoming: quinn::Incoming) {
@@ -282,25 +281,23 @@ impl Broker {
         if !got {
             bail!("peer closed the stream");
         }
-        // 版本握手（见 airhand_proto::signal 的"版本握手"）：任何版本的客户端都能读出它的开头
-        let hello = ClientHello::decode(&buf).context("the first message must be Hello")?;
-        let role = hello.role;
-        let name: String = hello.name.chars().take(64).collect();
-        let os: String = hello.os.chars().take(64).collect();
-        let answer = hello.negotiate(SIGNAL_MIN, SIGNAL_VERSION, features::signal::SUPPORTED);
-        write_frame(&mut send, &answer.encode()).await?;
-        let ServerHello::Welcome { version, .. } = answer else {
-            info!(%peer, min = hello.min_version, max = hello.version, "rejected client: no common signal version");
+        // 版本握手（见 airhand_proto::signal 的"版本握手"）：先只读版本区间，任何版本的客户端都能听懂回答
+        let versions: Versions =
+            framing::decode_known(&buf).context("the first message must be Hello")?;
+        let answer = ServerHello::answer(versions, features::signal::SUPPORTED);
+        write_frame(&mut send, &framing::to_vec(&answer)).await?;
+        let Some(version) = answer.version else {
+            info!(%peer, min = versions.min, max = versions.max, "rejected client: no common signal version");
             let _ = send.finish();
             tokio::time::sleep(Duration::from_millis(500)).await;
             return Ok(());
         };
-        // 客户端支持的话，会话开始时告诉它自己的公网地址（直连打洞用，见 airhand_proto::signal 的"公网地址"）
-        let observe = hello
-            .features
-            .common(features::signal::SUPPORTED)
-            .has(features::signal::OBSERVED_ADDR);
-        info!(%peer, conn_id, ?role, %name, %os, version, observe, "client connected");
+        let hello: ClientHello = framing::decode_known(&buf).context("bad Hello")?;
+        let role = hello.role;
+        anyhow::ensure!(role.is_known(), "unknown role {role:?}");
+        let name: String = hello.name.chars().take(64).collect();
+        let os: String = hello.os.chars().take(64).collect();
+        info!(%peer, conn_id, ?role, %name, %os, version, "client connected");
 
         let (tx, rx) = mpsc::channel::<ServerMsg>(64);
         let tx = SignalTx {
@@ -312,7 +309,7 @@ impl Broker {
             writer_loop(send, rx).await;
             writer_conn.close(VarInt::from_u32(close::SIGNAL), b"signal writer ended");
         });
-        let acceptor = tokio::spawn(self.clone().accept_sessions(conn.clone(), conn_id, role));
+        let acceptor = tokio::spawn(self.clone().accept_lanes(conn.clone(), conn_id, role));
         let datagrams = tokio::spawn(self.clone().relay_datagrams(conn.clone(), conn_id));
 
         // 被控端注册到的控制码：断开时按它直接找到自己的登记，不用遍历所有被控端
@@ -326,12 +323,11 @@ impl Broker {
                     name: &name,
                     os: &os,
                     tx: &tx,
-                    observe,
                 };
                 self.host_loop(&host, recv, &mut buf, &mut host_code).await
             }
-            Role::Controller => {
-                self.controller_loop(conn_id, peer, name, tx, observe, recv, &mut buf)
+            _ => {
+                self.controller_loop(conn_id, peer, name, tx, recv, &mut buf)
                     .await
             }
         };

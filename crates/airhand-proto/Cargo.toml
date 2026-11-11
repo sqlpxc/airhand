@@ -6,10 +6,9 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+# 界面 JSON 用到的类型（画质设置、输入事件、开放枚举……）
 serde = { version = "1", features = ["derive"] }
-# 只用于冻结的版本握手（见 signal 模块的"版本握手"）：它的编码永远不变
-postcard = { version = "1", features = ["use-std"] }
-# 其它消息：带编号、能前后兼容的 CBOR（见 framing 模块）
+# 消息：带编号、能前后兼容的 CBOR（见 framing 模块）
 minicbor = { version = "2", features = ["derive", "alloc", "std"] }
 # 这个库只做编解码，不碰 IO、不依赖异步运行时（从流里读写帧在 airhand-link 的 wire 模块）：
 # 这样它能编译成 wasm，解析对方数据的函数也都只吃字节，可以直接拿去 fuzz

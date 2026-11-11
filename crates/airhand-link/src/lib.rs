@@ -2,20 +2,25 @@
 //!
 //! * [`net`]：QUIC 连接、证书固定、版本握手、断线重连；
 //! * [`wire`]：从流里读写长度前缀帧（帧的格式和消息的编解码在 `airhand_proto::framing`，那边不碰 IO）；
-//! * [`transport`]：会话的四条流（控制、画面、声音、大块）；
-//! * [`direct`]：中转之外两端之间的直连（打洞、证明对面是谁、画面走哪条路），[`merge`]：几条路上的帧按计数排好；
-//! * [`secure`]：端到端加密：设备的身份密钥、控制通道上的握手、每一帧的加解密；
+//! * [`secure`]：端到端加密：设备的身份密钥、握手、每一帧的加解密；
+//! * [`lanes`]：会话的通道（每端为自己要发的开单向流）和数据报从哪里来、往哪里去，中转和直连共用；
+//!   [`merge`]：几条路上的帧按计数排好；[`transport`]：通道的写任务和控制端的接收端；
+//! * [`direct`]：中转之外两端之间的直连（打洞、TLS 只认对方的证书指纹、画面走哪条路）；
 //! * [`controller`]：控制端服务与会话。与界面无关：界面的命令是 [`controller::Command`]，
 //!   画面和事件交给 [`controller::SessionUi`]；
 //! * [`host`]：被控端与服务器的连接和会话（协议层的事在这里，采集、编码、注入输入由各平台实现 [`host::Platform`]）；
 //! * [`flow`]：被控端的在途控制（按字节）和码率控制（按排队时延和带宽估计）；
 //! * [`Problem`]：显示给用户的问题，以类型而不是文字的形式传给界面。
 //!
+//! 两端的消息通道用同一种发送队列（`queue`：只留最新值的槽位 + 有界的队列），时钟在 `clock`。
+//!
 //! # feature
 //!
 //! 除了 [`wire`]，都在默认打开的 `client` 里。中转服务器关掉它（`default-features = false`）、只用 [`wire`]：
 //! 读写几帧不用把 Noise、SPAKE2 这些它用不到的库也编译进去。
 
+#[cfg(feature = "client")]
+mod clock;
 #[cfg(feature = "client")]
 pub mod controller;
 #[cfg(feature = "client")]
@@ -25,11 +30,15 @@ pub mod flow;
 #[cfg(feature = "client")]
 pub mod host;
 #[cfg(feature = "client")]
+pub mod lanes;
+#[cfg(feature = "client")]
 pub mod merge;
 #[cfg(feature = "client")]
 pub mod net;
 #[cfg(feature = "client")]
 mod problem;
+#[cfg(feature = "client")]
+mod queue;
 #[cfg(feature = "client")]
 pub mod secure;
 #[cfg(feature = "client")]

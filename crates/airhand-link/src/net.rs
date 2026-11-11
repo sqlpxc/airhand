@@ -14,7 +14,7 @@
 //! # 直连
 //!
 //! 连中转的 UDP socket 也是打洞、直连用的那一个（服务器看到的就是它在 NAT 上的映射，见 [`crate::direct`]）：
-//! [`Signal`] 带着它的 [`Endpoint`] 和 [`Punch`]。被控端的 endpoint 还能接受控制端连过来的直连。
+//! [`Signal`] 带着它的 [`Endpoint`] 和 [`Punch`]。被控端在它上面接受控制端连过来的直连（[`crate::direct::DirectHub`]）。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::wire::{read_frame, write_frame};
+use airhand_proto::framing;
 use airhand_proto::signal::{ClientHello, ServerHello};
 use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};
@@ -202,7 +203,7 @@ pub struct Signal {
     /// 和服务器商定的信令版本，双方都支持的信令能力位（见 `airhand_proto::signal` 的"版本握手"）
     pub version: u16,
     pub features: Features,
-    /// 连服务器的 endpoint：直连也用它（同一个 socket，见模块说明的"直连"）。被控端的还能接受直连
+    /// 连服务器的 endpoint：直连也用它（同一个 socket，见模块说明的"直连"）
     pub endpoint: Endpoint,
     /// 从这个 socket 发打洞包
     pub punch: Punch,
@@ -210,8 +211,9 @@ pub struct Signal {
 
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
-    t.max_concurrent_bidi_streams(VarInt::from_u32(256)); // 3 lanes per session + signaling
-    t.max_concurrent_uni_streams(VarInt::from_u32(0));
+    // 服务器不开双向流（信令流是客户端开的）；会话的通道是服务器转过来的单向流，每个会话每端几条
+    t.max_concurrent_bidi_streams(VarInt::from_u32(0));
+    t.max_concurrent_uni_streams(VarInt::from_u32(256));
     // 短保活间隔：既能防止 NAT 映射过期，也能让掉线在 10 秒内被发现并重连
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(2)));
@@ -300,13 +302,12 @@ fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// 连上了的一个地址：endpoint、打洞用的句柄、连接、对方证书的指纹
 type Attempt = (Endpoint, Punch, Connection, [u8; 32]);
 
-/// 连上服务器的一个地址（QUIC + TLS）。被控端的 endpoint 同时接受直连（见模块说明的"直连"）
+/// 连上服务器的一个地址（QUIC + TLS）
 async fn attempt(
     addr: SocketAddr,
     sni: Arc<str>,
     expected: Option<[u8; 32]>,
     mismatch: Arc<AtomicBool>,
-    role: Role,
 ) -> Result<Attempt> {
     let bind: SocketAddr = if addr.is_ipv6() {
         "[::]:0".parse()?
@@ -316,14 +317,8 @@ async fn attempt(
     let seen = Arc::new(Seen::default());
     let (socket, punch, runtime) =
         crate::direct::bind(bind).context("can't create a UDP socket")?;
-    let server = match role {
-        Role::Host => crate::direct::tls::server_config()
-            .inspect_err(|e| warn!("direct connections are unavailable: {e:#}"))
-            .ok(),
-        Role::Controller => None,
-    };
     let mut endpoint =
-        Endpoint::new_with_abstract_socket(EndpointConfig::default(), server, socket, runtime)
+        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
             .context("can't create a QUIC endpoint")?;
     endpoint.set_default_client_config(client_config(expected, seen.clone())?);
     let result = endpoint.connect(addr, &sni)?.await;
@@ -347,7 +342,6 @@ async fn connect_any(
     sni: String,
     expected: Option<[u8; 32]>,
     mismatch: Arc<AtomicBool>,
-    role: Role,
 ) -> Result<Attempt> {
     const STAGGER: Duration = Duration::from_millis(250);
     type Attempts = JoinSet<Result<Attempt>>;
@@ -356,7 +350,7 @@ async fn connect_any(
     let mut tasks: Attempts = JoinSet::new();
     let mut last_err: Option<anyhow::Error> = None;
     let spawn = |tasks: &mut Attempts, addr: SocketAddr| {
-        tasks.spawn(attempt(addr, sni.clone(), expected, mismatch.clone(), role));
+        tasks.spawn(attempt(addr, sni.clone(), expected, mismatch.clone()));
     };
     if let Some(addr) = next.next() {
         spawn(&mut tasks, addr);
@@ -413,10 +407,10 @@ async fn handshake(cfg: &LinkConfig, role: Role, mismatch: Arc<AtomicBool>) -> R
     let (addrs, sni) = resolve(&cfg.server).await?;
     let expected = cfg.expected();
     let (endpoint, punch, conn, fp) =
-        connect_any(&cfg.server, addrs, sni, expected, mismatch, role).await?;
+        connect_any(&cfg.server, addrs, sni, expected, mismatch).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientHello::new(role, cfg.name.clone(), cfg.os.clone());
-    write_frame(&mut send, &hello.encode()).await?;
+    write_frame(&mut send, &framing::to_vec(&hello)).await?;
     let mut buf = Vec::new();
     let got = tokio::time::timeout(
         Duration::from_secs(8),
@@ -427,30 +421,29 @@ async fn handshake(cfg: &LinkConfig, role: Role, mismatch: Arc<AtomicBool>) -> R
     if !got {
         bail!("the server closed the connection during the handshake");
     }
-    let resp = ServerHello::decode(&buf).context("unexpected answer from the server")?;
+    let resp: ServerHello =
+        framing::decode_known(&buf).context("unexpected answer from the server")?;
     // 对方说的是 Airhand 的协议（版本对不上也算）：第一次连接的话，记下它的指纹
     if let (Trust::FirstUse(store), None) = (&cfg.trust, expected) {
         info!(server = %cfg.server, fingerprint = %format_fingerprint(&fp), "first connection to this server, remembering its certificate");
         store.save(&cfg.server, fp);
     }
-    match resp {
-        ServerHello::Welcome { version, features } => {
-            anyhow::ensure!(
-                (SIGNAL_MIN..=SIGNAL_VERSION).contains(&version),
-                "the server chose signal version {version}, which we can't speak"
-            );
-            Ok(Signal {
-                conn,
-                send,
-                recv,
-                version,
-                features: features.common(hello.features),
-                endpoint,
-                punch,
-            })
-        }
-        ServerHello::Incompatible { min, max } => Err(incompatible(min, max).into()),
-    }
+    let Some(version) = resp.version else {
+        return Err(incompatible(resp.min, resp.max).into());
+    };
+    anyhow::ensure!(
+        (SIGNAL_MIN..=SIGNAL_VERSION).contains(&version),
+        "the server chose signal version {version}, which we can't speak"
+    );
+    Ok(Signal {
+        conn,
+        send,
+        recv,
+        version,
+        features: resp.features.common(hello.features),
+        endpoint,
+        punch,
+    })
 }
 
 /// 服务器能说 `min..=max`，和本端没有交集：谁太旧了（`server` 比 `client` 大就是客户端该更新）

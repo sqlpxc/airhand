@@ -135,10 +135,17 @@ impl Selector {
         }
     }
 
-    /// 往直连上写画面失败了：当它断了
-    pub fn broken(&mut self, now: Instant) -> Option<Switch> {
+    /// 往直连上写画面失败了，画面的写任务放弃了直连上的流（还没送到的帧随之丢了）：当它断了。
+    /// 不管现在走的是哪条路都是一次"断了"：丢了的帧要靠关键帧补上，码率控制也不能再等它们的确认
+    pub fn broken(&mut self, now: Instant) -> Switch {
         self.direct.last = None;
-        self.decide(now)
+        self.media = Via::Relay;
+        self.better_since = None;
+        self.hold_until = Some(now + HOLD_AFTER_LOSS);
+        Switch {
+            to: Via::Relay,
+            lost: true,
+        }
     }
 
     /// 每次探测之后看一看要不要换路
@@ -300,9 +307,11 @@ mod tests {
         assert!(held.is_empty(), "{held:?}");
         let back = run(&mut s, &mut now, 20, Some(50.0), Some(20.0));
         assert_eq!(back, [to(Via::Direct, false)]);
-        // 往直连上写失败：也一样
-        assert_eq!(s.broken(now), Some(to(Via::Relay, true)));
-        assert_eq!(s.broken(now), None);
+        // 往直连上写失败：也一样；已经在中转上了也算（写任务丢掉了直连上的帧）
+        assert_eq!(s.broken(now), to(Via::Relay, true));
+        assert_eq!(s.media(), Via::Relay);
+        assert_eq!(s.broken(now), to(Via::Relay, true));
+        assert!(run(&mut s, &mut now, 4, Some(50.0), Some(20.0)).is_empty());
     }
 
     /// 中转上的探测没有回声：直连通着就走直连，不会因为量不出中转而一直等

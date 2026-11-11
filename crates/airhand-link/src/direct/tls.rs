@@ -1,31 +1,32 @@
-//! 直连的 QUIC 配置。
+//! 直连的 QUIC 配置和证书。
 //!
-//! 直连上的 TLS 只管把这一条 QUIC 连接加密：证书是被控端在本次运行里随便生成的一张（自签名），控制端不看它是谁。
-//! 对面是谁由会话密钥证明（[`super::prove`]，绑定这条连接的 TLS 导出密钥，中间人转发不了）；
-//! 直连上跑的帧本来就是端到端加密的，TLS 这一层被冒充了也看不到、改不了内容。
+//! 两端各有一张临时生成的自签名证书（[`Cert`]），指纹在加密的控制通道上交换（`DirectOffer::cert`）。
+//! TLS 双向认证：控制端只认被控端给的那个指纹（[`client_config`]）；被控端要求控制端出示证书（[`server_config`]），
+//! 握手完成后按它的指纹（[`peer_fingerprint`]）找到是哪个会话的、核对是不是那个会话的控制端给的。
+//! 两边都照样校验 TLS 1.3 的握手签名：拿得出私钥的才是证书的主人，中间人冒充不了任何一边。
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use airhand_proto::DIRECT_ALPN;
 use anyhow::{Context, Result, anyhow};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, ServerConfig, TransportConfig, VarInt};
-use rustls::DigitallySignedStruct;
+use quinn::{ClientConfig, Connection, ServerConfig, TransportConfig, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+use sha2::{Digest, Sha256};
 
-/// 控制端连直连时用的服务器名（和证书里的一样，不过控制端本来也不看）
+/// 控制端连直连时用的服务器名（和证书里的一样，不过谁也不看它：只认指纹）
 pub(crate) const SERVER_NAME: &str = "airhand";
 
-/// 直连的传输参数：和连中转的差不多（BBR、大窗口、2 秒内发现掉线），另外
-///
-/// * 打洞时第一个包常常被对方的 NAT 丢掉（对方还没往这边发过包）：起始 RTT 按 100 ms 算，重发得快一点；
-/// * 每条通道是一条单向流（见 `airhand_proto` 的"直连"），双向流只有控制端证明身份用的那一条
+/// 直连的传输参数：和连中转的差不多（BBR、大窗口、2 秒内发现掉线），另外打洞时第一个包常常被对方的 NAT 丢掉
+/// （对方还没往这边发过包）：起始 RTT 按 100 ms 算，重发得快一点。每条通道是一条单向流，没有双向流
 pub(crate) fn transport() -> TransportConfig {
     let mut t = TransportConfig::default();
-    t.max_concurrent_bidi_streams(VarInt::from_u32(2));
+    t.max_concurrent_bidi_streams(VarInt::from_u32(0));
     t.max_concurrent_uni_streams(VarInt::from_u32(16));
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(1)));
@@ -42,29 +43,38 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// 被控端在本次运行里用的证书（第一次用时生成）
-fn certificate() -> Result<&'static (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> {
-    static CERT: OnceLock<Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>), String>> =
-        OnceLock::new();
-    CERT.get_or_init(|| {
-        let ck = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
-            .map_err(|e| e.to_string())?;
-        Ok((
-            ck.cert.der().clone(),
-            PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
-        ))
-    })
-    .as_ref()
-    .map_err(|e| anyhow!("can't generate the direct path certificate: {e}"))
+/// 证书的 SHA-256 指纹
+pub(crate) fn fingerprint(der: &[u8]) -> [u8; 32] {
+    Sha256::digest(der).into()
 }
 
-/// 被控端：接受控制端连过来的直连（放在连中转的那个 endpoint 上）
-pub(crate) fn server_config() -> Result<ServerConfig> {
-    let (cert, key) = certificate()?;
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+/// 本端直连用的证书（每条服务器连接、每个控制端会话生成一张，不保存）
+pub(crate) struct Cert {
+    der: CertificateDer<'static>,
+    key: PrivatePkcs8KeyDer<'static>,
+    pub fingerprint: [u8; 32],
+}
+
+impl Cert {
+    pub fn generate() -> Result<Self> {
+        let ck = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
+            .map_err(|e| anyhow!("can't generate a direct path certificate: {e}"))?;
+        let der = ck.cert.der().clone();
+        Ok(Self {
+            fingerprint: fingerprint(&der),
+            der,
+            key: PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+        })
+    }
+}
+
+/// 被控端：接受控制端连过来的直连（放在连中转的那个 endpoint 上）。控制端必须出示证书，是谁握手之后按指纹认
+pub(crate) fn server_config(cert: &Cert) -> Result<ServerConfig> {
+    let provider = provider();
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key.clone_key().into())
+        .with_client_cert_verifier(Arc::new(AnyClient(provider)))
+        .with_single_cert(vec![cert.der.clone()], cert.key.clone_key().into())
         .context("bad direct path certificate")?;
     tls.alpn_protocols = vec![DIRECT_ALPN.to_vec()];
     tls.max_early_data_size = 0;
@@ -73,48 +83,79 @@ pub(crate) fn server_config() -> Result<ServerConfig> {
     Ok(cfg)
 }
 
-/// 控制端：连被控端的直连
-pub(crate) fn client_config() -> Result<ClientConfig> {
+/// 控制端：用证书 `cert` 连被控端的直连，只认指纹是 `host` 的被控端
+pub(crate) fn client_config(cert: &Cert, host: [u8; 32]) -> Result<ClientConfig> {
     let provider = provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(Arc::new(Pinned {
+            provider,
+            fingerprint: host,
+        }))
+        .with_client_auth_cert(vec![cert.der.clone()], cert.key.clone_key().into())
+        .context("bad direct path certificate")?;
     tls.alpn_protocols = vec![DIRECT_ALPN.to_vec()];
     let mut cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     cfg.transport_config(Arc::new(transport()));
     Ok(cfg)
 }
 
-/// 什么证书都接受，但照样校验 TLS 1.3 的握手签名（见模块说明：对面是谁由会话密钥证明）
-#[derive(Debug)]
-struct AnyCertificate(Arc<CryptoProvider>);
+/// 直连另一头的证书指纹（握手完成之后才有）
+pub(crate) fn peer_fingerprint(conn: &Connection) -> Option<[u8; 32]> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    certs.first().map(|c| fingerprint(c))
+}
 
-impl ServerCertVerifier for AnyCertificate {
+fn tls13_signature(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    rustls::crypto::verify_tls13_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
+}
+
+/// 只认这个指纹的服务器证书（照样校验握手签名）
+#[derive(Debug)]
+struct Pinned {
+    provider: Arc<CryptoProvider>,
+    fingerprint: [u8; 32],
+}
+
+impl ServerCertVerifier for Pinned {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        if fingerprint(end_entity) == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "the direct peer isn't this session's host".into(),
+            ))
+        }
     }
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        Err(rustls::Error::General("TLS 1.2 isn't used".into()))
     }
 
     fn verify_tls13_signature(
@@ -123,15 +164,53 @@ impl ServerCertVerifier for AnyCertificate {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        tls13_signature(&self.provider, message, cert, dss)
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// 任何客户端证书都接受（照样校验握手签名），是谁握手之后按指纹认（见模块说明）
+#[derive(Debug)]
+struct AnyClient(Arc<CryptoProvider>);
+
+impl ClientCertVerifier for AnyClient {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("TLS 1.2 isn't used".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        tls13_signature(&self.0, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }

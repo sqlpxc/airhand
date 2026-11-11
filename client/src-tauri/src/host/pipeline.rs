@@ -11,7 +11,7 @@
 //! 编码器只需要补残差，几帧之内就接近原画（实测 VideoToolbox H.264、4 Mbps、2880×1800 缩到 1080p 的文字：
 //! 42 dB → 58 dB，补的几帧一共约 40 KB）。编码器偶尔丢掉的帧（返回空）也靠这一步补发。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,8 @@ struct Ctrl {
     settings: Mutex<QualitySettings>,
     settings_ver: AtomicU64,
     force_key: AtomicBool,
+    /// 最近发出去的关键帧的序号（0：还没有）：控制端要的关键帧已经在路上了就不再编（见 [`Pipeline::request_keyframe`]）
+    last_key: AtomicU32,
     stop: AtomicBool,
     flow: Arc<Flow>,
     /// 控制端缓存了哪些光标形状（整个会话一份）
@@ -64,6 +66,7 @@ impl Pipeline {
             settings: Mutex::new(settings),
             settings_ver: AtomicU64::new(0),
             force_key: AtomicBool::new(true),
+            last_key: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             flow,
             cursors,
@@ -84,7 +87,16 @@ impl Pipeline {
         self.ctrl.settings_ver.fetch_add(1, Ordering::Release);
     }
 
-    pub fn request_keyframe(&self) {
+    /// 要一个关键帧。`after`：控制端收到的最后一帧：在那之后已经发过关键帧（还在路上）就不再编。
+    /// 解码出错、换路缺了帧、界面切回来各自会要，一个往返里的几次请求只编一个；`None`：一定要编
+    pub fn request_keyframe(&self, after: Option<u32>) {
+        let sent = self.ctrl.last_key.load(Ordering::Acquire);
+        if let Some(after) = after
+            && sent != 0
+            && sent.wrapping_sub(after) as i32 > 0
+        {
+            return;
+        }
         self.ctrl.force_key.store(true, Ordering::Release);
     }
 
@@ -335,6 +347,9 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     }
                 }
                 let seq = ctrl.flow.sent(size);
+                if ef.key {
+                    ctrl.last_key.store(seq, Ordering::Release);
+                }
                 let info = e.info();
                 let len = ef.data.len();
                 if !fresh && !force && len < REFINE_DONE_BYTES {

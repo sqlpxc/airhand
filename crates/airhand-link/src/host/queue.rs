@@ -1,26 +1,24 @@
-//! 被控端发给控制端的消息队列（有界），和控制端的命令队列（`crate::controller::queue`）是同一个设计：
+//! 被控端发给控制端的消息队列（有界），和控制端的命令队列一样建在 [`crate::queue`] 上：
 //!
-//! * **走哪条通道由消息决定**（[`HostMsg::lane`]）：发的一方只管 [`Outbox::send`]，不用自己挑控制流还是大块通道。
+//! * **走哪条通道由消息决定**（[`HostMsg::lane`]）：发的一方只管 [`Outbox::send`]，不用自己挑控制通道还是大块通道。
 //!   大的消息（剪贴板、光标形状）在大块通道上排队，挡不住控制消息；
 //! * **只关心最新值的状态不排队**：Pong、显示器列表、光标状态（控制通道）各占一个槽位、只留最新的一个，
-//!   写任务先发它们，再按顺序发排着队的。网络慢时不会越积越多、占满队列，
-//!   Pong 也不会排在一串提示后面、把控制端测到的往返时延拉长；
+//!   写任务先发它们，再按顺序发排着队的；
 //! * 其它消息按顺序排队，有上限。满了怎么办由发的一方决定（[`SendError::Full`]）：控制消息排满了说明对方早就不收了，
 //!   会话结束；剪贴板丢掉这一次；光标图像下一轮再发那时最新的。
 //!
 //! 显示器列表不能越过还排着队的 [`HostMsg::Hello`]（它带着开始时的显示器列表），不然新的会被旧的盖掉；
 //! 反过来，Hello 排进队列时，槽位里更早的显示器列表就作废了。
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use airhand_proto::SessionLane;
 use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::session::HostMsg;
 use bytes::Bytes;
-use tokio::sync::Notify;
 
+use crate::queue::{Item, Limit, Mailbox};
 use crate::transport::Frames;
 
 /// 控制通道最多排这么多条。控制消息都很小，排满了说明对方早就不收了
@@ -30,9 +28,19 @@ const CONTROL_MESSAGES: usize = 32;
 const BULK_MESSAGES: usize = 32;
 const BULK_BYTES: usize = 4 * 1024 * 1024;
 
-/// 队列里的两条通道
+/// 队列里的两条通道和它们的上限
 const CONTROL: usize = 0;
 const BULK: usize = 1;
+const LIMITS: [Limit; 2] = [
+    Limit {
+        messages: CONTROL_MESSAGES,
+        bytes: usize::MAX,
+    },
+    Limit {
+        messages: BULK_MESSAGES,
+        bytes: BULK_BYTES,
+    },
+];
 /// 控制通道上只留最新值的槽位（写任务按这个先后发）
 const PONG: usize = 0;
 const DISPLAYS: usize = 1;
@@ -50,10 +58,12 @@ enum Place {
 
 impl Place {
     fn of(msg: &HostMsg) -> Self {
-        let queued = |before| Place::Queued {
-            lane: lane_index(msg.lane()),
-            before,
+        let lane = match msg.lane() {
+            SessionLane::Bulk => BULK,
+            // 画面不是消息，不走这里
+            SessionLane::Control | SessionLane::Video => CONTROL,
         };
+        let queued = |before| Place::Queued { lane, before };
         match msg {
             HostMsg::Pong { .. } => Place::Latest(PONG),
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
@@ -74,14 +84,6 @@ impl Place {
             Place::Latest(_) => CONTROL,
             Place::Queued { lane, .. } => lane,
         }
-    }
-}
-
-fn lane_index(lane: SessionLane) -> usize {
-    match lane {
-        SessionLane::Bulk => BULK,
-        // 画面、声音不是消息，不走这里
-        SessionLane::Control | SessionLane::Video | SessionLane::Audio => CONTROL,
     }
 }
 
@@ -120,93 +122,8 @@ pub enum SendError {
     TooLarge,
 }
 
-struct Item {
-    bytes: Bytes,
-    before: Option<usize>,
-}
-
-#[derive(Default)]
-struct State {
-    slots: [Option<Bytes>; SLOTS],
-    /// 每个槽位前面还排着几条它不能越过的消息
-    held: [usize; SLOTS],
-    items: VecDeque<Item>,
-    bytes: usize,
-    /// 写任务不在了：再发都是 [`SendError::Closed`]
-    closed: bool,
-    /// 发送端都不在了：排着的发完就结束
-    finished: bool,
-}
-
-impl State {
-    fn push(&mut self, msg: Encoded, limit: &Limit) -> Result<(), SendError> {
-        if self.closed {
-            return Err(SendError::Closed);
-        }
-        match msg.place {
-            Place::Latest(slot) => self.slots[slot] = Some(msg.bytes),
-            Place::Queued { before, .. } => {
-                let len = msg.bytes.len();
-                if self.items.len() >= limit.messages
-                    || (self.bytes + len > limit.bytes && !self.items.is_empty())
-                {
-                    return Err(SendError::Full);
-                }
-                if let Some(i) = before {
-                    // 这条消息带着更新的值：槽位里的作废，之后的要排在它后面
-                    self.slots[i] = None;
-                    self.held[i] += 1;
-                }
-                self.bytes += len;
-                self.items.push_back(Item {
-                    bytes: msg.bytes,
-                    before,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn pop(&mut self) -> Option<Bytes> {
-        for i in 0..SLOTS {
-            if self.held[i] == 0
-                && let Some(b) = self.slots[i].take()
-            {
-                return Some(b);
-            }
-        }
-        let item = self.items.pop_front()?;
-        self.bytes -= item.bytes.len();
-        if let Some(i) = item.before {
-            self.held[i] -= 1;
-        }
-        Some(item.bytes)
-    }
-}
-
-struct Limit {
-    messages: usize,
-    bytes: usize,
-}
-
-struct Lane {
-    state: Mutex<State>,
-    ready: Notify,
-    limit: Limit,
-}
-
-impl Lane {
-    fn new(messages: usize, bytes: usize) -> Self {
-        Self {
-            state: Mutex::default(),
-            ready: Notify::new(),
-            limit: Limit { messages, bytes },
-        }
-    }
-}
-
 struct Shared {
-    lanes: [Lane; 2],
+    lanes: [Mailbox<()>; 2],
 }
 
 /// 最后一个 [`Outbox`] 丢掉时告诉写任务：排着的发完就结束
@@ -215,8 +132,7 @@ struct Alive(Arc<Shared>);
 impl Drop for Alive {
     fn drop(&mut self) {
         for lane in &self.0.lanes {
-            lane.state.lock().unwrap().finished = true;
-            lane.ready.notify_one();
+            lane.finish();
         }
     }
 }
@@ -237,10 +153,7 @@ pub struct LaneReceiver {
 /// 一个会话的消息队列：发送端，控制通道、大块通道各自的接收端
 pub fn channel() -> (Outbox, LaneReceiver, LaneReceiver) {
     let shared = Arc::new(Shared {
-        lanes: [
-            Lane::new(CONTROL_MESSAGES, usize::MAX),
-            Lane::new(BULK_MESSAGES, BULK_BYTES),
-        ],
+        lanes: [Mailbox::new(SLOTS), Mailbox::new(0)],
     });
     let receiver = |lane| LaneReceiver {
         shared: shared.clone(),
@@ -275,9 +188,28 @@ impl Outbox {
         if msg.bytes.len() - framing::PREFIX + SEAL_OVERHEAD > msg.lane().max_frame_size() {
             return Err(SendError::TooLarge);
         }
-        let lane = &self.shared.lanes[msg.place.lane()];
-        lane.state.lock().unwrap().push(msg, &lane.limit)?;
-        lane.ready.notify_one();
+        let index = msg.place.lane();
+        let lane = &self.shared.lanes[index];
+        {
+            let mut m = lane.lock();
+            if m.closed {
+                return Err(SendError::Closed);
+            }
+            match msg.place {
+                Place::Latest(slot) => m.set(slot, msg.bytes),
+                Place::Queued { before, .. } => {
+                    if m.full(LIMITS[index], msg.bytes.len()) {
+                        return Err(SendError::Full);
+                    }
+                    m.push_back(Item {
+                        bytes: msg.bytes,
+                        before,
+                        meta: (),
+                    });
+                }
+            }
+        }
+        lane.wake();
         Ok(())
     }
 }
@@ -285,25 +217,12 @@ impl Outbox {
 impl LaneReceiver {
     /// 下一帧要发的；发送端都不在了、排着的也发完了时为 `None`。可以放在 `select!` 里（取消不丢消息）
     pub async fn recv(&mut self) -> Option<Bytes> {
-        let lane = &self.shared.lanes[self.lane];
-        loop {
-            let notified = lane.ready.notified();
-            {
-                let mut s = lane.state.lock().unwrap();
-                if let Some(b) = s.pop() {
-                    return Some(b);
-                }
-                if s.finished {
-                    return None;
-                }
-            }
-            notified.await;
-        }
+        self.shared.lanes[self.lane].recv(|_| {}).await
     }
 
     /// 现在就能发的下一帧（没有就是 `None`）
     pub fn try_recv(&mut self) -> Option<Bytes> {
-        self.shared.lanes[self.lane].state.lock().unwrap().pop()
+        self.shared.lanes[self.lane].try_recv()
     }
 }
 
@@ -315,12 +234,7 @@ impl Frames for LaneReceiver {
 
 impl Drop for LaneReceiver {
     fn drop(&mut self) {
-        let mut s = self.shared.lanes[self.lane].state.lock().unwrap();
-        s.closed = true;
-        s.items.clear();
-        s.slots = Default::default();
-        s.held = Default::default();
-        s.bytes = 0;
+        self.shared.lanes[self.lane].close();
     }
 }
 

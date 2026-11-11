@@ -2,11 +2,10 @@
 //!
 //! 负载是什么：
 //!
-//! * 信令流上的第一条消息（版本握手）：永远不变的 postcard 编码（见 [`crate::signal`] 的"版本握手"）；
-//! * 其它信令消息、端到端握手、会话的控制消息：CBOR（[`encode`] / [`decode`]）；
-//! * 画面流、声音流：媒体包（见 [`crate::media`]），原样读出来交给界面。
+//! * 信令消息（包括版本握手，见 [`crate::signal`]）、端到端握手、会话的控制和大块消息：CBOR（[`encode`] / [`decode`]）；
+//! * 画面通道：媒体包（见 [`crate::media`]），原样读出来交给界面。
 //!
-//! 会话流上的负载在端到端握手之后都是密文（见 `airhand_link::secure`），解密之后才是上面的格式。
+//! 会话通道上的负载在端到端握手之后都是密文（见 `airhand_link::secure`），解密之后才是上面的格式。
 //!
 //! 这里只有编解码，不碰 IO，也不依赖任何异步运行时：从流里读写帧在 `airhand_link::wire`（它用的就是这里的
 //! [`payload_len`] / [`decode`]）。手里已经有一段字节的（网页里的 wasm、fuzz）用 [`split`] / [`take_msg`]：
@@ -43,8 +42,6 @@ pub const PREFIX: usize = 4;
 pub enum FrameError {
     #[error("encoding error: {0}")]
     Decode(#[from] minicbor::decode::Error),
-    #[error("encoding error: {0}")]
-    Postcard(#[from] postcard::Error),
     #[error("message too large: {0} bytes")]
     TooLarge(usize),
 }
@@ -345,11 +342,13 @@ mod tests {
                 req_id: 4,
                 code: 123_456,
                 resume: Some(token),
+                init: vec![1, 2, 3],
             },
             ClientMsg::Connect {
                 req_id: 5,
                 code: 654_321,
                 resume: None,
+                init: vec![],
             },
             ClientMsg::Rekey { secret: [6; 16] },
             ClientMsg::Release,
@@ -376,7 +375,7 @@ mod tests {
                     host_name: "PC".into(),
                     host_os: "Windows".into(),
                     resume: token,
-                    observed: Some("203.0.113.9:50000".parse().unwrap()),
+                    observed: "203.0.113.9:50000".parse().unwrap(),
                 }),
             ),
             ServerMsg::connect_result(6, Err(ConnectError::Offline)),
@@ -386,12 +385,14 @@ mod tests {
             ServerMsg::Incoming {
                 session_id: 9,
                 peer: peer("10.0.0.7"),
-                observed: None,
+                observed: "10.0.0.8:4433".parse().unwrap(),
+                init: vec![7; 40],
             },
             ServerMsg::Incoming {
                 session_id: 9,
                 peer: peer("2001:db8::1"),
-                observed: Some("[2001:db8::2]:4433".parse().unwrap()),
+                observed: "[2001:db8::2]:4433".parse().unwrap(),
+                init: vec![],
             },
             ServerMsg::HostOnline { code: 123_456 },
             ServerMsg::Rekeyed { secret: [3; 16] },
@@ -477,6 +478,7 @@ mod tests {
                 "192.168.1.20:50000".parse().unwrap(),
                 "[2001:db8::7]:4433".parse().unwrap(),
             ],
+            cert: [0xc5; 32],
         };
         let h = HostMsg::Direct(offer.clone());
         assert_eq!(h.lane(), SessionLane::Control);
@@ -549,7 +551,11 @@ mod tests {
     #[test]
     fn hostile_bytes_never_panic() {
         use crate::{MAX_SIGNAL_MSG, Role, SessionHeader, SessionLane};
-        let hello = ClientHello::new(Role::Host, "PC".into(), "Windows 11".into()).encode();
+        let hello = to_vec(&ClientHello::new(
+            Role::Host,
+            "PC".into(),
+            "Windows 11".into(),
+        ));
         let mut signal = Vec::new();
         for m in [
             ClientMsg::Register {
@@ -564,16 +570,18 @@ mod tests {
                 req_id: 4,
                 code: 123_456,
                 resume: Some([7; 16]),
+                init: vec![9; 20],
             },
             ClientMsg::Rekey { secret: [5; 16] },
             ClientMsg::Release,
         ] {
             signal.extend(encode(&m));
         }
-        let header = SessionHeader::new(7, Role::Controller, SessionLane::Bulk).encode();
+        let header = SessionHeader::new(7, SessionLane::Bulk).encode();
 
         let try_all = |hello: &[u8], signal: &[u8], header: &[u8; SessionHeader::LEN]| {
-            let _ = ClientHello::decode(hello);
+            let _ = decode_known::<Versions>(hello);
+            let _ = decode_known::<ClientHello>(hello);
             let mut r = signal;
             while let Ok(Some(_)) = take_msg::<ClientMsg>(&mut r, MAX_SIGNAL_MSG) {}
             let _ = SessionHeader::decode(header);

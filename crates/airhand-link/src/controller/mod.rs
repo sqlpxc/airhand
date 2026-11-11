@@ -26,8 +26,8 @@
 //!
 //! # 端到端加密
 //!
-//! 服务器批准之后，`connect` 在控制流上和被控端握手（[`crate::secure::initiate`]，协议见
-//! `airhand_proto::handshake`），之后每条流的每一帧都是密文。本机的身份（[`Identity`]）由平台保存，
+//! `connect` 发起会话时就带着握手的第一条消息（[`crate::secure::initiate`]，协议见 `airhand_proto::handshake`），
+//! 服务器批准之后在控制通道上做完（[`establish`]），之后每条通道的每一帧都是密文。本机的身份（[`Identity`]）由平台保存，
 //! 启动服务时给进来；被控端的公钥由界面保管（"我的设备"，和重连凭证一样，见 [`ConnectOptions::host_key`]）：
 //!
 //! * 第一次连（界面没有它的公钥）：记下对方的公钥（[`SessionInfo::host_key`]），界面保存下来；
@@ -37,34 +37,36 @@
 //!   （[`ConnectOptions::pairing`]）。配对之后被控端记住本机，以后不用再输；
 //! * [`SessionInfo::safety`] 是安全码：被控端显示的是同一个，第一次连接时两边的人可以对一下。
 //!
-//! # 声音
+//! # 通道和数据报
 //!
-//! 被控端的声音包走 QUIC 数据报（见 `airhand_proto::datagram`）。一条连接上可能有好几个会话，
-//! 连接的读任务按数据报开头的会话 ID 交给对应会话的 [`HostReceiver`]（探测数据报交给会话的直连任务）。
+//! 一条服务器连接上可能有好几个会话：连接的 [`Router`] 按会话 ID 把被控端的通道（单向流）和数据报
+//! （声音、探测）交给对应的会话（见 [`crate::lanes`]）。
 //!
 //! # 直连
 //!
-//! 两端都支持时，会话开始之后被控端发来候选地址，控制端从连服务器的那个 endpoint 连过去（见 [`crate::direct`]）。
+//! 会话开始之后被控端发来候选地址，控制端从连服务器的那个 endpoint 连过去（见 [`crate::direct`]）。
 //! 连上了对界面没有什么不同，只是更快；画面从直连来的时候 [`SessionEvent::Stats`] 的 `direct` 是 true。
 
 mod cursor;
+mod link;
 mod queue;
 mod session;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::direct::{self, Mirrors, Via};
+use crate::direct::{self, Mirror};
+use crate::lanes::Router;
 use crate::secure::{self, Identity, InitiatorParams};
-use crate::transport::{HostReceiver, Openers, open_session};
+use crate::tasks::OwnedTask;
 use crate::wire::{read_msg, write_msg};
 use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, datagram, features};
+use airhand_proto::{MAX_SIGNAL_MSG, Role};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use quinn::{Connection, Endpoint};
@@ -72,25 +74,18 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::net::{self, LinkConfig, Reconnect, Report};
 use crate::{Problem, ServerState};
+pub use link::{Established, establish};
 pub use session::{NoticeView, SessionEvent, SessionUi, UiClosed};
 
 /// 桌面版检查本机剪贴板变化的间隔
 pub const CLIPBOARD_POLL: Duration = Duration::from_millis(300);
 
-/// 每个会话最多排着这么多个还没交出去的声音数据报（再多就丢：本来就可能丢）
-const DATAGRAM_QUEUE: usize = 16;
 /// 大块通道（剪贴板）最多排着这么多条：网络慢的时候再复制，丢掉的是这一次（之前排着的发完了就轮到下一次）
 const BULK_QUEUE: usize = 4;
-
-/// 控制端的时钟（微秒）：Ping 和输入里的 `t`、确认里画面的到达时刻都是它
-pub(crate) fn now_us() -> u64 {
-    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
-    EPOCH.elapsed().as_micros() as u64
-}
 
 /// 本机剪贴板的双向同步（桌面版；实现见客户端的 `clipboard.rs`）。
 pub trait ClipboardSync: Send + 'static {
@@ -211,36 +206,13 @@ pub struct ConnectOptions {
     pub audio: bool,
 }
 
-/// 一个会话的数据报交给谁：声音交给接收端，探测交给直连任务（见 [`crate::direct`]）
-struct SessionDatagrams {
-    audio: mpsc::Sender<Bytes>,
-    probes: mpsc::Sender<(Via, Bytes)>,
-}
-
-/// 会话 ID → 交给这个会话的数据报
-type Datagrams = Mutex<HashMap<u64, SessionDatagrams>>;
-
-/// 会话收数据报的登记，丢掉时注销（会话结束、被中止，或者还没开始就失败了）
-struct DatagramRoute {
-    inner: Arc<Inner>,
-    session_id: u64,
-}
-
-impl Drop for DatagramRoute {
-    fn drop(&mut self) {
-        self.inner
-            .datagrams
-            .lock()
-            .unwrap()
-            .remove(&self.session_id);
-    }
-}
-
 #[derive(Clone)]
 struct Live {
     conn: Connection,
     /// 连服务器的 endpoint：直连也从它发起（同一个 socket，见 [`crate::direct`]）
     endpoint: Endpoint,
+    /// 被控端的通道、数据报按会话交给会话
+    router: Arc<Router>,
     tx: mpsc::Sender<ClientMsg>,
     pending: Pending,
 }
@@ -263,8 +235,6 @@ struct Inner {
     rt: Handle,
     live: Mutex<Option<Live>>,
     sessions: Mutex<HashMap<u32, SessionHandle>>,
-    /// 声音数据报交给哪个会话（见模块说明的"声音"）
-    datagrams: Datagrams,
     next_req: AtomicU32,
     next_sid: AtomicU32,
     host_online: HostOnline,
@@ -307,7 +277,6 @@ impl ControllerService {
             rt: rt.clone(),
             live: Mutex::default(),
             sessions: Mutex::default(),
-            datagrams: Mutex::default(),
             next_req: AtomicU32::new(0),
             next_sid: AtomicU32::new(0),
             host_online,
@@ -336,6 +305,22 @@ impl ControllerService {
                 Some(secure::unhex32(k).ok_or_else(|| Problem::failed("invalid saved host key"))?)
             }
         };
+        // 端到端握手的第一条消息随请求一起发给服务器，它转给被控端（见模块说明的"端到端加密"）。
+        // 开始时的画质和声音在介绍里：被控端一开始就按它建编码器，不用先按默认设置建一个再重建
+        let intro = secure::controller_intro(
+            &self.inner.cfg.name,
+            &self.inner.cfg.os,
+            opts.settings,
+            opts.audio,
+        );
+        let (initiator, init) = secure::initiate(InitiatorParams {
+            code,
+            me: &self.inner.identity,
+            host_key,
+            pairing: pairing.as_deref(),
+            intro: &intro,
+        })
+        .map_err(Problem::failed)?;
         let resume = opts.resume;
         let live = self
             .inner
@@ -366,6 +351,7 @@ impl ControllerService {
                 req_id,
                 code,
                 resume,
+                init,
             })
             .map_err(|_| server_gone())?;
         let grant = match tokio::time::timeout(Duration::from_secs(10), orx).await {
@@ -378,93 +364,33 @@ impl ControllerService {
             }
         };
 
-        // 先登记再开流：被控端一开始发声音，数据报就有地方去
-        let (dgram_tx, dgram_rx) = mpsc::channel(DATAGRAM_QUEUE);
-        let (probe_tx, probe_rx) = mpsc::channel(DATAGRAM_QUEUE);
-        self.inner.datagrams.lock().unwrap().insert(
-            grant.session_id,
-            SessionDatagrams {
-                audio: dgram_tx.clone(),
-                probes: probe_tx.clone(),
-            },
-        );
-        let route = DatagramRoute {
-            inner: self.inner.clone(),
-            session_id: grant.session_id,
-        };
-        let streams = open_session(&live.conn, grant.session_id, Role::Controller)
+        // 在控制通道上做完握手：确认对方的身份、让对方确认本机
+        let link = establish(&live.router, &live.conn, grant.session_id, initiator)
             .await
-            .map_err(Problem::failed)?;
-        let (mut send, mut recv) = streams.control;
-        // 端到端握手：确认对方的身份、让对方确认本机（见模块说明的"端到端加密"）。
-        // 开始时的画质和声音在介绍里：被控端一开始就按它建编码器，不用先按默认设置建一个再重建
-        let intro = secure::controller_intro(
-            &self.inner.cfg.name,
-            &self.inner.cfg.os,
-            opts.settings,
-            opts.audio,
-        );
-        let init = secure::initiate(
-            &mut recv,
-            &mut send,
-            InitiatorParams {
-                session_id: grant.session_id,
-                code,
-                me: &self.inner.identity,
-                host_key,
-                pairing: pairing.as_deref(),
-                intro: &intro,
-            },
-        )
-        .await
-        .map_err(|e| Problem::from_error(e, Problem::failed))?;
-        let secured = init.secured;
-        let negotiated = init.negotiated;
-        let (bulk_send, bulk_recv) = streams.bulk;
-        let recv = HostReceiver::new(
-            recv,
-            bulk_recv,
-            streams.video,
-            streams.audio,
-            Some(dgram_rx),
-            Openers {
-                control: init.opener,
-                bulk: secured.bulk.opener,
-                video: secured.video.opener,
-                audio: secured.audio.opener,
-            },
-        );
+            .map_err(|e| Problem::from_error(e, Problem::failed))?;
+        let (peer, safety) = (link.peer, link.safety.clone());
         let arrivals = Arc::new(Mutex::new(session::Arrivals::default()));
 
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
         let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
-        // 直连（两端都支持时）：等被控端发来候选地址
-        let mirrors = Mirrors::default();
-        let direct = negotiated.has(features::session::DIRECT).then(|| {
-            let (offers_tx, offers) = mpsc::channel(4);
-            let answer = tx.clone();
-            let task = direct::controller::run(direct::controller::Session {
-                endpoint: live.endpoint.clone(),
-                relay: live.conn.clone(),
-                session_id: grant.session_id,
-                observed: grant.observed,
-                key: secured.direct,
-                probe: secured.probe,
-                offers,
-                answer: Box::new(move |offer| {
-                    let _ = answer.send(ControllerMsg::Direct(offer));
-                }),
-                attach: recv.attach(),
-                mirrors: mirrors.clone(),
-                audio: dgram_tx,
-                probes: probe_rx,
-                probe_tx,
-            });
-            session::Direct {
-                offers: offers_tx,
-                task: Box::pin(task),
-            }
+        // 直连：等被控端发来候选地址
+        let mirror = Mirror::default();
+        let (offers_tx, offers) = mpsc::channel(4);
+        let answer = tx.clone();
+        let direct = direct::controller::run(direct::controller::Session {
+            endpoint: live.endpoint.clone(),
+            relay: live.conn.clone(),
+            session_id: grant.session_id,
+            observed: grant.observed,
+            probe: link.probe,
+            probes: link.probes,
+            feed: link.feed,
+            offers,
+            answer: Box::new(move |offer| {
+                let _ = answer.send(ControllerMsg::Direct(offer));
+            }),
+            mirror: mirror.clone(),
         });
         let (mode, clipboard) = match frontend {
             Frontend::Desktop { clipboard, sync } => {
@@ -478,18 +404,21 @@ impl ControllerService {
             Frontend::Browser => (session::Mode::Browser, None),
         };
         let io = session::SessionIo {
-            send,
-            sealer: init.sealer,
-            bulk: (bulk_send, bulk_rx, secured.bulk.sealer),
+            control: link.control,
+            bulk: (link.bulk.0, bulk_rx, link.bulk.1),
             bulk_tx: bulk_tx.clone(),
-            recv,
+            recv: link.receiver,
             ui,
             mode,
-            negotiated,
+            negotiated: link.negotiated,
             arrivals: arrivals.clone(),
-            mirrors,
-            direct,
+            mirror,
+            direct: session::Direct {
+                offers: offers_tx,
+                task: Box::pin(direct),
+            },
         };
+        let registration = link.registration;
         let inner = self.inner.clone();
         let tx2 = tx.clone();
         // Hold the registry lock until insertion; a fast EOF must not remove a
@@ -497,7 +426,7 @@ impl ControllerService {
         let mut sessions = self.inner.sessions.lock().unwrap();
         let handle = self.inner.rt.spawn(async move {
             // 会话结束或者被中止时随之注销
-            let _route = route;
+            let _registration = registration;
             session::run(sid, io, tx2, rx).await;
             inner.sessions.lock().unwrap().remove(&sid);
         });
@@ -511,15 +440,15 @@ impl ControllerService {
                 arrivals,
             },
         );
-        info!(sid, code, host = %grant.host_name, safety = %secured.safety, "session established");
+        info!(sid, code, host = %grant.host_name, %safety, "session established");
         Ok(SessionInfo {
             sid,
             code: airhand_proto::format_code(code),
             host_name: grant.host_name,
             host_os: grant.host_os,
             resume: grant.resume,
-            host_key: secure::hex(&secured.peer),
-            safety: secured.safety.clone(),
+            host_key: secure::hex(&peer),
+            safety,
         })
     }
 
@@ -530,7 +459,12 @@ impl ControllerService {
             Command::Settings { sid, settings } => {
                 (sid, ControllerMsg::Settings(settings.sanitized()))
             }
-            Command::Keyframe { sid } => (sid, ControllerMsg::RequestKeyframe),
+            Command::Keyframe { sid } => {
+                let sessions = self.inner.sessions.lock().unwrap();
+                let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+                let after = s.arrivals.lock().unwrap().last();
+                return s.tx.send(ControllerMsg::RequestKeyframe { after });
+            }
             Command::Display { sid, index } => (sid, ControllerMsg::SelectDisplay { index }),
             Command::Audio { sid, enabled } => (sid, ControllerMsg::Audio { enabled }),
             Command::Clipboard { sid, text } => {
@@ -568,7 +502,11 @@ impl ControllerService {
     pub fn ack(&self, sid: u32, seq: u32) -> Result<(), Problem> {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-        let arrived = s.arrivals.lock().unwrap().get(seq);
+        let Some(arrived) = s.arrivals.lock().unwrap().take(seq) else {
+            // 不是这个会话交出去的帧（界面的毛病），或者已经确认过了：确认是累积的，不用再发
+            debug!(sid, seq, "ignoring an acknowledgement for an unknown frame");
+            return Ok(());
+        };
         s.tx.send(ControllerMsg::Ack { seq, arrived })
     }
 
@@ -634,9 +572,12 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     let sig = net::connect_signal(&inner.cfg, Role::Controller).await?;
     let (tx, mut rx) = mpsc::channel::<ClientMsg>(64);
     let pending: Pending = Arc::default();
+    // 被控端的通道、数据报按会话 ID 交给会话（见模块说明的"通道和数据报"）
+    let (router, _router): (_, OwnedTask<()>) = Router::start(&sig.conn);
     *inner.live.lock().unwrap() = Some(Live {
         conn: sig.conn.clone(),
         endpoint: sig.endpoint.clone(),
+        router,
         tx,
         pending: pending.clone(),
     });
@@ -646,32 +587,6 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     let mut send = sig.send;
     let mut recv = sig.recv;
     let inner = inner.clone();
-    // 数据报：按会话 ID 交给会话（见模块说明的"声音"）。会话跟不上（或者已经结束了）就丢掉这一包
-    let dgram_conn = sig.conn.clone();
-    let dgram_inner = inner.clone();
-    let datagrams = async move {
-        loop {
-            let d = dgram_conn.read_datagram().await?;
-            let Some(session_id) = datagram::session(&d) else {
-                continue;
-            };
-            let routes = dgram_inner.datagrams.lock().unwrap();
-            let Some(to) = routes.get(&session_id) else {
-                continue;
-            };
-            match datagram::kind(&d) {
-                Some(datagram::AUDIO) => {
-                    let _ = to.audio.try_send(d);
-                }
-                Some(datagram::PROBE) => {
-                    let _ = to.probes.try_send((Via::Relay, d));
-                }
-                _ => {}
-            }
-        }
-        #[allow(unreachable_code)]
-        anyhow::Ok(())
-    };
     let writer = async move {
         while let Some(m) = rx.recv().await {
             write_msg(&mut send, &m).await?;
@@ -703,7 +618,6 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
     tokio::select! {
         r = reader => r,
         r = writer => r,
-        r = datagrams => r,
         e = sig.conn.closed() => Err(anyhow!(e)),
     }
 }

@@ -1,12 +1,10 @@
 //! Airhand 协议定义。
 //!
-//! 整体结构：
-//!
 //! ```text
 //!  被控端(Host) ──QUIC──┐                 ┌──QUIC── 控制端(Controller)
 //!                      │  airhand-server │
 //!   信令流(bi #0) ──────┤   信令 + 中转   ├────── 信令流(bi #0)
-//!   会话流(bi #n) ══════╪═════ 字节透传 ══╪══════ 会话流(bi #n)
+//!   通道(uni) ═════════╪═════ 字节透传 ══╪══════ 通道(uni)
 //!                      │   （只看会话头）  │
 //!               └──────── 端到端加密（Noise）────────┘
 //! ```
@@ -18,61 +16,48 @@
 //! | 信令 / 中转 | 服务器 | ALPN、版本握手、[`signal`] 消息、[`SessionHeader`]、数据报开头的会话 ID（[`datagram`]） | [`SIGNAL_VERSION`] |
 //! | 会话 | 只有两端 | 端到端握手（[`handshake`]）、[`session`] 消息、媒体包（[`media`]） | [`SESSION_VERSION`] |
 //!
-//! 服务器只检查信令版本（而且是区间：[`SIGNAL_MIN`]..=[`SIGNAL_VERSION`]），从不看会话内容：会话层怎么改都不用升级服务器。
-//! 会话版本由两端在端到端握手里协商（握手是加密、认证过的，服务器改不了，也就没法让两端降级）。
+//! 服务器只检查信令版本（区间 [`SIGNAL_MIN`]..=[`SIGNAL_VERSION`]），从不看会话内容：会话层怎么改都不用升级服务器。
+//! 会话版本由两端在端到端握手里协商（加密、认证过，服务器改不了，也就没法让两端降级）。
 //!
-//! 版本号只在**没法兼容**的改动时加 1。加功能用能力位（[`Features`]）：两端（或者客户端和服务器）各自报上自己支持的，
-//! 双方都支持才用。消息是带编号的 CBOR（见 [`framing`]）：不认识的消息、字段跳过，不认识的枚举值留着原值，不断开。
-//! 端到端握手本身没有版本号：握手要改就加一个新的模式（[`handshake::Pattern`]）。
+//! 版本号只在**没法兼容**的改动时加 1。加功能用能力位（[`Features`]）：双方都支持才用。消息是带编号的 CBOR
+//! （见 [`framing`]）：不认识的消息、字段跳过，不认识的枚举值留着原值，不断开。端到端握手没有版本号：要改就加一个新的模式
+//! （[`handshake::Pattern`]）。
 //!
 //! # 会话
 //!
-//! * 每条 QUIC 连接上客户端打开的**第一条**双向流是"信令流"，承载 [`signal`] 消息。
-//! * 每个远控会话双方各打开几条双向流（"通道"，[`SessionLane`]：控制、画面、声音、大块），先写入 [`SessionHeader`]。
-//!   服务器按会话 ID 和通道编号配对，然后**零拷贝透传**。服务器不管会话有几条通道、各是什么：
-//!   以后加通道（例如传文件）不用改服务器。
-//! * 控制通道上先做端到端握手（[`handshake`]，Noise），之后每条通道上的每一帧、每个数据报都是加密的：
-//!   服务器看不到画面、声音、键盘输入和剪贴板，也没法篡改、插入。
+//! * 每条 QUIC 连接上客户端打开的第一条双向流是"信令流"，承载 [`signal`] 消息。控制端发起会话时把端到端握手的第一条消息
+//!   一起交给服务器（[`signal::ClientMsg::Connect`]），服务器原样转给被控端（[`signal::ServerMsg::Incoming`]）。
+//! * 会话的每条"通道"（[`SessionLane`]）是**单向流**：每端只为自己要发的通道开流，开头写 [`SessionHeader`]。
+//!   服务器收到之后向另一端开一条单向流、写同样的头，然后**零拷贝透传**；它不配对、不管会话有几条通道、各是什么
+//!   （只限制数量 [`MAX_LANES`]），以后加通道不用改服务器。任何一端的控制通道结束，整个会话结束。
+//! * 端到端握手在控制通道上做完（[`handshake`]，Noise），之后每条通道上的每一帧、每个数据报都是加密的：
+//!   服务器看不到、也没法篡改或插入。
 //! * 每条流各自有序，跨流没有顺序保证（音画用采集时间同步），一条流堵住不影响其它的：
 //!
-//! | 通道 | 方向                | 内容                                              | 编码 |
-//! |------|---------------------|---------------------------------------------------|------|
-//! | 控制 | 双向                | 小而急的 [`session::HostMsg`] / [`session::ControllerMsg`]：输入、确认、Ping…… | CBOR（[`framing`]） |
-//! | 画面 | 被控端 → 控制端     | 画面包                                            | 媒体包（[`media`]） |
-//! | 声音 | 被控端 → 控制端     | 放不进数据报的声音包（很少见）                    | 媒体包（[`media`]） |
-//! | 大块 | 双向                | 大的消息：剪贴板、光标（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
+//! | 通道 | 方向 | 内容 | 编码 |
+//! |------|------|------|------|
+//! | 控制 | 双向 | 小而急的 [`session::HostMsg`] / [`session::ControllerMsg`]：输入、确认、Ping…… | CBOR（[`framing`]） |
+//! | 画面 | 被控端 → 控制端 | 画面包 | 媒体包（[`media`]） |
+//! | 大块 | 双向 | 大的消息：剪贴板、光标图像（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
-//! "之后的每一帧"）。媒体包是定长头 + 原始数据，控制端解密后原样交给界面，不重新编码。
-//!
-//! 声音包平时走 QUIC 数据报（[`datagram`]）：丢了就丢了，不重传，也不用排在丢了的包后面等重传。
-//! 服务器按数据报开头的会话 ID 在这个会话的两端之间原样转发。
+//! "之后的每一帧"）。声音包走 QUIC 数据报（[`datagram`]）：丢了就丢了，不重传，也不用排在丢了的包后面等。
 //!
 //! # 直连
 //!
-//! 经过中转时每个字节都要两次 QUIC 加解密、两套重传，中转上还要排队；中转离用户远（跨境）时尤其明显。
-//! 会话的加密（[`handshake`]）和传输无关，所以两端可以在中转之外再打通一条**直连**，帧原样（同样的密文、同样的计数）
-//! 从直连发：
+//! 会话的加密和传输无关，所以两端在中转之外再打通一条**直连**，同样的密文帧原样从直连发：
 //!
-//! * 服务器告诉每个客户端它看到的这个客户端的公网地址（[`signal::SessionGrant::observed`]、
-//!   [`signal::ServerMsg::Incoming`] 的 `observed`，信令能力位 [`features::signal::OBSERVED_ADDR`]）；
-//! * 会话开始之后（被控端的用户同意了之后），两端在加密的控制通道上交换各自的候选地址（公网地址和局域网地址，
-//!   [`session::DirectOffer`]，会话能力位 [`features::session::DIRECT`]）：中转看不到局域网地址，
-//!   还没被放进来的控制端也拿不到被控端的地址；
-//! * 两端用连中转的那个 UDP socket 打洞：被控端往控制端的地址发几个字节的打洞包（打开自己 NAT 上的映射），
-//!   控制端用同一个 socket 发起 QUIC 连接（ALPN [`DIRECT_ALPN`]），连上之后用会话密钥证明自己（绑定这条 QUIC 连接的
-//!   TLS 导出密钥，中间人转发不了）。打不通（对称 NAT）就一直走中转；
-//! * 直连上每条通道是一条单向流，开头一个字节是通道编号（[`SessionLane`]），之后和中转上一样是一帧一帧的密封单元；
-//!   数据报和中转上的格式一样。
+//! * 服务器告诉每一端它看到的这一端自己的公网地址（[`signal::SessionGrant::observed`]、
+//!   [`signal::ServerMsg::Incoming`] 的 `observed`）；
+//! * 会话开始之后（被控端的用户同意了之后），两端在加密的控制通道上交换候选地址和各自直连证书的指纹
+//!   （[`session::DirectOffer`]）：中转看不到局域网地址，还没被放进来的控制端拿不到被控端的地址；
+//! * 两端用连中转的那个 UDP socket 打洞，控制端发起 QUIC 连接（ALPN [`DIRECT_ALPN`]）。TLS 双向认证只认对方在
+//!   控制通道上给的证书指纹（和 WebRTC 一样），握手完成时就知道对面是谁，中间人冒充不了任何一边；
+//! * 直连上每条通道也是一条单向流，开头同样是 [`SessionHeader`]；数据报的格式也和中转上一样。
 //!
-//! 两条路怎么分工：
-//!
-//! * **控制、大块通道两条路都发**：每一帧都写进中转（完整的一份），直连通着的话再从直连发一份。接收端按计数合并，
-//!   重复的丢掉：输入、确认、Ping 总是走更快的那条路，直连突然断了也不会丢；
-//! * **画面、声音只走一条路**：被控端每隔一会儿在两条路上各发一个探测数据报，控制端原样（重新加密）弹回来，
-//!   被控端据此量两条路的往返时延，选延迟低的那条（有一点滞后，免得来回切换）。直连可能比中转还慢
-//!   （例如两端的运营商之间绕路），这时就留在中转上。换路时接收端按计数排好再交出去；直连断了，被控端马上改回中转、
-//!   编一个关键帧，接收端不再等断在直连上的帧（关键帧不用等前面的帧）。
+//! 两条路怎么分工：**控制通道两条路都发**（每一帧都写进中转，直连通着的话再从直连发一份，接收端按计数合并：
+//! 输入、确认、Ping 总是走更快的那条，直连突然断了也不丢）；**画面、声音只走一条路**，被控端按两条路上探测到的往返时延
+//! 选（直连可能比中转还慢，这时就留在中转上）；大块通道只走中转。
 
 pub mod cbor;
 pub mod framing;
@@ -84,24 +69,22 @@ pub mod media;
 pub mod session;
 pub mod signal;
 
-/// 信令协议版本（客户端 ⇄ 服务器，包括 [`SessionHeader`] 和数据报的会话 ID）。
-///
-/// 只在没法兼容的改动时加 1（加功能用 [`features::signal`] 里的能力位）。服务器接受
-/// [`SIGNAL_MIN`]..=[`SIGNAL_VERSION`] 之间的客户端（见 [`signal`] 模块的"版本握手"）。
+use cbor::open_enum;
+
+/// 信令协议版本（客户端 ⇄ 服务器，包括 [`SessionHeader`] 和数据报的会话 ID）。只在没法兼容的改动时加 1
 pub const SIGNAL_VERSION: u16 = 9;
 /// 本端还能说的最老的信令版本
 pub const SIGNAL_MIN: u16 = 9;
 
 /// 会话协议版本（被控端 ⇄ 控制端，服务器不看）。两端在端到端握手里取双方都支持的最高版本
-/// （见 [`handshake`]）。只在没法兼容的改动时加 1（加功能用 [`features::session`] 里的能力位）。
 pub const SESSION_VERSION: u16 = 1;
 /// 本端还能说的最老的会话版本
 pub const SESSION_MIN: u16 = 1;
 
-/// QUIC ALPN 标识。与版本握手一样永远不变，否则旧客户端连 TLS 握手都过不了，无法得知版本不一致。
+/// QUIC ALPN 标识。和版本握手（见 [`signal`]）一样永远不变，否则不同版本连 TLS 握手都过不了，无法得知版本不一致
 pub const ALPN: &[u8] = b"airhand/1";
 
-/// 两端之间直连（见模块说明的"直连"）的 QUIC ALPN。直连只在会话里协商好之后才建，不用像 [`ALPN`] 那样永远不变
+/// 两端之间直连的 QUIC ALPN。直连只在会话里协商好之后才建，不用像 [`ALPN`] 那样永远不变
 pub const DIRECT_ALPN: &[u8] = b"airhand-direct/1";
 
 /// 控制码范围：6 位数字，首位不为 0，避免口头报码时产生歧义。
@@ -113,83 +96,86 @@ pub const PAIRING_DIGITS: usize = 6;
 
 /// 信令流单条消息上限。
 pub const MAX_SIGNAL_MSG: usize = 64 * 1024;
-/// 会话控制通道单条消息上限，含加密开销（[`handshake::SEAL_OVERHEAD`]）。长输入分批，大消息走 Bulk。
+/// 会话控制通道单条消息上限，含加密开销（[`handshake::SEAL_OVERHEAD`]）。长输入分批，大消息走大块通道
 pub const MAX_CONTROL_MSG: usize = 64 * 1024;
 /// 大块通道单条消息上限（1 MiB 的剪贴板文本、光标图像），含加密开销。
 pub const MAX_BULK_MSG: usize = 2 * 1024 * 1024;
 
-/// 会话流头部魔数（"AHS1" 是 v9 之前的格式：固定三条通道）。
-pub const SESSION_MAGIC: [u8; 4] = *b"AHS2";
+/// 会话头的魔数
+pub const SESSION_MAGIC: [u8; 4] = *b"AHS9";
 
-/// 一个会话最多这么多条通道（服务器的资源上限，与通道是什么无关）
+/// 一个会话每端最多这么多条通道（服务器的资源上限，与通道是什么无关）
 pub const MAX_LANES: u8 = 8;
 
-/// 连接角色。
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Role {
-    /// 被控端
-    Host,
-    /// 控制端
-    Controller,
+open_enum! {
+    /// 连接角色
+    pub enum Role {
+        /// 被控端
+        Host = 0 => "host",
+        /// 控制端
+        Controller = 1 => "controller",
+    }
 }
 
-/// 会话里已知的通道（见模块说明）。服务器不认识它们：线上只是一个编号（[`SessionHeader::lane`]），取值不能改。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 会话里已知的通道（见模块说明）。服务器不认识它们：线上只是一个编号（[`SessionHeader::lane`]），取值不能改
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SessionLane {
     Control = 0,
     Video = 1,
-    Audio = 2,
-    /// 大的消息（剪贴板、光标）：不挡控制通道上的输入、确认（见 [`session`] 的"走哪条通道"）
-    Bulk = 3,
+    /// 大的消息（剪贴板、光标图像）：不挡控制通道上的输入、确认（见 [`session`] 的"走哪条通道"）
+    Bulk = 2,
 }
 
 impl SessionLane {
-    pub const ALL: [Self; 4] = [Self::Control, Self::Video, Self::Audio, Self::Bulk];
+    pub const ALL: [Self; 3] = [Self::Control, Self::Video, Self::Bulk];
 
-    /// 一帧负载的资源上限（含加密开销，不含长度前缀），发送和接收共用。
+    pub const fn from_u8(lane: u8) -> Option<Self> {
+        match lane {
+            0 => Some(Self::Control),
+            1 => Some(Self::Video),
+            2 => Some(Self::Bulk),
+            _ => None,
+        }
+    }
+
+    /// 一帧负载的资源上限（含加密开销，不含长度前缀），发送和接收共用
     pub const fn max_frame_size(self) -> usize {
         match self {
             Self::Control => MAX_CONTROL_MSG,
             Self::Bulk => MAX_BULK_MSG,
             Self::Video => media::MAX_VIDEO_PACKET + handshake::SEAL_OVERHEAD,
-            Self::Audio => media::MAX_AUDIO_PACKET + handshake::SEAL_OVERHEAD,
         }
     }
 
-    /// 服务器往这条通道写数据时的优先级（越大越先发）：控制消息不能排在画面后面。
-    /// 大块和画面一样：一样的优先级 QUIC 轮流发，1 MiB 的剪贴板不会把画面完全挡住，光标也不会排在一串画面后面
+    /// 这条通道的流的优先级（越大越先发，服务器转发时也用它）：控制消息不能排在画面后面。
+    /// 大块和画面一样：QUIC 轮流发，1 MiB 的剪贴板不会把画面完全挡住，光标图像也不会排在一串画面后面
     pub const fn priority(self) -> u8 {
         match self {
-            SessionLane::Control => 10,
-            SessionLane::Audio => 5,
-            SessionLane::Video | SessionLane::Bulk => 0,
+            Self::Control => 10,
+            Self::Video | Self::Bulk => 0,
         }
     }
 }
 
-/// 会话流头部（固定 16 字节）：`magic[4] | session_id u64 LE | role u8 | lane u8 | priority u8 | 0`。
-/// 服务器不管会话有几条通道（最多 [`MAX_LANES`]），加通道不用升级服务器。
+/// 通道流的开头（固定 16 字节）：`magic[4] | session_id u64 LE | lane u8 | priority u8 | 0 | 0`。
 ///
-/// 服务器按 `(session_id, lane)` 把两端的流配对，往这一端写数据时用这里给的优先级。
-/// 通道 0（控制）结束时整个会话结束。
+/// 服务器按会话 ID 找到会话的另一端，向它开一条单向流、写同样的头，然后转发；往那一端写数据时用这里给的优先级。
+/// 直连上的通道流开头也是它（会话 ID 必须是这条直连的会话）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {
     pub session_id: u64,
-    pub role: Role,
     /// 通道编号，小于 [`MAX_LANES`]
     pub lane: u8,
-    /// 服务器往这一端写数据时的优先级（越大越先发）
     pub priority: u8,
 }
 
 impl SessionHeader {
     pub const LEN: usize = 16;
 
-    pub fn new(session_id: u64, role: Role, lane: SessionLane) -> Self {
+    pub fn new(session_id: u64, lane: SessionLane) -> Self {
         Self {
             session_id,
-            role,
             lane: lane as u8,
             priority: lane.priority(),
         }
@@ -199,34 +185,19 @@ impl SessionHeader {
         let mut b = [0u8; Self::LEN];
         b[..4].copy_from_slice(&SESSION_MAGIC);
         b[4..12].copy_from_slice(&self.session_id.to_le_bytes());
-        b[12] = match self.role {
-            Role::Host => 1,
-            Role::Controller => 2,
-        };
-        b[13] = self.lane;
-        b[14] = self.priority;
+        b[12] = self.lane;
+        b[13] = self.priority;
         b
     }
 
     pub fn decode(b: &[u8; Self::LEN]) -> Option<Self> {
-        if b[..4] != SESSION_MAGIC {
-            return None;
-        }
-        let session_id = u64::from_le_bytes(b[4..12].try_into().ok()?);
-        let role = match b[12] {
-            1 => Role::Host,
-            2 => Role::Controller,
-            _ => return None,
-        };
-        let lane = b[13];
-        if lane >= MAX_LANES {
+        if b[..4] != SESSION_MAGIC || b[12] >= MAX_LANES {
             return None;
         }
         Some(Self {
-            session_id,
-            role,
-            lane,
-            priority: b[14],
+            session_id: u64::from_le_bytes(b[4..12].try_into().ok()?),
+            lane: b[12],
+            priority: b[13],
         })
     }
 }
@@ -234,20 +205,19 @@ impl SessionHeader {
 /// QUIC 数据报：`会话 ID（u64 LE）| 种类 u8 | 密封单元`（没有长度前缀，一个数据报就是一个包）。
 ///
 /// 服务器只看开头的会话 ID：发送方是这个会话的一端，就原样转给另一端，否则丢掉。
-/// 后面是端到端加密的内容，和流上的一帧一样是 `密文 | 标签 | 计数`（见 [`handshake`] 的"之后的每一帧"），
-/// 种类决定用哪把密钥：
+/// 后面是端到端加密的内容（见 [`handshake`] 的"之后的每一帧"），种类决定用哪把密钥：
 ///
-/// * [`AUDIO`]：被控端的声音包（见 [`media`]），和声音流用同一把密钥、同一串计数；
+/// * [`AUDIO`]：被控端的声音包（见 [`media`]）；
 /// * [`PROBE`]：量两条路（中转、直连）的往返时延的探测包（见模块说明的"直连"），两个方向各一把密钥。
 ///
 /// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。
 pub mod datagram {
     /// 开头的会话 ID 和种类
     pub const HEADER: usize = 9;
-    /// 声音包（编号和声音通道一样）
-    pub const AUDIO: u8 = crate::SessionLane::Audio as u8;
+    /// 声音包
+    pub const AUDIO: u8 = 0;
     /// 探测包
-    pub const PROBE: u8 = 16;
+    pub const PROBE: u8 = 1;
     /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
     /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
     pub const MAX: usize = 1000;
@@ -268,11 +238,10 @@ pub mod datagram {
 /// 信令层（客户端 ⇄ 服务器，在版本握手里交换）和会话层（被控端 ⇄ 控制端，在端到端握手里交换）各有一套编号
 /// （[`features::signal`]、[`features::session`]），用同一个类型。规则：
 ///
-/// * 实际能用的 = 自己的 ∩ 对方的（[`Features::common`]）：只用双方都支持的；
-/// * 不认识的位原样保留、不用管；
-/// * 位永远不复用。某个功能在一次版本升级之后成了必备的，它的位就标成"保留"，不再分给别的功能；
-/// * 只放**协议**的能力（懂不懂某条消息、某种格式）。设备的能力（有没有触摸屏、有哪些编码器）会变，
-///   是会话消息里的数据（例如 [`session::HostHello`]），不是能力位。
+/// * 实际能用的 = 自己的 ∩ 对方的（[`Features::common`]）；
+/// * 不认识的位原样保留、不用管；位永远不复用；
+/// * 只放**协议**的能力（懂不懂某条消息、某种格式）。设备的能力（有没有触摸屏、有哪些编码器）是会话消息里的数据
+///   （例如 [`session::HostHello`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Features(u64);
 
@@ -319,28 +288,22 @@ impl<'b, C> minicbor::Decode<'b, C> for Features {
     }
 }
 
-/// 能力位的编号（见 [`Features`]）。v9 已有的功能都是必备的，不占位；以后的可选功能从这里开始分配。
+/// 能力位的编号（见 [`Features`]）。v9 的功能都是必备的，不占位；以后的可选功能从 0 号位开始分配
 pub mod features {
     /// 信令层：客户端 ⇄ 服务器
     pub mod signal {
         use crate::Features;
 
-        /// 服务器在会话开始时告诉客户端它看到的这个客户端的公网地址（直连打洞用，见 crate 说明的"直连"）
-        pub const OBSERVED_ADDR: Features = Features::from_bits(1 << 0);
-
         /// 本端支持的
-        pub const SUPPORTED: Features = OBSERVED_ADDR;
+        pub const SUPPORTED: Features = Features::NONE;
     }
 
     /// 会话层：被控端 ⇄ 控制端
     pub mod session {
         use crate::Features;
 
-        /// 两端交换候选地址、打洞，在中转之外再走一条直连（见 crate 说明的"直连"）
-        pub const DIRECT: Features = Features::from_bits(1 << 0);
-
         /// 本端支持的
-        pub const SUPPORTED: Features = DIRECT;
+        pub const SUPPORTED: Features = Features::NONE;
     }
 }
 
@@ -381,23 +344,27 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = SessionHeader::new(0xdead_beef_1234, Role::Controller, SessionLane::Video);
+        let h = SessionHeader::new(0xdead_beef_1234, SessionLane::Video);
         assert_eq!(h.priority, 0);
         assert_eq!(SessionHeader::decode(&h.encode()), Some(h));
         let mut bad = h.encode();
         bad[0] = b'X';
         assert_eq!(SessionHeader::decode(&bad), None);
-        // 服务器不认识的通道照样配对（以后加的通道），只要不超过上限
+        // 服务器不认识的通道照样转发（以后加的通道），只要不超过上限
         let mut other = h.encode();
-        other[13] = 5;
+        other[12] = 5;
         assert_eq!(SessionHeader::decode(&other).map(|h| h.lane), Some(5));
-        other[13] = MAX_LANES;
+        other[12] = MAX_LANES;
         assert_eq!(SessionHeader::decode(&other), None);
-        let c = SessionHeader::new(1, Role::Host, SessionLane::Control);
-        assert_eq!(c.encode()[12..], [1, 0, 10, 0]);
-        let b = SessionHeader::new(1, Role::Controller, SessionLane::Bulk);
-        assert_eq!(b.encode()[12..], [2, 3, 0, 0]);
-        assert!(SessionLane::ALL.iter().all(|l| (*l as u8) < MAX_LANES));
+        let c = SessionHeader::new(1, SessionLane::Control);
+        assert_eq!(c.encode()[12..], [0, 10, 0, 0]);
+        let b = SessionHeader::new(1, SessionLane::Bulk);
+        assert_eq!(b.encode()[12..], [2, 0, 0, 0]);
+        for lane in SessionLane::ALL {
+            assert!((lane as u8) < MAX_LANES);
+            assert_eq!(SessionLane::from_u8(lane as u8), Some(lane));
+        }
+        assert_eq!(SessionLane::from_u8(7), None);
     }
 
     #[test]
@@ -407,7 +374,6 @@ mod tests {
         assert_eq!(datagram::kind(&d), Some(datagram::PROBE));
         assert_eq!(datagram::session(&d[..7]), None);
         assert_eq!(datagram::kind(&d[..8]), None);
-        assert_eq!(datagram::AUDIO, 2);
     }
 
     #[test]
