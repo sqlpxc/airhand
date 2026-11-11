@@ -19,6 +19,7 @@ import app.airhand.android.core.Quality
 import app.airhand.android.core.ServerState
 import app.airhand.android.core.Stats
 import app.airhand.android.core.SystemAction
+import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.optStringOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -102,7 +103,12 @@ class RemoteSession(
 
     /** 本机播放声音出错 */
     val audioError = MutableStateFlow<String?>(null)
-    val quality = MutableStateFlow(Preset.of(app.settings.value.preset).quality(VideoDecoder.decodable.firstOrNull { it in Codec.PRIORITY } ?: Codec.H264))
+    val quality = MutableStateFlow(
+        Preset.of(app.settings.value.preset).quality(
+            VideoDecoder.decodable.firstOrNull { it in Codec.PRIORITY } ?: Codec.H264,
+            VideoPriority.fromWire(app.settings.value.priority),
+        ),
+    )
 
     private val _clipboard = MutableSharedFlow<String>(extraBufferCapacity = 4)
 
@@ -560,6 +566,12 @@ class RemoteSession(
         val host = hello.value?.codecs ?: return
         val next = pickCodec(host)
         if (quality.value.codec != next) setQuality(quality.value.copy(codec = next))
+    }
+
+    /** 对方缩小画面时优先低延迟还是文字清晰：记进设置，以后的会话也用它 */
+    fun setPriority(p: VideoPriority) {
+        app.updateSettings { it.copy(priority = p.wire) }
+        if (quality.value.priority != p) setQuality(quality.value.copy(priority = p))
     }
 
     fun selectDisplay(index: Int) {

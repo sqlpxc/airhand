@@ -68,7 +68,7 @@ cargo run --release --example headless_host
 cargo run --release --example encode_bench
 ```
 
-测画面流畅度或音画同步时请用 release 构建：调试构建缩放很慢（4K → 1080p 每帧约 0.5 秒）。
+测画面流畅度或音画同步时请用 release 构建：调试构建的 CPU 缩放很慢（“文字清晰”或者显卡不支持时用，4K → 1080p 每帧约 0.5 秒）。比较 GPU 零拷贝和 CPU 两条路的耗时：`cargo run --release --example encode_bench`。
 
 ## 调试 Windows 服务
 

@@ -1,7 +1,8 @@
 //! macOS VideoToolbox 硬件编码（Apple 芯片的媒体引擎 / Intel 核显），支持 H.264 和 HEVC。
 //!
 //! * 实时模式、低延迟码率控制（H.264）、无 B 帧、超长 GOP（只在需要时插入关键帧）；
-//! * BGRA 直接转换进编码器自己缓冲池里的 NV12 缓冲（IOSurface），没有多余拷贝；
+//! * 画面的两种来路：ScreenCaptureKit 已经缩放好的 NV12（GPU 零拷贝，`CVPixelBuffer` 原样交给编码器，见
+//!   `capture/sck.rs`）；内存里的 BGRA 直接转换进编码器自己缓冲池里的 NV12 缓冲（IOSurface），没有多余拷贝；
 //! * 编码器是异步的：提交一帧后等它完成（`CompleteFrames`），变成"一进一出"的同步调用；
 //! * 输出是 AVCC / HVCC（长度前缀），转换成控制端使用的 Annex-B，关键帧前面带上参数集。
 
@@ -43,6 +44,7 @@ use objc2_video_toolbox::{
 use yuvutils_rs::{YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix};
 
 use super::{EncodedFrame, VideoEncoder, annexb_nal_types};
+use crate::host::capture::GpuFrame;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -134,10 +136,20 @@ pub struct VtEncoder {
     last_pts: i64,
     /// 紧密排列的 UV 平面（见 [`Self::pixel_buffer`]）
     uv_scratch: Vec<u8>,
+    /// 直接编码系统缩放好的画面（GPU 零拷贝）：画面的尺寸就是编码尺寸
+    gpu: bool,
 }
 
 impl VtEncoder {
-    pub fn new(codec: Codec, w: u32, h: u32, fps: u8, kbps: u32) -> Result<Self> {
+    /// `gpu`：采集给的是系统缩放好的画面（[`GpuFrame`]），尺寸和编码尺寸一样时直接编码它们
+    pub fn new(
+        codec: Codec,
+        w: u32,
+        h: u32,
+        fps: u8,
+        kbps: u32,
+        gpu: Option<&GpuFrame>,
+    ) -> Result<Self> {
         if codec == Codec::AV1 {
             bail!("VideoToolbox can't encode AV1");
         }
@@ -214,6 +226,7 @@ impl VtEncoder {
             epoch: Instant::now(),
             last_pts: -1,
             uv_scratch: Vec::new(),
+            gpu: gpu.is_some_and(|g| g.size() == (w, h)),
         };
         let yes: &CFType = CFBoolean::new(true);
         let no: &CFType = CFBoolean::new(false);
@@ -380,6 +393,25 @@ impl VideoEncoder for VtEncoder {
 
     fn encode(&mut self, bgra: &[u8], force_key: bool) -> Result<Option<EncodedFrame>> {
         let pb = self.pixel_buffer(bgra)?;
+        self.submit(&pb, force_key)
+    }
+
+    fn takes_gpu(&self) -> bool {
+        self.gpu
+    }
+
+    fn encode_gpu(&mut self, frame: &GpuFrame, force_key: bool) -> Result<Option<EncodedFrame>> {
+        let (w, h) = (self.info.width, self.info.height);
+        if frame.size() != (w, h) {
+            bail!("the frame is {:?}, the encoder {w}x{h}", frame.size());
+        }
+        self.submit(frame.pixel_buffer(), force_key)
+    }
+}
+
+impl VtEncoder {
+    /// 交给编码器一帧，等它编完
+    fn submit(&mut self, pb: &CVPixelBuffer, force_key: bool) -> Result<Option<EncodedFrame>> {
         // 时间戳用真实时间：码率控制据此分配每帧的比特数（画面静止一段时间后的那一帧可以多用一些）
         let pts = (self.epoch.elapsed().as_micros() as i64).max(self.last_pts + 1);
         self.last_pts = pts;
@@ -393,7 +425,7 @@ impl VideoEncoder for VtEncoder {
         *self.out.0.lock().unwrap() = None;
         let status = unsafe {
             self.session.encode_frame(
-                &pb,
+                pb,
                 CMTime::new(pts, 1_000_000),
                 kCMTimeInvalid,
                 props.as_deref(),
@@ -534,7 +566,7 @@ mod tests {
         }
         // 纯红色：BT.709 有限范围 Y=63、U=102、V=240
         for (w, h) in [(1590u32, 994u32), (1662, 1080), (1728, 1080), (722, 406)] {
-            let mut enc = VtEncoder::new(Codec::H264, w, h, 30, 4000).unwrap();
+            let mut enc = VtEncoder::new(Codec::H264, w, h, 30, 4000, None).unwrap();
             let red = [0u8, 0, 255, 255].repeat((w * h) as usize);
             let pb = enc.pixel_buffer(&red).unwrap();
             let ro = CVPixelBufferLockFlags::ReadOnly;
@@ -592,7 +624,7 @@ mod tests {
                 continue;
             }
             let (w, h) = (1280u32, 720u32);
-            let mut enc = VtEncoder::new(codec, w, h, 30, 4000).unwrap();
+            let mut enc = VtEncoder::new(codec, w, h, 30, 4000, None).unwrap();
             let mut frame = vec![0u8; (w * h * 4) as usize];
             let hevc = codec == Codec::H265;
             let mut kinds = Vec::new();

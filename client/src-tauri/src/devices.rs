@@ -7,7 +7,7 @@
 //! alias = "设计部"
 //! os = "Windows 11 Pro"
 //! last_used = 2026-11-08T10:20:30Z
-//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264" }
+//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264", priority = "clarity" }
 //! resume = "q83vEjRWeJCrze8SNFZ4kA=="
 //! host_key = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 //! ```
@@ -22,7 +22,7 @@
 //!
 //! 手动添加时 `code` 写 6 位数字在所有平台上都可以。
 
-use airhand_proto::session::{Codec, QualitySettings};
+use airhand_proto::session::{Codec, QualitySettings, VideoPriority};
 use airhand_proto::signal::ResumeToken;
 use anyhow::Result;
 use base64::Engine;
@@ -169,6 +169,12 @@ fn quality_from(item: &Item) -> Option<QualitySettings> {
         max_short: u16::try_from(int("max_short")?).ok()?,
         adaptive: t.get("adaptive").and_then(Item::as_bool)?,
         codec,
+        // 之前的版本没有这一项；低延迟（默认）也不写
+        priority: t
+            .get("priority")
+            .and_then(Item::as_str)
+            .and_then(VideoPriority::from_name)
+            .unwrap_or_default(),
     })
 }
 
@@ -238,6 +244,11 @@ pub fn to_table(d: &Device) -> Option<Table> {
         it.insert("max_short", i64::from(q.max_short).into());
         it.insert("adaptive", q.adaptive.into());
         it.insert("codec", q.codec.or_h264().name().unwrap_or("h264").into());
+        if let Some(p) = q.priority.or_latency().name()
+            && q.priority != VideoPriority::Latency
+        {
+            it.insert("priority", p.into());
+        }
         t["quality"] = toml_edit::value(it);
     }
     if let Some(r) = &d.resume {
@@ -331,6 +342,7 @@ mod tests {
                 max_short: 1080,
                 adaptive: true,
                 codec: Codec::H265,
+                priority: VideoPriority::Clarity,
             }),
             host_key: Some("ab".repeat(32)),
         }
@@ -366,9 +378,19 @@ mod tests {
             quality: None,
             last_used: 0,
             host_key: None,
-            ..d
+            ..d.clone()
         };
         assert_eq!(from_table(&to_table(&bare).unwrap()), Some(bare));
+        // 低延迟优先（默认）不写进文件
+        let mut q = d.quality.unwrap();
+        q.priority = VideoPriority::Latency;
+        let latency = Device {
+            quality: Some(q),
+            ..d
+        };
+        let t = to_table(&latency).unwrap();
+        assert!(!t.to_string().contains("priority"));
+        assert_eq!(from_table(&t), Some(latency));
     }
 
     #[test]
@@ -399,8 +421,11 @@ name = "no code"
         assert!(list[1].last_used > 0);
         // 帧率超出范围：画质整个不要，用控制台的默认
         assert_eq!(list[1].quality, None);
-        // 之前的版本写的编码格式是 "H265" 这样的：照样认
-        assert_eq!(list[2].quality.map(|q| q.codec), Some(Codec::H265));
+        // 之前的版本写的编码格式是 "H265" 这样的：照样认；没有优先项：低延迟
+        assert_eq!(
+            list[2].quality.map(|q| (q.codec, q.priority)),
+            Some((Codec::H265, VideoPriority::Latency))
+        );
         assert!(list.into_iter().all(|d| open(d).is_some()));
     }
 

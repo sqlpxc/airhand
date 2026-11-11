@@ -178,6 +178,11 @@
     <string name="preset_native_desc">原始分辨率 · 60 fps · 30 Mbps</string>
     <string name="codec">编码格式</string>
     <string name="encoder_info">正在使用 %1$s %2$d×%3$d（%4$s，%5$s）</string>
+    <string name="scaling_priority">缩放优先</string>
+    <string name="priority_latency">低延迟</string>
+    <string name="priority_latency_desc">在对方电脑的显卡上缩放：延迟和对方的 CPU 占用更低</string>
+    <string name="priority_clarity">文字清晰</string>
+    <string name="priority_clarity_desc">在对方电脑的 CPU 上用更锐利的算法缩放：高分屏缩小时文字更清楚，延迟和 CPU 占用更高。不缩放时与低延迟相同</string>
 
     <!-- 远程画面 -->
     <string name="session_connecting">正在连接 %1$s…</string>

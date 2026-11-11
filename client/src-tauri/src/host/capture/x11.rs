@@ -210,6 +210,7 @@ impl X11Capturer {
         let mut frame = pool.checkout(w, h);
         let f = Arc::get_mut(&mut frame).expect("unique frame");
         f.captured = captured;
+        let data = f.pixels_mut();
         match &self.shm {
             Some(s) => {
                 self.x
@@ -228,7 +229,7 @@ impl X11Capturer {
                     .reply()
                     .context("ShmGetImage")?;
                 let src = unsafe { std::slice::from_raw_parts(s.ptr, len) };
-                f.data.copy_from_slice(src);
+                data.copy_from_slice(src);
             }
             None => {
                 let r = self
@@ -240,12 +241,12 @@ impl X11Capturer {
                 if r.data.len() < len {
                     bail!("GetImage returned incomplete data");
                 }
-                f.data.copy_from_slice(&r.data[..len]);
+                data.copy_from_slice(&r.data[..len]);
             }
         }
         if self.damage.is_none() {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            f.data.hash(&mut hasher);
+            data.hash(&mut hasher);
             let h = hasher.finish();
             if h == self.last_hash && !self.first {
                 return Ok(None);
@@ -469,18 +470,20 @@ mod tests {
                 .unwrap()
                 .frame
             {
+                let d = f.pixels().unwrap();
                 let px = |x: usize, y: usize| {
                     let i = (y * f.width as usize + x) * 4;
-                    [f.data[i], f.data[i + 1], f.data[i + 2]]
+                    [d[i], d[i + 1], d[i + 2]]
                 };
                 if px(40 + 32, 30 + 24) == [0x56, 0x34, 0x12] {
                     break f;
                 }
             }
         };
+        let d = frame.pixels().unwrap();
         let px = |x: usize, y: usize| {
             let i = (y * frame.width as usize + x) * 4;
-            [frame.data[i], frame.data[i + 1], frame.data[i + 2]]
+            [d[i], d[i + 1], d[i + 2]]
         };
         // 内存中是 BGRA 排列
         assert_eq!(px(40 + 32, 30 + 24), [0x56, 0x34, 0x12]);

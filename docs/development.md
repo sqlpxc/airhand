@@ -68,7 +68,7 @@ cargo run --release --example headless_host
 cargo run --release --example encode_bench
 ```
 
-Use release builds when judging smoothness or A/V sync: debug builds scale very slowly (4K → 1080p takes about 0.5 s per frame).
+Use release builds when judging smoothness or A/V sync: CPU scaling is very slow in debug builds (used for "Sharp text" or when the GPU can't scale; 4K → 1080p takes about 0.5 s per frame). To compare the GPU zero-copy and CPU paths: `cargo run --release --example encode_bench`.
 
 ## Debugging the Windows service
 

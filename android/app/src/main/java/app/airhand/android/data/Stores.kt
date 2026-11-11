@@ -76,6 +76,8 @@ data class Settings(
     val avSync: Boolean = false,
     /** 视频编码格式：空字符串表示自动（双方都支持的压缩率最高的格式），否则是 `Codec.wire` */
     val codec: String = "",
+    /** 对方缩小画面时优先低延迟还是文字清晰（`VideoPriority.wire`）；会话里改了也记在这里，以后的连接也用 */
+    val priority: String = "latency",
     /** 电视上画面的缩放方式 */
     val tvScale: ScaleMode = ScaleMode.FIT,
     /** 控制手机时显示返回 / 主页 / 最近任务按钮 */
@@ -108,6 +110,7 @@ data class Settings(
         .put("audio", audio)
         .put("avSync", avSync)
         .put("codec", codec)
+        .put("priority", priority)
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
         .put("requireApproval", requireApproval)
@@ -129,6 +132,7 @@ data class Settings(
                 audio = o.optBoolean("audio", d.audio),
                 avSync = o.optBoolean("avSync", d.avSync),
                 codec = o.optString("codec", d.codec),
+                priority = o.optString("priority", d.priority),
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),
                 requireApproval = o.optBoolean("requireApproval", d.requireApproval),

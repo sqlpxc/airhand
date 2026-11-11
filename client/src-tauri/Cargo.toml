@@ -117,7 +117,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 ] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
   "std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDirectDisplay", "CGDisplayConfiguration",
-  "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGImage", "CGRemoteOperation",
+  "CGDisplayStream", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGImage", "CGRemoteOperation",
   "libc",
 ] }
 objc2-core-media = { version = "0.3", default-features = false, features = [

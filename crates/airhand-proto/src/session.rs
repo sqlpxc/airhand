@@ -377,6 +377,35 @@ impl Codec {
     }
 }
 
+open_enum! {
+    /// 被控端缩放画面时优先什么（[`QualitySettings::priority`]）。只在需要缩放时有区别：
+    /// 不缩放时两种都在 GPU 上转换颜色（画质一样）
+    #[derive(Default)]
+    pub enum VideoPriority {
+        /// 延迟低、被控端 CPU 占用低：显卡能缩放就在显卡上缩放、转换颜色，画面不离开显卡，直接交给硬件编码器。
+        /// 显卡的缩放滤镜由驱动决定，缩小很多时（4K、Retina 屏缩到 1080p）文字不一定有 CPU 缩放清楚
+        #[default]
+        Latency = 0 => "latency",
+        /// 文字清楚：画面读回内存，在 CPU 上用 Catmull-Rom 卷积缩放（4K 缩到 1080p 每帧多十几毫秒，CPU 占用也高）
+        Clarity = 1 => "clarity",
+    }
+}
+
+impl VideoPriority {
+    fn is_latency(&self) -> bool {
+        *self == VideoPriority::Latency
+    }
+
+    /// 不认识的值（对方版本新增的）按低延迟处理
+    pub fn or_latency(self) -> Self {
+        if self.is_known() {
+            self
+        } else {
+            VideoPriority::Latency
+        }
+    }
+}
+
 /// 控制端 → 被控端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ControllerMsg {
@@ -514,6 +543,11 @@ pub struct QualitySettings {
     /// 期望的编码格式（被控端不支持时自动回退到 H.264；不认识的格式也是 H.264，见 [`QualitySettings::sanitized`]）
     #[n(4)]
     pub codec: Codec,
+    /// 缩放画面时优先低延迟还是清楚。低延迟（默认）不写进线上的数组，和之前的版本发的字节一样；
+    /// 之前的版本不发这一项，也就是低延迟
+    #[cbor(n(5), skip_if = "VideoPriority::is_latency")]
+    #[serde(default)]
+    pub priority: VideoPriority,
 }
 
 impl Default for QualitySettings {
@@ -524,16 +558,18 @@ impl Default for QualitySettings {
             max_short: 1080,
             adaptive: true,
             codec: Codec::H264,
+            priority: VideoPriority::Latency,
         }
     }
 }
 
 impl QualitySettings {
-    /// 范围校验；不认识的编码格式（对方版本新增的）换成 H.264
+    /// 范围校验；不认识的编码格式（对方版本新增的）换成 H.264，不认识的优先项按低延迟
     pub fn sanitized(mut self) -> Self {
         self.fps = self.fps.clamp(1, 120);
         self.bitrate_kbps = self.bitrate_kbps.clamp(100, 100_000);
         self.codec = self.codec.or_h264();
+        self.priority = self.priority.or_latency();
         self
     }
 }
@@ -746,6 +782,37 @@ mod tests {
         assert_eq!(q.sanitized().codec, Codec::H264);
         let q: QualitySettings = minicbor::decode(&wire(2)).unwrap();
         assert_eq!(q.codec, Codec::AV1);
+        // 之前的版本没有优先项：低延迟
+        assert_eq!(q.priority, VideoPriority::Latency);
+
+        // 新版本带了优先项（还有再新的版本加的字段）：认识的照用，不认识的优先项按低延迟
+        let newer = |priority: u8| {
+            let mut e = minicbor::Encoder::new(Vec::new());
+            e.array(7).unwrap();
+            e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
+            e.bool(true).unwrap().u8(1).unwrap().u8(priority).unwrap();
+            e.str("later").unwrap();
+            e.into_writer()
+        };
+        let q: QualitySettings = minicbor::decode(&newer(1)).unwrap();
+        assert_eq!((q.codec, q.priority), (Codec::H265, VideoPriority::Clarity));
+        let q: QualitySettings = minicbor::decode(&newer(5)).unwrap();
+        assert_eq!(q.priority, VideoPriority::Unknown(5));
+        assert_eq!(q.sanitized().priority, VideoPriority::Latency);
+        // 之前的版本解得出新版本发的（多出来的字段跳过）
+        #[derive(minicbor::Decode)]
+        struct Before {
+            #[n(0)]
+            fps: u8,
+            #[n(4)]
+            codec: Codec,
+        }
+        let q = QualitySettings {
+            priority: VideoPriority::Clarity,
+            ..Default::default()
+        };
+        let old: Before = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
+        assert_eq!((old.fps, old.codec), (q.fps, q.codec));
 
         // Bye(77)：[9, [77]]
         let mut e = minicbor::Encoder::new(Vec::new());
@@ -794,11 +861,18 @@ mod tests {
             max_short: 1080,
             adaptive: true,
             codec: Codec::AV1,
+            priority: VideoPriority::Clarity,
         };
         assert_eq!(
             serde_json::to_value(q).unwrap(),
-            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" })
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity" })
         );
+        // 之前的界面不带优先项：低延迟
+        let old: QualitySettings = serde_json::from_value(
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }),
+        )
+        .unwrap();
+        assert_eq!(old.priority, VideoPriority::Latency);
         let events = vec![
             InputEvent::MouseMove { x: 0.5, y: 0.25 },
             InputEvent::MouseButton {

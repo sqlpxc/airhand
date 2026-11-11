@@ -18,6 +18,12 @@ import type { Lang } from "./i18n";
 
 export type Codec = "h264" | "h265" | "av1";
 
+/**
+ * 被控端缩放画面时优先什么（airhand_proto::session::VideoPriority）：
+ * latency：在显卡上缩放，画面不经过 CPU；clarity：在 CPU 上用更锐利的算法缩放。不需要缩放时一样
+ */
+export type VideoPriority = "latency" | "clarity";
+
 /** 与 airhand_proto::session::QualitySettings 对应 */
 export interface QualitySettings {
   fps: number;
@@ -26,6 +32,8 @@ export interface QualitySettings {
   maxShort: number;
   adaptive: boolean;
   codec: Codec;
+  /** 不带（之前保存的画质、Android）就是 latency */
+  priority?: VideoPriority;
 }
 
 export interface DisplayInfo {

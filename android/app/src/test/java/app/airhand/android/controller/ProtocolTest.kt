@@ -3,6 +3,7 @@ package app.airhand.android.controller
 import app.airhand.android.core.Codec
 import app.airhand.android.core.Quality
 import app.airhand.android.core.SystemAction
+import app.airhand.android.core.VideoPriority
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -104,6 +105,13 @@ class ProtocolTest {
         val events = JSONArray().put(Input.delta(1, 2)).put(Input.releaseAll())
         assertSame(want["input"], Commands.input(3, events))
         assertSame(want["settings"], Commands.settings(3, Quality(60, 8000, 1080, true, Codec.H265)))
+        // 清楚优先才写 priority（低延迟是默认，和 Rust 一样不写，样例里就没有）
+        val sharp = Commands.settings(3, Quality(60, 8000, 1080, true, Codec.H265, VideoPriority.CLARITY))
+        assertEquals("clarity", sharp.getJSONObject("settings").getString("priority"))
+        assertSame(want["settings"], JSONObject(sharp.toString()).apply { getJSONObject("settings").remove("priority") })
+        assertEquals(VideoPriority.LATENCY, VideoPriority.fromWire(null))
+        assertEquals(VideoPriority.LATENCY, VideoPriority.fromWire("later"))
+        assertEquals(VideoPriority.CLARITY, VideoPriority.fromWire("clarity"))
         assertSame(want["keyframe"], Commands.keyframe(3))
         assertSame(want["display"], Commands.display(3, 1))
         assertSame(want["audio"], Commands.audio(3, true))

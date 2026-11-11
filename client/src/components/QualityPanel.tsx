@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Codec, QualitySettings } from "../lib/api";
+import type { Codec, QualitySettings, VideoPriority } from "../lib/api";
 import { useT } from "../lib/i18n";
 import { CODEC_PRIORITY, codecUsable } from "../lib/codec";
 import { CODEC_LABEL, PRESETS, codecHint, matchPreset, presetDesc, presetName, presetSettings } from "../lib/presets";
@@ -16,6 +16,9 @@ const RES: { v: number; label?: string }[] = [
   { v: 2160, label: "4K" },
   { v: 0 },
 ];
+
+/** 缩放画面时优先什么：低延迟（显卡缩放，默认）/ 清楚（CPU 缩放） */
+const PRIORITIES: VideoPriority[] = ["latency", "clarity"];
 
 // 码率滑块使用对数刻度：0.5 ~ 50 Mbps
 const MIN_KBPS = 500;
@@ -36,6 +39,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const timer = useRef<number | undefined>(undefined);
   const cur = s.settings;
   const preset = matchPreset(cur);
+  const priority = cur.priority ?? "latency";
 
   useEffect(() => setDraftKbps(cur.bitrateKbps), [cur.bitrateKbps]);
 
@@ -56,7 +60,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
               key={p.id}
               className={preset === p.id ? "active" : ""}
               title={presetDesc(p.id)}
-              onClick={() => s.updateSettings(presetSettings(p.id, cur.codec))}
+              onClick={() => s.updateSettings({ ...presetSettings(p.id, cur.codec), priority: cur.priority })}
             >
               {presetName(p.id)}
             </button>
@@ -76,6 +80,23 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
             </button>
           ))}
         </div>
+      </div>
+
+      <div className="field">
+        <label>{t("quality.priority")}</label>
+        <div className="segmented">
+          {PRIORITIES.map((p) => (
+            <button
+              key={p}
+              className={priority === p ? "active" : ""}
+              title={t(`quality.priority.${p}.hint`)}
+              onClick={() => apply({ priority: p })}
+            >
+              {t(`quality.priority.${p}`)}
+            </button>
+          ))}
+        </div>
+        <div className="muted small">{t(`quality.priority.${priority}.hint`)}</div>
       </div>
 
       <div className="field">

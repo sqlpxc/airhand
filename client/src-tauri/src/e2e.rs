@@ -16,7 +16,7 @@ use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerDatagram, ControllerMsg, HostMsg, InputEvent, Notice,
-    QualitySettings,
+    QualitySettings, VideoPriority,
 };
 use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg, connect_outcome};
 use airhand_proto::{MAX_SIGNAL_MSG, Role};
@@ -266,13 +266,15 @@ async fn e2e_roundtrip() {
             clip_written = true;
             crate::clipboard::set_text(&from_host).unwrap();
         }
-        // 3 秒后切换到 AV1/HEVC（若被控端支持），验证运行时切换编码器
+        // 3 秒后切换到 AV1/HEVC（若被控端支持）、清楚优先（要缩放时改在 CPU 上缩放，macOS 换一路采集），
+        // 验证运行时切换编码器和画面来路
         if !switched && started.elapsed() > Duration::from_secs(3) {
             switched = true;
             let s = QualitySettings {
                 codec: Codec::AV1,
                 fps: 60,
                 bitrate_kbps: 8000,
+                priority: VideoPriority::Clarity,
                 ..settings
             };
             ctl.send(&ControllerMsg::Settings(s)).await;

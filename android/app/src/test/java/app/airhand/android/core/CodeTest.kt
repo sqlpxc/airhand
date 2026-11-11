@@ -33,6 +33,11 @@ class CodeTest {
     fun presets() {
         assertEquals(Preset.BALANCED, Preset.of("nope"))
         assertEquals(Preset.HD, Preset.match(Preset.HD.quality(Codec.AV1)))
+        // 换预设时保留缩放优先；它不影响认是哪个预设
+        val sharp = Preset.HD.quality(Codec.AV1, VideoPriority.CLARITY)
+        assertEquals(VideoPriority.CLARITY, sharp.priority)
+        assertEquals(Preset.HD, Preset.match(sharp))
+        assertEquals(VideoPriority.LATENCY, Preset.HD.quality(Codec.AV1).priority)
         assertEquals(1080, Preset.SMOOTH.maxShort)
     }
 

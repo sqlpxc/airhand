@@ -1,13 +1,16 @@
 //! Windows DXGI Desktop Duplication 采集。
 //!
-//! * 画面由 GPU 合成后直接复制到 staging 纹理，只在桌面有变化时才产生新帧；
+//! * 只在桌面有变化时才产生新帧；
+//! * 显卡支持视频处理器时（几乎都支持），画面复制进自己的纹理，留在显卡上（[`GpuFrame`]）：硬件编码器在同一个
+//!   设备上缩放、转换颜色、编码（见 `encoder/mf.rs`），需要像素时才读回内存（[`GpuFrame::read_pixels`]）。
+//!   不支持时每帧复制到 staging 纹理、读回内存；
 //! * 优先使用 `DuplicateOutput1`（支持 HDR 桌面自动转换为 BGRA8）；
 //! * 打开前先切到当前的输入桌面（见 [`crate::host::desktop`]）：UAC 确认框、锁屏出现时桌面复制会中断
 //!   （`DXGI_ERROR_ACCESS_LOST`），重新打开时就跟着切过去了；
 //! * 旋转了的显示器（竖屏）：桌面复制给出的是没有旋转的画面，复制时转成用户看到的方向（见 [`Rotation`]），
 //!   画面的宽高、方向与 [`DisplayInfo`]（桌面坐标）一致，控制端的鼠标坐标才能对上。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_proto::session::{CursorShape, DisplayInfo};
@@ -18,9 +21,11 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    ID3D11Multithread, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
@@ -29,13 +34,274 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
-    IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter, IDXGIAdapter1,
+    IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
 use windows::core::Interface;
 
-use super::{CaptureUpdate, Capturer, FramePool};
+use super::{CaptureUpdate, Capturer, Frame, FramePool};
+
+// ───────────────────────────── GPU 上的画面 ─────────────────────────────
+
+/// 一次打开桌面复制所用的 D3D11 设备。GPU 上的画面属于它，编码器在同一个设备上处理这些画面。
+///
+/// 采集线程、各个会话的编码线程（视频处理器、读回）和硬件编码器都用这个设备的立即上下文，所以打开了多线程保护。
+pub struct D3dSource {
+    /// 见 [`super::next_source`]
+    id: u64,
+    device: ID3D11Device,
+    ctx: ID3D11DeviceContext,
+    /// 显卡的 LUID（硬件编码器要在同一块显卡上）
+    luid: u64,
+    /// 读回用的 staging 纹理
+    staging: Mutex<Option<(ID3D11Texture2D, u32, u32)>>,
+}
+
+// D3D11 设备本身是线程安全的；立即上下文打开了多线程保护（见 `D3dSource::new`）
+unsafe impl Send for D3dSource {}
+unsafe impl Sync for D3dSource {}
+
+impl D3dSource {
+    /// 设备要带 `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` 创建（视频处理器要用）
+    pub(crate) fn new(device: ID3D11Device, ctx: ID3D11DeviceContext) -> Result<Self> {
+        unsafe {
+            device
+                .cast::<ID3D11VideoDevice>()
+                .context("the device has no video support")?;
+            let mt: ID3D11Multithread = ctx.cast().context("ID3D11Multithread")?;
+            let _ = mt.SetMultithreadProtected(true);
+            let adapter = device.cast::<IDXGIDevice>()?.GetAdapter()?;
+            Ok(Self {
+                id: super::next_source(),
+                luid: adapter_luid(&adapter)?,
+                device,
+                ctx,
+                staging: Mutex::new(None),
+            })
+        }
+    }
+
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.ctx
+    }
+
+    pub fn luid(&self) -> u64 {
+        self.luid
+    }
+}
+
+/// 显卡的 LUID，按 `MFT_ENUM_ADAPTER_LUID` 的方式拼成 64 位（低 32 位是 LowPart）
+pub(crate) fn adapter_luid(adapter: &IDXGIAdapter) -> Result<u64> {
+    let desc = unsafe { adapter.GetDesc() }.context("IDXGIAdapter::GetDesc")?;
+    let l = desc.AdapterLuid;
+    Ok(((l.HighPart as u32 as u64) << 32) | l.LowPart as u64)
+}
+
+/// GPU 上的一帧画面：没有旋转过的 BGRA 纹理（桌面复制给出的方向），转成用户看到的方向由用的一方做
+/// （视频处理器转，或者读回时转，见 [`Rotation`]）。
+#[derive(Clone)]
+pub struct GpuFrame {
+    source: Arc<D3dSource>,
+    texture: ID3D11Texture2D,
+    width: u32,
+    height: u32,
+    rotation: Rotation,
+}
+
+// 纹理只在打开了多线程保护的设备上使用（见 D3dSource）
+unsafe impl Send for GpuFrame {}
+unsafe impl Sync for GpuFrame {}
+
+impl GpuFrame {
+    /// 在 `source` 的设备上新建一个 `w`×`h` 的纹理（还没有画面）
+    pub(crate) fn new(source: Arc<D3dSource>, w: u32, h: u32, rotation: Rotation) -> Result<Self> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            // 和桌面复制给出的纹理一样；视频处理器的输入视图要求其一
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex = None;
+        unsafe { source.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .context("CreateTexture2D")?;
+        Ok(Self {
+            texture: tex.ok_or_else(|| anyhow!("the texture is null"))?,
+            source,
+            width: w,
+            height: h,
+            rotation,
+        })
+    }
+
+    /// 采集的编号（见 [`super::next_source`]）
+    pub fn source(&self) -> u64 {
+        self.source.id
+    }
+
+    pub fn d3d(&self) -> &Arc<D3dSource> {
+        &self.source
+    }
+
+    pub fn texture(&self) -> &ID3D11Texture2D {
+        &self.texture
+    }
+
+    /// 纹理的尺寸（没有旋转的）
+    pub fn texture_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// 要顺时针转多少度才是用户看到的方向（0、90、180、270）
+    pub fn rotation_degrees(&self) -> u32 {
+        match self.rotation {
+            Rotation::None => 0,
+            Rotation::R90 => 90,
+            Rotation::R180 => 180,
+            Rotation::R270 => 270,
+        }
+    }
+
+    /// 这个纹理能不能装 `source` 下一帧 `w`×`h` 的画面
+    fn reusable(&self, source: &D3dSource, w: u32, h: u32) -> bool {
+        self.source.id == source.id && (self.width, self.height) == (w, h)
+    }
+
+    /// 读回内存：转成用户看到的方向、紧密排列的 BGRA（`out` 的大小是转过之后的宽 × 高 × 4）
+    pub(super) fn read_pixels(&self, out: &mut [u8]) -> Result<()> {
+        let src = &*self.source;
+        let (w, h) = (self.width, self.height);
+        let mut staging = src.staging.lock().unwrap();
+        let tex = match &*staging {
+            Some((t, sw, sh)) if (*sw, *sh) == (w, h) => t.clone(),
+            _ => {
+                let t = staging_texture(&src.device, w, h)?;
+                *staging = Some((t.clone(), w, h));
+                t
+            }
+        };
+        unsafe {
+            src.ctx.CopyResource(&tex, &self.texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            src.ctx
+                .Map(&tex, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Map")?;
+            copy_mapped(&mapped, w, h, self.rotation, out);
+            src.ctx.Unmap(&tex, 0);
+        }
+        Ok(())
+    }
+}
+
+fn staging_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut tex = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.context("CreateTexture2D")?;
+    tex.ok_or_else(|| anyhow!("staging texture is null"))
+}
+
+/// 把映射出来的 `w`×`h` 原始画面转成用户看到的方向，紧密排列地写进 `dst`
+///
+/// # Safety
+/// `mapped` 是一个 `w`×`h` 的 BGRA 纹理映射出来的、还没有 Unmap
+unsafe fn copy_mapped(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    w: u32,
+    h: u32,
+    rotation: Rotation,
+    dst: &mut [u8],
+) {
+    let row = w as usize * 4;
+    let pitch = mapped.RowPitch as usize;
+    let src = mapped.pData as *const u8;
+    assert!(dst.len() >= row * h as usize);
+    unsafe {
+        if rotation != Rotation::None {
+            let len = pitch * (h as usize - 1) + row;
+            let src = std::slice::from_raw_parts(src, len);
+            copy_rotated(src, w as usize, h as usize, pitch, rotation, dst);
+        } else if pitch == row {
+            std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), row * h as usize);
+        } else {
+            for y in 0..h as usize {
+                std::ptr::copy_nonoverlapping(
+                    src.add(y * pitch),
+                    dst.as_mut_ptr().add(y * row),
+                    row,
+                );
+            }
+        }
+    }
+}
+
+/// 在 `adapter` 上创建 D3D11 设备：先要视频支持（视频处理器、画面留在显卡上），不行再不要
+pub(crate) fn create_device(
+    adapter: &IDXGIAdapter1,
+) -> Result<(ID3D11Device, ID3D11DeviceContext, bool)> {
+    let levels: [D3D_FEATURE_LEVEL; 4] = [
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    ];
+    let create = |flags: D3D11_CREATE_DEVICE_FLAG| unsafe {
+        let mut device: Option<ID3D11Device> = None;
+        let mut ctx: Option<ID3D11DeviceContext> = None;
+        D3D11CreateDevice(
+            adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            flags,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut ctx),
+        )
+        .context("D3D11CreateDevice")?;
+        let device = device.ok_or_else(|| anyhow!("D3D11 device is null"))?;
+        let ctx = ctx.ok_or_else(|| anyhow!("D3D11 context is null"))?;
+        anyhow::Ok((device, ctx))
+    };
+    match create(D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT) {
+        Ok((d, c)) => Ok((d, c, true)),
+        Err(e) => {
+            tracing::debug!("no D3D11 video support: {e:#}");
+            let (d, c) = create(D3D11_CREATE_DEVICE_BGRA_SUPPORT)?;
+            Ok((d, c, false))
+        }
+    }
+}
+
+// ───────────────────────────── 桌面复制 ─────────────────────────────
 
 struct Output {
     adapter: IDXGIAdapter1,
@@ -118,6 +384,8 @@ pub struct DxgiCapturer {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
+    /// 画面留在显卡上（显卡支持视频处理器时）；`None` 时每帧读回内存
+    gpu: Option<Arc<D3dSource>>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
     first: bool,
     shape_buf: Vec<u8>,
@@ -136,30 +404,20 @@ impl DxgiCapturer {
         let o = outs
             .get(index as usize)
             .ok_or_else(|| anyhow!("display {index} doesn't exist"))?;
+        let (device, ctx, video) = create_device(&o.adapter)?;
+        let gpu = if video {
+            match D3dSource::new(device.clone(), ctx.clone()) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::info!("frames will be read back from the GPU: {e:#}");
+                    None
+                }
+            }
+        } else {
+            tracing::info!("no D3D11 video support, frames will be read back from the GPU");
+            None
+        };
         unsafe {
-            let mut device: Option<ID3D11Device> = None;
-            let mut ctx: Option<ID3D11DeviceContext> = None;
-            let levels: [D3D_FEATURE_LEVEL; 4] = [
-                D3D_FEATURE_LEVEL_11_1,
-                D3D_FEATURE_LEVEL_11_0,
-                D3D_FEATURE_LEVEL_10_1,
-                D3D_FEATURE_LEVEL_10_0,
-            ];
-            D3D11CreateDevice(
-                &o.adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut ctx),
-            )
-            .context("D3D11CreateDevice")?;
-            let device = device.ok_or_else(|| anyhow!("D3D11 device is null"))?;
-            let ctx = ctx.ok_or_else(|| anyhow!("D3D11 context is null"))?;
-
             let dup = match o.output.cast::<IDXGIOutput5>() {
                 Ok(o5) => match o5.DuplicateOutput1(&device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]) {
                     Ok(d) => d,
@@ -191,6 +449,7 @@ impl DxgiCapturer {
                 device,
                 ctx,
                 dup,
+                gpu,
                 staging: None,
                 first: true,
                 shape_buf: Vec::new(),
@@ -206,28 +465,42 @@ impl DxgiCapturer {
         {
             return Ok(t.clone());
         }
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: w,
-            Height: h,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut tex = None;
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-            .context("CreateTexture2D")?;
-        let tex = tex.ok_or_else(|| anyhow!("staging texture is null"))?;
+        let tex = staging_texture(&self.device, w, h)?;
         self.staging = Some((tex.clone(), w, h));
         Ok(tex)
     }
+
+    /// 把桌面复制给出的纹理复制一份：显卡上的复制进帧缓冲池里的纹理，否则复制进 staging 纹理（之后读回）
+    fn copy(&mut self, tex: &ID3D11Texture2D, pool: &mut FramePool) -> Result<Copied> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.GetDesc(&mut desc) };
+        let (w, h) = (desc.Width, desc.Height);
+        let Some(source) = &self.gpu else {
+            let staging = self.staging(w, h)?;
+            unsafe { self.ctx.CopyResource(&staging, tex) };
+            return Ok(Copied::Staging(staging, w, h));
+        };
+        let (fw, fh) = self.rotation.rotated_size(w, h);
+        let mut frame = pool.checkout_with(fw, fh, |g| g.reusable(source, w, h));
+        let f = Arc::get_mut(&mut frame).expect("unique frame");
+        if f.gpu.is_none() {
+            f.gpu = Some(GpuFrame::new(source.clone(), w, h, self.rotation)?);
+        }
+        let g = f.gpu.as_mut().expect("just set");
+        g.rotation = self.rotation;
+        unsafe {
+            self.ctx.CopyResource(&g.texture, tex);
+            // 马上交给显卡去复制，不等用的一方提交
+            self.ctx.Flush();
+        }
+        Ok(Copied::Gpu(frame))
+    }
+}
+
+/// 这一帧复制到哪里了
+enum Copied {
+    Gpu(Arc<Frame>),
+    Staging(ID3D11Texture2D, u32, u32),
 }
 
 impl Capturer for DxgiCapturer {
@@ -257,70 +530,44 @@ impl Capturer for DxgiCapturer {
         let copied = if info.LastPresentTime == 0 && !self.first {
             Ok(None)
         } else {
-            (|| -> Result<Option<(ID3D11Texture2D, u32, u32)>> {
-                let tex: ID3D11Texture2D = res
-                    .take()
-                    .ok_or_else(|| anyhow!("desktop resource is null"))?
-                    .cast()?;
-                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                unsafe { tex.GetDesc(&mut desc) };
-                let staging = self.staging(desc.Width, desc.Height)?;
-                unsafe { self.ctx.CopyResource(&staging, &tex) };
-                Ok(Some((staging, desc.Width, desc.Height)))
-            })()
+            res.take()
+                .ok_or_else(|| anyhow!("desktop resource is null"))
+                .and_then(|r| Ok(r.cast::<ID3D11Texture2D>()?))
+                .and_then(|tex| self.copy(&tex, pool))
+                .map(Some)
         };
         drop(res);
         // 尽早释放，让 DWM 继续合成
         let _ = unsafe { self.dup.ReleaseFrame() };
-        let Some((staging, w, h)) = copied? else {
+        let Some(copied) = copied? else {
             return Ok(update);
         };
         self.first = false;
 
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.ctx
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        }
-        .context("Map")?;
-        let (fw, fh) = self.rotation.rotated_size(w, h);
-        let mut frame = pool.checkout(fw, fh);
-        {
-            let f = Arc::get_mut(&mut frame).expect("unique frame");
-            // 采集时间用画面真正呈现的时刻（LastPresentTime），比"复制完成的时刻"更准，
-            // 声音包也用同一个时钟（QPC），音画同步就靠这两个时间戳对齐
-            if let Some(t) = crate::host::clock::from_qpc(info.LastPresentTime) {
-                f.captured = t;
-            }
-            let row = w as usize * 4;
-            let pitch = mapped.RowPitch as usize;
-            let src = mapped.pData as *const u8;
-            unsafe {
-                if self.rotation != Rotation::None {
-                    let len = pitch * (h as usize - 1) + row;
-                    let src = std::slice::from_raw_parts(src, len);
-                    copy_rotated(
-                        src,
-                        w as usize,
-                        h as usize,
-                        pitch,
-                        self.rotation,
-                        &mut f.data,
-                    );
-                } else if pitch == row {
-                    std::ptr::copy_nonoverlapping(src, f.data.as_mut_ptr(), row * h as usize);
-                } else {
-                    for y in 0..h as usize {
-                        std::ptr::copy_nonoverlapping(
-                            src.add(y * pitch),
-                            f.data.as_mut_ptr().add(y * row),
-                            row,
-                        );
-                    }
+        let mut frame = match copied {
+            Copied::Gpu(frame) => frame,
+            Copied::Staging(staging, w, h) => {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                unsafe {
+                    self.ctx
+                        .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 }
+                .context("Map")?;
+                let (fw, fh) = self.rotation.rotated_size(w, h);
+                let mut frame = pool.checkout(fw, fh);
+                let f = Arc::get_mut(&mut frame).expect("unique frame");
+                unsafe {
+                    copy_mapped(&mapped, w, h, self.rotation, f.pixels_mut());
+                    self.ctx.Unmap(&staging, 0);
+                }
+                frame
             }
+        };
+        // 采集时间用画面真正呈现的时刻（LastPresentTime），比"复制完成的时刻"更准，
+        // 声音包也用同一个时钟（QPC），音画同步就靠这两个时间戳对齐
+        if let Some(t) = crate::host::clock::from_qpc(info.LastPresentTime) {
+            Arc::get_mut(&mut frame).expect("unique frame").captured = t;
         }
-        unsafe { self.ctx.Unmap(&staging, 0) };
         pool.keep(&frame);
         update.frame = Some(frame);
         Ok(update)
@@ -333,7 +580,7 @@ impl Capturer for DxgiCapturer {
 /// 需要自己转过来。对应关系与微软的 DXGIDesktopDuplication 示例（DisplayManager::SetDirtyVert）相同。
 /// 光标的形状和位置已经是用户看到的方向，不用转。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rotation {
+pub(crate) enum Rotation {
     None,
     R90,
     R180,
@@ -590,5 +837,54 @@ mod tests {
         let (twice, ..) = rotate(&r90, w90, h90, w90 * 4, Rotation::R90);
         let (r180, ..) = rotate(&src, w, h, pitch, Rotation::R180);
         assert_eq!(twice, r180);
+    }
+
+    /// GPU 上的画面按需读回：和每帧读回一样转成用户看到的方向；只读回一次，帧缓冲池复用纹理和读回的缓冲
+    #[test]
+    fn gpu_frames_read_back_on_demand() {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(0) }) else {
+            return;
+        };
+        let Ok((device, ctx, true)) = create_device(&adapter) else {
+            println!("no D3D11 video support, skipping");
+            return;
+        };
+        let source = Arc::new(D3dSource::new(device, ctx).unwrap());
+        let (w, h) = (77usize, 45usize);
+        let (img, _) = image(w, h, 0);
+        let mut pool = FramePool::default();
+        for rot in [
+            Rotation::None,
+            Rotation::R90,
+            Rotation::R180,
+            Rotation::R270,
+        ] {
+            let (fw, fh) = rot.rotated_size(w as u32, h as u32);
+            let mut frame = pool.checkout_with(fw, fh, |g| g.reusable(&source, w as u32, h as u32));
+            let f = Arc::get_mut(&mut frame).unwrap();
+            if f.gpu.is_none() {
+                f.gpu = Some(GpuFrame::new(source.clone(), w as u32, h as u32, rot).unwrap());
+            }
+            let g = f.gpu.as_mut().unwrap();
+            g.rotation = rot;
+            unsafe {
+                source.ctx.UpdateSubresource(
+                    &g.texture,
+                    0,
+                    None,
+                    img.as_ptr().cast(),
+                    (w * 4) as u32,
+                    0,
+                );
+            }
+            let first = frame.pixels().unwrap().as_ptr();
+            let (want, ..) = rotate(&img, w, h, w * 4, rot);
+            assert_eq!(frame.pixels().unwrap(), want, "{rot:?}");
+            assert_eq!(frame.pixels().unwrap().as_ptr(), first, "read back twice");
+            pool.keep(&frame);
+        }
+        // 池里只有一帧：同一个纹理一直在用
+        assert_eq!(pool.frames.len(), 1);
     }
 }

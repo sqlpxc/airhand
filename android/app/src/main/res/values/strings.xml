@@ -181,6 +181,11 @@
     <string name="preset_native_desc">Native resolution · 60 fps · 30 Mbps</string>
     <string name="codec">Video format</string>
     <string name="encoder_info">Using %1$s %2$d×%3$d (%4$s, %5$s)</string>
+    <string name="scaling_priority">Scaling</string>
+    <string name="priority_latency">Low latency</string>
+    <string name="priority_latency_desc">Scaled on the remote computer\'s GPU: lower latency and CPU usage</string>
+    <string name="priority_clarity">Sharp text</string>
+    <string name="priority_clarity_desc">Scaled on the remote computer\'s CPU with a sharper filter: clearer text when shrinking a high-res screen, more latency and CPU. Same as low latency when no scaling is needed</string>
 
     <!-- Session -->
     <string name="session_connecting">Connecting to %1$s…</string>

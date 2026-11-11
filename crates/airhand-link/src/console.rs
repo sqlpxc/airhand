@@ -487,7 +487,8 @@ mod tests {
                 bitrate_kbps: 8000,
                 max_short: 1080,
                 adaptive: true,
-                codec: Codec::AV1
+                codec: Codec::AV1,
+                priority: Default::default(),
             }
         );
         assert!(opts.audio);

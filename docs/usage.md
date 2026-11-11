@@ -143,6 +143,8 @@ Tray → **Switch to controller** opens the console. Closing the console window 
 
 **Quality panel**: presets from Data saver (720p / 24 fps / 1.2 Mbps) through Balanced (1080p / 30 fps / 4 Mbps), Smooth (1080p / 60 fps / 8 Mbps) and HD (1440p / 60 fps / 16 Mbps) to Original (native resolution / 60 fps / 30 Mbps), or set the resolution cap, frame rate (15–120), bitrate cap (0.5–50 Mbps), codec and adaptive bitrate yourself. The console only offers codecs this computer can hardware-decode; if the host has no matching hardware encoder it falls back automatically, and the toolbar shows the encoder actually in use.
 
+**Scaling**: how the picture is shrunk when the remote screen is larger than the requested resolution (a 4K or Retina screen down to 1080p, say). **Low latency** (default) scales on the remote GPU, frames never touch its CPU, so latency and its CPU usage are much lower; **Sharp text** scales on the remote CPU with a sharper filter, so small text stays clearer when shrinking a lot, at the cost of roughly 10–30 ms more per frame and higher CPU usage on the remote computer. Without scaling the two are the same. If the remote GPU can't do it, the CPU is used automatically.
+
 Besides the resolution cap, the picture is never larger than what the window actually shows: when the window is smaller than the remote screen, the host scales straight to the window size and the console shows it 1:1 instead of scaling it a second time (sharper text, less bandwidth). While you drag the window border, the resolution changes once you stop. In actual size (1:1) mode the window doesn't limit the resolution.
 
 ## Language

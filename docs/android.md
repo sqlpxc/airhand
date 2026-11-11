@@ -18,7 +18,7 @@ On a TV, the phone entry point also switches to the TV interface.
 - **My devices**: every device you connect to is saved (name, OS, control code, last connection, resume token, its end-to-end public key), so next time it's **one tap**. If it's offline the row says "Offline · connects automatically when it's back" and the remote screen opens by itself when it comes online; you can cancel any time. Devices can be renamed, their code copied, or removed (with undo)
 - A card at the top leads back to a session that's still running
 
-The remote screen is full screen with just one **draggable round button** (it snaps to the left / right edge) that opens the menu: keyboard, shortcuts, sound, A/V sync, quality (same presets as the desktop, plus the video format), clipboard (send to the remote clipboard / type it in), displays (with several monitors), fit screen, gestures, disconnect. The top of the menu shows the device's name, video format, frame rate, latency and bitrate. Rotating the phone to landscape fills the screen.
+The remote screen is full screen with just one **draggable round button** (it snaps to the left / right edge) that opens the menu: keyboard, shortcuts, sound, A/V sync, quality (same presets as the desktop, plus scaling (low latency / sharp text, only for computers, see the quality panel in the [usage guide](usage.md)) and the video format), clipboard (send to the remote clipboard / type it in), displays (with several monitors), fit screen, gestures, disconnect. The top of the menu shows the device's name, video format, frame rate, latency and bitrate. Rotating the phone to landscape fills the screen.
 
 Two **touch input modes** (two big buttons in the menu switch any time, Settings sets the default; the default "Automatic" uses the trackpad for computers and touch for phones). The gestures are explained the first time each mode is used:
 
@@ -64,12 +64,12 @@ Remote input maps to the phone like this: touch points and the left mouse button
 
 ## Phone: Settings
 
-Server address and certificate fingerprint (defaults are compiled in and can be changed here; a malformed fingerprint can't be saved; left empty, the server's certificate is remembered on the first connection and a different one is refused later, and saving the fingerprint again forgets it), this device's name (shown to others, defaults to the system device name), ask before someone connects, change control code, default quality, default touch input, play sound by default, A/V sync, navigation keys for phones, clear saved devices, version and protocol version.
+Server address and certificate fingerprint (defaults are compiled in and can be changed here; a malformed fingerprint can't be saved; left empty, the server's certificate is remembered on the first connection and a different one is refused later, and saving the fingerprint again forgets it), this device's name (shown to others, defaults to the system device name), ask before someone connects, change control code, default quality, scaling, default touch input, play sound by default, A/V sync, navigation keys for phones, clear saved devices, version and protocol version.
 
 ## TV
 
 - Enter the control code on the left with the remote's number keys or the on-screen keypad; recent devices are on the right (arrow keys to pick, OK to connect); to remove a device, use the delete button next to it, or hold OK / press Menu on it (asks first); Settings (server, fingerprint, device name) is at the top right
-- The picture is full screen with sound on. **OK / Menu** opens the side menu: sound, A/V sync, displays, quality (each press picks the next preset), video format (auto / each format both sides support, each press picks the next one), picture size (fit / fill, cropping the edges / stretch), connection info, disconnect; video format and picture size are remembered for later connections; **left / right** switch the remote display; **Back** closes the menu, and asks before disconnecting
+- The picture is full screen with sound on. **OK / Menu** opens the side menu: sound, A/V sync, displays, quality (each press picks the next preset), scaling (low latency / sharp text, only for computers), video format (auto / each format both sides support, each press picks the next one), picture size (fit / fill, cropping the edges / stretch), connection info, disconnect; scaling, video format and picture size are remembered for later connections; **left / right** switch the remote display; **Back** closes the menu, and asks before disconnecting
 - TVs only watch, so there's no warning when the other side hasn't allowed remote control (the phone's accessibility service, the Mac's Accessibility permission)
 
 ## Where the data is stored

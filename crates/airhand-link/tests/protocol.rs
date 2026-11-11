@@ -12,6 +12,7 @@ use airhand_link::controller::{Command, ConnectOptions};
 use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
     Codec, CursorShape, InputEvent, MouseButton, QualitySettings, SystemAction, TouchPhase,
+    VideoPriority,
 };
 use serde_json::{Value, json};
 
@@ -60,6 +61,8 @@ fn settings() -> QualitySettings {
         max_short: 1080,
         adaptive: true,
         codec: Codec::H265,
+        // 界面不带优先项时是低延迟（之前的界面、Android 都不带）
+        priority: VideoPriority::Latency,
     }
 }
 
@@ -293,6 +296,19 @@ fn json_shapes_roundtrip() {
         assert_eq!(parsed, cmd);
         assert_eq!(parsed.sid(), 3);
     }
+    // 清楚优先：界面（桌面、网页、Android）只在选了它时带 priority
+    let mut sharp = json!({ "cmd": "settings", "sid": 3, "settings": serde_json::to_value(settings()).unwrap() });
+    sharp["settings"]["priority"] = json!("clarity");
+    assert_eq!(
+        serde_json::from_value::<Command>(sharp).unwrap(),
+        Command::Settings {
+            sid: 3,
+            settings: QualitySettings {
+                priority: VideoPriority::Clarity,
+                ..settings()
+            },
+        }
+    );
     // 认不出的命令是错误（界面会收到 failed）
     assert!(serde_json::from_value::<Command>(json!({ "cmd": "nope", "sid": 1 })).is_err());
     let (json, opts) = connect_options();

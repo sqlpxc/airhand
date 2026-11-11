@@ -155,11 +155,13 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
-    let sub = capture::subscribe(screen, settings.fps);
-    let slot = sub.slot();
+    // 要哪种画面取决于画质设置（macOS 让系统直接缩放，见 capture::output_for），设置变了可能要换一路采集
+    let mut output = capture::output_for(screen, &settings);
+    let mut sub = capture::subscribe(screen, settings.fps, output);
     let mut enc: Option<Encoder> = None;
-    // 硬件编码器连续失败时改用软件编码
+    // 硬件编码器连续失败时改用软件编码；GPU 零拷贝连续失败时硬件编码器改用内存里的画面
     let mut hw_failures = 0u32;
+    let mut gpu_failures = 0u32;
     let (mut frame_seq, mut cursor_seq, mut shape_seq) = (0u64, 0u64, 0u64);
     // 光标有变化还没发出去（大块通道的队列满了）：下一轮再发最新的
     let mut cursor_pending = false;
@@ -183,6 +185,17 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         if v != ver {
             ver = v;
             settings = *ctrl.settings.lock().unwrap();
+            let want = capture::output_for(screen, &settings);
+            if want != output {
+                // 换一路采集：旧的画面不再用，等新的一路的第一帧（采集一开始就会给）；光标状态重新发
+                info!(?output, ?want, "switching the capture");
+                output = want;
+                sub = capture::subscribe(screen, settings.fps, output);
+                (frame_seq, cursor_seq, shape_seq) = (0, 0, 0);
+                last_frame = None;
+                refine_left = 0;
+                ctrl.force_key.store(true, Ordering::Release);
+            }
             sub.set_fps(settings.fps);
             pacer.set_fps(settings.fps);
             ctrl.flow
@@ -192,7 +205,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 // 需要重建编码器（例如换了编码格式）：用上一帧马上重建，画面静止时也立即生效，
                 // 控制端也能马上收到新的 HostMsg::Encoder（界面上显示的是实际在用的格式）
                 if let Some(f) = &last_frame
-                    && !e.compatible(f.width, f.height, &settings)
+                    && !e.compatible(f, &settings)
                 {
                     ctrl.force_key.store(true, Ordering::Release);
                 }
@@ -207,6 +220,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         } else {
             Duration::from_millis(40)
         };
+        let slot = sub.slot();
         let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
 
         // 光标变化：可见性和形状引用走控制通道（只留最新值）；控制端还没有的形状（动画光标第一次转到的帧）
@@ -290,15 +304,15 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         let mut force = ctrl.force_key.swap(false, Ordering::AcqRel);
         if !enc
             .as_ref()
-            .is_some_and(|e| e.compatible(frame.width, frame.height, &settings))
+            .is_some_and(|e| e.compatible(&frame, &settings))
         {
             enc = None;
             match Encoder::new(
-                frame.width,
-                frame.height,
+                &frame,
                 &settings,
                 ctrl.flow.bitrate_kbps(),
                 hw_failures < 3,
+                gpu_failures < 2,
             ) {
                 Ok(e) => {
                     if !send(&HostMsg::Encoder(e.info().clone())) {
@@ -377,8 +391,13 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 }
             }
             Err(err) => {
-                warn!("encoding failed, recreating the encoder: {err:#}");
-                if e.info().hardware {
+                warn!(
+                    gpu = e.uses_gpu(),
+                    "encoding failed, recreating the encoder: {err:#}"
+                );
+                if e.uses_gpu() {
+                    gpu_failures += 1;
+                } else if e.info().hardware {
                     hw_failures += 1;
                 }
                 enc = None;

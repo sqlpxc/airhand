@@ -891,5 +891,6 @@ interface CursorImage {
 
 function sameQuality(a: QualitySettings, b: QualitySettings): boolean {
   return a.fps === b.fps && a.bitrateKbps === b.bitrateKbps && a.maxShort === b.maxShort
-    && a.adaptive === b.adaptive && a.codec === b.codec;
+    && a.adaptive === b.adaptive && a.codec === b.codec
+    && (a.priority ?? "latency") === (b.priority ?? "latency");
 }

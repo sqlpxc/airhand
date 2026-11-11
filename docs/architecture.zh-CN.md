@@ -6,7 +6,7 @@
 
 ```mermaid
 flowchart LR
-    host["<b>被控端</b><br>Windows / macOS / Linux / Android<br><br>屏幕采集（Windows：DXGI 桌面复制）<br>SIMD 缩放 + NV12 转换<br>硬件编码 AV1 / HEVC / H.264<br>键鼠注入（Windows：SendInput）<br>系统声音（Windows：WASAPI 环回）+ Opus"]
+    host["<b>被控端</b><br>Windows / macOS / Linux / Android<br><br>屏幕采集（Windows：DXGI 桌面复制）<br>GPU 缩放 + NV12 转换（零拷贝）<br>硬件编码 AV1 / HEVC / H.264<br>键鼠注入（Windows：SendInput）<br>系统声音（Windows：WASAPI 环回）+ Opus"]
     relay["<b>airhand-server</b>（Docker）<br><br>控制码注册 / 取回<br>会话配对<br>字节级零拷贝透传<br>防暴力猜码限速"]
     ctrl["<b>控制端</b><br>桌面控制台 / 网页控制台 / Android<br><br>硬件解码（WebCodecs；Android 用 MediaCodec）<br>低延迟渲染<br>输入采集 + 本地光标<br>多会话 / 多屏总览<br>声音抖动缓冲播放"]
     host <-->|"QUIC / TLS 1.3<br>UDP 4433"| relay
@@ -125,7 +125,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 |---|---|
 | 采集 | 只在画面变化时产生帧（Windows 靠 DXGI，macOS 靠 ScreenCaptureKit，X11 靠 DAMAGE），静止的桌面几乎不占带宽。帧率按画面自己的时间戳节流（`client/src-tauri/src/host/pace.rs`，Android 同样），不按上一帧处理完的时刻，处理花的时间不会累积成延迟，也不会每隔一阵跳掉一帧 |
 | 静止后补画质 | 画面大面积变化（切换窗口、滚动）的那一帧只能分到大约一帧的码率，文字是糊的。画面停下来 200 ms 后把最后一帧再编几次，编码器只补残差，几帧之内就接近原画（补到编码器不再输出有意义的数据为止，最多 8 帧），之后就不再发帧 |
-| 预处理 | `fast_image_resize`（SIMD，Catmull-Rom）缩放，按行分成几条用多个核同时缩放（缩放在每帧的关键路径上，Apple M1 上 2880×1800 → 1080p 从约 18 ms 降到约 9 ms，结果与整幅缩放逐像素相同），`yuvutils-rs`（AVX2）BGRA→NV12/I420，缓冲区全部复用 |
+| 预处理 | **GPU 零拷贝**（默认，画质面板里“缩放优先：低延迟”）：画面不离开显卡。Windows 把桌面复制的画面复制进自己的纹理，硬件编码器在同一个 D3D11 设备上用 `ID3D11VideoProcessor` 缩放、旋转、转成 NV12（BT.709 有限范围），`MFCreateDXGISurfaceBuffer` + `IMFDXGIDeviceManager` 直接交给硬件 MFT（只用和采集同一块显卡上的编码器）；macOS 让 ScreenCaptureKit 直接按编码尺寸输出 NV12，`CVPixelBuffer` 原样交给 VideoToolbox。省掉了读回、几十 MB 的拷贝、CPU 缩放和色彩转换（`client/src-tauri/src/host/encoder/mod.rs`）<br>**CPU**（“缩放优先：文字清晰”而且需要缩小、软件编码、显卡不支持、Linux）：画面读回内存，`fast_image_resize`（SIMD，Catmull-Rom）缩放，按行分成几条用多个核同时缩放（Apple M1 上 2880×1800 → 1080p 从约 18 ms 降到约 9 ms，结果与整幅缩放逐像素相同），`yuvutils-rs`（AVX2）BGRA→NV12/I420，缓冲区全部复用。GPU 的缩放滤镜由驱动决定，缩小很多时文字不一定有 Catmull-Rom 清楚，所以留了这个选项；不需要缩放时两种一样，都走 GPU |
 | 编码 | **硬件优先**：Media Foundation 硬件编码器（NVENC / Quick Sync / AMF），支持 **AV1 / HEVC / H.264**，低延迟模式、无 B 帧、超长 GOP；macOS 上是 VideoToolbox（H.264 / HEVC，H.264 用低延迟码率控制）；没有硬件编码器时回退到 **OpenH264 屏幕内容模式**。格式按 **AV1 > HEVC > H.264** 的优先级，自动选用双方都支持（对方能编码、本机能解码）的里压缩率最高的 |
 | 码率控制 | 控制端每帧都回 ACK，被控端限制**在途字节**（≈ 码率 ×（基础 RTT + 50 ms）），网络慢时等待并**跳到最新一帧**，不会越积越卡；码率每次确认都按量到的排队时延和带宽调整（见上） |
 | 传输 | QUIC + **BBR**；控制、画面使用独立的有界队列和 QUIC 流，声音走 QUIC 数据报，避免视频流内的丢包 / 背压阻塞其它流。仍共享连接带宽；控制台最后一段（桌面版在本机）仍是单条 WebSocket。打得通[直连](#直连)、并且它不比中转慢时，画面和声音走直连，不经过服务器 |
@@ -134,7 +134,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | 光标 | 远端光标的**形状**同步到本地光标，移动在本地完成，**感觉不到延迟**。形状按槽位缓存（每个会话 32 个，由被控端决定哪个槽位放什么）：动画光标（例如忙碌时的转圈）反复用到的那几帧只在第一次发图像，之后控制流上只发槽位，界面也按槽位缓存生成好的光标 |
 | 后台会话 | 不在屏幕上的会话自动降到 5 fps |
 
-本机实测（RTX 显卡，4K 屏输出 1080p）：硬件 AV1 每帧编码约 7 ms，H.264 约 9 ms；OpenH264 软件编码约 40 ms。
+本机实测（RTX 4080 笔记本，4K 屏输出 1080p，每帧从交给编码器到拿到码流，中位数，`cargo run --release --example encode_bench`）：GPU 零拷贝 H.264 约 5 ms、HEVC 约 4.5 ms、AV1 约 3 ms；CPU 路径（读回 + 缩放 + 色彩转换 + 同一个硬件编码器）约 30 ms；OpenH264 软件编码约 50 ms。
 
 ## 声音
 

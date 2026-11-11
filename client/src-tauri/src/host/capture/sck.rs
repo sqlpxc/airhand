@@ -1,7 +1,11 @@
 //! macOS 屏幕采集：ScreenCaptureKit。
 //!
 //! * 系统只在画面有变化时交付新画面（静止时是 `Idle` 状态的空样本），静止的桌面不产生帧；
-//! * 系统在 GPU 上直接输出物理像素（Retina 屏是"点"的两倍）的 BGRA，并转换到 sRGB；
+//! * 两种画面（见 [`Output`]）：
+//!   * 缩放好的（`Output::Scaled`，GPU 零拷贝）：系统采集时就在 GPU 上缩放成编码尺寸、转换成 NV12（BT.709 有限范围），
+//!     `CVPixelBuffer`（IOSurface）原样交给 VideoToolbox（[`GpuFrame`]），CPU 不碰像素；
+//!   * 原始分辨率（`Output::Native`）：物理像素（Retina 屏是"点"的两倍）的 BGRA 复制进内存，在 CPU 上缩放（清楚优先时）；
+//! * 都转换到 sRGB；
 //! * 画面里不含光标：光标形状另外读取（`NSCursor`），与 Windows / Linux 一样由控制端本地绘制；
 //! * 显示器分辨率或排列变化、流被系统停止时报错，由采集线程重建采集器。
 
@@ -12,21 +16,25 @@ use std::time::{Duration, Instant};
 use airhand_proto::session::CursorShape;
 use anyhow::{Context, Result, anyhow, bail};
 use objc2::rc::{Retained, autoreleasepool};
+use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
     kCGColorSpaceSRGB,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+    CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_screen_capture_kit::{SCFrameStatus, SCStreamConfiguration, SCStreamOutputType};
 
-use super::{CaptureUpdate, Capturer, Frame, FramePool};
+use super::{CaptureUpdate, Capturer, Frame, FramePool, Output};
 use crate::host::macos::{self, Display};
 use crate::host::sck::{self, Sample};
 
@@ -36,6 +44,66 @@ const LAYOUT_CHECK: Duration = Duration::from_secs(2);
 const CURSOR_POLL: Duration = Duration::from_millis(50);
 /// 系统内部最多排队的画面数
 const QUEUE_DEPTH: isize = 4;
+/// 缩放好的画面直接交给编码器，编码线程会拿着几帧（上一帧要留着补画质、重发关键帧，几个会话各拿各的），
+/// 拿着的画面系统不能复用：多留几个空位（最多 8）
+const GPU_QUEUE_DEPTH: isize = 7;
+
+/// GPU 上的一帧：系统缩放好的 NV12（BT.709 有限范围，IOSurface），尺寸就是编码尺寸，原样交给 VideoToolbox。
+///
+/// 画面属于系统的缓冲池，拿着它系统就不能复用（见 [`GPU_QUEUE_DEPTH`]）：所以这种帧不放进帧缓冲池。
+#[derive(Clone)]
+pub struct GpuFrame {
+    source: u64,
+    buffer: CFRetained<CVPixelBuffer>,
+}
+
+// CVPixelBuffer 的引用计数是线程安全的；系统交出来之后不再写它，这里只读
+unsafe impl Send for GpuFrame {}
+unsafe impl Sync for GpuFrame {}
+
+impl GpuFrame {
+    /// 采集的编号（见 [`super::next_source`]）
+    pub fn source(&self) -> u64 {
+        self.source
+    }
+
+    pub fn pixel_buffer(&self) -> &CVPixelBuffer {
+        &self.buffer
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (
+            CVPixelBufferGetWidth(&self.buffer) as u32,
+            CVPixelBufferGetHeight(&self.buffer) as u32,
+        )
+    }
+
+    /// 转成 BGRA 读进内存（软件编码时用）
+    pub(super) fn read_pixels(&self, out: &mut [u8]) -> Result<()> {
+        let pb = &*self.buffer;
+        let ro = CVPixelBufferLockFlags::ReadOnly;
+        if unsafe { CVPixelBufferLockBaseAddress(pb, ro) } != 0 {
+            bail!("can't lock the frame");
+        }
+        let plane = |i: usize| {
+            let p = CVPixelBufferGetBaseAddressOfPlane(pb, i) as *const u8;
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, i);
+            let rows = CVPixelBufferGetHeightOfPlane(pb, i);
+            (!p.is_null()).then(|| {
+                (
+                    unsafe { std::slice::from_raw_parts(p, stride * rows) },
+                    stride,
+                )
+            })
+        };
+        let r = match (plane(0), plane(1)) {
+            (Some(y), Some(uv)) => super::nv12_to_bgra(self.size(), y, uv, &mut Vec::new(), out),
+            _ => Err(anyhow!("the frame has no pixel data")),
+        };
+        unsafe { CVPixelBufferUnlockBaseAddress(pb, ro) };
+        r
+    }
+}
 
 /// 采集流交给采集线程的东西：最新的一帧画面（旧的直接丢弃）
 #[derive(Default)]
@@ -53,6 +121,10 @@ struct InboxState {
 pub struct SckCapturer {
     index: u8,
     display: Display,
+    /// 系统直接缩放成这个尺寸的 NV12（`Output::Scaled`）；`None`：原始分辨率的 BGRA
+    scaled: Option<(u32, u32)>,
+    /// 见 [`super::next_source`]
+    source: u64,
     config: Retained<SCStreamConfiguration>,
     stream: sck::Stream,
     inbox: Arc<Inbox>,
@@ -67,19 +139,43 @@ fn frame_interval(fps: u8) -> CMTime {
 }
 
 impl SckCapturer {
-    pub fn open(index: u8, fps: u8) -> Result<Self> {
+    pub fn open(index: u8, fps: u8, output: Output) -> Result<Self> {
         macos::check_screen_permission()?;
         let display = macos::display(index)?;
         let target = sck::shareable_display(display.id)?;
+        let scaled = match output {
+            Output::Scaled(max_short) => Some(crate::host::encoder::target_size(
+                display.width,
+                display.height,
+                max_short,
+            )),
+            Output::Native => None,
+        };
         let config = unsafe {
             let c = SCStreamConfiguration::new();
-            c.setWidth(display.width as usize);
-            c.setHeight(display.height as usize);
-            c.setPixelFormat(kCVPixelFormatType_32BGRA);
+            match scaled {
+                Some((w, h)) => {
+                    c.setWidth(w as usize);
+                    c.setHeight(h as usize);
+                    c.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+                    // 和 VideoToolbox 的设置、内存那条路的色彩转换一样：BT.709
+                    c.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_709_2);
+                    c.setQueueDepth(GPU_QUEUE_DEPTH);
+                    // 编码尺寸取整到偶数，宽高比和显示器差不到一个像素：铺满，不留黑边（macOS 14 起才能设置）
+                    if objc2::available!(macos = 14.0) {
+                        c.setPreservesAspectRatio(false);
+                    }
+                }
+                None => {
+                    c.setWidth(display.width as usize);
+                    c.setHeight(display.height as usize);
+                    c.setPixelFormat(kCVPixelFormatType_32BGRA);
+                    c.setQueueDepth(QUEUE_DEPTH);
+                }
+            }
             c.setColorSpaceName(kCGColorSpaceSRGB);
             c.setShowsCursor(false);
             c.setMinimumFrameInterval(frame_interval(fps));
-            c.setQueueDepth(QUEUE_DEPTH);
             c
         };
         let inbox = Arc::new(Inbox::default());
@@ -113,11 +209,14 @@ impl SckCapturer {
             w = d.width,
             h = d.height,
             scale = d.scale(),
+            ?scaled,
             "ScreenCaptureKit capture opened"
         );
         Ok(Self {
             index,
             display,
+            scaled,
+            source: super::next_source(),
             config,
             stream,
             inbox,
@@ -128,9 +227,29 @@ impl SckCapturer {
         })
     }
 
-    /// 把样本里的画面复制进帧缓冲（紧密排列的 BGRA）。
-    fn copy(&self, sb: &CMSampleBuffer, pool: &mut FramePool) -> Result<Arc<Frame>> {
+    /// 样本里的画面：缩放好的直接留在 GPU 上，原始分辨率的复制进帧缓冲（紧密排列的 BGRA）。
+    fn frame(&self, sb: &CMSampleBuffer, pool: &mut FramePool) -> Result<Arc<Frame>> {
         let pb = unsafe { sb.image_buffer() }.ok_or_else(|| anyhow!("the frame has no image"))?;
+        // 采集时间用画面的呈现时间（主机时钟），声音包用同一个时钟，音画同步靠它对齐
+        let captured = macos::instant_from_host_time(unsafe { sb.presentation_time_stamp() });
+        if self.scaled.is_some() {
+            if CVPixelBufferGetPixelFormatType(&pb)
+                != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            {
+                bail!("unexpected pixel format from ScreenCaptureKit");
+            }
+            let gpu = GpuFrame {
+                source: self.source,
+                buffer: pb,
+            };
+            let (w, h) = gpu.size();
+            let mut f = Frame::empty(w, h);
+            if let Some(t) = captured {
+                f.captured = t;
+            }
+            f.gpu = Some(gpu);
+            return Ok(Arc::new(f));
+        }
         if CVPixelBufferGetPixelFormatType(&pb) != kCVPixelFormatType_32BGRA {
             bail!("unexpected pixel format from ScreenCaptureKit");
         }
@@ -147,21 +266,16 @@ impl SckCapturer {
         } else {
             let mut frame = pool.checkout(w as u32, h as u32);
             let f = Arc::get_mut(&mut frame).expect("unique frame");
-            // 采集时间用画面的呈现时间（主机时钟），声音包用同一个时钟，音画同步靠它对齐
-            if let Some(t) = macos::instant_from_host_time(unsafe { sb.presentation_time_stamp() })
-            {
+            if let Some(t) = captured {
                 f.captured = t;
             }
+            let dst = f.pixels_mut().as_mut_ptr();
             unsafe {
                 if pitch == row {
-                    std::ptr::copy_nonoverlapping(src, f.data.as_mut_ptr(), row * h);
+                    std::ptr::copy_nonoverlapping(src, dst, row * h);
                 } else {
                     for y in 0..h {
-                        std::ptr::copy_nonoverlapping(
-                            src.add(y * pitch),
-                            f.data.as_mut_ptr().add(y * row),
-                            row,
-                        );
+                        std::ptr::copy_nonoverlapping(src.add(y * pitch), dst.add(y * row), row);
                     }
                 }
             }
@@ -203,7 +317,7 @@ impl Capturer for SckCapturer {
             st.sample.take()
         };
         if let Some(s) = sample {
-            update.frame = Some(self.copy(&s.0, pool).context("reading the frame")?);
+            update.frame = Some(self.frame(&s.0, pool).context("reading the frame")?);
             self.first = false;
         }
         Ok(update)
@@ -346,7 +460,7 @@ mod tests {
         if !sck::require_permission() {
             return;
         }
-        let mut cap = SckCapturer::open(0, 30).expect("打开采集");
+        let mut cap = SckCapturer::open(0, 30, Output::Native).expect("打开采集");
         let mut pool = FramePool::default();
         let started = Instant::now();
         let frame = loop {
@@ -369,7 +483,50 @@ mod tests {
             frame.width, frame.height, age
         );
         assert!(age < Duration::from_millis(500));
-        assert!(frame.data.iter().any(|&b| b != 0), "画面全黑");
+        assert!(frame.pixels().unwrap().iter().any(|&b| b != 0), "画面全黑");
         cap.set_fps(10);
+    }
+
+    /// 系统直接缩放成编码尺寸的 NV12：画面在 GPU 上，尺寸和 target_size 一样；需要时转成 BGRA 读回来，
+    /// 和原始分辨率的画面大致一样（缩放过，比较整幅的平均亮度）。
+    /// 需要"屏幕与系统录音"权限。`cargo test --lib sck_scaled -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sck_scaled() {
+        if !sck::require_permission() {
+            return;
+        }
+        let grab = |output: Output| {
+            let mut cap = SckCapturer::open(0, 30, output).expect("打开采集");
+            let mut pool = FramePool::default();
+            let started = Instant::now();
+            loop {
+                assert!(started.elapsed() < Duration::from_secs(5), "没有收到画面");
+                if let Some(f) = cap
+                    .next(Duration::from_millis(100), &mut pool)
+                    .unwrap()
+                    .frame
+                {
+                    break (f, cap.display.clone());
+                }
+            }
+        };
+        let (scaled, d) = grab(Output::Scaled(720));
+        let (w, h) = crate::host::encoder::target_size(d.width, d.height, 720);
+        assert_eq!((scaled.width, scaled.height), (w, h));
+        let g = scaled.gpu.as_ref().expect("缩放好的画面应当在 GPU 上");
+        assert_eq!(g.size(), (w, h));
+        let (native, _) = grab(Output::Native);
+        assert!(native.gpu.is_none());
+        let mean = |p: &[u8]| p.iter().map(|&v| v as u64).sum::<u64>() as f64 / p.len() as f64;
+        let (a, b) = (
+            mean(scaled.pixels().unwrap()),
+            mean(native.pixels().unwrap()),
+        );
+        println!(
+            "缩放 {w}x{h}，原始 {}x{}，平均亮度 {a:.1} / {b:.1}",
+            native.width, native.height
+        );
+        assert!((a - b).abs() < 12.0, "缩放后的画面和原始画面差得太多");
     }
 }

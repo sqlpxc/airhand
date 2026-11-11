@@ -142,6 +142,7 @@ fn main() {
         max_short: 720,
         adaptive: true,
         codec: Codec::H264,
+        ..Default::default()
     };
     // 开始时的画质和声音在握手里就告诉被控端
     let info = rt()

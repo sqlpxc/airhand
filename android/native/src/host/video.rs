@@ -589,6 +589,7 @@ mod tests {
                 max_short: 720,
                 adaptive: false,
                 codec: Codec::H265,
+                ..Default::default()
             },
         );
         let t = hub.tick().unwrap();

@@ -137,6 +137,14 @@ fn session_messages_keep_their_wire_encoding() {
         ControllerMsg::Settings(QualitySettings::default()),
         "82038185181e190fa0190438f500",
     );
+    // 后来加的优先项：低延迟（默认）不写，字节和上面一样；清楚优先是第 6 项
+    golden(
+        ControllerMsg::Settings(QualitySettings {
+            priority: VideoPriority::Clarity,
+            ..QualitySettings::default()
+        }),
+        "82038186181e190fa0190438f50001",
+    );
 }
 
 #[test]
