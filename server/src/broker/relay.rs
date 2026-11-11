@@ -245,7 +245,8 @@ impl Broker {
         };
         let open = async {
             let mut send = peer.open_uni().await?;
-            // 往另一端写数据时用这一端在会话头里给的优先级
+            // 往另一端写数据时用这一端在会话头里给的优先级（解码时已经压到 MAX_PRIORITY 以内：
+            // 握手之前就转发，不压的话一端能把自己的流排到同一台被控端别的会话的控制通道前面）
             send.set_priority(i32::from(h.priority))?;
             send.write_all(&h.encode()).await?;
             anyhow::Ok(send)

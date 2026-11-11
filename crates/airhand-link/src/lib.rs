@@ -3,8 +3,10 @@
 //! * [`net`]：QUIC 连接、证书固定、版本握手、断线重连；
 //! * [`wire`]：从流里读写长度前缀帧（帧的格式和消息的编解码在 `airhand_proto::framing`，那边不碰 IO）；
 //! * [`secure`]：端到端加密：设备的身份密钥、握手、每一帧的加解密；
-//! * [`lanes`]：会话的通道（每端为自己要发的开单向流）和数据报从哪里来、往哪里去，中转和直连共用；
-//!   [`merge`]：几条路上的帧按计数排好；[`transport`]：通道的写任务和控制端的接收端；
+//! * [`lanes`]：会话的通道（每端为自己要发的开单向流）和数据报从哪里来，中转和直连共用；
+//!   [`paths`]：往哪条路发（中转、直连，控制帧和 Ping / 确认两条路都发，画面、声音只走一条）；
+//!   [`merge`]：几条路上的帧按计数排好；[`transport`]：两端共用的通道写任务和消息读取；
+//! * [`udp`]：收发缓冲区调大了的 UDP socket（中转服务器也用）；
 //! * [`direct`]：中转之外两端之间的直连（打洞、TLS 只认对方的证书指纹、画面走哪条路）；
 //! * [`controller`]：控制端服务与会话。与界面无关：界面的命令是 [`controller::Command`]，
 //!   画面和事件交给 [`controller::SessionUi`]；
@@ -17,7 +19,7 @@
 //!
 //! # feature
 //!
-//! 除了 [`wire`]，都在默认打开的 `client` 里。中转服务器关掉它（`default-features = false`）、只用 [`wire`]：
+//! 除了 [`wire`] 和 [`udp`]，都在默认打开的 `client` 里。中转服务器关掉它（`default-features = false`）、只用这两个：
 //! 读写几帧不用把 Noise、SPAKE2 这些它用不到的库也编译进去。
 
 #[cfg(feature = "client")]
@@ -39,6 +41,8 @@ pub mod merge;
 #[cfg(feature = "client")]
 pub mod net;
 #[cfg(feature = "client")]
+pub mod paths;
+#[cfg(feature = "client")]
 mod problem;
 #[cfg(feature = "client")]
 mod queue;
@@ -48,6 +52,7 @@ pub mod secure;
 pub mod tasks;
 #[cfg(feature = "client")]
 pub mod transport;
+pub mod udp;
 pub mod wire;
 
 #[cfg(feature = "client")]

@@ -7,7 +7,7 @@
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
 //! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：同意流程（同时在等本机用户回答的请求有上限，
 //!   [`ApprovalSlots`]）、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
-//! * [`HostStreams`]：会话的链路。先回答端到端握手（[`crate::secure::respond`]，控制端的第一条消息在
+//! * [`HostStreams`]：会话的链路（写任务在 `write`）。先回答端到端握手（[`crate::secure::respond`]，控制端的第一条消息在
 //!   [`Incoming::init`] 里）：让不让这个控制端进来由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），
 //!   发出决定就开始，控制端确认了才显示它、才请本机用户同意（重放的握手消息走不到这一步）。
 //!   过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
@@ -23,6 +23,7 @@ mod cursor;
 pub mod queue;
 pub mod session;
 mod streams;
+mod write;
 
 use std::future::Future;
 use std::sync::Arc;

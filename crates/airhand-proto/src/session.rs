@@ -6,9 +6,10 @@
 //!
 //! 消息走两条通道（[`crate::SessionLane`]）和控制数据报，编码一样：
 //!
-//! * **控制数据报**（[`ControllerDatagram`] / [`HostDatagram`]，`crate::datagram::CONTROL`）：Ping / Pong、画面确认。
-//!   只看最新值、丢了也不要紧，不用排在流里别的消息后面、也不会被丢了的包挡住（被控端的码率控制、控制端测的往返时延
-//!   都靠它们）。丢了的确认由控制端重发（见 [`ControllerDatagram::Ack`]）；
+//! * **控制数据报**（[`ControllerDatagram`] / [`HostDatagram`]，`crate::datagram::CONTROL`）：Ping / Pong、画面确认、
+//!   探测和回声。只看最新值、丢了也不要紧，不用排在流里别的消息后面、也不会被丢了的包挡住（被控端的码率控制、
+//!   控制端测的往返时延都靠它们）。丢了的确认由控制端重发（见 [`ControllerDatagram::Ack`]）。直连通着时 Ping、Pong、
+//!   确认两条路各发一份（同一个计数，后到的那份被接收端的重放窗口挡掉）；探测和回声只发在要量的那条路上；
 //! * **控制**：输入、设置、提示……都很小，要快，不能丢、不能乱序；
 //! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标图像
 //!   （[`HostMsg::CursorImage`]，几十 KB）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
@@ -461,6 +462,12 @@ pub enum ControllerDatagram {
         #[n(1)]
         arrived: u64,
     },
+    /// 回答 [`HostDatagram::Probe`]：`t` 原样带回，从收到探测的那条路发回去
+    #[n(2)]
+    Echo {
+        #[n(0)]
+        t: u64,
+    },
 }
 
 /// 被控端 → 控制端的控制数据报（见模块说明的"走哪条通道"）。变体的编号不能改、不能复用
@@ -469,6 +476,13 @@ pub enum HostDatagram {
     /// 回应 [`ControllerDatagram::Ping`]，用于测量端到端往返时延。
     #[n(0)]
     Pong {
+        #[n(0)]
+        t: u64,
+    },
+    /// 量一条路（中转、直连）的往返时延：直连通着时被控端定时在两条路上各发一个（`t` 是被控端的时钟，微秒），
+    /// 控制端从收到它的那条路回 [`ControllerDatagram::Echo`]。画面、声音走哪条路据此决定（见 crate 说明的"直连"）
+    #[n(1)]
+    Probe {
         #[n(0)]
         t: u64,
     },

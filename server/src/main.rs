@@ -27,7 +27,7 @@ use std::time::Duration;
 use airhand_proto::ALPN;
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
+use quinn::{Endpoint, EndpointConfig, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::info;
 
@@ -140,8 +140,17 @@ async fn main() -> Result<()> {
         "(to enable certificate pinning, set AIRHAND_SERVER_FP to this fingerprint when building the clients and when starting the web console; installed clients can also set it as server_fp in config.toml, or in Settings on Android)"
     );
 
-    let endpoint = Endpoint::server(server_config(cert.chain, cert.key)?, listen)
+    // 收发缓冲区调大了的 socket（见 airhand_link::udp；Linux 上还要在宿主机上调大 net.core.rmem_max / wmem_max）
+    let socket = airhand_link::udp::bind(listen, false)
         .with_context(|| format!("can't listen on {listen}"))?;
+    let runtime = quinn::default_runtime().context("no async runtime")?;
+    let endpoint = Endpoint::new(
+        EndpointConfig::default(),
+        Some(server_config(cert.chain, cert.key)?),
+        socket,
+        runtime,
+    )
+    .with_context(|| format!("can't listen on {listen}"))?;
     info!("Airhand server started on udp://{listen}, up to {max_sessions} sessions per host");
 
     let broker = broker::Broker::new(broker::Config {

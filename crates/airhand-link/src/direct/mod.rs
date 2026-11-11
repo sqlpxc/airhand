@@ -5,10 +5,12 @@
 //!   （`DirectOffer::cert`），TLS 双向认证只认它：握手完成时就知道对面是谁，中间人冒充不了任何一边
 //!   （和 WebRTC 把 DTLS 证书的指纹放进信令里一样）；
 //! * 直连上对方的流和数据报由 [`crate::lanes::accept_direct`] 交给会话，和中转上来的放在一起合并（`crate::merge`）；
-//! * 控制通道每一帧、每个控制数据报在中转上发一份，直连通着的话再从直连发一份（[`Mirror`]）；
+//! * 本端往哪条路发由会话的 [`Paths`] 决定：直连通了接上去（控制通道每一帧、Ping / Pong / 确认两条路都发），
+//!   断了拿下来；
 //! * 候选地址两种地址族都给（[`candidates`]）：连中转的 socket 是双栈的（`socket::bind`），中转走 IPv4 时
 //!   两端也能用公网 IPv6 直连：IPv6 一般没有 NAT，打洞只是让两边的防火墙放行，IPv4 打不通（对称 NAT、运营商级 NAT）时往往通；
-//! * 画面、声音走哪条路由被控端决定（[`Route`]，`select` 里的规则），控制端只管把探测数据报弹回去；
+//! * 画面、声音走哪条路由被控端决定（[`Paths::media`]，`select` 里的规则）：它在两条路上各发探测
+//!   （`HostDatagram::Probe`），控制端从同一条路弹回来（见 [`crate::controller::HostReceiver`]）；
 //! * [`host`]：被控端这边（[`DirectHub`]：一条服务器连接上接受直连；每个会话一个任务：发候选地址、打洞、换路）；
 //!   [`controller`]：控制端这边（回答候选地址、发起连接、弹回探测）。
 //!
@@ -22,79 +24,15 @@ mod socket;
 pub(crate) mod tls;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 
 use airhand_proto::session::MAX_DIRECT_ADDRS;
-use bytes::Bytes;
-use quinn::{Connection, Endpoint, SendStream};
-use tokio::sync::mpsc;
+use quinn::{Connection, Endpoint};
 
 pub use crate::lanes::Via;
+pub use crate::paths::Paths;
 pub use host::{DirectHub, HostLink};
 pub use socket::Punch;
 pub(crate) use socket::bind;
-
-/// 控制通道、控制数据报在直连上的那一份：每一帧、每个数据报也从这里发（见模块说明）。直连没通时什么也不做
-#[derive(Clone, Default)]
-pub struct Mirror(Arc<Mutex<Option<MirrorTo>>>);
-
-struct MirrorTo {
-    /// 本端在直连上开的控制通道（的写任务）
-    frames: mpsc::Sender<Bytes>,
-    conn: Connection,
-}
-
-/// 直连上最多排着这么多帧没写出去，再多就不写了（中转上还有一份）
-const MIRROR_QUEUE: usize = 64;
-
-impl Mirror {
-    /// 写任务每加密一帧就调用一次（`sealed`：带长度前缀的密文）
-    pub(crate) fn offer(&self, sealed: &Bytes) {
-        let mut to = self.0.lock().unwrap();
-        if let Some(t) = &*to
-            && let Err(mpsc::error::TrySendError::Closed(_)) = t.frames.try_send(sealed.clone())
-        {
-            *to = None;
-        }
-    }
-
-    /// 一个控制数据报（加密好的）也从直连发
-    pub(crate) fn datagram(&self, d: &Bytes) {
-        if let Some(t) = &*self.0.lock().unwrap() {
-            let _ = t.conn.send_datagram(d.clone());
-        }
-    }
-
-    /// 从现在起每一帧也写进直连 `conn` 上的 `send`（本端在直连上开的控制通道），每个控制数据报也从 `conn` 发。
-    /// 返回写的任务（直连断了、[`Mirror::stop`] 之后结束）
-    pub(crate) fn start(
-        &self,
-        mut send: SendStream,
-        conn: Connection,
-    ) -> impl Future<Output = ()> + Send + 'static {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(MIRROR_QUEUE);
-        *self.0.lock().unwrap() = Some(MirrorTo { frames: tx, conn });
-        async move {
-            while let Some(b) = rx.recv().await {
-                if send.write_chunk(b).await.is_err() {
-                    return;
-                }
-            }
-            let _ = send.finish();
-        }
-    }
-
-    pub(crate) fn stop(&self) {
-        *self.0.lock().unwrap() = None;
-    }
-}
-
-/// 被控端的画面、声音走哪里（被控端的直连任务决定，写任务每一帧看一眼）
-#[derive(Clone, Default)]
-pub struct Route {
-    /// 走这条直连；`None`：走中转
-    pub media: Option<Connection>,
-}
 
 /// 问路由用的公网地址（[`route_ip`]：UDP 的 connect 不发包，哪个公网地址都行）
 const PUBLIC_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
@@ -172,34 +110,9 @@ pub(crate) fn usable(theirs: &[SocketAddr], endpoint: &Endpoint) -> Vec<SocketAd
     out
 }
 
-// ───────────────────────────── 探测 ─────────────────────────────
-
-/// 探测包的明文：`走的路 u8 | 被控端发出的时刻（微秒） u64 LE`。控制端原样（重新加密之后）从同一条路弹回去
-pub(crate) fn probe_payload(via: Via, t_us: u64) -> [u8; 9] {
-    let mut p = [0u8; 9];
-    p[0] = via as u8;
-    p[1..].copy_from_slice(&t_us.to_le_bytes());
-    p
-}
-
-/// 弹回来的探测包：从 `via` 发出、`via` 回来的才算，返回发出的时刻
-pub(crate) fn probe_sent_at(payload: &[u8], via: Via) -> Option<u64> {
-    let p: &[u8; 9] = payload.try_into().ok()?;
-    (p[0] == via as u8).then(|| u64::from_le_bytes(p[1..].try_into().unwrap()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn probe_payload_roundtrip() {
-        let p = probe_payload(Via::Direct, 123_456_789);
-        assert_eq!(probe_sent_at(&p, Via::Direct), Some(123_456_789));
-        // 从别的路弹回来的不算
-        assert_eq!(probe_sent_at(&p, Via::Relay), None);
-        assert_eq!(probe_sent_at(&p[..8], Via::Direct), None);
-    }
 
     #[test]
     fn mapped_addresses_are_canonical() {

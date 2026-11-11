@@ -2,7 +2,7 @@
 //! 也就是服务器看到的那个 NAT 映射），对方的 NAT 才认得出来、放行之后的直连。
 //!
 //! socket 是双栈的（IPv6，同时收发 IPv4）：中转走哪种地址都行，直连也能两种地址都试（见 [`super::candidates`]）。
-//! 系统不让开双栈的（关掉了 IPv6）退回按中转的地址族开。
+//! 系统不让开双栈的（关掉了 IPv6）退回按中转的地址族开。收发缓冲区调大了（见 [`crate::udp`]）。
 
 use std::io::{self, IoSliceMut};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -108,13 +108,13 @@ pub(crate) type Bound = (Arc<dyn AsyncUdpSocket>, Punch, Arc<dyn Runtime>);
 pub(crate) fn bind(peer: SocketAddr) -> io::Result<Bound> {
     let runtime =
         quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
-    let socket = udp((Ipv6Addr::UNSPECIFIED, 0).into(), true).or_else(|_| {
+    let socket = crate::udp::bind((Ipv6Addr::UNSPECIFIED, 0).into(), true).or_else(|_| {
         let any: SocketAddr = if peer.is_ipv6() {
             (Ipv6Addr::UNSPECIFIED, 0).into()
         } else {
             (Ipv4Addr::UNSPECIFIED, 0).into()
         };
-        udp(any, false)
+        crate::udp::bind(any, false)
     })?;
     let socket = Arc::new(PunchSocket {
         inner: runtime.wrap_udp_socket(socket)?,
@@ -122,14 +122,4 @@ pub(crate) fn bind(peer: SocketAddr) -> io::Result<Bound> {
         only_to: Default::default(),
     });
     Ok((socket.clone(), Punch(socket), runtime))
-}
-
-fn udp(addr: SocketAddr, dual: bool) -> io::Result<std::net::UdpSocket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-    if dual {
-        s.set_only_v6(false)?;
-    }
-    s.bind(&addr.into())?;
-    Ok(s.into())
 }

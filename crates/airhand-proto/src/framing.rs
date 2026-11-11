@@ -476,14 +476,16 @@ mod tests {
                 seq: 9,
                 arrived: 77,
             },
+            ControllerDatagram::Echo { t: 3 },
         ] {
             let Decoded::Msg(back) = decode::<ControllerDatagram>(&to_vec(&m)).unwrap() else {
                 panic!()
             };
             assert_eq!(back, m);
         }
-        let pong = HostDatagram::Pong { t: 5 };
-        assert!(matches!(decode::<HostDatagram>(&to_vec(&pong)), Ok(Decoded::Msg(p)) if p == pong));
+        for m in [HostDatagram::Pong { t: 5 }, HostDatagram::Probe { t: 6 }] {
+            assert!(matches!(decode::<HostDatagram>(&to_vec(&m)), Ok(Decoded::Msg(p)) if p == m));
+        }
         #[derive(minicbor::Encode)]
         enum Future {
             #[n(40)]

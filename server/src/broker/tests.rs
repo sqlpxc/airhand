@@ -309,8 +309,8 @@ fn waiter_count(broker: &Broker) -> usize {
 /// 画面通道正常结束也盖不住被控端有意发的最后一条控制消息
 #[tokio::test]
 async fn blocked_video_lane_does_not_block_control_or_audio() {
+    use airhand_link::controller::FromHost;
     use airhand_link::lanes::first_stream;
-    use airhand_link::transport::FromHost;
     use airhand_proto::session::{HostMsg, Notice};
     let (_broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
@@ -1531,7 +1531,7 @@ async fn fixed_codes_are_never_handed_out() {
 
 /// 直连：两端在服务器之外打通一条路，画面换到直连上（控制端的统计里 direct 为 true），控制消息照常；
 /// 直连突然断了（被控端的 socket 只往服务器发）：画面马上改回中转、要一个关键帧，控制端不再等断在直连上的帧，
-/// 画面接着来；直连恢复之后再换回去。整个过程中画面的序号只增不减
+/// 画面接着来；直连恢复之后再换回去。整个过程中画面的序号只增不减，跳过了帧的地方界面拿到的是关键帧
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
     use airhand_link::host::{Acks, DirectHub, HostLink};
@@ -1696,6 +1696,12 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                     continue;
                 };
                 assert!(h.seq > last, "video went backwards: {} after {last}", h.seq);
+                // 断在直连上的帧等不到了：界面拿到的下一帧必须是关键帧（缺了参考帧的增量帧解出来是花屏）
+                assert!(
+                    h.seq == last + 1 || h.key,
+                    "frame {} after {last} isn't a keyframe",
+                    h.seq
+                );
                 last = h.seq;
                 frames.fetch_add(1, Ordering::Relaxed);
                 let _ = svc.ack(sid, h.seq);

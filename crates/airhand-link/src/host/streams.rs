@@ -9,8 +9,9 @@
 //! 和确认都晚了，控制端测到的往返时延、被控端的码率控制都会把它当成网络变慢。控制端的其它消息在读任务里就换成了
 //! [`Request`]。
 //!
-//! 有直连（[`Incoming::direct`]）时会话开始之后还有一个直连任务：控制通道每一帧、每个控制数据报也从直连发一份，
-//! 直连上控制端发来的控制通道和中转上的合并（[`crate::merge`]），画面、声音走哪条路由它决定。
+//! 有直连（[`Incoming::direct`]）时会话开始之后还有一个直连任务：直连通了就接到会话的 [`Paths`] 上
+//! （控制通道每一帧、Pong 也从直连发一份），直连上控制端发来的控制通道和中转上的合并（[`crate::merge`]），
+//! 画面、声音走哪条路由它按两条路上的探测决定（控制端的回声在读任务里转给它）。
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -24,22 +25,21 @@ use airhand_proto::session::{
 };
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use quinn::Connection;
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{info, warn};
 
 use super::Incoming;
 use super::clock::InputClock;
 use super::queue::{self, Outbox};
 use super::session::{Acks, Request};
-use crate::direct::{self, Mirror, Route};
+use super::write::{Writers, write_all};
+use crate::direct;
 use crate::lanes::{Via, first_stream, open_lane};
 use crate::merge::{Merge, Policy};
+use crate::paths::{DatagramSender, Paths};
 use crate::secure::{self, Admission, Gate, Opener, ResponderParams, STEP_TIMEOUT};
 use crate::tasks::OwnedTask;
-use crate::transport::{
-    DatagramSender, next_msg, open_datagram, write_audio, write_lane, write_video,
-};
+use crate::transport::{next_msg, open_datagram};
 
 /// 被控端一个会话的链路。
 ///
@@ -162,6 +162,8 @@ impl Express {
                     acks.ack(seq, arrived);
                 }
             }
+            // 直连任务的事（读任务转给它）
+            ControllerDatagram::Echo { .. } => {}
         }
     }
 }
@@ -273,18 +275,15 @@ impl HostStreams {
         let (out, ctl_rx, bulk_rx) = queue::channel();
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
-        // 画面、声音走哪条路（直连任务决定，没有直连时一直是中转）；控制通道、控制数据报在直连上的那一份
-        let (route_tx, route) = watch::channel(Route::default());
-        let mirror = Mirror::default();
-        let (broken_tx, broken) = watch::channel(None);
+        // 两条路：直连通了由直连任务接上，画面、声音走哪条也由它决定（没有直连时一直是中转）
+        let paths = Paths::new(conn.clone());
         let writer = OwnedTask(tokio::spawn(write_all(Writers {
-            conn: conn.clone(),
             session_id,
-            control: (send, ctl_rx, r.sealer, mirror.clone()),
+            paths: paths.clone(),
+            control: (send, ctl_rx, r.sealer),
             bulk: (bulk_send, bulk_rx, secured.bulk.sealer),
-            video: (video_send, video_rx, secured.video.sealer, broken_tx),
+            video: (video_send, video_rx, secured.video.sealer),
             audio: (audio_rx, secured.audio.sealer),
-            route,
         })));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过信箱交给会话。
         // 控制端的控制通道握手时已经等到了的（Noise_XX）先放进去，没等到的（Noise_IK）之后从信箱来
@@ -307,28 +306,23 @@ impl HostStreams {
         let (control_tx, control_rx) = mpsc::channel(capacity);
         let (bulk_tx, bulk_rx) = mpsc::channel(2);
         let (confirm_tx, confirm_rx) = oneshot::channel();
-        let datagrams = DatagramSender::new(
-            session_id,
-            conn.clone(),
-            mirror.clone(),
-            secured.datagrams.sealer,
-        );
-        let express = Express::new(move |t| datagrams.send(&HostDatagram::Pong { t }));
+        let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
+        let pong = datagrams.clone();
+        let express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }));
         let incoming = ControllerReceiver::new(control_rx, bulk_rx, confirm_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
+        let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
         let started = Arc::new(Notify::new());
         let direct = inc.direct.as_ref().map(|link| {
             OwnedTask(tokio::spawn(direct::host::run(direct::host::Session {
                 link: link.clone(),
                 session_id,
-                probe: secured.probe,
-                probes: inbox.probes,
+                paths,
+                datagrams,
+                echoes,
                 feed: inbox.feed.clone(),
                 out: out.clone(),
                 answers,
-                mirror,
-                route: route_tx,
-                broken,
                 acks: express.acks.clone(),
                 keyframe: control_tx.downgrade(),
                 started: started.clone(),
@@ -344,6 +338,7 @@ impl HostStreams {
             control_tx,
             bulk_tx,
             answers: answers_tx,
+            echoes: echoes_tx,
         })));
         Ok((
             Self {
@@ -406,59 +401,16 @@ impl HostStreams {
     }
 }
 
-/// 本端各条通道的写任务要的东西
-struct Writers {
-    conn: Connection,
-    session_id: u64,
-    control: (
-        quinn::SendStream,
-        queue::LaneReceiver,
-        secure::Sealer,
-        Mirror,
-    ),
-    bulk: (quinn::SendStream, queue::LaneReceiver, secure::Sealer),
-    video: (
-        quinn::SendStream,
-        mpsc::Receiver<Bytes>,
-        secure::Sealer,
-        watch::Sender<Option<Connection>>,
-    ),
-    audio: (mpsc::Receiver<Bytes>, secure::Sealer),
-    route: watch::Receiver<Route>,
-}
-
-async fn write_all(w: Writers) -> Result<((), (), (), ())> {
-    let Writers {
-        conn,
-        session_id,
-        control: (control, ctl_rx, ctl_sealer, mirror),
-        bulk: (bulk, bulk_rx, bulk_sealer),
-        video: (video, video_rx, video_sealer, broken),
-        audio: (audio_rx, audio_sealer),
-        route,
-    } = w;
-    tokio::try_join!(
-        write_lane(control, ctl_rx, ctl_sealer, Some(mirror)),
-        write_lane(bulk, bulk_rx, bulk_sealer, None),
-        write_video(
-            video,
-            video_rx,
-            video_sealer,
-            session_id,
-            route.clone(),
-            broken
-        ),
-        write_audio(conn, session_id, audio_rx, audio_sealer, route)
-    )
-}
+/// 两条路上弹回来的探测最多排着这么多个没交给直连任务（每条路每 250 ms 一个）
+const ECHO_QUEUE: usize = 8;
 
 /// 读任务要的东西
 struct Readers {
     session_id: u64,
     control: Merge,
     bulk: Merge,
-    /// 控制数据报（Ping、确认）和它们的解密端
-    datagrams: (mpsc::Receiver<Bytes>, Opener),
+    /// 控制数据报（Ping、确认、回声）：从哪条路来、整个数据报，和它们的解密端
+    datagrams: (mpsc::Receiver<(Via, Bytes)>, Opener),
     express: Express,
     /// 解开了控制端的确认
     confirm: oneshot::Sender<()>,
@@ -466,10 +418,12 @@ struct Readers {
     bulk_tx: mpsc::Sender<Request>,
     /// 直连的回答交给直连任务
     answers: mpsc::Sender<DirectOffer>,
+    /// 探测的回声（从哪条路回来的、探测发出的时刻）也交给它
+    echoes: mpsc::Sender<(Via, u64)>,
 }
 
 /// 读控制端的控制通道（第一帧是确认）、大块通道和控制数据报：Ping、确认就地处理（[`Express`]），
-/// 直连的回答交给直连任务，其它的换成请求交给会话。三样各读各的：会话的主循环慢了（请求的信箱满了），
+/// 直连的回答、探测的回声交给直连任务，其它的换成请求交给会话。三样各读各的：会话的主循环慢了（请求的信箱满了），
 /// Pong 和确认照样不等
 async fn read_all(r: Readers) -> Result<()> {
     let Readers {
@@ -482,16 +436,24 @@ async fn read_all(r: Readers) -> Result<()> {
         control_tx,
         bulk_tx,
         answers,
+        echoes,
     } = r;
     // Ping 和输入都是"晚到了多久"的样本（见 InputClock）
     let clock = Mutex::new(InputClock::default());
     let dgrams = async {
-        while let Some(d) = datagrams.recv().await {
+        while let Some((via, d)) = datagrams.recv().await {
             let Some(m) = open_datagram::<ControllerDatagram>(&mut opener, &d) else {
                 continue;
             };
-            if let ControllerDatagram::Ping { t } = m {
-                clock.lock().unwrap().stale(t, Instant::now());
+            match m {
+                ControllerDatagram::Ping { t } => {
+                    clock.lock().unwrap().stale(t, Instant::now());
+                }
+                // 没有直连时没人收（也不会有回声），丢掉就是了
+                ControllerDatagram::Echo { t } => {
+                    let _ = echoes.try_send((via, t));
+                }
+                ControllerDatagram::Ack { .. } => {}
             }
             express.datagram(m);
         }
@@ -724,6 +686,7 @@ mod tests {
                 control_tx,
                 bulk_tx: mpsc::channel(1).0,
                 answers: mpsc::channel(1).0,
+                echoes: mpsc::channel(1).0,
             }));
             if genuine {
                 (&mut confirmed).await.unwrap();

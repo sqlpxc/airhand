@@ -40,7 +40,7 @@
 //! # 通道和数据报
 //!
 //! 一条服务器连接上可能有好几个会话：连接的 [`Router`] 按会话 ID 把被控端的通道（单向流）和数据报
-//! （声音、探测）交给对应的会话（见 [`crate::lanes`]）。
+//! （声音、控制数据报）交给对应的会话（见 [`crate::lanes`]），会话的 [`HostReceiver`] 把它们解密、交出来。
 //!
 //! # 直连
 //!
@@ -50,6 +50,7 @@
 mod cursor;
 mod link;
 mod queue;
+mod receiver;
 mod session;
 
 use std::collections::HashMap;
@@ -57,11 +58,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::direct::{self, Mirror};
+use crate::direct;
 use crate::lanes::Router;
 use crate::secure::{self, Identity, InitiatorParams};
 use crate::tasks::OwnedTask;
-use crate::transport::DatagramSender;
 use crate::wire::{read_msg, write_msg};
 use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
@@ -80,6 +80,7 @@ use tracing::{debug, info, warn};
 use crate::net::{self, LinkConfig, Reconnect, Report};
 use crate::{Problem, ServerState};
 pub use link::{Established, establish};
+pub use receiver::{FromHost, HostReceiver};
 pub use session::{NoticeView, SessionEvent, SessionUi, UiClosed};
 
 /// 桌面版检查本机剪贴板变化的间隔
@@ -377,30 +378,21 @@ impl ControllerService {
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
         let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
-        // 直连：等被控端发来候选地址
-        let mirror = Mirror::default();
         // Ping、画面确认：控制数据报，中转上发、直连通着时直连上也发
-        let feedback = Arc::new(session::Feedback::new(DatagramSender::new(
-            grant.session_id,
-            live.conn.clone(),
-            mirror.clone(),
-            link.datagrams,
-        )));
+        let feedback = Arc::new(session::Feedback::new(link.datagrams));
+        // 直连：等被控端发来候选地址
         let (offers_tx, offers) = mpsc::channel(4);
         let answer = tx.clone();
         let direct = direct::controller::run(direct::controller::Session {
             endpoint: live.endpoint.clone(),
-            relay: live.conn.clone(),
             session_id: grant.session_id,
             observed: grant.observed,
-            probe: link.probe,
-            probes: link.probes,
+            paths: link.paths.clone(),
             feed: link.feed,
             offers,
             answer: Box::new(move |offer| {
                 let _ = answer.send(ControllerMsg::Direct(offer));
             }),
-            mirror: mirror.clone(),
         });
         let (mode, clipboard) = match frontend {
             Frontend::Desktop { clipboard, sync } => {
@@ -423,7 +415,7 @@ impl ControllerService {
             negotiated: link.negotiated,
             arrivals: arrivals.clone(),
             feedback: feedback.clone(),
-            mirror,
+            paths: link.paths,
             direct: session::Direct {
                 offers: offers_tx,
                 task: Box::pin(direct),

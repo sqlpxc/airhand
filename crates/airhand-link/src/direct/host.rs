@@ -4,30 +4,30 @@
 //!   交给那个会话（有会话在发候选地址时才接受：被控端不是一台随便能连的服务器）；
 //! * [`run`]：每个会话一个任务。会话开始之后发一轮候选地址（[`HostMsg::Direct`]，带着本端证书的指纹），等控制端回答
 //!   （带着它的指纹）、打洞、等它连过来（它可能从好几个地址都连上了：用它开了流的那一条，见 [`chosen`]）；
-//!   通了之后每 [`PROBE_EVERY`] 在两条路上各探测一次，按 [`Selector`] 换路；断了过一会儿再来一轮。
+//!   通了之后接到会话的 [`Paths`] 上，每 [`PROBE_EVERY`] 在两条路上各探测一次（`HostDatagram::Probe`），
+//!   按 [`Selector`] 换路；断了过一会儿再来一轮。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use airhand_proto::session::{DirectOffer, HostMsg};
-use airhand_proto::{SessionLane, datagram};
+use airhand_proto::SessionLane;
+use airhand_proto::session::{DirectOffer, HostDatagram, HostMsg};
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use quinn::{Connection, Endpoint, RecvStream};
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::select::{PROBE_EVERY, Selector, Switch};
 use super::tls::{self, Cert};
-use super::{Mirror, Punch, Route, Via, candidates, probe_payload, probe_sent_at, usable};
+use super::{Punch, Via, candidates, usable};
 use crate::clock::now_us;
 use crate::host::{Acks, Outbox, Request};
 use crate::lanes::{Feed, accept_direct, open_lane};
-use crate::secure::LaneKeys;
+use crate::paths::{DatagramSender, Paths};
 use crate::tasks::OwnedTask;
 
 /// 同时最多这么多条还没交给会话的直连（握手中、等控制端的回答到）
@@ -164,19 +164,18 @@ impl DirectHub {
 pub(crate) struct Session {
     pub link: HostLink,
     pub session_id: u64,
-    pub probe: LaneKeys,
-    /// 中转、直连上来的探测数据报（会话的 [`crate::lanes::Inbox`]）
-    pub probes: mpsc::Receiver<(Via, Bytes)>,
+    /// 会话的两条路：直连通了接上去、断了拿下来，画面、声音走哪条由这里决定
+    pub paths: Paths,
+    /// 发探测（控制数据报，每条路各一个）
+    pub datagrams: DatagramSender,
+    /// 弹回来的探测：从哪条路来、发出的时刻（`ControllerDatagram::Echo`，读任务转过来的）
+    pub echoes: mpsc::Receiver<(Via, u64)>,
     /// 直连上来的流、数据报交给会话
     pub feed: Feed,
     /// 发 [`HostMsg::Direct`]
     pub out: Outbox,
     /// 控制端的回答（[`airhand_proto::session::ControllerMsg::Direct`]，读任务转过来的）
     pub answers: mpsc::Receiver<DirectOffer>,
-    pub mirror: Mirror,
-    pub route: watch::Sender<Route>,
-    /// 往哪条直连上写画面失败了（画面的写任务报告）：只认现在这条的，别的（之前那条的、换路之前的）不算
-    pub broken: watch::Receiver<Option<Connection>>,
     /// 画面的确认交给谁（平台的，会话开始时才有）：换路时告诉它
     pub acks: Arc<OnceLock<Arc<dyn Acks>>>,
     /// 直连断了要一个关键帧：交给会话
@@ -322,7 +321,7 @@ async fn serve(s: &mut Session, conn: Connection, first: RecvStream) -> bool {
     ));
     match open_lane(&conn, s.session_id, SessionLane::Control).await {
         Ok(send) => {
-            tasks.spawn(s.mirror.start(send, conn.clone()));
+            tasks.spawn(s.paths.attach(conn.clone(), send));
         }
         Err(e) => {
             warn!(
@@ -334,30 +333,30 @@ async fn serve(s: &mut Session, conn: Connection, first: RecvStream) -> bool {
         }
     }
     let mut sel = Selector::default();
-    // 之前报告的都是别的直连的
-    s.broken.mark_unchanged();
+    // 往这条直连上写画面失败了（之前报告的都是别的直连的）
+    let mut broken = s.paths.broken();
     let mut tick = tokio::time::interval(PROBE_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let switch = tokio::select! {
             _ = tick.tick() => {
-                probe(s, &conn);
+                // 两条路上各发一个探测，控制端从同一条路弹回来
+                let probe = HostDatagram::Probe { t: now_us() };
+                s.datagrams.send_on(Via::Relay, &probe);
+                s.datagrams.send_on(Via::Direct, &probe);
                 sel.decide(Instant::now())
             }
-            d = s.probes.recv() => {
-                let Some((via, d)) = d else { break };
-                if let Some(rtt) = echo(s, via, &d) {
-                    sel.sample(via, rtt, Instant::now());
-                }
+            e = s.echoes.recv() => {
+                let Some((via, t)) = e else { break };
+                let rtt = now_us().saturating_sub(t) as f64 / 1000.0;
+                sel.sample(via, rtt, Instant::now());
                 None
             }
-            r = s.broken.changed() => {
-                // 写任务不在了：会话在结束
+            r = broken.changed() => {
                 if r.is_err() {
                     break;
                 }
-                let this = s.broken.borrow_and_update().as_ref().is_some_and(|c| c.stable_id() == conn.stable_id());
-                this.then(|| sel.broken(Instant::now()))
+                Some(sel.broken(Instant::now()))
             }
             e = conn.closed() => {
                 info!(session_id = s.session_id, "direct path closed: {e}");
@@ -373,10 +372,9 @@ async fn serve(s: &mut Session, conn: Connection, first: RecvStream) -> bool {
                 direct_ms = ?sel.rtt(Via::Direct),
                 "video and audio switch paths"
             );
-            apply(s, sw, &conn);
+            apply(s, sw);
         }
     }
-    s.mirror.stop();
     if sel.media() == Via::Direct {
         apply(
             s,
@@ -384,18 +382,17 @@ async fn serve(s: &mut Session, conn: Connection, first: RecvStream) -> bool {
                 to: Via::Relay,
                 lost: true,
             },
-            &conn,
         );
     }
+    s.paths.detach();
     conn.close(0u32.into(), b"closed");
     true
 }
 
-/// 换路：告诉画面、声音的写任务，告诉平台的码率控制（新的路时延不一样；断了的话在途的帧不会确认了），
+/// 换路：画面、声音的写任务下一帧走新的路，告诉平台的码率控制（新的路时延不一样；断了的话在途的帧不会确认了），
 /// 断了的话要一个关键帧（接收端不再等断在直连上的帧）
-fn apply(s: &Session, sw: Switch, conn: &Connection) {
-    let media = (sw.to == Via::Direct).then(|| conn.clone());
-    s.route.send_replace(Route { media });
+fn apply(s: &Session, sw: Switch) {
+    s.paths.set_media(sw.to);
     if let Some(acks) = s.acks.get() {
         acks.path_changed(sw.lost);
     }
@@ -404,31 +401,6 @@ fn apply(s: &Session, sw: Switch, conn: &Connection) {
     {
         let _ = tx.try_send(Request::Keyframe(None));
     }
-}
-
-/// 两条路上各发一个探测数据报
-fn probe(s: &mut Session, direct: &Connection) {
-    for (via, conn) in [(Via::Relay, &s.link.hub.relay), (Via::Direct, direct)] {
-        let payload = probe_payload(via, now_us());
-        match s
-            .probe
-            .sealer
-            .seal_datagram(s.session_id, datagram::PROBE, &payload)
-        {
-            Ok(d) => {
-                let _ = conn.send_datagram(Bytes::from(d));
-            }
-            Err(e) => warn!("can't seal a probe: {e:#}"),
-        }
-    }
-}
-
-/// 弹回来的探测：这条路的往返时延（毫秒）
-fn echo(s: &mut Session, via: Via, d: &[u8]) -> Option<f64> {
-    let mut body = d.get(datagram::HEADER..)?.to_vec();
-    s.probe.opener.open(&mut body).ok()?;
-    let sent = probe_sent_at(&body, via)?;
-    Some(now_us().saturating_sub(sent) as f64 / 1000.0)
 }
 
 #[cfg(test)]

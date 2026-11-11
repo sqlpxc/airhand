@@ -41,7 +41,7 @@
 //! | 大块 | 双向 | 大的消息：剪贴板、光标图像（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
-//! "之后的每一帧"）。声音包，以及 Ping / Pong、画面确认这些只看最新值的控制消息走 QUIC 数据报（[`datagram`]）：
+//! "之后的每一帧"）。声音包，以及 Ping / Pong、画面确认、探测这些只看最新值的控制消息走 QUIC 数据报（[`datagram`]）：
 //! 丢了就丢了，不重传，也不用排在丢了的包、流里别的消息后面等。
 //!
 //! # 直连
@@ -58,7 +58,8 @@
 //!
 //! 两条路怎么分工：**控制通道和控制数据报两条路都发**（每一帧都写进中转，直连通着的话再从直连发一份，接收端按计数合并：
 //! 输入、确认、Ping 总是走更快的那条，直连突然断了也不丢）；**画面、声音只走一条路**，被控端按两条路上探测到的往返时延
-//! 选（直连可能比中转还慢，这时就留在中转上）；大块通道只走中转。
+//! 选（直连可能比中转还慢，这时就留在中转上）；大块通道只走中转。探测（[`session::HostDatagram::Probe`]）和它的回声
+//! 是只发在一条路上的控制数据报：每条路各探测一次，控制端从收到的那条路弹回去。
 //!
 //! 候选地址两种地址族都有：连中转的 socket 是双栈的，中转走 IPv4 时也能用两端的公网 IPv6 直连
 //! （IPv6 一般没有 NAT，IPv4 的对称 NAT、运营商级 NAT 打不通时它往往通）。
@@ -110,6 +111,10 @@ pub const SESSION_MAGIC: [u8; 4] = *b"AHS9";
 
 /// 一个会话每端最多这么多条通道（服务器的资源上限，与通道是什么无关）
 pub const MAX_LANES: u8 = 8;
+
+/// 会话头里的优先级最高这么多（控制通道的）：更大的值解码时压到它。服务器在端到端握手之前就转发通道，
+/// 不压的话任何知道控制码的一端都能把自己的流标得比别的会话的控制通道还高
+pub const MAX_PRIORITY: u8 = SessionLane::Control.priority();
 
 open_enum! {
     /// 连接角色
@@ -164,13 +169,14 @@ impl SessionLane {
 
 /// 通道流的开头（固定 16 字节）：`magic[4] | session_id u64 LE | lane u8 | priority u8 | 0 | 0`。
 ///
-/// 服务器按会话 ID 找到会话的另一端，向它开一条单向流、写同样的头，然后转发；往那一端写数据时用这里给的优先级。
-/// 直连上的通道流开头也是它（会话 ID 必须是这条直连的会话）
+/// 服务器按会话 ID 找到会话的另一端，向它开一条单向流、写同样的头，然后转发；往那一端写数据时用这里给的优先级
+/// （不超过 [`MAX_PRIORITY`]）。直连上的通道流开头也是它（会话 ID 必须是这条直连的会话）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {
     pub session_id: u64,
     /// 通道编号，小于 [`MAX_LANES`]
     pub lane: u8,
+    /// 不超过 [`MAX_PRIORITY`]
     pub priority: u8,
 }
 
@@ -201,7 +207,7 @@ impl SessionHeader {
         Some(Self {
             session_id: u64::from_le_bytes(b[4..12].try_into().ok()?),
             lane: b[12],
-            priority: b[13],
+            priority: b[13].min(MAX_PRIORITY),
         })
     }
 }
@@ -212,9 +218,8 @@ impl SessionHeader {
 /// 后面是端到端加密的内容（见 [`handshake`] 的"之后的每一帧"），种类决定用哪把密钥：
 ///
 /// * [`AUDIO`]：被控端的声音包（见 [`media`]）；
-/// * [`PROBE`]：量两条路（中转、直连）的往返时延的探测包（见模块说明的"直连"），两个方向各一把密钥；
-/// * [`CONTROL`]：控制数据报（[`session::ControllerDatagram`] / [`session::HostDatagram`]：Ping、Pong、画面确认），
-///   CBOR，和控制通道上的消息一样不认识的跳过。
+/// * [`CONTROL`]：控制数据报（[`session::ControllerDatagram`] / [`session::HostDatagram`]：Ping、Pong、画面确认、
+///   量两条路往返时延的探测和回声），CBOR，和控制通道上的消息一样不认识的跳过。
 ///
 /// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。
 pub mod datagram {
@@ -222,10 +227,8 @@ pub mod datagram {
     pub const HEADER: usize = 9;
     /// 声音包
     pub const AUDIO: u8 = 0;
-    /// 探测包
-    pub const PROBE: u8 = 1;
     /// 控制数据报
-    pub const CONTROL: u8 = 2;
+    pub const CONTROL: u8 = 1;
     /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
     /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
     pub const MAX: usize = 1000;
@@ -235,7 +238,7 @@ pub mod datagram {
         Some(u64::from_le_bytes(d.get(..8)?.try_into().ok()?))
     }
 
-    /// 数据报的种类（[`AUDIO`]、[`PROBE`]……）；不到一个头长时为 `None`
+    /// 数据报的种类（[`AUDIO`]、[`CONTROL`]）；不到一个头长时为 `None`
     pub fn kind(d: &[u8]) -> Option<u8> {
         d.get(8).copied()
     }
@@ -366,6 +369,13 @@ mod tests {
         assert_eq!(SessionHeader::decode(&other), None);
         let c = SessionHeader::new(1, SessionLane::Control);
         assert_eq!(c.encode()[12..], [0, 10, 0, 0]);
+        // 比控制通道还高的优先级压到控制通道的
+        let mut greedy = SessionHeader::new(1, SessionLane::Bulk).encode();
+        greedy[13] = 255;
+        assert_eq!(
+            SessionHeader::decode(&greedy).map(|h| h.priority),
+            Some(MAX_PRIORITY)
+        );
         let b = SessionHeader::new(1, SessionLane::Bulk);
         assert_eq!(b.encode()[12..], [2, 0, 0, 0]);
         for lane in SessionLane::ALL {
@@ -377,9 +387,9 @@ mod tests {
 
     #[test]
     fn datagram_layout() {
-        let d = [8, 7, 6, 5, 4, 3, 2, 1, datagram::PROBE, 9];
+        let d = [8, 7, 6, 5, 4, 3, 2, 1, datagram::CONTROL, 9];
         assert_eq!(datagram::session(&d), Some(0x0102_0304_0506_0708));
-        assert_eq!(datagram::kind(&d), Some(datagram::PROBE));
+        assert_eq!(datagram::kind(&d), Some(datagram::CONTROL));
         assert_eq!(datagram::session(&d[..7]), None);
         assert_eq!(datagram::kind(&d[..8]), None);
     }

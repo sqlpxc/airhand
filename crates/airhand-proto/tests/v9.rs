@@ -80,7 +80,9 @@ fn signal_messages_keep_their_wire_encoding() {
 #[test]
 fn session_messages_keep_their_wire_encoding() {
     golden(HostDatagram::Pong { t: 99 }, "8200811863");
+    golden(HostDatagram::Probe { t: 7 }, "82018107");
     golden(ControllerDatagram::Ping { t: 5 }, "82008105");
+    golden(ControllerDatagram::Echo { t: 7 }, "82028107");
     golden(
         ControllerDatagram::Ack {
             seq: 99,

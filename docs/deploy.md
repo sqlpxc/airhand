@@ -22,6 +22,14 @@ Environment variables (see `docker-compose.yml`):
 
 The image is based on distroless, runs as a non-root user, and is about 28 MB.
 
+**UDP buffers**: the server sets its socket's send and receive buffers to 8 MiB (the system default is only about 208 KB, which a burst of video at a few tens of Mbps fills up, dropping whole batches of packets: stutter and latency spikes). The Linux kernel silently caps anything above `net.core.rmem_max` / `wmem_max` (this can't be changed from inside the container; set it on the host), and the server logs a warning at startup when that happens:
+
+```bash
+sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+# to keep it after a reboot:
+echo -e 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-airhand.conf
+```
+
 ## Web console (Docker)
 
 The controller can also run in a container: start it with Docker Compose and open one port in a browser to get the console, with nothing to install or build on the computer you control from. It's the same console as the desktop one (several sessions, multi-screen overview, quality, sound, clipboard…); the computers being controlled still run the Airhand client.

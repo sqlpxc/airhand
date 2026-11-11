@@ -22,6 +22,14 @@
 
 镜像基于 distroless、以非 root 用户运行，约 28 MB。
 
+**UDP 缓冲区**：服务器把 socket 的收发缓冲区设成 8 MiB（系统默认只有约 208 KB，几十 Mbps 的画面一个突发就能把它填满、整批丢包，表现为卡顿和延迟尖峰）。Linux 内核会把超过 `net.core.rmem_max` / `wmem_max` 的部分悄悄截掉（容器里改不了，要在宿主机上改），被截掉时服务器启动时会在日志里警告：
+
+```bash
+sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+# 重启后仍然有效：
+echo -e 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-airhand.conf
+```
+
 ## 网页控制台（Docker）
 
 控制端也可以跑在容器里：用 Docker Compose 启动，浏览器打开一个端口就是控制台，操作的电脑上不用安装或构建任何东西。界面和桌面版的控制台完全一样（多会话、多屏总览、画质、声音、剪贴板……）；被控的电脑仍然运行 Airhand 客户端。

@@ -1,6 +1,8 @@
 # Airhand 中转服务器
 #   启动：docker compose up -d
 #   查看证书指纹：docker compose logs airhand | grep fingerprint
+#   Linux 宿主机上先调大 UDP 缓冲区的上限（容器里改不了，见 docs/deploy.zh-CN.md）：
+#     sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
 # 网页控制台（在浏览器里使用的控制端）见 web/docker-compose.yml
 services:
   airhand:

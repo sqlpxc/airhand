@@ -5,7 +5,7 @@
 //!   （最后是控制端的确认）；[`respond`]：被控端回答（发出决定就返回，确认由会话的读任务解开）。
 //!   两边都得到 [`Secured`] 和双方协商好的 [`Negotiated`]；
 //! * [`Secured`]：握手一次性派生的通道密钥：每条通道每个方向一个 [`Sealer`] / [`Opener`]，声音数据报、
-//!   控制数据报各一对，探测两条路的往返时延用的一对（[`Secured::probe`]）。
+//!   控制数据报各一对。
 //!
 //! 加解密都是原地做的：发送的帧预留了标签和计数的位置（`airhand_proto::framing::encode_with_spare`、
 //! `airhand_proto::media::frame`），收到的帧解密之后截掉尾巴，画面包照样原样交给界面，不多拷贝。
@@ -276,11 +276,9 @@ pub struct Secured {
     pub bulk: LaneKeys,
     /// 声音数据报。乱序可以、重放不行
     pub audio: LaneKeys,
-    /// 控制数据报（Ping、Pong、画面确认，`airhand_proto::datagram::CONTROL`）。乱序可以、重放不行：
+    /// 控制数据报（Ping、Pong、画面确认、探测和回声，`airhand_proto::datagram::CONTROL`）。乱序可以、重放不行：
     /// 直连通着时同一个数据报两条路各发一份，后到的那份就是重放
     pub datagrams: LaneKeys,
-    /// 探测数据报（`airhand_proto::datagram::PROBE`）：量中转、直连两条路的往返时延。乱序可以、重放不行
-    pub probe: LaneKeys,
 }
 
 /// 仅握手内部持有的原始材料，消费后派生一次全部通道密钥。
@@ -347,7 +345,6 @@ impl KeyMaterial {
                 bulk: self.keys(label(SessionLane::Bulk), Order::Next(0)),
                 audio: self.keys(b"airhand audio", window()),
                 datagrams: self.keys(b"airhand control datagram", window()),
-                probe: self.keys(b"airhand probe", window()),
             },
             self.keys(label(SessionLane::Control), Order::Next(0)),
         )
@@ -1418,10 +1415,7 @@ mod tests {
         assert!(open(&mut o, bad).is_err());
         assert_eq!(open(&mut o, body(&d[3])).unwrap(), [3; 10]);
         assert_eq!(open(&mut o, body(&d[2])).unwrap(), [2; 10]);
-        // 探测、控制数据报和声音的密钥都不一样
-        let mut p = host_keys.probe.sealer;
-        let probe = p.seal(&[1]).unwrap();
-        assert!(open(&mut o, probe).is_err());
+        // 控制数据报和声音的密钥不一样
         let mut c = host_keys.datagrams.sealer;
         let control = c.seal(&[1]).unwrap();
         assert!(open(&mut o, control.clone()).is_err());

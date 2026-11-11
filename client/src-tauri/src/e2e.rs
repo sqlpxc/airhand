@@ -8,16 +8,14 @@
 
 use std::time::{Duration, Instant};
 
-use airhand_link::controller::establish;
-use airhand_link::direct::Mirror;
+use airhand_link::controller::{FromHost, establish};
 use airhand_link::host::Router;
 use airhand_link::secure::{self, Identity, InitiatorParams, Sealer};
-use airhand_link::transport::{DatagramSender, FromHost};
 use airhand_link::wire::{read_msg, write_msg};
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
-    ByeReason, Codec, ControllerDatagram, ControllerMsg, HostDatagram, HostMsg, InputEvent, Notice,
+    ByeReason, Codec, ControllerDatagram, ControllerMsg, HostMsg, InputEvent, Notice,
     QualitySettings,
 };
 use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg, connect_outcome};
@@ -197,12 +195,7 @@ async fn e2e_roundtrip() {
         sealer: link.bulk.1,
     };
     // Ping、画面确认是控制数据报（这个协议级的控制端不建直连：只在中转上发）
-    let datagrams = DatagramSender::new(
-        grant.session_id,
-        sig.conn.clone(),
-        Mirror::default(),
-        link.datagrams,
-    );
+    let datagrams = link.datagrams;
     let mut recv = link.receiver;
     let _registration = link.registration;
     ctl.send(&ControllerMsg::Input {
@@ -340,7 +333,7 @@ async fn e2e_roundtrip() {
                 }
                 continue;
             }
-            FromHost::Datagram(HostDatagram::Pong { .. }) => {
+            FromHost::Pong(_) => {
                 rep.pongs += 1;
                 continue;
             }

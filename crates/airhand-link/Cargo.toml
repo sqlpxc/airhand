@@ -11,7 +11,7 @@ license = "MIT"
 [features]
 default = ["client"]
 # 客户端的全部：QUIC 连接、端到端加密（Noise、SPAKE2）、会话、控制端和被控端。
-# 关掉它只剩 wire（从流里读写长度前缀帧）：中转服务器就是这样用的（见 server/Cargo.toml），
+# 关掉它只剩 wire（从流里读写长度前缀帧）和 udp（收发缓冲区调大了的 UDP socket）：中转服务器就是这样用的（见 server/Cargo.toml），
 # 不用为了读写几帧把 Noise、SPAKE2 这些它用不到的库也编译进去
 client = [
     "dep:anyhow",
@@ -25,7 +25,6 @@ client = [
     "dep:serde",
     "dep:sha2",
     "dep:snow",
-    "dep:socket2",
     "dep:spake2",
     "tokio/rt",
     "tokio/macros",
@@ -39,8 +38,10 @@ console = ["client", "dep:futures-util", "dep:serde_json"]
 test-hooks = ["client"]
 
 [dependencies]
-# wire 用的（总是有）
+# wire、udp 用的（总是有）
 airhand-proto = { path = "../airhand-proto" }
+# 调大 UDP socket 的收发缓冲区；客户端连中转的 socket 开成双栈的（绑定之前关掉 IPV6_V6ONLY，见 src/udp.rs）
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util"] }
 tracing = "0.1"
@@ -61,8 +62,6 @@ serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 # risky-raw-split：取出 Noise 的两把密钥，再派生每条通道、每个方向各自的密钥（见 src/secure.rs）
 snow = { version = "0.10", features = ["risky-raw-split"], optional = true }
-# 连中转的 socket 开成双栈的（绑定之前关掉 IPV6_V6ONLY，见 src/direct/socket.rs）
-socket2 = { version = "0.6", optional = true }
 spake2 = { version = "0.4", optional = true }
 
 [dev-dependencies]

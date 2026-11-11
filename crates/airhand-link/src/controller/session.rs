@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::direct::Mirror;
+use super::receiver::{FromHost, HostReceiver};
+use crate::paths::{DatagramSender, Paths};
 use crate::secure::{Negotiated, Sealer};
-use crate::transport::{DatagramSender, FromHost, HostReceiver, write_lane};
+use crate::transport::write_lane;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
-    ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostDatagram,
-    HostMsg, Notice, Platform, SystemAction,
+    ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostMsg, Notice,
+    Platform, SystemAction,
 };
 use anyhow::Result;
 use bytes::Bytes;
@@ -31,51 +32,123 @@ const HOST_TIMEOUT: Duration = Duration::from_secs(20);
 const ACK_REPEAT: Duration = Duration::from_millis(30);
 const ACK_REPEATS: u8 = 3;
 
-/// 发给被控端的控制数据报：每秒的 Ping、画面确认（`ControllerDatagram`）。
-///
-/// 确认走数据报，会丢。丢的要是最后一个（画面停了，或者被控端的在途帧满了、正等着它），被控端就一直等：
-/// 所以没有新的确认时，最近的一个每隔 [`ACK_REPEAT`] 重发一次、共 [`ACK_REPEATS`] 次，之后随每秒的 Ping 再发一次。
-/// 确认是累积的，被控端收到重复的什么也不做
+/// 发给被控端的控制数据报：每秒的 Ping、画面确认（`ControllerDatagram`）。丢了的确认怎么补见 [`AckState`]
 pub(super) struct Feedback {
     out: DatagramSender,
-    /// 最近的确认，还要重发几次
-    last: std::sync::Mutex<Option<(ControllerDatagram, u8)>>,
+    acks: std::sync::Mutex<AckState>,
 }
 
 impl Feedback {
     pub fn new(out: DatagramSender) -> Self {
         Self {
             out,
-            last: Default::default(),
+            acks: Default::default(),
         }
     }
 
-    /// 界面收到了第 `seq` 帧，它开始到达的时刻是 `arrived`
+    /// 第 `seq` 帧到了（界面收到了，或者界面反正解不了、这里替它确认），它开始到达的时刻是 `arrived`
     pub fn ack(&self, seq: u32, arrived: u64) {
-        let m = ControllerDatagram::Ack { seq, arrived };
-        *self.last.lock().unwrap() = Some((m, ACK_REPEATS));
-        self.out.send(&m);
+        let m = self.acks.lock().unwrap().ack(seq, arrived, Instant::now());
+        if let Some(m) = m {
+            self.out.send(&m);
+        }
     }
 
-    /// 每隔 [`ACK_REPEAT`]：还没重发够的确认再发一次
+    /// 定时调用：好一阵没有新的确认了，最近的一个再发一次
     fn repeat(&self) {
-        let m = match &mut *self.last.lock().unwrap() {
-            Some((m, left)) if *left > 0 => {
-                *left -= 1;
-                *m
-            }
-            _ => return,
-        };
-        self.out.send(&m);
+        let m = self.acks.lock().unwrap().repeat(Instant::now());
+        if let Some(m) = m {
+            self.out.send(&m);
+        }
     }
 
     /// 每秒一次：Ping（也是保活），再带一次最近的确认
     fn ping(&self) {
         self.out.send(&ControllerDatagram::Ping { t: now_us() });
-        let last = self.last.lock().unwrap().map(|(m, _)| m);
+        let last = self.acks.lock().unwrap().last();
         if let Some(m) = last {
             self.out.send(&m);
         }
+    }
+}
+
+/// 画面确认发什么、什么时候补发。
+///
+/// 确认走数据报，会丢。丢的要是最后一个（画面停了，或者被控端的在途帧满了、正等着它），被控端就一直等：
+/// 所以 [`ACK_REPEAT`] 里没有新的确认时，最近的一个再发一次、最多 [`ACK_REPEATS`] 次，之后随每秒的 Ping 再发一次。
+/// 画面一直在来时每帧都有新的确认，不补发。确认是累积的：比发过的还旧的（界面晚到的确认）不用发
+#[derive(Default)]
+struct AckState {
+    last: Option<LastAck>,
+}
+
+#[derive(Clone, Copy)]
+struct LastAck {
+    seq: u32,
+    arrived: u64,
+    /// 上次发出的时刻
+    at: Instant,
+    /// 还能补发几次
+    left: u8,
+}
+
+impl LastAck {
+    fn msg(&self) -> ControllerDatagram {
+        ControllerDatagram::Ack {
+            seq: self.seq,
+            arrived: self.arrived,
+        }
+    }
+}
+
+impl AckState {
+    /// 第 `seq` 帧到了：要发的确认（不比发过的新就不发）
+    fn ack(&mut self, seq: u32, arrived: u64, now: Instant) -> Option<ControllerDatagram> {
+        if self
+            .last
+            .is_some_and(|l| seq.wrapping_sub(l.seq) as i32 <= 0)
+        {
+            return None;
+        }
+        let l = LastAck {
+            seq,
+            arrived,
+            at: now,
+            left: ACK_REPEATS,
+        };
+        self.last = Some(l);
+        Some(l.msg())
+    }
+
+    /// [`ACK_REPEAT`] 里没有发过确认了：最近的一个再发一次（最多 [`ACK_REPEATS`] 次）
+    fn repeat(&mut self, now: Instant) -> Option<ControllerDatagram> {
+        let l = self.last.as_mut()?;
+        if l.left == 0 || now.saturating_duration_since(l.at) < ACK_REPEAT {
+            return None;
+        }
+        l.left -= 1;
+        l.at = now;
+        Some(l.msg())
+    }
+
+    /// 最近的确认（随 Ping 再发一次）
+    fn last(&self) -> Option<ControllerDatagram> {
+        self.last.map(|l| l.msg())
+    }
+}
+
+/// 画面断过（前面有帧断在直连上等不到了，[`FromHost::Video`] 的 `gap`）：之后的增量帧缺了参考帧，硬件解码器多半
+/// 不报错、而是解出花屏。所以从断的地方到下一个关键帧之间的帧不交给界面（三种界面都不用知道有过缺口）
+#[derive(Default)]
+struct Keyframes {
+    waiting: bool,
+}
+
+impl Keyframes {
+    /// 这一帧交不交给界面
+    fn admit(&mut self, gap: bool, key: bool) -> bool {
+        self.waiting = (self.waiting || gap) && !key;
+        !self.waiting
     }
 }
 
@@ -265,8 +338,8 @@ pub(super) struct SessionIo {
     pub arrivals: Arc<std::sync::Mutex<Arrivals>>,
     /// Ping、画面确认（控制数据报）
     pub feedback: Arc<Feedback>,
-    /// 控制通道在直连上的那一份（直连没通时什么也不做）
-    pub mirror: Mirror,
+    /// 会话的两条路：控制通道在直连通着时也从直连发一份
+    pub paths: Paths,
     /// 直连任务
     pub direct: Direct,
 }
@@ -304,7 +377,7 @@ pub(super) async fn run(
         negotiated,
         arrivals,
         feedback,
-        mirror,
+        paths,
         direct: Direct {
             offers,
             task: direct_task,
@@ -319,7 +392,7 @@ pub(super) async fn run(
     // 队列失败了（排满了不能丢的命令）写任务就结束
     let overflow = tx.clone();
     let writer = async move {
-        write_lane(send, rx, sealer, Some(mirror)).await?;
+        write_lane(send, rx, sealer, Some(paths)).await?;
         anyhow::ensure!(!overflow.failed(), "controller command queue overflow");
         anyhow::Ok(())
     };
@@ -338,8 +411,10 @@ pub(super) async fn run(
     let st = stats.clone();
     let clip_in = local_clip.clone();
     let keyframe_tx = tx.clone();
+    let acker = feedback.clone();
     let reader = async move {
         let mut cursor = super::cursor::CursorReceiver::default();
+        let mut keyframes = Keyframes::default();
         loop {
             let msg = match recv.recv().await? {
                 // 画面、声音：只看一眼头做统计，原样交给界面
@@ -356,7 +431,6 @@ pub(super) async fn run(
                     if gap {
                         keyframe_tx.send(ControllerMsg::RequestKeyframe { after: h.seq })?;
                     }
-                    arrivals.lock().unwrap().record(h.seq, arrived);
                     {
                         let mut s = st.lock().unwrap();
                         s.last_msg = Instant::now();
@@ -367,6 +441,12 @@ pub(super) async fn run(
                         s.h = h.height;
                         s.direct = direct;
                     }
+                    if !keyframes.admit(gap, h.key) {
+                        // 解不了的增量帧不交给界面，这里替它确认：不然被控端的在途窗口停住，关键帧也发不过来
+                        acker.ack(h.seq, arrived);
+                        continue;
+                    }
+                    arrivals.lock().unwrap().record(h.seq, arrived);
                     out.packet(p).map_err(|_| ui_closed())?;
                     continue;
                 }
@@ -379,7 +459,7 @@ pub(super) async fn run(
                     out.packet(p).map_err(|_| ui_closed())?;
                     continue;
                 }
-                FromHost::Datagram(HostDatagram::Pong { t }) => {
+                FromHost::Pong(t) => {
                     let sample = now_us().saturating_sub(t) as f32 / 1000.0;
                     let mut s = st.lock().unwrap();
                     s.last_msg = Instant::now();
@@ -566,6 +646,60 @@ fn ui_closed() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ack(seq: u32) -> Option<ControllerDatagram> {
+        Some(ControllerDatagram::Ack { seq, arrived: 0 })
+    }
+
+    /// 画面一直在来时不补发；停了之后每隔 ACK_REPEAT 补一次、最多 ACK_REPEATS 次；旧的、重复的确认不发
+    #[test]
+    fn acks_are_repeated_only_when_no_new_ones_follow() {
+        let mut a = AckState::default();
+        let t0 = Instant::now();
+        assert_eq!(a.repeat(t0), None);
+        // 60 fps：每帧都有新的确认，定时器不补
+        let frame = Duration::from_micros(16_667);
+        for i in 1..=10u32 {
+            let now = t0 + frame * i;
+            assert_eq!(a.ack(i, 0, now), ack(i));
+            assert_eq!(a.repeat(now + frame / 2), None, "frame {i}");
+        }
+        // 界面晚到的旧确认、重复的：不发，也不把最近的换成旧的
+        let last = t0 + frame * 10;
+        assert_eq!(a.ack(7, 0, last), None);
+        assert_eq!(a.ack(10, 0, last), None);
+        assert_eq!(a.last(), ack(10));
+        // 画面停了：补发三次，每次隔 ACK_REPEAT
+        let mut now = last;
+        let mut repeats = 0;
+        for _ in 0..20 {
+            now += Duration::from_millis(10);
+            if a.repeat(now).is_some() {
+                repeats += 1;
+            }
+        }
+        assert_eq!(repeats, ACK_REPEATS);
+        assert_eq!(a.last(), ack(10));
+        // 序号绕回
+        let mut a = AckState::default();
+        assert_eq!(a.ack(u32::MAX, 0, t0), ack(u32::MAX));
+        assert_eq!(a.ack(0, 0, t0), ack(0));
+    }
+
+    /// 断过之后等关键帧：中间的增量帧不交给界面
+    #[test]
+    fn frames_after_a_gap_wait_for_a_keyframe() {
+        let mut k = Keyframes::default();
+        assert!(k.admit(false, true));
+        assert!(k.admit(false, false));
+        assert!(!k.admit(true, false));
+        assert!(!k.admit(false, false));
+        assert!(k.admit(false, true));
+        assert!(k.admit(false, false));
+        // 断在关键帧前面：关键帧不用等前面的帧
+        assert!(k.admit(true, true));
+        assert!(k.admit(false, false));
+    }
 
     /// 控制台（client/src/lib/api.ts 的 SessionEvent / Notice 类型）依赖这个 JSON 形状
     #[test]
