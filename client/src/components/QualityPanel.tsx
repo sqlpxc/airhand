@@ -47,7 +47,7 @@ function Label({ text, hint, htmlFor }: { text: string; hint?: string; htmlFor?:
 }
 
 /**
- * 画质面板：预设一行，下面是发给对方的各项设置（左名称 / 右控件，一项一行），最后是只影响本机显示的画面增强。
+ * 画质面板：预设一行，下面是发给对方的各项设置（左名称 / 右控件，一项一行），最后是只影响本机显示的画面增强、本地光标。
  * 标题与底部的编码器信息固定，中间放不下时滚动（高度上限见 Popover 的 --pop-max-h）
  */
 export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
@@ -55,9 +55,11 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   useSession(s);
   const decoders = useStore((st) => st.decoders);
   const enhance = useStore((st) => st.enhance);
+  const localCursor = useStore((st) => st.localCursor);
   const [draftKbps, setDraftKbps] = useState(s.settings.bitrateKbps);
   const timer = useRef<number | undefined>(undefined);
   const adaptiveId = useId();
+  const localCursorId = useId();
   const cur = s.settings;
   const preset = matchPreset(cur);
   const priority = cur.priority ?? "latency";
@@ -178,7 +180,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
             ))}
           </div>
 
-          {/* 本机显示的偏好，不发给对方；所有连接通用（见 enhance.ts） */}
+          {/* 本机显示的偏好，不发给对方；所有连接通用（见 store.ts） */}
           <div className="qp-section">{t("quality.local")}</div>
           <Label text={t("quality.enhance")} hint={t("quality.enhance.hint")} />
           <div className="segmented">
@@ -188,6 +190,15 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
               </button>
             ))}
           </div>
+
+          <Label text={t("quality.localCursor")} hint={t("quality.localCursor.hint")} htmlFor={localCursorId} />
+          <input
+            id={localCursorId}
+            type="checkbox"
+            className="switch"
+            checked={localCursor}
+            onChange={(e) => store.setLocalCursor(e.target.checked)}
+          />
         </div>
       </div>
 

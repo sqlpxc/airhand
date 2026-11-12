@@ -188,7 +188,7 @@ export class RemoteSession {
   /** 被控端按槽位缓存的光标形状（动画光标反复用到的那几帧，见 media.ts），只在一个会话里有效 */
   private cursorSlots = new Map<number, CursorImage>();
   private cursorVisible = true;
-  /** 被控端的光标已经画在画面里了（软件光标）：不显示本地光标，鼠标照常用绝对坐标 */
+  /** 被控端的光标已经画在画面里了（软件光标）：鼠标照常用绝对坐标，本地光标显不显示看设置（store 的 localCursor） */
   private cursorInFrame = false;
   private cursorCss = "default";
 
@@ -611,8 +611,8 @@ export class RemoteSession {
       this.setCursor(this.input.relative ? "none" : "default");
       return;
     }
-    // 画面里已经有光标了（例如对方正在拖动、缩放窗口）：本机再显示一个就是两个
-    if (this.cursorInFrame) {
+    // 画面里已经有光标了（例如对方正在拖动、缩放窗口）：默认照样显示本机的（跟手）；设置里关掉了就只看画面里的，不会有两个
+    if (this.cursorInFrame && !store.get().localCursor) {
       this.setCursor("none");
       return;
     }
@@ -681,6 +681,11 @@ export class RemoteSession {
   /** 画面增强的设置（store 的 enhance）变了 */
   refreshLayout() {
     this.layout();
+  }
+
+  /** 本地光标的设置（store 的 localCursor）变了 */
+  refreshCursor() {
+    this.applyCursor();
   }
 
   /** 画面增强的强度：全局设置，只用在正在操作的会话上（多屏总览的缩略图不增强） */

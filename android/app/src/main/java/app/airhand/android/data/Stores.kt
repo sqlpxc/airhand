@@ -82,6 +82,11 @@ data class Settings(
     val tvScale: ScaleMode = ScaleMode.FIT,
     /** 控制手机时显示返回 / 主页 / 最近任务按钮 */
     val navKeys: Boolean = true,
+    /**
+     * 对方把光标画进了画面里时（拖动、缩放窗口等）也画本机的光标：跟手，只是和画面里的那个一起有两个。
+     * 关掉时只看画面里的（见 [app.airhand.android.ui.session.RemoteView]）
+     */
+    val localCursor: Boolean = true,
     /** 别人连接本机时先请我同意 */
     val requireApproval: Boolean = true,
     /** 已经看过的手势说明（trackpad / touch / tv） */
@@ -113,6 +118,7 @@ data class Settings(
         .put("priority", priority)
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
+        .put("localCursor", localCursor)
         .put("requireApproval", requireApproval)
         .put("tipsSeen", JSONArray(tipsSeen.toList()))
         .put("identity", identity)
@@ -135,6 +141,7 @@ data class Settings(
                 priority = o.optString("priority", d.priority),
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),
+                localCursor = o.optBoolean("localCursor", d.localCursor),
                 requireApproval = o.optBoolean("requireApproval", d.requireApproval),
                 tipsSeen = if (tips == null) emptySet() else (0 until tips.length()).map { tips.getString(it) }.toSet(),
                 identity = o.optString("identity", ""),

@@ -137,6 +137,8 @@ export default {
   "quality.enhance.medium": "中",
   "quality.enhance.high": "强",
   "quality.enhance.hint": "在这台电脑的显卡上把画面放大得更清楚、锐化文字边缘，不增加带宽；太强会让压缩的痕迹更明显。对所有连接生效",
+  "quality.localCursor": "本地光标",
+  "quality.localCursor.hint": "对方拖动、缩放窗口时会把光标画进画面里。打开：照样显示本机的光标，跟手不延迟；关闭：只看画面里的那个，不会有两个光标。对所有连接生效",
   "quality.fps": "帧率",
   "quality.bitrate": "码率上限",
   "quality.idleHint": "画面静止时几乎不占带宽",

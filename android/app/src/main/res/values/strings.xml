@@ -159,6 +159,8 @@
     <string name="menu_av_sync_off">A/V sync off</string>
     <string name="nav_keys">Navigation keys for phones</string>
     <string name="nav_keys_desc">Back, Home and Recents below the screen when controlling a phone</string>
+    <string name="local_cursor">Local cursor while dragging windows</string>
+    <string name="local_cursor_desc">The other computer draws its cursor into the picture while a window is dragged or resized. On: still draw this device\'s cursor, which follows your finger with no delay. Off: show only the one in the picture</string>
     <string name="settings_data">Data</string>
     <string name="clear_devices">Clear saved devices</string>
     <string name="clear_devices_desc">%1$d saved</string>

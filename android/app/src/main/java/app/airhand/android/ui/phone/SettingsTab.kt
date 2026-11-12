@@ -15,6 +15,7 @@ import androidx.compose.material.icons.outlined.Gesture
 import androidx.compose.material.icons.outlined.HighQuality
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Navigation
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Smartphone
@@ -132,6 +133,9 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
         }
         Toggle(Icons.Outlined.Navigation, stringResource(R.string.nav_keys), stringResource(R.string.nav_keys_desc), s.navKeys) { v ->
             app.updateSettings { it.copy(navKeys = v) }
+        }
+        Toggle(Icons.Outlined.Mouse, stringResource(R.string.local_cursor), stringResource(R.string.local_cursor_desc), s.localCursor) { v ->
+            app.updateSettings { it.copy(localCursor = v) }
         }
 
         SectionTitle(stringResource(R.string.settings_data))

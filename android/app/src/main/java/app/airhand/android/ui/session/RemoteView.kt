@@ -290,6 +290,13 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             overlay.invalidate()
         }
 
+    /** 对方把光标画进了画面里时（[CursorState.inFrame]）也画本机的：跟手，只是有两个（设置里的 localCursor） */
+    var localCursor = true
+        set(v) {
+            field = v
+            overlay.invalidate()
+        }
+
     private var cursor = CursorState()
 
     fun setCursor(c: CursorState) {
@@ -404,8 +411,8 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             }
             if (ripples.isNotEmpty()) postInvalidateOnAnimation()
 
-            // 光标已经画在画面里了（对方拖动、缩放窗口等）：再画一个就是两个
-            if (!showCursor || !cursor.visible || cursor.inFrame || content.width() <= 0f) return
+            // 光标已经画在画面里了（对方拖动、缩放窗口等）：默认照样画（跟手），设置里关掉了就只看画面里的
+            if (!showCursor || !cursor.visible || (cursor.inFrame && !localCursor) || content.width() <= 0f) return
             val x = content.left + gestures.cursorX * content.width()
             val y = content.top + gestures.cursorY * content.height()
             val bmp: Bitmap? = cursor.bitmap

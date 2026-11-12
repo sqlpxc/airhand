@@ -41,7 +41,7 @@ import kotlin.concurrent.thread
 /**
  * 远端光标：形状由被控端发来，位置由本机决定（触控板模式下本机画出来）。
  * 隐藏了（游戏里转视角等）时鼠标改发相对移动（见 [Input.delta]）；
- * [inFrame]：已经画在画面里了（对方拖动、缩放窗口等），本机不再画，鼠标照常用绝对坐标
+ * [inFrame]：已经画在画面里了（对方拖动、缩放窗口等），鼠标照常用绝对坐标，本机画不画看设置（Settings.localCursor）
  */
 data class CursorState(
     val visible: Boolean = true,

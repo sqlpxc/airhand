@@ -191,7 +191,7 @@ fn fixture() -> Value {
         visibility: CursorVisibility::Hidden,
         shape: None,
     });
-    // 画在画面里的光标（被控端改用了软件光标）：界面不显示本地光标，形状换成槽位里已有的
+    // 画在画面里的光标（被控端改用了软件光标）：界面照常用绝对坐标，本地光标看设置；形状换成槽位里已有的
     let drawn = media::cursor_packet(&CursorState {
         visibility: CursorVisibility::InFrame,
         shape: Some(CursorSlot {

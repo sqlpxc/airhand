@@ -129,6 +129,8 @@ const en: Record<MsgKey, Msg> = {
   "quality.enhance.medium": "Medium",
   "quality.enhance.high": "High",
   "quality.enhance.hint": "Upscales the picture on this computer's GPU with a sharper filter and sharpens text edges, with no extra bandwidth. Strong settings also make compression artifacts more visible. Applies to all connections",
+  "quality.localCursor": "Local cursor",
+  "quality.localCursor.hint": "The other computer draws its cursor into the picture while a window is dragged or resized. On: keep showing this computer's cursor, which follows your hand with no delay. Off: show only the one in the picture, so there aren't two cursors. Applies to all connections",
   "quality.fps": "Frame rate",
   "quality.bitrate": "Max bitrate",
   "quality.idleHint": "Almost no bandwidth when the screen is still",

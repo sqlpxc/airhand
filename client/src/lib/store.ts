@@ -1,5 +1,5 @@
 // 全局状态：标签（会话 / 新建连接 / 多屏总览）、我的设备、服务器状态等。
-// "我的设备"保存在 config.toml 里（见 actions.ts 的 saveDevices）；画面增强是这台电脑自己显示的偏好，
+// "我的设备"保存在 config.toml 里（见 actions.ts 的 saveDevices）；画面增强、本地光标是这台电脑自己显示的偏好，
 // 和对方无关，存在 WebView / 浏览器的 localStorage 里；其余只在控制台打开期间有效。
 import { useCallback, useSyncExternalStore } from "react";
 import type { AppInfo, Codec, Problem, QualitySettings, SavedDevice, ServerState } from "./api";
@@ -55,10 +55,16 @@ interface State {
   immersive: boolean;
   /** 画面增强（所有会话通用，见 enhance.ts） */
   enhance: EnhanceLevel;
+  /**
+   * 对方把光标画进了画面里时（拖动、缩放窗口等）也显示本机的光标：跟手，只是和画面里的那个一起有两个。
+   * 关掉时只看画面里的。所有会话通用，默认打开（见 session.ts 的 applyCursor）
+   */
+  localCursor: boolean;
 }
 
 const MAX_RECENT = 8;
 const ENHANCE_KEY = "airhand.enhance";
+const LOCAL_CURSOR_KEY = "airhand.localCursor";
 
 /** 上次选的画面增强（读不到就是关） */
 export function loadEnhance(): EnhanceLevel {
@@ -70,9 +76,19 @@ export function loadEnhance(): EnhanceLevel {
   }
 }
 
-function saveEnhance(level: EnhanceLevel) {
+/** 本地光标的设置（读不到就是打开） */
+export function loadLocalCursor(): boolean {
   try {
-    globalThis.localStorage?.setItem(ENHANCE_KEY, level);
+    return globalThis.localStorage?.getItem(LOCAL_CURSOR_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+/** 记下这台电脑的显示偏好 */
+function saveLocal(key: string, value: string) {
+  try {
+    globalThis.localStorage?.setItem(key, value);
   } catch {
     // 存不了（例如浏览器禁用了存储）：只在这次有效
   }
@@ -100,6 +116,7 @@ let state: State = {
   decoders: ["h264"],
   immersive: false,
   enhance: loadEnhance(),
+  localCursor: loadLocalCursor(),
 };
 
 const listeners = new Set<() => void>();
@@ -161,9 +178,16 @@ export const store = {
   /** 画面增强：记下来，所有会话马上按它重画 */
   setEnhance: (enhance: EnhanceLevel) => {
     if (enhance === state.enhance) return;
-    saveEnhance(enhance);
+    saveLocal(ENHANCE_KEY, enhance);
     set({ enhance });
     for (const s of state.sessions) s.refreshLayout();
+  },
+  /** 画面里有光标时显不显示本机的光标：记下来，所有会话马上换指针 */
+  setLocalCursor: (localCursor: boolean) => {
+    if (localCursor === state.localCursor) return;
+    saveLocal(LOCAL_CURSOR_KEY, localCursor ? "1" : "0");
+    set({ localCursor });
+    for (const s of state.sessions) s.refreshCursor();
   },
 
   // ── 标签 ──

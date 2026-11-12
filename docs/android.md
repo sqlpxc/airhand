@@ -66,7 +66,7 @@ Remote input maps to the phone like this: touch points and the left mouse button
 
 ## Phone: Settings
 
-Server address and certificate fingerprint (defaults are compiled in and can be changed here; a malformed fingerprint can't be saved; left empty, the server's certificate is remembered on the first connection and a different one is refused later, and saving the fingerprint again forgets it), this device's name (shown to others, defaults to the system device name), ask before someone connects, change control code, default quality, scaling, default touch input, play sound by default, A/V sync, navigation keys for phones, clear saved devices, version and protocol version.
+Server address and certificate fingerprint (defaults are compiled in and can be changed here; a malformed fingerprint can't be saved; left empty, the server's certificate is remembered on the first connection and a different one is refused later, and saving the fingerprint again forgets it), this device's name (shown to others, defaults to the system device name), ask before someone connects, change control code, default quality, scaling, default touch input, play sound by default, A/V sync, navigation keys for phones, local cursor while dragging windows (on by default: the trackpad cursor is still drawn while a Windows host draws its own into the picture), clear saved devices, version and protocol version.
 
 ## TV
 
