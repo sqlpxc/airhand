@@ -20,6 +20,8 @@ import java.nio.ByteOrder
  *
  * 光标形状按槽位缓存（动画光标反复用到的那几帧只传一次）：标志 bit1 = 新形状（RGBA 在头后面），存进槽位并换成它；
  * bit2 = 换成槽位里已有的形状；都没有 = 形状没变。槽位只在一个会话里有效。
+ * bit0 = 可见；bit3 = 光标已经画在画面里了（被控端改用了软件光标，例如 Windows 拖动、缩放窗口时）：
+ * 不画本地光标（不然有两个），鼠标照常用绝对坐标。
  */
 object Media {
     /** 头最短的长度（本版本写的长度） */
@@ -34,9 +36,15 @@ object Media {
 
     /**
      * 光标。`shape`：新的形状（RGBA 跟在头后面），存进 `slot` 并换成它；`cached`：换成 `slot` 里已有的形状；
-     * 都没有表示形状没变
+     * 都没有表示形状没变。`inFrame`：光标已经画在画面里了，不画本地光标（只在 `visible` 时有意义）
      */
-    data class Cursor(val visible: Boolean, val shape: Shape?, val slot: Int = 0, val cached: Boolean = false)
+    data class Cursor(
+        val visible: Boolean,
+        val shape: Shape?,
+        val slot: Int = 0,
+        val cached: Boolean = false,
+        val inFrame: Boolean = false,
+    )
 
     /** 头的长度（第 3 个字节）；不到 24、或者比包还长时为 0（不是合法的包） */
     fun headerLen(b: ByteArray): Int {
@@ -79,7 +87,13 @@ object Media {
         val bb = le(b)
         val flags = b[1].toInt()
         val shape = if (flags and 2 != 0) Shape(bb.u16(8), bb.u16(10), bb.u16(12), bb.u16(14)) else null
-        return Cursor(visible = flags and 1 != 0, shape = shape, slot = b[2].toInt() and 0xff, cached = flags and 4 != 0)
+        return Cursor(
+            visible = flags and 1 != 0,
+            shape = shape,
+            slot = b[2].toInt() and 0xff,
+            cached = flags and 4 != 0,
+            inFrame = flags and 8 != 0,
+        )
     }
 }
 

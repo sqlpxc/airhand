@@ -94,20 +94,27 @@ fn session_messages_keep_their_wire_encoding() {
     golden(HostMsg::Clipboard { text: "hi".into() }, "820881626869");
     golden(
         HostMsg::Cursor {
-            visible: false,
+            visibility: CursorVisibility::Hidden,
             shape: None,
         },
-        "820781f4",
+        "82078100",
     );
     golden(
         HostMsg::Cursor {
-            visible: false,
+            visibility: CursorVisibility::Shown,
             shape: Some(CursorRef {
                 slot: 2,
                 generation: 7,
             }),
         },
-        "820782f4820207",
+        "82078201820207",
+    );
+    golden(
+        HostMsg::Cursor {
+            visibility: CursorVisibility::InFrame,
+            shape: None,
+        },
+        "82078102",
     );
     golden(
         HostMsg::CursorImage {

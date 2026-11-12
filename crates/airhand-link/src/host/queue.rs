@@ -240,7 +240,8 @@ impl Drop for LaneReceiver {
 mod tests {
     use super::*;
     use airhand_proto::session::{
-        ByeReason, CursorRef, CursorShape, DisplayInfo, HostHello, Notice, Platform,
+        ByeReason, CursorRef, CursorShape, CursorVisibility, DisplayInfo, HostHello, Notice,
+        Platform,
     };
     use std::time::Duration;
 
@@ -292,9 +293,13 @@ mod tests {
         HostMsg::Notice(Some(Notice::NoDisplays))
     }
 
-    fn cursor(visible: bool, slot: u8) -> HostMsg {
+    fn cursor(shown: bool, slot: u8) -> HostMsg {
         HostMsg::Cursor {
-            visible,
+            visibility: if shown {
+                CursorVisibility::Shown
+            } else {
+                CursorVisibility::Hidden
+            },
             shape: Some(CursorRef {
                 slot,
                 generation: 1,
@@ -372,7 +377,13 @@ mod tests {
         let out = drain(&mut control);
         assert_eq!(out.len(), 4, "{out:?}");
         assert_eq!(shown(&out[0]), "new");
-        assert!(matches!(out[1], HostMsg::Cursor { visible: false, .. }));
+        assert!(matches!(
+            out[1],
+            HostMsg::Cursor {
+                visibility: CursorVisibility::Hidden,
+                ..
+            }
+        ));
         assert!(matches!(out[2], HostMsg::Notice(_)));
         assert!(matches!(out[3], HostMsg::Bye(ByeReason::Kicked)));
         // 槽位不占队列的位置：排满了它们照样放得进去
@@ -427,7 +438,7 @@ mod tests {
         assert!(matches!(
             messages[0],
             HostMsg::Cursor {
-                visible: false,
+                visibility: CursorVisibility::Hidden,
                 shape: Some(CursorRef { slot: 2, .. })
             }
         ));

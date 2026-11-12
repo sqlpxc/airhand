@@ -300,7 +300,7 @@ impl Capturer for SckCapturer {
             update.cursor_shape = Some(shape);
         }
         if self.first {
-            update.cursor_visible = Some(true);
+            update.cursor_visibility = Some(super::CursorVisibility::Shown);
         }
         let sample = {
             let st = self.inbox.st.lock().unwrap();

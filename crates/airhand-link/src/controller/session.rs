@@ -518,8 +518,8 @@ pub(super) async fn run(
                     }
                     return Err(Problem::from(reason).into());
                 }
-                HostMsg::Cursor { visible, shape } => {
-                    let state = cursor.update(visible, shape);
+                HostMsg::Cursor { visibility, shape } => {
+                    let state = cursor.update(visibility, shape);
                     out.packet(media::cursor_packet(&state))
                         .map_err(|_| ui_closed())?;
                 }

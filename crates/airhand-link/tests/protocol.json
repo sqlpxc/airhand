@@ -172,6 +172,7 @@
     {
       "cached": false,
       "hex": "020307180000000002000100010000000000000000000000ff0000ff0000ff80",
+      "inFrame": false,
       "kind": 2,
       "name": "cursor",
       "payload": "ff0000ff0000ff80",
@@ -187,6 +188,7 @@
     {
       "cached": true,
       "hex": "020507180000000000000000000000000000000000000000",
+      "inFrame": false,
       "kind": 2,
       "name": "cached cursor",
       "payload": "",
@@ -197,12 +199,24 @@
     {
       "cached": false,
       "hex": "020000180000000000000000000000000000000000000000",
+      "inFrame": false,
       "kind": 2,
       "name": "hidden cursor",
       "payload": "",
       "shape": null,
       "slot": 0,
       "visible": false
+    },
+    {
+      "cached": true,
+      "hex": "020d07180000000000000000000000000000000000000000",
+      "inFrame": true,
+      "kind": 2,
+      "name": "cursor drawn in the frame",
+      "payload": "",
+      "shape": null,
+      "slot": 7,
+      "visible": true
     },
     {
       "captureUs": 123456829012,

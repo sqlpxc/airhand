@@ -20,7 +20,7 @@ use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder};
 
-use super::{CaptureUpdate, Capturer, FramePool};
+use super::{CaptureUpdate, Capturer, CursorVisibility, FramePool};
 use crate::host::x11::{self, Monitor, X11};
 
 /// 共享内存段（memfd + mmap），Drop 时解除映射。
@@ -281,12 +281,16 @@ impl Capturer for X11Capturer {
             self.cursor_dirty = false;
             if let Some(shape) = self.cursor_shape()? {
                 // 全透明的光标就是隐藏了光标（例如播放视频时）
-                update.cursor_visible =
-                    Some(shape.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
+                let shown = shape.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
+                update.cursor_visibility = Some(if shown {
+                    CursorVisibility::Shown
+                } else {
+                    CursorVisibility::Hidden
+                });
                 update.cursor_shape = Some(shape);
             }
         } else if self.first {
-            update.cursor_visible = Some(true);
+            update.cursor_visibility = Some(CursorVisibility::Shown);
         }
         if self.dirty || self.damage.is_none() {
             update.frame = self.grab(pool)?;

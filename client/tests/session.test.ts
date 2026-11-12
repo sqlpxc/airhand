@@ -296,6 +296,27 @@ test("光标形状按槽位缓存：只带槽位的包换成缓存里的形状�
   assert.equal(s.cursorSlots.size, 0);
 });
 
+test("光标画在画面里（对方拖动、缩放窗口）：不显示本地光标，鼠标照常用绝对坐标", () => {
+  const s = sessionHarness().session;
+  const style: any = {};
+  const hidden: boolean[] = [];
+  Object.assign(s, { canvas: { style }, input: { relative: false, setRemoteCursorHidden(h: boolean) { hidden.push(h); } } });
+  const push = (flags: number) => {
+    const b = new Uint8Array(media.HEADER_LEN);
+    b[0] = media.CURSOR;
+    b[1] = flags;
+    b[3] = media.HEADER_LEN;
+    s.onCursor(b);
+  };
+  push(1);
+  assert.equal(style.cursor, "default", "还没有形状：普通的指针");
+  push(1 | 8);
+  assert.equal(style.cursor, "none");
+  push(1);
+  assert.equal(style.cursor, "default");
+  assert.deepEqual(hidden, [false, false, false], "一直没有改发相对移动");
+});
+
 test("stale completion cannot finish a newer attempt", () => {
   const attempt = new ConnectionAttempt();
   const old = attempt.begin();

@@ -188,6 +188,8 @@ export class RemoteSession {
   /** 被控端按槽位缓存的光标形状（动画光标反复用到的那几帧，见 media.ts），只在一个会话里有效 */
   private cursorSlots = new Map<number, CursorImage>();
   private cursorVisible = true;
+  /** 被控端的光标已经画在画面里了（软件光标）：不显示本地光标，鼠标照常用绝对坐标 */
+  private cursorInFrame = false;
   private cursorCss = "default";
 
   /**
@@ -580,6 +582,7 @@ export class RemoteSession {
     // 负载从头里写的长度处开始（以后的版本可能把头加长）
     const rgba = media.payload(pkt, dv);
     this.cursorVisible = c.visible;
+    this.cursorInFrame = c.inFrame;
     const s = c.shape;
     if (s && s.width > 0 && s.height > 0 && rgba.byteLength >= s.width * s.height * 4) {
       // 新的形状：存进被控端指定的槽位。复制一份，不一直占着整个包的缓冲区
@@ -606,6 +609,11 @@ export class RemoteSession {
     if (!this.cursorVisible || this.input.relative) {
       // 发相对移动时本机指针的位置没有意义，不显示；用户按 Esc 解除了锁定就显示一个普通的指针
       this.setCursor(this.input.relative ? "none" : "default");
+      return;
+    }
+    // 画面里已经有光标了（例如对方正在拖动、缩放窗口）：本机再显示一个就是两个
+    if (this.cursorInFrame) {
+      this.setCursor("none");
       return;
     }
     const c = this.cursorRaw;

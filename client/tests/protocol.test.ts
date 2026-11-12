@@ -30,7 +30,7 @@ test("媒体包：头和数据按 media.ts 解析，负载从头里写的长度�
       assert.deepEqual(media.audioHeader(dv), { seq: m.seq, start: m.start, captureUs: m.captureUs }, m.name);
       assert.equal(media.videoSeq(dv), null);
     } else {
-      assert.deepEqual(media.cursorHeader(dv), { visible: m.visible, slot: m.slot, shape: m.shape, cached: m.cached }, m.name);
+      assert.deepEqual(media.cursorHeader(dv), { visible: m.visible, inFrame: m.inFrame, slot: m.slot, shape: m.shape, cached: m.cached }, m.name);
     }
   }
   assert.equal(media.kind(new DataView(new ArrayBuffer(10))), 0, "不到一个头长");

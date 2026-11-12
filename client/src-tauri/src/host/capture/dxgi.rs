@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use airhand_proto::session::{CursorShape, DisplayInfo};
 use anyhow::{Context, Result, anyhow, bail};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -38,9 +38,12 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CURSOR_SHOWING, CURSOR_SUPPRESSED, CURSORINFO, GetCursorInfo,
+};
 use windows::core::Interface;
 
-use super::{CaptureUpdate, Capturer, Frame, FramePool};
+use super::{CaptureUpdate, Capturer, CursorVisibility, Frame, FramePool};
 
 // ───────────────────────────── GPU 上的画面 ─────────────────────────────
 
@@ -389,6 +392,10 @@ pub struct DxgiCapturer {
     staging: Option<(ID3D11Texture2D, u32, u32)>,
     first: bool,
     shape_buf: Vec<u8>,
+    /// 桌面复制上一次报告的硬件光标是否可见（不可见时每一帧都用 [`software_cursor`] 再看一次）
+    hw_cursor: bool,
+    /// 这块显示器在桌面上的范围（物理像素）
+    desktop: RECT,
     /// 显示器的旋转方向（旋转方向变了桌面复制会中断，重新打开时更新）
     rotation: Rotation,
 }
@@ -453,6 +460,8 @@ impl DxgiCapturer {
                 staging: None,
                 first: true,
                 shape_buf: Vec::new(),
+                hw_cursor: true,
+                desktop: o.desc.DesktopCoordinates,
                 rotation,
             })
         }
@@ -518,9 +527,18 @@ impl Capturer for DxgiCapturer {
         }
         let mut update = CaptureUpdate::default();
 
-        // 光标：位置由控制端本地光标负责，这里只同步可见性与形状
+        // 光标：位置由控制端本地光标负责，这里只同步可见性与形状。
+        // 硬件光标不可见时不一定是隐藏了，可能是改成了画进画面里的软件光标（见 software_cursor）：
+        // 这期间每一帧都再看一次，软件光标期间程序隐藏了光标（画面会变）也能发现
         if info.LastMouseUpdateTime != 0 {
-            update.cursor_visible = Some(info.PointerPosition.Visible.as_bool());
+            self.hw_cursor = info.PointerPosition.Visible.as_bool();
+        }
+        if info.LastMouseUpdateTime != 0 || !self.hw_cursor {
+            update.cursor_visibility = Some(if self.hw_cursor {
+                CursorVisibility::Shown
+            } else {
+                software_cursor(&self.desktop)
+            });
         }
         if info.PointerShapeBufferSize > 0 {
             update.cursor_shape = self.pointer_shape(info.PointerShapeBufferSize);
@@ -666,6 +684,41 @@ impl DxgiCapturer {
                 .ok()?;
         }
         convert_pointer(&self.shape_buf, &si)
+    }
+}
+
+/// 硬件光标不可见时，光标到底怎么样了（`desktop`：这块显示器在桌面上的范围）。
+///
+/// 桌面复制的 `PointerPosition.Visible` 说的是**硬件光标**：拖动窗口、改变窗口大小时（还有放大镜、
+/// 某些显卡驱动和虚拟显示器）系统改用软件光标，直接画进桌面画面里，这时它也是 FALSE，光标却没有隐藏。
+/// 把它当成隐藏，控制端就会改发相对移动、锁定指针，每拖一次窗口锁一次（浏览器每次都提示"按 Esc 显示光标"）。
+/// 用 `GetCursorInfo` 区分：
+///
+/// * 游戏等真的隐藏了光标（`ShowCursor(FALSE)`、`SetCursor(NULL)`），它也说不显示：隐藏；
+/// * 显示着、在这块显示器上：画在画面里了，控制端不再显示本地光标（不然有两个）；
+/// * 显示着、在别的显示器上（这块显示器的硬件光标也是不可见）：控制端照常显示本地光标、发绝对坐标，
+///   一动就回到这块屏幕上。
+///
+/// 采集线程跟着输入桌面走（见 [`crate::host::desktop`]），看到的是用户正在用的那个桌面的光标；
+/// 线程按每显示器 DPI 感知运行，坐标和 `DesktopCoordinates` 一样是物理像素
+fn software_cursor(desktop: &RECT) -> CursorVisibility {
+    let mut ci = CURSORINFO {
+        cbSize: size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetCursorInfo(&mut ci) }.is_err()
+        || ci.flags.0 & CURSOR_SHOWING.0 == 0
+        || ci.flags.0 & CURSOR_SUPPRESSED.0 != 0
+        || ci.hCursor.is_invalid()
+    {
+        return CursorVisibility::Hidden;
+    }
+    let p = ci.ptScreenPos;
+    if (desktop.left..desktop.right).contains(&p.x) && (desktop.top..desktop.bottom).contains(&p.y)
+    {
+        CursorVisibility::InFrame
+    } else {
+        CursorVisibility::Shown
     }
 }
 

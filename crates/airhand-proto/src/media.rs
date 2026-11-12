@@ -21,7 +21,7 @@
 //! | 偏移 | 类型    | 画面（1）            | 光标（2）                         | 声音（3）            |
 //! |-----:|---------|----------------------|-----------------------------------|----------------------|
 //! | 0    | u8      | 类型                 | 类型                              | 类型                 |
-//! | 1    | u8      | 标志：bit0 关键帧    | bit0 可见，bit1 新形状，bit2 旧形状 | bit0 停顿后的第一包  |
+//! | 1    | u8      | 标志：bit0 关键帧    | bit0 可见，bit1 新形状，bit2 旧形状，bit3 画在画面里 | bit0 停顿后的第一包  |
 //! | 2    | u8      | [`Codec`] 的编号     | 形状的槽位                        | 0                    |
 //! | 3    | u8      | **头的长度**（现在是 24） | 同左                         | 同左                 |
 //! | 4    | u32     | 帧序号               | 0                      | 包序号               |
@@ -70,7 +70,7 @@
 //! 一个包最多 [`MAX_AUDIO_PACKET`]（带上长度前缀、单独一包放得进一个数据报），被控端的 Opus 编码器按
 //! [`MAX_OPUS_PACKET`] 限长，放不下的（只可能来自不能限长的编码器）丢掉，由解码器的丢包补偿盖过去。
 
-use crate::session::{Codec, CursorShape};
+use crate::session::{Codec, CursorShape, CursorVisibility};
 
 /// 本版本写的媒体包头的长度，也是头最短的长度（读的时候按第 3 个字节，见 [`header_len`]）
 pub const HEADER_LEN: usize = 24;
@@ -136,6 +136,7 @@ const FLAG_START: u8 = 1;
 const FLAG_VISIBLE: u8 = 1;
 const FLAG_SHAPE: u8 = 2;
 const FLAG_CACHED: u8 = 4;
+const FLAG_IN_FRAME: u8 = 8;
 
 fn u16_at(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([b[i], b[i + 1]])
@@ -271,7 +272,7 @@ pub fn audio_packets(plain: &[u8]) -> Option<Vec<&[u8]>> {
 /// 交给界面的光标（[`cursor_packet`]）。由控制端合并线上的光标消息得到，不在线上传
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorState {
-    pub visible: bool,
+    pub visibility: CursorVisibility,
     /// 换成了哪个形状；`None` 表示形状没变
     pub shape: Option<CursorSlot>,
 }
@@ -288,7 +289,12 @@ pub struct CursorSlot {
 pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
     let image = c.shape.as_ref().and_then(|s| s.image.as_ref());
     let mut h = new_header(Kind::Cursor);
-    h[1] = if c.visible { FLAG_VISIBLE } else { 0 };
+    h[1] = match c.visibility {
+        CursorVisibility::Hidden => 0,
+        CursorVisibility::InFrame => FLAG_VISIBLE | FLAG_IN_FRAME,
+        // 不认识的（对方版本新增的）：照常显示本地光标、发绝对坐标
+        CursorVisibility::Shown | CursorVisibility::Unknown(_) => FLAG_VISIBLE,
+    };
     if let Some(s) = &c.shape {
         h[2] = s.slot;
         h[1] |= if image.is_some() {
@@ -490,7 +496,7 @@ mod tests {
     #[test]
     fn cursor_layout() {
         let p = cursor_packet(&CursorState {
-            visible: true,
+            visibility: CursorVisibility::Shown,
             shape: Some(CursorSlot {
                 slot: 5,
                 image: Some(CursorShape {
@@ -511,7 +517,7 @@ mod tests {
         assert_eq!(&p[HEADER_LEN..], &[9; 8]);
         // 槽位里已有的形状：只有头
         let cached = cursor_packet(&CursorState {
-            visible: true,
+            visibility: CursorVisibility::Shown,
             shape: Some(CursorSlot {
                 slot: 31,
                 image: None,
@@ -520,10 +526,23 @@ mod tests {
         assert_eq!(cached.len(), HEADER_LEN);
         assert_eq!((cached[1], cached[2]), (FLAG_VISIBLE | FLAG_CACHED, 31));
         let hidden = cursor_packet(&CursorState {
-            visible: false,
+            visibility: CursorVisibility::Hidden,
             shape: None,
         });
         assert_eq!(hidden.len(), HEADER_LEN);
         assert_eq!(hidden[1], 0);
+        // 画在画面里（软件光标）：只多一个标志位
+        let drawn = cursor_packet(&CursorState {
+            visibility: CursorVisibility::InFrame,
+            shape: None,
+        });
+        assert_eq!(drawn.len(), HEADER_LEN);
+        assert_eq!(drawn[1], FLAG_VISIBLE | FLAG_IN_FRAME);
+        // 不认识的（对方版本新增的）：当作显示着
+        let newer = cursor_packet(&CursorState {
+            visibility: CursorVisibility::Unknown(9),
+            shape: None,
+        });
+        assert_eq!(newer[1], FLAG_VISIBLE);
     }
 }

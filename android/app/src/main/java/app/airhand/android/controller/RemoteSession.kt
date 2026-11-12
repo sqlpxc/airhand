@@ -40,9 +40,16 @@ import kotlin.concurrent.thread
 
 /**
  * 远端光标：形状由被控端发来，位置由本机决定（触控板模式下本机画出来）。
- * 隐藏了（游戏里转视角等）时鼠标改发相对移动（见 [Input.delta]）
+ * 隐藏了（游戏里转视角等）时鼠标改发相对移动（见 [Input.delta]）；
+ * [inFrame]：已经画在画面里了（对方拖动、缩放窗口等），本机不再画，鼠标照常用绝对坐标
  */
-data class CursorState(val visible: Boolean = true, val bitmap: Bitmap? = null, val hotX: Int = 0, val hotY: Int = 0)
+data class CursorState(
+    val visible: Boolean = true,
+    val bitmap: Bitmap? = null,
+    val hotX: Int = 0,
+    val hotY: Int = 0,
+    val inFrame: Boolean = false,
+)
 
 /**
  * 一个远程会话（看 / 操作一台设备）。连接、断线重连、等对方上线都在这里，界面只观察 [phase] 等状态。
@@ -412,7 +419,7 @@ class RemoteSession(
                     c.cached -> cursorSlots[c.slot]
                     else -> null
                 }
-                cursor.value = (shape ?: cursor.value).copy(visible = c.visible)
+                cursor.value = (shape ?: cursor.value).copy(visible = c.visible, inFrame = c.inFrame)
             }
             Media.AUDIO -> {
                 val a = Media.audio(b)

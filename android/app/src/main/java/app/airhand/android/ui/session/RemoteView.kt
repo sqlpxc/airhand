@@ -404,7 +404,8 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             }
             if (ripples.isNotEmpty()) postInvalidateOnAnimation()
 
-            if (!showCursor || !cursor.visible || content.width() <= 0f) return
+            // 光标已经画在画面里了（对方拖动、缩放窗口等）：再画一个就是两个
+            if (!showCursor || !cursor.visible || cursor.inFrame || content.width() <= 0f) return
             val x = content.left + gestures.cursorX * content.width()
             val y = content.top + gestures.cursorY * content.height()
             val bmp: Bitmap? = cursor.bitmap

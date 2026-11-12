@@ -11,8 +11,8 @@
 use airhand_link::controller::{Command, ConnectOptions};
 use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
-    Codec, CursorShape, InputEvent, MouseButton, QualitySettings, SystemAction, TouchPhase,
-    VideoPriority,
+    Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, SystemAction,
+    TouchPhase, VideoPriority,
 };
 use serde_json::{Value, json};
 
@@ -174,22 +174,30 @@ fn fixture() -> Value {
         rgba: vec![255, 0, 0, 255, 0, 0, 255, 128],
     };
     let cursor = media::cursor_packet(&CursorState {
-        visible: true,
+        visibility: CursorVisibility::Shown,
         shape: Some(CursorSlot {
             slot: 7,
             image: Some(shape.clone()),
         }),
     });
     let cached = media::cursor_packet(&CursorState {
-        visible: true,
+        visibility: CursorVisibility::Shown,
         shape: Some(CursorSlot {
             slot: 7,
             image: None,
         }),
     });
     let hidden = media::cursor_packet(&CursorState {
-        visible: false,
+        visibility: CursorVisibility::Hidden,
         shape: None,
+    });
+    // 画在画面里的光标（被控端改用了软件光标）：界面不显示本地光标，形状换成槽位里已有的
+    let drawn = media::cursor_packet(&CursorState {
+        visibility: CursorVisibility::InFrame,
+        shape: Some(CursorSlot {
+            slot: 7,
+            image: None,
+        }),
     });
     // 以后的版本在头里加了一个 8 字节的扩展（类型 0xee、长度 6，头的长度是 32）：
     // 负载照样从头的长度处开始，不认识的扩展跳过
@@ -224,15 +232,19 @@ fn fixture() -> Value {
                 "kind": 3, "seq": 3, "start": true, "captureUs": capture_us + 20_000, "payload": "fcfffe"
             },
             {
-                "name": "cursor", "hex": hex(&cursor), "kind": 2, "visible": true, "slot": 7, "cached": false,
+                "name": "cursor", "hex": hex(&cursor), "kind": 2, "visible": true, "inFrame": false, "slot": 7, "cached": false,
                 "shape": { "width": 2, "height": 1, "hotX": 1, "hotY": 0 }, "payload": hex(&shape.rgba)
             },
             {
-                "name": "cached cursor", "hex": hex(&cached), "kind": 2, "visible": true, "slot": 7, "cached": true,
+                "name": "cached cursor", "hex": hex(&cached), "kind": 2, "visible": true, "inFrame": false, "slot": 7, "cached": true,
                 "shape": null, "payload": ""
             },
             {
-                "name": "hidden cursor", "hex": hex(&hidden), "kind": 2, "visible": false, "slot": 0, "cached": false,
+                "name": "hidden cursor", "hex": hex(&hidden), "kind": 2, "visible": false, "inFrame": false, "slot": 0, "cached": false,
+                "shape": null, "payload": ""
+            },
+            {
+                "name": "cursor drawn in the frame", "hex": hex(&drawn), "kind": 2, "visible": true, "inFrame": true, "slot": 7, "cached": true,
                 "shape": null, "payload": ""
             },
             {

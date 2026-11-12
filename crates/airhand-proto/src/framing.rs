@@ -172,15 +172,19 @@ mod tests {
             HostMsg::Notice(Some(Notice::AudioRecovered)),
             HostMsg::Bye(ByeReason::CodeChanged),
             HostMsg::Cursor {
-                visible: false,
+                visibility: CursorVisibility::Hidden,
                 shape: None,
             },
             HostMsg::Cursor {
-                visible: true,
+                visibility: CursorVisibility::Shown,
                 shape: Some(CursorRef {
                     slot: 3,
                     generation: 9,
                 }),
+            },
+            HostMsg::Cursor {
+                visibility: CursorVisibility::InFrame,
+                shape: None,
             },
         ];
         let mut wire = Vec::new();

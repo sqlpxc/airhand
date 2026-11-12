@@ -235,7 +235,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 Some(s) if c.shape_seq > shape_seq => Some(s.as_ref()),
                 _ => None,
             };
-            match ctrl.cursors.lock().unwrap().send(&out, c.visible, shape) {
+            match ctrl.cursors.lock().unwrap().send(&out, c.visibility, shape) {
                 Ok(()) => {
                     shape_seq = c.shape_seq;
                     cursor_pending = false;

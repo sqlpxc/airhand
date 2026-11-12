@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::{Outbox, SendError};
-use airhand_proto::session::{CURSOR_SLOTS, CursorRef, CursorShape, HostMsg};
+use airhand_proto::session::{CURSOR_SLOTS, CursorRef, CursorShape, CursorVisibility, HostMsg};
 
 /// 槽位里是哪个形状
 #[derive(Clone, Copy)]
@@ -44,7 +44,7 @@ impl CursorCache {
     pub fn send(
         &mut self,
         out: &Outbox,
-        visible: bool,
+        visibility: CursorVisibility,
         shape: Option<&CursorShape>,
     ) -> Result<(), SendError> {
         let mut result = Ok(());
@@ -65,7 +65,7 @@ impl CursorCache {
             }
         }
         out.send(&HostMsg::Cursor {
-            visible,
+            visibility,
             shape: self.current,
         })?;
         result
@@ -133,7 +133,9 @@ mod tests {
     fn images_are_retried_without_delaying_visibility() {
         let (out, mut control, mut bulk) = super::super::queue::channel();
         let mut cache = CursorCache::default();
-        cache.send(&out, true, Some(&shape(1))).unwrap();
+        cache
+            .send(&out, CursorVisibility::Shown, Some(&shape(1)))
+            .unwrap();
         assert!(matches!(
             decode(&bulk.try_recv().unwrap()),
             HostMsg::CursorImage { .. }
@@ -141,7 +143,7 @@ mod tests {
         assert!(matches!(
             decode(&control.try_recv().unwrap()),
             HostMsg::Cursor {
-                visible: true,
+                visibility: CursorVisibility::Shown,
                 shape: Some(_)
             }
         ));
@@ -149,19 +151,21 @@ mod tests {
             out.send(&HostMsg::Clipboard { text: "x".into() }).unwrap();
         }
         assert_eq!(
-            cache.send(&out, false, Some(&shape(2))),
+            cache.send(&out, CursorVisibility::Hidden, Some(&shape(2))),
             Err(SendError::Full)
         );
         // 可见性到了；形状还是控制端已经有的那一个
         let HostMsg::Cursor {
-            visible: false,
+            visibility: CursorVisibility::Hidden,
             shape: Some(kept),
         } = decode(&control.try_recv().unwrap())
         else {
             panic!()
         };
         while bulk.try_recv().is_some() {}
-        cache.send(&out, false, Some(&shape(2))).unwrap();
+        cache
+            .send(&out, CursorVisibility::Hidden, Some(&shape(2)))
+            .unwrap();
         let HostMsg::CursorImage { reference, image } = decode(&bulk.try_recv().unwrap()) else {
             panic!()
         };

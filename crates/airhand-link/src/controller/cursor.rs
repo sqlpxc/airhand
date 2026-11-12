@@ -1,7 +1,7 @@
 //! 合并跨通道的光标状态（控制通道）与图像（大块通道），换成交给界面的光标包（`airhand_proto::media::cursor_packet`）：
 //! 三种界面不需要各写一份乱序处理。
 use airhand_proto::media::{CursorSlot, CursorState};
-use airhand_proto::session::{CURSOR_SLOTS, CursorRef, CursorShape};
+use airhand_proto::session::{CURSOR_SLOTS, CursorRef, CursorShape, CursorVisibility};
 
 struct Image {
     generation: u64,
@@ -10,7 +10,7 @@ struct Image {
 }
 
 pub(super) struct CursorReceiver {
-    visible: bool,
+    visibility: CursorVisibility,
     wanted: Option<CursorRef>,
     slots: Vec<Option<Image>>,
 }
@@ -18,7 +18,7 @@ pub(super) struct CursorReceiver {
 impl Default for CursorReceiver {
     fn default() -> Self {
         Self {
-            visible: true,
+            visibility: CursorVisibility::Shown,
             wanted: None,
             slots: (0..CURSOR_SLOTS).map(|_| None).collect(),
         }
@@ -26,8 +26,12 @@ impl Default for CursorReceiver {
 }
 
 impl CursorReceiver {
-    pub fn update(&mut self, visible: bool, shape: Option<CursorRef>) -> CursorState {
-        self.visible = visible;
+    pub fn update(
+        &mut self,
+        visibility: CursorVisibility,
+        shape: Option<CursorRef>,
+    ) -> CursorState {
+        self.visibility = visibility;
         self.wanted = shape.filter(|r| r.slot < CURSOR_SLOTS);
         self.current()
     }
@@ -68,7 +72,7 @@ impl CursorReceiver {
             })
         });
         CursorState {
-            visible: self.visible,
+            visibility: self.visibility,
             shape,
         }
     }
@@ -77,6 +81,7 @@ impl CursorReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use CursorVisibility::{Hidden, InFrame, Shown};
 
     fn image(n: u8) -> CursorShape {
         CursorShape {
@@ -95,14 +100,14 @@ mod tests {
             slot: 0,
             generation: 1,
         };
-        assert!(c.update(true, Some(r)).shape.is_none());
-        let hidden = c.update(false, Some(r));
-        assert!(!hidden.visible && hidden.shape.is_none());
+        assert!(c.update(Shown, Some(r)).shape.is_none());
+        let hidden = c.update(Hidden, Some(r));
+        assert!(hidden.visibility == Hidden && hidden.shape.is_none());
         let arrival = c.image(r, image(1)).unwrap();
-        assert!(!arrival.visible);
+        assert_eq!(arrival.visibility, Hidden);
         assert_eq!(arrival.shape.unwrap().image, Some(image(1)));
-        let shown = c.update(true, Some(r));
-        assert!(shown.visible);
+        let shown = c.update(InFrame, Some(r));
+        assert_eq!(shown.visibility, InFrame);
         assert!(
             shown.shape.unwrap().image.is_none(),
             "frontend already has this image"
@@ -120,12 +125,12 @@ mod tests {
             slot: 0,
             generation: 2,
         };
-        c.update(true, Some(new));
+        c.update(Shown, Some(new));
         assert!(c.image(old, image(1)).is_none());
         let fresh = c.image(new, image(2)).unwrap();
         assert_eq!(fresh.shape.unwrap().image, Some(image(2)));
         assert!(c.image(old, image(1)).is_none());
-        assert!(c.update(false, Some(old)).shape.is_none());
+        assert!(c.update(Hidden, Some(old)).shape.is_none());
     }
 
     #[test]
@@ -141,8 +146,14 @@ mod tests {
         };
         assert!(c.image(a, image(1)).is_none());
         assert!(c.image(b, image(2)).is_none());
-        assert_eq!(c.update(true, Some(b)).shape.unwrap().image, Some(image(2)));
-        assert_eq!(c.update(true, Some(a)).shape.unwrap().image, Some(image(1)));
+        assert_eq!(
+            c.update(Shown, Some(b)).shape.unwrap().image,
+            Some(image(2))
+        );
+        assert_eq!(
+            c.update(Shown, Some(a)).shape.unwrap().image,
+            Some(image(1))
+        );
         assert!(
             c.image(
                 CursorRef {
@@ -155,7 +166,7 @@ mod tests {
         );
         assert!(
             c.update(
-                false,
+                Hidden,
                 Some(CursorRef {
                     slot: 255,
                     generation: 7

@@ -60,7 +60,10 @@ class ProtocolTest {
                     val shape = s?.let { Media.Shape(it.getInt("width"), it.getInt("height"), it.getInt("hotX"), it.getInt("hotY")) }
                     assertEquals(
                         name,
-                        Media.Cursor(m.getBoolean("visible"), shape, m.getInt("slot"), m.getBoolean("cached")),
+                        Media.Cursor(
+                            m.getBoolean("visible"), shape, m.getInt("slot"), m.getBoolean("cached"),
+                            inFrame = m.getBoolean("inFrame"),
+                        ),
                         Media.cursor(b),
                     )
                 }

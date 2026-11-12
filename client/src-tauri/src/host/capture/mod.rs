@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use airhand_proto::session::{CursorShape, DisplayInfo, Notice, QualitySettings};
+use airhand_proto::session::{CursorShape, CursorVisibility, DisplayInfo, Notice, QualitySettings};
 use anyhow::{Result, anyhow};
 use tracing::{info, warn};
 
@@ -253,20 +253,20 @@ impl FramePool {
 #[derive(Default)]
 pub struct CaptureUpdate {
     pub frame: Option<Arc<Frame>>,
-    /// 光标可见性变化
-    pub cursor_visible: Option<bool>,
+    /// 光标可见性（变没变都可以给，没变不算变化）
+    pub cursor_visibility: Option<CursorVisibility>,
     /// 光标形状变化
     pub cursor_shape: Option<CursorShape>,
 }
 
 /// 光标的最新状态（带版本号，编码线程据此判断是否需要通知控制端）。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CursorSnapshot {
     /// 任意变化都会递增
     pub seq: u64,
     /// 形状变化时递增
     pub shape_seq: u64,
-    pub visible: bool,
+    pub visibility: CursorVisibility,
     pub shape: Option<Arc<CursorShape>>,
 }
 
@@ -290,7 +290,12 @@ impl FrameSlot {
                 seq: 0,
                 frame: None,
                 error: None,
-                cursor: CursorSnapshot::default(),
+                cursor: CursorSnapshot {
+                    seq: 0,
+                    shape_seq: 0,
+                    visibility: CursorVisibility::Hidden,
+                    shape: None,
+                },
             }),
             cv: Condvar::new(),
         }
@@ -304,10 +309,10 @@ impl FrameSlot {
             st.error = None;
         }
         let mut cursor_changed = false;
-        if let Some(v) = u.cursor_visible
-            && v != st.cursor.visible
+        if let Some(v) = u.cursor_visibility
+            && v != st.cursor.visibility
         {
-            st.cursor.visible = v;
+            st.cursor.visibility = v;
             cursor_changed = true;
         }
         if let Some(shape) = u.cursor_shape
@@ -555,7 +560,7 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 if let Some(f) = &u.frame {
                     pacer.done(f.captured);
                 }
-                if u.frame.is_some() || u.cursor_visible.is_some() || u.cursor_shape.is_some() {
+                if u.frame.is_some() || u.cursor_visibility.is_some() || u.cursor_shape.is_some() {
                     shared.slot.publish(u);
                 }
             }

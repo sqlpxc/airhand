@@ -38,9 +38,12 @@
 //! # 鼠标
 //!
 //! 平时鼠标用绝对坐标（[`InputEvent::MouseMove`]）：控制端的指针在哪里，被控端的光标就在哪里。
-//! 被控端的光标隐藏了（[`HostMsg::Cursor`] 的 `visible` 为 false，例如游戏里按住右键转视角、第一人称游戏）时，
+//! 被控端的光标隐藏了（[`CursorVisibility::Hidden`]，例如游戏里按住右键转视角、第一人称游戏）时，
 //! 控制端改发相对移动（[`InputEvent::MouseDelta`]）：游戏这时自己把光标拉回原位、只看移动了多少，
 //! 绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动了）。
+//!
+//! 光标显示着、但已经画在画面里了（[`CursorVisibility::InFrame`]，被控端改用了软件光标，例如 Windows 拖动、
+//! 缩放窗口时）：控制端照常发绝对坐标，只是不再显示本地光标，不然画面里一个、本地一个，两个光标。
 //!
 //! # 过时的输入
 //!
@@ -101,7 +104,7 @@ pub enum HostMsg {
     #[n(7)]
     Cursor {
         #[n(0)]
-        visible: bool,
+        visibility: CursorVisibility,
         #[n(1)]
         shape: Option<CursorRef>,
     },
@@ -224,6 +227,19 @@ open_enum! {
         Unanswered = 3 => "unanswered",
         /// 被控端上已经有好几个连接请求在等它的用户回答，这一个没有问（过一会儿再试）
         TooManyRequests = 4 => "tooManyRequests",
+    }
+}
+
+open_enum! {
+    /// 被控端的光标显示成什么样（见模块说明的"鼠标"）。
+    /// 不认识的值（对方版本新增的）控制端按 `Shown` 对待：照常显示本地光标、发绝对坐标
+    pub enum CursorVisibility {
+        /// 隐藏了（游戏里转视角等）：控制端改发相对移动
+        Hidden = 0 => "hidden",
+        /// 显示着：控制端用本地光标显示它的形状
+        Shown = 1 => "shown",
+        /// 显示着，已经画在画面里了（软件光标）：控制端照常发绝对坐标，不再显示本地光标
+        InFrame = 2 => "inFrame",
     }
 }
 
