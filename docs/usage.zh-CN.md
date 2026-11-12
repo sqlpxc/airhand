@@ -64,7 +64,7 @@ Airhand 要保存的东西都在一个 `config.toml` 里（里面有注释）。
 
 ## 卸载
 
-按下面的步骤做完，Airhand 在这台电脑上什么都不会留下。配置文件里有本机的控制码和“我的设备”里别的电脑的控制码（相当于钥匙），不再用 Airhand 的话请一定删掉。
+按下面的步骤做完，Airhand 在这台电脑上不会留下什么（macOS 上有两样受系统保护的东西 Airhand 删不掉，见 [macOS](#macos) 的最后）。配置文件里有本机的控制码和“我的设备”里别的电脑的控制码（相当于钥匙），不再用 Airhand 的话请一定删掉。
 
 ### Windows
 
@@ -74,42 +74,72 @@ Airhand 要保存的东西都在一个 `config.toml` 里（里面有注释）。
 
 ### macOS
 
-点菜单栏里的 Airhand 图标，选**卸载 Airhand…**，确认之后会按顺序做完下面的第 1～4 步，把 Airhand 移到废纸篓并退出，清空废纸篓就彻底删掉了。哪一步没做成，最后的提示里会列出来，再按下面的步骤手动补上。
+macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身。除了程序，Airhand 在 macOS 上还会留下这几样（按卸载的顺序）：
 
-Airhand 打不开、或者想自己动手时，按下面的步骤手动卸载。macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身，下面几样也要清掉，而且**顺序不能乱**：登录项要由 Airhand 自己注销，权限记录要在 App 还在的时候才能清除。
+| 项目 | 位置 | 说明 |
+|---|---|---|
+| 登录时自动启动 | “系统设置 → 通用 → 登录项”（有的系统版本叫“登录项与扩展”）里“登录时打开”和“后台 App 活动”两处 | 要由 Airhand 自己注销：先删掉 App 的话，两处都会留下一个失效的 Airhand |
+| 权限记录 | “系统设置 → 隐私与安全性”里的“屏幕与系统录音”“辅助功能”等 | 要在 App 还在的时候清除，App 删掉之后系统就找不到它了 |
+| 配置文件 | `~/Library/Application Support/app.airhand.client/` | 里面有控制码，一定要删 |
+| 系统为它生成的缓存 | 系统的缓存目录和临时目录（`getconf DARWIN_USER_CACHE_DIR`、`DARWIN_USER_TEMP_DIR`）里的 `*app.airhand.client` | Metal、WebKit 以 Airhand 的名字建的，大多是空的，最多是一点 GPU 着色器缓存。临时目录里 WebKit 的几个删不掉，见最后 |
+| 崩溃报告 | `~/Library/Logs/DiagnosticReports/airhand-*.ips`、`~/Library/Application Support/CrashReporter/airhand_*.plist` | 只有 Airhand 崩溃过才有 |
+| 菜单栏图标的设置 | `~/Library/Preferences/app.airhand.client.plist` | Airhand 自己不用这个文件，平时也没有：按住 ⌘ 拖动过菜单栏图标（记下位置）、或者在“系统设置 → 菜单栏”里关掉过它（记下不显示）时由系统写入。不删的话，重新安装后图标还是藏着的 |
+
+**用菜单卸载**：点菜单栏里的 Airhand 图标，选**卸载 Airhand…**，确认之后会按上表的顺序全部清掉（受系统保护、删不掉的跳过，见最后），再把 Airhand 移到废纸篓并退出，清空废纸篓就彻底删掉了。哪一项没做成，最后的提示里会列出来，用下面手动卸载里对应的命令补上。
+
+**手动卸载**：Airhand 打不开、或者想自己动手时用。前两步要在删掉 App 之前做，**顺序不能乱**。
 
 1. 点菜单栏里的 Airhand 图标，**关掉“登录时自动启动”**，然后选**退出**（旧版本的菜单里没有这一项，也就没有登记过登录项，直接退出）。
-   不先关掉就删掉 App 的话，“系统设置 → 通用 → 登录项”（有的系统版本叫“登录项与扩展”）里“登录时打开”和“后台 App 活动”两处都会留下一个失效的 Airhand。
-2. 打开“终端”，清除 Airhand 的权限记录（“屏幕与系统录音”“辅助功能”等，只影响 Airhand）：
+2. 打开“终端”，清除权限记录（只影响 Airhand）：
 
    ```bash
    tccutil reset All app.airhand.client
    ```
 
    看到 `Successfully reset All approval status for app.airhand.client` 就好了。如果提示 `No such bundle identifier`，说明 App 已经删掉了，见下面的“已经直接删掉了 App”。
-3. 删除程序、配置文件，以及 macOS 为它生成的缓存（WebKit、Metal 在系统的临时目录和缓存目录里以 Airhand 的名字建的几个目录，大多是空的）：
+3. 删除其余几样和程序：
 
    ```bash
-   rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    rm -rf ~/Library/Application\ Support/app.airhand.client
    find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name '*app.airhand.client' -exec rm -rf {} + 2>/dev/null
-   ```
-
-   第一行也可以换成在“应用程序”文件夹里把 Airhand 拖进废纸篓（再清空废纸篓）。`find` 会碰到别的 App 受保护的目录，那些报错已经忽略了，不影响结果。
-4. （可选）删除 macOS 记下的崩溃报告（只有 Airhand 崩溃过才有）：
-
-   ```bash
    find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' -delete 2>/dev/null
+   defaults delete app.airhand.client 2>/dev/null; rm -f ~/Library/Preferences/app.airhand.client.plist
+   rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    ```
 
-检查：下面的命令什么都不输出，并且“系统设置 → 通用 → 登录项”和“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里都没有 Airhand，就是删干净了。
+   一行一项，依次是配置文件、系统为它生成的缓存、崩溃报告、菜单栏图标的设置和程序。最后一行也可以换成在“应用程序”文件夹里把 Airhand 拖进废纸篓（再清空废纸篓）。`find` 会碰到别的 App 受保护的目录，那些报错已经忽略了，不影响结果。菜单栏图标的设置先用 `defaults delete` 经过系统的偏好设置服务删，它会留下一个空文件，再用 `rm` 删掉。
+
+**检查**：下面的命令除了临时目录里 WebKit 的几个空目录（删不掉，见最后）之外什么都不输出，并且“系统设置 → 通用 → 登录项”和“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里都没有 Airhand，就是删干净了。
 
 ```bash
-ls -d /Applications/Airhand.app ~/Applications/Airhand.app ~/Library/Application\ Support/app.airhand.client 2>/dev/null
+ls -d ~/Library/Application\ Support/app.airhand.client ~/Library/Preferences/app.airhand.client.plist /Applications/Airhand.app ~/Applications/Airhand.app 2>/dev/null
 find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name '*app.airhand.client' 2>/dev/null
+find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' 2>/dev/null
 ```
 
-**已经直接删掉了 App**（没有先做第 1、2 步）：把 Airhand.app 重新放回原来的位置（例如从下载的 `.dmg` 里再拖进“应用程序”文件夹），打开它，再从第 1 步做起。系统还记着原来的登录项，在菜单里关掉就会把“登录时打开”和“后台 App 活动”里的两处一起删掉。不想再装一次的话也可以手动删：“登录项”里在“登录时打开”中选中 Airhand 点“−”，“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里选中 Airhand 点“−”。
+**已经直接删掉了 App**（没有先做第 1、2 步）：把 Airhand.app 重新放回原来的位置（例如从下载的 `.dmg` 里再拖进“应用程序”文件夹），打开它，再从第 1 步做起。系统还记着原来的登录项，在菜单里关掉就会把“登录时打开”和“后台 App 活动”里的两处一起删掉。不想再装一次的话也可以手动删：“登录项”里在“登录时打开”中选中 Airhand 点“−”，“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里选中 Airhand 点“−”，然后做第 3 步。
+
+**Airhand 删不掉的**：下面两样受系统保护。
+
+- 系统临时目录里 WebKit 的几个目录 `com.apple.WebKit.*+app.airhand.client`（打开过控制台才有）：有系统完整性保护（SIP），谁都删不掉，删除时提示 `Operation not permitted`，用菜单卸载时会跳过它们。里面是空的；用到 WebKit 的 App（包括 Safari）在这里都有这样的目录。
+- macOS 26 起，“系统设置 → 菜单栏”里允许在菜单栏显示的 App 列表（Allow in the Menu Bar）可能还有 Airhand。这份列表由系统记在受保护的文件里，系统没有提供删除单个 App 的办法，只能按下面的方法把整个列表重置。它只是一条记录，不重置也不影响什么；以后重新安装时，如果之前在这里关掉过 Airhand，菜单栏里不会出现它的图标，在这里重新打开就行。
+
+**重置菜单栏的 App 列表**（可选，macOS 26 起）：这个列表记在 `~/Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist` 的 `trackedApplications` 一项里。删掉这一项、注销再登录之后列表就清空了，以后有菜单栏图标的 App 运行时会重新加进来，已经删掉的 App 不会再出现。这不是苹果提供的功能，而是改系统自己的文件，**会把所有 App 在这个列表里的选择一起清掉**：之前关掉的菜单栏图标会重新出现，要再到“系统设置 → 菜单栏”里关一遍。
+
+1. 给“终端”完全磁盘访问权限：在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”里打开“终端”（列表里没有就点“+”添加“应用程序 → 实用工具 → 终端”），然后退出终端再重新打开。这个文件在受保护的目录里，没有这个权限读不到也改不了。
+2. 退出“系统设置”，在终端里先备份，再删掉这一项：
+
+   ```bash
+   cd ~/Library/Group\ Containers/group.com.apple.controlcenter/Library/Preferences
+   cp group.com.apple.controlcenter.plist ~/group.com.apple.controlcenter.plist.bak
+   defaults delete "$PWD/group.com.apple.controlcenter.plist" trackedApplications
+   ```
+
+   要用 `defaults` 删，不要直接改文件：系统的偏好设置服务里还缓存着它，直接改文件的话，可能又被缓存里的旧内容写回来。
+3. 注销再登录（或者重新启动），再打开“系统设置 → 菜单栏”看一下。
+4. 回到“完全磁盘访问权限”里把“终端”关掉。
+
+想恢复原来的列表：同样在有完全磁盘访问权限的终端里运行 `defaults import ~/Library/Group\ Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist ~/group.com.apple.controlcenter.plist.bak`，再注销、登录。
 
 ### Linux
 

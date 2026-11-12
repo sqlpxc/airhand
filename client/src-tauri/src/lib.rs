@@ -775,6 +775,8 @@ fn uninstall_app(app: &AppHandle) {
     }
     // 还没完全停下的被控端不能再把配置文件写回去，删掉也不再重新生成
     config::freeze();
+    // 菜单栏图标要在删偏好设置之前拿掉（见 tray::remove）
+    tray::remove(app);
     let plan = uninstall::Plan {
         bundle: login_item::bundle(),
         bundle_id: config::BUNDLE_ID.into(),

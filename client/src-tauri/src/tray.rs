@@ -101,6 +101,13 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
         .build(app)
 }
 
+/// macOS 卸载时：先拿掉菜单栏图标。AppKit 移除图标时会改写 App 自己的偏好设置（清掉图标的位置等），
+/// 要在删偏好设置之前做，删完之后再移除会留下一个空的偏好设置文件（见 `uninstall::remove_preferences`）
+#[cfg(target_os = "macos")]
+pub fn remove(app: &AppHandle) {
+    drop(app.remove_tray_by_id(TRAY_ID));
+}
+
 fn label(app: &AppHandle, text: impl AsRef<str>) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::new(app, text, false, None::<&str>)
 }

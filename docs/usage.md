@@ -64,7 +64,7 @@ Everything Airhand saves is in one `config.toml` (with comments). The menu in th
 
 ## Uninstalling
 
-After these steps nothing of Airhand is left on the computer. The configuration file holds this computer's control code and the codes of the computers in My devices (they work like keys), so do delete it if you stop using Airhand.
+After these steps nothing of Airhand is left on the computer (except two things on macOS that the system protects and Airhand can't remove, see the end of [macOS](#macos)). The configuration file holds this computer's control code and the codes of the computers in My devices (they work like keys), so do delete it if you stop using Airhand.
 
 ### Windows
 
@@ -74,42 +74,72 @@ Settings → Apps → Airhand → Uninstall. The uninstaller stops and removes t
 
 ### macOS
 
-Click the Airhand icon in the menu bar and choose **Uninstall Airhand…**. After you confirm, it goes through steps 1–4 below in order, moves Airhand to the Trash and quits; empty the Trash to delete it for good. If a step didn't work out, the final message lists it, and you can finish it by hand as described below.
+macOS apps have no uninstaller, and moving the app to the Trash only removes the program itself. Besides the program, Airhand leaves these behind on macOS (in the order they're removed):
 
-If Airhand won't open, or you'd rather do it yourself, uninstall it by hand. macOS apps have no uninstaller, and moving the app to the Trash only removes the program itself. The items below have to go too, **in this order**: the login item has to be unregistered by Airhand itself, and the permission records can only be cleared while the app is still there.
+| Item | Where | Notes |
+|---|---|---|
+| Open at login | System Settings → General → Login Items ("Login Items & Extensions" on some versions of macOS), under both "Open at Login" and "App Background Activity" | Has to be unregistered by Airhand itself: if you delete the app first, a dead Airhand entry stays in both places |
+| Permissions | System Settings → Privacy & Security: Screen & System Audio Recording, Accessibility and so on | Can only be cleared while the app is still there; once it's deleted macOS can't find it any more |
+| Configuration | `~/Library/Application Support/app.airhand.client/` | Holds the control codes, so be sure to delete it |
+| Caches macOS created for it | `*app.airhand.client` in the system's cache and temporary directories (`getconf DARWIN_USER_CACHE_DIR`, `DARWIN_USER_TEMP_DIR`) | Created by Metal and WebKit under Airhand's name; mostly empty, at most a small GPU shader cache. WebKit's ones in the temporary directory can't be removed, see the end |
+| Crash reports | `~/Library/Logs/DiagnosticReports/airhand-*.ips`, `~/Library/Application Support/CrashReporter/airhand_*.plist` | Only there if Airhand has crashed |
+| Menu bar icon settings | `~/Library/Preferences/app.airhand.client.plist` | Airhand doesn't use this file and it normally doesn't exist: macOS writes it when you ⌘-drag the menu bar icon (its position) or turn it off in System Settings → Menu Bar (hidden). If it stays, the icon is still hidden after installing Airhand again |
+
+**Uninstalling from the menu**: click the Airhand icon in the menu bar and choose **Uninstall Airhand…**. After you confirm, it removes everything in the table in that order (skipping what the system protects, see the end), moves Airhand to the Trash and quits; empty the Trash to delete it for good. If an item didn't work out, the final message lists it; finish it with the matching command under "Uninstalling by hand" below.
+
+**Uninstalling by hand**: if Airhand won't open, or you'd rather do it yourself. The first two steps have to come before the app is deleted, **in this order**.
 
 1. Click the Airhand icon in the menu bar, **turn off "Open at login"**, then choose **Quit** (older versions don't have this item and never registered a login item, so just quit).
-   If you delete the app without turning it off first, a dead Airhand entry stays in both "Open at Login" and "App Background Activity" in System Settings → General → Login Items ("Login Items & Extensions" on some versions of macOS).
-2. Open Terminal and clear Airhand's permission records (Screen & System Audio Recording, Accessibility and so on; only Airhand's):
+2. Open Terminal and clear the permissions (only Airhand's):
 
    ```bash
    tccutil reset All app.airhand.client
    ```
 
    It should say `Successfully reset All approval status for app.airhand.client`. If it says `No such bundle identifier`, the app is already gone, see "Already deleted the app" below.
-3. Delete the program, the configuration file, and the caches macOS created for it (a few directories that WebKit and Metal create under Airhand's name in the system's temporary and cache directories, mostly empty):
+3. Delete the rest and the program:
 
    ```bash
-   rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    rm -rf ~/Library/Application\ Support/app.airhand.client
    find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name '*app.airhand.client' -exec rm -rf {} + 2>/dev/null
-   ```
-
-   Instead of the first line you can also drag Airhand from the Applications folder to the Trash (and empty it). `find` runs into other apps' protected directories; those errors are silenced and don't affect the result.
-4. (Optional) Delete the crash reports macOS kept (only there if Airhand has crashed):
-
-   ```bash
    find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' -delete 2>/dev/null
+   defaults delete app.airhand.client 2>/dev/null; rm -f ~/Library/Preferences/app.airhand.client.plist
+   rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    ```
 
-Check: if these commands print nothing, and neither System Settings → General → Login Items nor Privacy & Security → Screen & System Audio Recording / Accessibility lists Airhand, it's all gone.
+   One line per item: the configuration, the caches macOS created for it, the crash reports, the menu bar icon settings and the program. Instead of the last line you can also drag Airhand from the Applications folder to the Trash (and empty it). `find` runs into other apps' protected directories; those errors are silenced and don't affect the result. The menu bar icon settings are first deleted through the system's preferences service (`defaults delete`), which leaves an empty file behind for `rm` to delete.
+
+**Check**: if these commands print nothing except WebKit's empty directories in the temporary directory (they can't be removed, see the end), and neither System Settings → General → Login Items nor Privacy & Security → Screen & System Audio Recording / Accessibility lists Airhand, it's all gone.
 
 ```bash
-ls -d /Applications/Airhand.app ~/Applications/Airhand.app ~/Library/Application\ Support/app.airhand.client 2>/dev/null
+ls -d ~/Library/Application\ Support/app.airhand.client ~/Library/Preferences/app.airhand.client.plist /Applications/Airhand.app ~/Applications/Airhand.app 2>/dev/null
 find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name '*app.airhand.client' 2>/dev/null
+find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' 2>/dev/null
 ```
 
-**Already deleted the app** (without steps 1 and 2 first): put Airhand.app back where it was (for example drag it from the downloaded `.dmg` into the Applications folder again), open it, and start again from step 1. macOS still remembers the login item, and turning it off in the menu removes both entries, under "Open at Login" and "App Background Activity". If you'd rather not install it again, remove them by hand: select Airhand under "Open at Login" in Login Items and click "−", and do the same in Privacy & Security → Screen & System Audio Recording / Accessibility.
+**Already deleted the app** (without steps 1 and 2 first): put Airhand.app back where it was (for example drag it from the downloaded `.dmg` into the Applications folder again), open it, and start again from step 1. macOS still remembers the login item, and turning it off in the menu removes both entries, under "Open at Login" and "App Background Activity". If you'd rather not install it again, remove them by hand: select Airhand under "Open at Login" in Login Items and click "−", do the same in Privacy & Security → Screen & System Audio Recording / Accessibility, then do step 3.
+
+**What Airhand can't remove**: the system protects these two.
+
+- WebKit's directories `com.apple.WebKit.*+app.airhand.client` in the system's temporary directory (only there if you've opened the console): they're under System Integrity Protection (SIP), so nobody can remove them; deleting them says `Operation not permitted`, and uninstalling from the menu skips them. They're empty; every app that uses WebKit (Safari included) has directories like these there.
+- On macOS 26 and later, the list of apps allowed in the menu bar (System Settings → Menu Bar → Allow in the Menu Bar) may still show Airhand. The system keeps that list in a protected file and offers no way to remove a single app from it; you can only reset the whole list as described below. It's only a record and does nothing if you leave it; if you install Airhand again and had turned it off there before, its icon won't appear in the menu bar until you turn it back on there.
+
+**Resetting the menu bar app list** (optional, macOS 26 and later): the list is the `trackedApplications` entry in `~/Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist`. Once that entry is deleted and you've logged out and back in, the list is empty; apps with a menu bar icon are added again as they run, and deleted apps don't come back. This isn't something Apple provides, it edits the system's own file, and **it clears the choices for every app in the list**: menu bar icons you turned off will show up again, and you'll have to turn them off again in System Settings → Menu Bar.
+
+1. Give Terminal Full Disk Access: turn on Terminal in System Settings → Privacy & Security → Full Disk Access (if it isn't listed, click "+" and add Applications → Utilities → Terminal), then quit Terminal and open it again. The file is in a protected directory and can't be read or changed without this.
+2. Quit System Settings, then in Terminal back the file up and delete the entry:
+
+   ```bash
+   cd ~/Library/Group\ Containers/group.com.apple.controlcenter/Library/Preferences
+   cp group.com.apple.controlcenter.plist ~/group.com.apple.controlcenter.plist.bak
+   defaults delete "$PWD/group.com.apple.controlcenter.plist" trackedApplications
+   ```
+
+   Delete it with `defaults` rather than editing the file: the system's preferences service still has it cached, and an edited file may get the old contents written back.
+3. Log out and back in (or restart), then have a look at System Settings → Menu Bar.
+4. Turn Terminal off again under Full Disk Access.
+
+To get the old list back: in a Terminal with Full Disk Access, run `defaults import ~/Library/Group\ Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist ~/group.com.apple.controlcenter.plist.bak`, then log out and back in.
 
 ### Linux
 

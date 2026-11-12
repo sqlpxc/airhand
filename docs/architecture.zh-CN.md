@@ -170,7 +170,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 - 被控端模式**不创建 WebView**，Airhand 自己不会产生任何文件（macOS 的系统框架以 Airhand 的名义建的目录见下）
 - 单实例锁用的是内核对象而不是锁文件：Windows 是命名互斥量，Linux 是抽象命名空间的 Unix 套接字，macOS 是登记在 bootstrap 服务里的 Mach 端口名
 - 控制台的 WebView 需要数据目录：放在临时目录下的随机子目录，开启隐私模式（不保存 Cookie 和缓存），关闭窗口或退出程序时删除；进程被强制结束时，下次启动会清理残留。macOS 的 WKWebView 不需要数据目录，隐私模式下不保存网页数据
-- macOS 上还有几样东西由系统记着、不在 Airhand 的目录里：登录时自动启动（系统的登录项）、“屏幕与系统录音”“辅助功能”等权限记录；WebKit 和 Metal 还会以 Airhand 的 bundle ID 在系统的临时 / 缓存目录（`getconf DARWIN_USER_TEMP_DIR`、`DARWIN_USER_CACHE_DIR`）里建几个目录（`*app.airhand.client`，大多是空的，最多是一点 GPU 着色器缓存）。卸载时怎么一起清掉见[卸载](usage.zh-CN.md#卸载)
+- macOS 上还有几样东西不在 Airhand 的目录里，是系统记着的、或者系统框架以 Airhand 的名义建的：登录时自动启动（系统的登录项）、“屏幕与系统录音”“辅助功能”等权限记录、WebKit 和 Metal 在系统临时 / 缓存目录里建的几个目录（大多是空的）、用户挪动或关掉菜单栏图标时系统记下的设置（`~/Library/Preferences/app.airhand.client.plist`，Airhand 自己不用）。完整的清单和卸载时怎么一起清掉见[卸载 → macOS](usage.zh-CN.md#macos)
 - Linux 上几样只能以文件形式交出去的东西（交给 AppIndicator 的托盘图标、WebKitGTK 的 GStreamer 插件缓存）放在 `XDG_RUNTIME_DIR`（内存盘）里本进程专用的随机目录，退出时删除（收到 SIGTERM / SIGINT 也一样）；Mesa / NVIDIA 的着色器磁盘缓存直接关闭
 - 控制台的其它设置（界面语言、关闭的标签……）只保存在内存里
 - Android：只在应用自己的私有目录里保存设置、连接过的设备和本机的控制码，不备份、不迁移，卸载时由系统全部删除（见[数据保存在哪里](android.zh-CN.md#数据保存在哪里)）

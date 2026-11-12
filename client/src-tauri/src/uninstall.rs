@@ -4,7 +4,9 @@
 //! 顺序有讲究（都是在真机上试出来的）：
 //! 1. 注销登录项：要由 App 自己做；先删 App 的话，系统设置的"登录时打开"和"后台 App 活动"里都会留下失效的条目；
 //! 2. 清除权限记录（`tccutil reset All <bundle ID>`）：要在 App 还在的时候做，App 删掉之后系统就找不到这个 bundle ID 了；
-//! 3. 删除配置文件所在的目录、WebKit / Metal 以 bundle ID 在系统临时 / 缓存目录里建的目录、Airhand 的崩溃报告；
+//! 3. 删除配置文件所在的目录、WebKit / Metal 以 bundle ID 在系统临时 / 缓存目录里建的目录（受系统保护的跳过，
+//!    见 [`is_protected`]）、Airhand 的崩溃报告、
+//!    AppKit 记下的菜单栏图标位置 / 是否显示（App 自己的偏好设置，见 [`remove_preferences`]）；
 //! 4. 把 App 移到废纸篓（放错了还能放回来，清空废纸篓就彻底删掉了）。
 //!
 //! 某一步没做成不影响后面的步骤，最后的提示里列出来，可以按使用指南手动清理。
@@ -40,8 +42,8 @@ pub fn confirm(mtm: MainThreadMarker) -> bool {
         "Uninstall Airhand?"
     )));
     alert.setInformativeText(&NSString::from_str(&tr!(
-        "会关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。",
-        "This turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches macOS created for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected."
+        "会关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存、记下的菜单栏图标设置，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。",
+        "This turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches and menu bar icon settings macOS keeps for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected."
     )));
     // 第一个按钮是默认按钮（回车）：默认是"取消"，不会一按回车就卸载了
     alert.addButtonWithTitle(&NSString::from_str(&tr!("取消", "Cancel")));
@@ -135,6 +137,15 @@ pub fn run(plan: &Plan) -> Vec<String> {
         tr!("删除崩溃报告", "Delete the crash reports"),
         remove_crash_reports(&plan.exe_name),
     );
+    // 菜单栏图标已经拿掉了（见 lib.rs 的 uninstall_app）：移除时 AppKit 对偏好设置的改写在这之前早就写完了
+    step(
+        tr!(
+            "删除菜单栏图标的设置（~/Library/Preferences/{id}.plist）",
+            "Delete the menu bar icon settings (~/Library/Preferences/{id}.plist)",
+            id = plan.bundle_id
+        ),
+        remove_preferences(&plan.bundle_id),
+    );
     if let Some(bundle) = &plan.bundle {
         let shown = bundle.display();
         step(
@@ -176,7 +187,8 @@ fn remove_config(dir: &Path, bundle_id: &str) -> Result<(), String> {
     remove(dir)
 }
 
-/// WebKit、Metal 以 bundle ID 在系统的临时 / 缓存目录（/var/folders/…/T、C）里建的目录
+/// WebKit、Metal 以 bundle ID 在系统的临时 / 缓存目录（/var/folders/…/T、C）里建的目录。
+/// 受系统保护的删不掉，跳过，不算没做成（见 [`is_protected`]）
 fn remove_caches(bundle_id: &str) -> Result<(), String> {
     let mut errors = Vec::new();
     for dir in [
@@ -191,11 +203,13 @@ fn remove_caches(bundle_id: &str) -> Result<(), String> {
             continue;
         };
         for entry in entries.flatten() {
+            let path = entry.path();
             if entry
                 .file_name()
                 .to_str()
                 .is_some_and(|n| is_cache_of(n, bundle_id))
-                && let Err(e) = remove(&entry.path())
+                && !is_protected(&path)
+                && let Err(e) = remove(&path)
             {
                 errors.push(e);
             }
@@ -206,6 +220,17 @@ fn remove_caches(bundle_id: &str) -> Result<(), String> {
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// 受系统完整性保护（SIP）、谁都删不掉的：WebKit 在临时目录里建的 `com.apple.WebKit.*+<bundle ID>`
+/// 带 `sunlnk`（实测 macOS 27，用到 WebKit 的 App 都一样，包括 Safari；里面是空的）。
+/// 删除只会得到 Operation not permitted，用户手动也删不掉，所以不算没做成（使用指南的"卸载"里有说明）
+fn is_protected(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    // <sys/stat.h>：要有权利（entitlement）才能写 / 不能删除、改名
+    const SF_RESTRICTED: u32 = 0x0008_0000;
+    const SF_NOUNLINK: u32 = 0x0010_0000;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.st_flags() & (SF_RESTRICTED | SF_NOUNLINK) != 0)
 }
 
 /// `app.airhand.client`（Metal）、`com.apple.WebKit.GPU+app.airhand.client`（WebKit 的各个进程）
@@ -246,6 +271,28 @@ fn remove_crash_reports(exe_name: &str) -> Result<(), String> {
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// App 自己的偏好设置（`~/Library/Preferences/<bundle ID>.plist`）。Airhand 不用它，平时也没有这个文件；
+/// 用户按住 ⌘ 拖动过菜单栏图标（`NSStatusItem Preferred Position Item-0`）、或者在“系统设置 → 菜单栏”里
+/// 关掉过它（macOS 26 起，`NSStatusItem VisibleCC Item-0`）时，AppKit 把这些记在这里。不删的话，重新安装后
+/// 菜单栏图标还是藏着的，而菜单栏图标是 Airhand 唯一的界面。
+/// 先经过 cfprefsd 删（`defaults delete`，不靠 cfprefsd 自己发现文件没了、清掉缓存），它会留下一个空文件，再把文件删掉。
+/// 调用之前菜单栏图标要已经拿掉：AppKit 移除图标时会改写偏好设置，删完之后再移除会重新生成一个空文件
+fn remove_preferences(bundle_id: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/defaults")
+        .args(["delete", bundle_id])
+        .output()
+        .map_err(|e| format!("can't run defaults: {e}"))?;
+    // 平时没有这个域：defaults 报 “Domain … not found”，不算错
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && !stderr.contains("not found") {
+        return Err(format!("defaults: {} {}", out.status, stderr.trim()));
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(());
+    };
+    remove(&home.join(format!("Library/Preferences/{bundle_id}.plist")))
 }
 
 fn is_crash_report_of(name: &str, exe_name: &str) -> bool {
@@ -351,6 +398,41 @@ mod tests {
         assert!(remove_config(&dir, "app.airhand.client").is_err());
         assert!(dir.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 偏好设置：有就删干净（`defaults delete` 留下的空文件也删掉），没有（平时就是这样）不算错
+    #[test]
+    fn removes_preferences() {
+        let id = format!("app.airhand.uninstall-test-{}", std::process::id());
+        let file = PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(format!("Library/Preferences/{id}.plist"));
+        let written = std::process::Command::new("/usr/bin/defaults")
+            .args([
+                "write",
+                &id,
+                "NSStatusItem VisibleCC Item-0",
+                "-bool",
+                "false",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(written && file.exists());
+        remove_preferences(&id).unwrap();
+        assert!(!file.exists());
+        remove_preferences(&id).unwrap();
+        assert!(!file.exists());
+    }
+
+    /// 普通的目录、不存在的路径都不算受保护（受保护的要 root 才能设置，测试里造不出来）
+    #[test]
+    fn ordinary_dirs_are_not_protected() {
+        let dir =
+            std::env::temp_dir().join(format!("airhand-protected-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_protected(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!is_protected(&dir));
     }
 
     #[test]
