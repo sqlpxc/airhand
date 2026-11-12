@@ -12,6 +12,8 @@ interface Arrival {
   at: number;
   start: boolean;
   planes: Float32Array[];
+  /** 采集时间（微秒）：给了就跟到达时刻一起交给缓冲，让它量晚到量 */
+  hostUs?: number;
 }
 
 /** 按发送时刻生成包：每包是连续的正弦波片段，`gaps` 内不发包（模拟被控端静音） */
@@ -46,7 +48,9 @@ function simulate(arrivals: Arrival[], seconds: number) {
   let audible = 0;
   for (let t = 0; t < seconds * RATE; t += QUANTUM) {
     while (next < arrivals.length && arrivals[next].at <= t) {
-      jb.push(arrivals[next].planes, arrivals[next].start);
+      const a = arrivals[next];
+      if (a.hostUs === undefined) jb.push(a.planes, a.start);
+      else jb.push(a.planes, a.start, a.hostUs, (t / RATE) * 1000);
       next++;
     }
     jb.pull(out, QUANTUM);
@@ -63,6 +67,29 @@ function simulate(arrivals: Arrival[], seconds: number) {
 /** 简单的确定性随机数 */
 function rng(seed: number) {
   return () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+}
+
+/**
+ * 带采集时间的到达序列：基础延迟 5 ms，`extra(发送时刻 ms)` 是这个包额外晚到的毫秒数。
+ * 包按顺序到达（WebSocket、页面主线程都是先进先出），前面的晚了后面的跟着排队
+ */
+function timed(seconds: number, extra: (sentMs: number) => number, opts: { drift?: number } = {}): Arrival[] {
+  let last = 0;
+  return packets(seconds, opts).map((p) => {
+    const sentMs = p.sentAt / 48;
+    const at = Math.max(last, p.sentAt + (5 + extra(sentMs)) * 48);
+    last = at;
+    // 被控端按自己的采样数计时：每包 20 ms（有时钟偏差时发送间隔和它对不上）
+    return { at, start: p.start, planes: p.planes, hostUs: 7e9 + Math.round(p.sentAt * (1 + (opts.drift ?? 0))) * (1e6 / RATE) };
+  });
+}
+
+/** `times`（秒）开始各卡 `ms` 毫秒：期间发出的包都等到卡完才到 */
+function stalls(times: number[], ms: number) {
+  return (sent: number) => {
+    for (const t of times) if (sent >= t * 1000 && sent < t * 1000 + ms) return t * 1000 + ms - sent;
+    return 0;
+  };
 }
 
 test("稳定网络：不断粮、不跳跃、波形连续，延迟回落到下限", () => {
@@ -106,6 +133,52 @@ test("延迟尖峰（例如大关键帧堵住流）：目标延迟自动加大�
     20,
   ).jb.stats().underruns;
   assert.equal(s.underruns, half, "稳定后仍在断粮");
+});
+
+test("偶尔整批晚到（WebKit 里页面主线程忙一下、Wi-Fi 卡一下）：只有第一次断粮，不会一回落又断", () => {
+  // 每隔 15~45 秒卡 100 ms：只看断粮学的话，两次之间目标延迟已经回落，每次都会断
+  const times = [5, 37, 67, 109, 144, 181, 216, 246, 265, 281];
+  const { jb } = simulate(timed(300, stalls(times, 100)), 300);
+  const s = jb.stats();
+  assert.ok(s.underruns <= 1, `断粮 ${s.underruns} 次`);
+  assert.equal(s.skips, 0);
+  assert.ok(s.targetMs >= 120 && s.targetMs <= 150, `目标延迟应刚好盖住 100 ms，实际 ${s.targetMs}`);
+});
+
+test("晚到但还没断粮：目标延迟提前加大，晚到量慢慢变大也不断", () => {
+  // 先稳定到目标延迟回落到 40 ms，然后每 3 秒有一包晚到，每 10 秒多晚 5 ms：20、25……、45 ms。
+  // 只看断粮的话晚到 40 ms 左右就会断（40 ms 的缓冲在包到达前只剩不到 40 ms）
+  const late = (sent: number) => {
+    if (sent < 60_000 || sent % 3000 >= 20) return 0;
+    return 20 + Math.floor((sent - 60_000) / 10_000) * 5;
+  };
+  const { jb } = simulate(timed(120, late), 120);
+  const s = jb.stats();
+  assert.equal(s.underruns, 0, `断粮 ${s.underruns} 次`);
+  assert.ok(s.targetMs >= 70, `目标延迟应跟着晚到量加大，实际 ${s.targetMs}`);
+});
+
+test("卡顿停了一分多钟之后目标延迟才回落；网络稳定时保持在下限", () => {
+  const until = (sec: number) => simulate(timed(sec, stalls([5, 20], 100)), sec).jb.stats();
+  assert.ok(until(70).targetMs >= 120, "最后一次卡顿之后不到一分钟不应回落");
+  assert.equal(Math.round(until(200).targetMs), 40, "卡顿停了之后应回落到下限");
+  const clean = simulate(timed(60, () => 0), 60).jb.stats();
+  assert.equal(clean.underruns, 0);
+  assert.equal(Math.round(clean.targetMs), 40);
+});
+
+test("断线一秒：缓冲盖不住，不按它把目标延迟加到很大", () => {
+  const s = simulate(timed(20, stalls([5], 1000)), 20).jb.stats();
+  assert.ok(s.targetMs <= 80, `目标延迟 ${s.targetMs}`);
+});
+
+test("时钟偏差不当成晚到", () => {
+  for (const drift of [0.005, -0.005]) {
+    const { jb } = simulate(timed(60, () => 0, { drift }), 60);
+    const s = jb.stats();
+    assert.ok(s.underruns <= 1, `drift=${drift} 断粮 ${s.underruns} 次`);
+    assert.ok(s.targetMs <= 50, `drift=${drift} 目标延迟 ${s.targetMs}`);
+  }
 });
 
 test("对方静音：不算网络抖动，目标延迟不变", () => {

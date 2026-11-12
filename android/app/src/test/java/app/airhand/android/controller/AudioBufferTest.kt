@@ -103,6 +103,81 @@ class AudioBufferTest {
         }
     }
 
+    /**
+     * 按 AudioPlayer 的循环仿真：每 10 ms 先放进已经到达的包（带网络到达时刻），再取 10 ms；100 ms 没有新包就把剩下的播完。
+     * 包基础延迟 5 ms，`late(发送时刻 ms)` 是额外晚到的毫秒数；按顺序到达，前面的晚了后面的跟着排队。
+     * `drift`：被控端按自己的时钟每 20 ms 一包，但在这边看间隔是 20 / (1 + drift) ms
+     */
+    private fun simulate(seconds: Int, drift: Double = 0.0, late: (Double) -> Double): AudioBuffer {
+        val buffer = AudioBuffer()
+        val period = 20.0 / (1 + drift)
+        var last = 0.0
+        val arrivals = (0 until (seconds * 1000 / period).toInt()).map { i ->
+            val sent = i * period
+            last = maxOf(last, sent + 5 + late(sent))
+            last
+        }
+        var next = 0
+        var lastPush = 0.0
+        for (ms in 0 until seconds * 1000 step 10) {
+            while (next < arrivals.size && arrivals[next] <= ms) {
+                buffer.push(packet(), 1920, next == 0, 7_000_000_000L + next * 20_000L, arrivals[next])
+                next++
+                lastPush = ms.toDouble()
+            }
+            buffer.pull(block, finishBurst = ms - lastPush > 100)
+        }
+        return buffer
+    }
+
+    /** `times`（秒）开始各卡 `ms` 毫秒：期间发出的包都等到卡完才到 */
+    private fun stalls(times: List<Int>, ms: Int): (Double) -> Double = { sent ->
+        times.firstOrNull { sent >= it * 1000 && sent < it * 1000 + ms }?.let { it * 1000.0 + ms - sent } ?: 0.0
+    }
+
+    @Test
+    fun occasionalStallsOnlyStarveTheFirstTime() {
+        // 每隔 15~45 秒卡 100 ms：只看断粮学的话，两次之间目标延迟已经回落，每次都会断
+        val buffer = simulate(300, late = stalls(listOf(5, 37, 67, 109, 144, 181, 216, 246, 265, 281), 100))
+        assertTrue("underruns ${buffer.underruns}", buffer.underruns <= 1)
+        assertEquals(0, buffer.skips)
+        assertTrue("target ${buffer.targetMs}", buffer.targetMs in 120.0..150.0)
+    }
+
+    @Test
+    fun latenessRaisesTargetBeforeStarving() {
+        // 先稳定到目标延迟回落到 40 ms，然后每 3 秒有一包晚到，每 10 秒多晚 5 ms：20、25……、45 ms
+        val buffer = simulate(120) { sent ->
+            if (sent < 60_000 || sent % 3000 >= 20) 0.0 else 20.0 + ((sent - 60_000) / 10_000).toInt() * 5
+        }
+        assertEquals(0, buffer.underruns)
+        assertTrue("target ${buffer.targetMs}", buffer.targetMs >= 70)
+    }
+
+    @Test
+    fun targetStaysUpForAMinuteAfterTheLastStallThenDecays() {
+        assertTrue(simulate(70, late = stalls(listOf(5, 20), 100)).targetMs >= 120)
+        assertEquals(40.0, simulate(200, late = stalls(listOf(5, 20), 100)).targetMs, 0.5)
+        val clean = simulate(60) { 0.0 }
+        assertEquals(0, clean.underruns)
+        assertEquals(40.0, clean.targetMs, 0.5)
+    }
+
+    @Test
+    fun outageIsNotLearnedAsJitter() {
+        val buffer = simulate(20, late = stalls(listOf(5), 1000))
+        assertTrue("target ${buffer.targetMs}", buffer.targetMs <= 80)
+    }
+
+    @Test
+    fun clockDriftIsNotLateness() {
+        for (drift in listOf(0.005, -0.005)) {
+            val buffer = simulate(60, drift) { 0.0 }
+            assertTrue("underruns at $drift: ${buffer.underruns}", buffer.underruns <= 1)
+            assertTrue("target at $drift: ${buffer.targetMs}", buffer.targetMs <= 50)
+        }
+    }
+
     @Test
     fun partialAndZeroWritesRetryAllSamplesInOrder() {
         val pcm = ShortArray(20) { it.toShort() }

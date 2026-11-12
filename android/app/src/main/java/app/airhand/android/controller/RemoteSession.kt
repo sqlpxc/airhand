@@ -417,7 +417,7 @@ class RemoteSession(
             Media.AUDIO -> {
                 val a = Media.audio(b)
                 val o = Media.payload(b)
-                audio?.submit(AudioPacket(a.start, a.captureUs, b, o, b.size - o))
+                audio?.submit(AudioPacket(a.start, a.captureUs, b, o, b.size - o, System.nanoTime()))
             }
         }
     }

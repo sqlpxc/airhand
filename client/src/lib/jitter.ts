@@ -1,7 +1,10 @@
 // 远程声音的抖动缓冲（运行在 AudioWorklet 里；纯逻辑、不依赖浏览器 API，便于单独测试）。
 //
 // * 开始播放前先攒够"目标延迟"的数据；
-// * 播放中途断粮：如果接下来的包不是"静音后第一包"，说明是网络抖动，目标延迟加大；
+// * 每个包到达时量一下它比"最快的那些包"晚了多少（到达时刻 − 采集时刻，相对最小值），目标延迟马上加大到
+//   能盖住它：包晚到不一定来自网络，WebKit（macOS / Linux 的 WebView）里 Worker 的 WebSocket 经页面主线程转交，
+//   主线程忙一下声音就整批晚到。最近约一分钟里最大的晚到量也是目标延迟回落的下限，偶尔卡一下的不会一回落就又断粮；
+// * 播放中途断粮：如果接下来的包不是"静音后第一包"，说明是网络抖动（或丢包），目标延迟再加大；
 //   如果是（对方只是没声音了），则不加大；
 // * 网络稳定一段时间、缓冲一直有余量时，目标延迟逐步回落；
 // * 用 -1%~+2% 的播放速度微调把缓冲维持在目标附近（同时抵消两端声卡的时钟偏差），
@@ -16,6 +19,17 @@ const MAX_TARGET_MS = 400;
 const UNDERRUN_STEP_MS = 20;
 /** 每次回落的幅度 */
 const DECREASE_STEP_MS = 5;
+/**
+ * 目标延迟至少比晚到量多这么多：包到达前缓冲里本来就少半个包（10 ms 的锯齿）、变速的死区（10 ms）、
+ * 一个输出块，再留一点余量
+ */
+const LATE_MARGIN_MS = 30;
+/** 晚到超过这么多算断线 / 卡死（缓冲盖不住），不按它加大目标延迟，只当一次断粮 */
+const MAX_LATE_MS = 250;
+/** 晚到量的基准（最小的"到达 − 采集"）每秒最多上浮这么多：跟上两端时钟的偏差、换了一条更慢的路 */
+const BASE_LEAK_MS_PER_S = 10;
+/** 记最近这么多个评估窗口（每个 WINDOW_MS）里的最大晚到量，约一分钟 */
+const LATE_WINDOWS = 30;
 /** 连续这么久没有断粮才允许回落 */
 const CALM_MS = 20_000;
 /** 评估窗口 */
@@ -80,6 +94,15 @@ export class JitterBuffer {
   private fade = 0;
   /** 每个包第一个采样的位置与采集时间 */
   private anchors: { pos: number; hostUs: number }[] = [];
+  /** 晚到量的基准：最小的"到达时刻 − 采集时刻"（毫秒，两台电脑的时钟差也在里面）；还没有包时为 null */
+  private lateBase: number | null = null;
+  /** 上一个包的到达时刻（毫秒） */
+  private lateAt = 0;
+  /** 当前评估窗口里的最大晚到量（毫秒） */
+  private lateNow = 0;
+  /** 之前各评估窗口的最大晚到量（毫秒，环形） */
+  private readonly lateWindows = new Float64Array(LATE_WINDOWS);
+  private lateIndex = 0;
 
   underruns = 0;
   skips = 0;
@@ -149,13 +172,43 @@ export class JitterBuffer {
     this.calm = 0;
     this.target = INITIAL_TARGET_MS * this.perMs;
     this.anchors = [];
+    this.lateBase = null;
+    this.lateNow = 0;
+    this.lateWindows.fill(0);
+  }
+
+  /** 最近约一分钟里最大的晚到量（毫秒） */
+  private get recentLate(): number {
+    let max = this.lateNow;
+    for (const v of this.lateWindows) max = Math.max(max, v);
+    return max;
+  }
+
+  /** 一个包在 `nowMs` 到达，第一个采样在 `hostMs` 采集（被控端时钟）：量晚到量，需要时马上加大目标延迟 */
+  private measure(nowMs: number, hostMs: number) {
+    const delay = nowMs - hostMs;
+    if (this.lateBase !== null) this.lateBase += (Math.max(0, nowMs - this.lateAt) * BASE_LEAK_MS_PER_S) / 1000;
+    this.lateAt = nowMs;
+    if (this.lateBase === null || delay < this.lateBase) {
+      this.lateBase = delay;
+      return;
+    }
+    const late = delay - this.lateBase;
+    // 断线 / 卡死：从这一包重新取基准，跟在它后面涌来的积压也就不算晚到
+    if (late > MAX_LATE_MS) {
+      this.lateBase = delay;
+      return;
+    }
+    this.lateNow = Math.max(this.lateNow, late);
+    this.target = Math.max(this.target, Math.min(MAX_TARGET_MS, late + LATE_MARGIN_MS) * this.perMs);
   }
 
   /**
    * 写入一个解码后的包（每声道一个数组）。`start` = 静音后的第一包；
-   * `hostUs` = 第一个采样的采集时间（被控端时钟，微秒）。
+   * `hostUs` = 第一个采样的采集时间（被控端时钟，微秒）；`nowMs` = 到达时刻（本地任意时基，毫秒，不随声音输出暂停）。
+   * 两个都给了才量晚到量。
    */
-  push(planes: Float32Array[], start: boolean, hostUs?: number) {
+  push(planes: Float32Array[], start: boolean, hostUs?: number, nowMs?: number) {
     if (planes.length === 0) return;
     let n = planes[0].length;
     if (n === 0) return;
@@ -167,6 +220,7 @@ export class JitterBuffer {
         this.calm = 0;
       }
     }
+    if (hostUs !== undefined && nowMs !== undefined) this.measure(nowMs, hostUs / 1000);
     let offset = 0;
     if (n > this.cap - 2) {
       offset = n - (this.cap - 2);
@@ -260,10 +314,14 @@ export class JitterBuffer {
     this.windowLeft = this.windowFrames;
     const low = this.low;
     this.low = Infinity;
+    // 回落的下限：最近约一分钟里最大的晚到量也要盖得住
+    const floor = Math.max(MIN_TARGET_MS, Math.min(MAX_TARGET_MS, this.recentLate + LATE_MARGIN_MS)) * this.perMs;
+    this.lateWindows[this.lateIndex] = this.lateNow;
+    this.lateIndex = (this.lateIndex + 1) % LATE_WINDOWS;
+    this.lateNow = 0;
     if (!this.playing || low === Infinity) return;
-    const min = MIN_TARGET_MS * this.perMs;
-    if (this.calm >= CALM_MS * this.perMs && low > (SLACK_MS * this.perMs) + this.extra && this.target > min) {
-      this.target = Math.max(min, this.target - DECREASE_STEP_MS * this.perMs);
+    if (this.calm >= CALM_MS * this.perMs && low > (SLACK_MS * this.perMs) + this.extra && this.target > floor) {
+      this.target = Math.max(floor, this.target - DECREASE_STEP_MS * this.perMs);
     }
   }
 }

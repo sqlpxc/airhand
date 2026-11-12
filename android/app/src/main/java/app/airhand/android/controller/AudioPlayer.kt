@@ -13,8 +13,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.LinkedBlockingQueue
 
-/** 一个 Opus 包（48 kHz 立体声，20 ms），保留与视频同源的采集时间。 */
-class AudioPacket(val start: Boolean, val ptsUs: Long, val data: ByteArray, val offset: Int, val length: Int)
+/**
+ * 一个 Opus 包（48 kHz 立体声，20 ms），保留与视频同源的采集时间。`arrivedNs` = 从网络上收到它的时刻（`System.nanoTime()`），
+ * 抖动缓冲据此量晚到量：按收到的时刻量，不按音频线程取到它的时刻（那个跟着播放循环走，不是网络的抖动）。
+ */
+class AudioPacket(val start: Boolean, val ptsUs: Long, val data: ByteArray, val offset: Int, val length: Int, val arrivedNs: Long)
 
 /** MediaCodec 解码 → 自适应 PCM 抖动缓冲 → AudioTrack。解码和输出都在专用音频线程。 */
 class AudioPlayer(
@@ -80,7 +83,7 @@ class AudioPlayer(
                         out.order(ByteOrder.nativeOrder()).asShortBuffer().get(pcm, 0, count)
                         // 第一包会裁掉编码器前瞻，裁掉的是开头的采样。
                         val skipped = (RATE / 50 - count / 2).coerceAtLeast(0)
-                        jitter.push(pcm, count, p.start, p.ptsUs + skipped * 1_000_000L / RATE)
+                        jitter.push(pcm, count, p.start, p.ptsUs + skipped * 1_000_000L / RATE, p.arrivedNs / 1e6)
                         lastPcmNs = System.nanoTime()
                     } finally {
                         dec.releaseOutputBuffer(index, false)

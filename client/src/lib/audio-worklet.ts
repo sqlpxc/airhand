@@ -53,7 +53,8 @@ class AirhandAudio extends AudioWorkletProcessor {
       this.player = m.port;
       m.port.onmessage = (e: MessageEvent<PlayerMessage>) => {
         const m = e.data;
-        if (m.type === "pcm") this.jb.push(m.planes, m.start, m.hostUs);
+        // 到达时刻用墙上时钟：AudioContext 暂停（例如还没有用户操作）时 currentTime 不走，包却照样在到
+        if (m.type === "pcm") this.jb.push(m.planes, m.start, m.hostUs, Date.now());
         else if (m.type === "extra") this.jb.setExtraMs(m.ms);
         else this.jb.reset();
       };

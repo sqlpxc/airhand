@@ -46,7 +46,7 @@ After you pinch to zoom the local view, a moment after your fingers stop the app
 - Back first asks "Disconnect?", so it can't happen by accident. Network drops reconnect automatically; if the device goes offline it says so and reconnects when it's back; if the other side disconnected you or changed its code, it says why and doesn't retry
 - In the background the session stays, at 2 fps and without sound, and resumes immediately when you return
 - **A/V sync** is off by default. Enable it in the session menu or Settings; the choice is saved. While sound is playing, video follows the actual audio output clock, and audio waits if video stays behind. This is useful for watching videos and adds control latency. Turning sound off, backgrounding and reconnecting reset the clock measurements
-- Sound uses adaptive jitter buffering: more buffering during network jitter, less after a stable period, and small speed corrections for clock drift. Excessive backlog skips old audio; short notification sounds still play
+- Sound uses adaptive jitter buffering (the same approach as the desktop console): each packet's lateness is measured against its capture time and the buffer grows right away to cover it, and the largest lateness of roughly the last minute is also the floor it shrinks back to, so an occasional hiccup doesn't cause another dropout as soon as the buffer shrinks. Small speed corrections cancel clock drift. Excessive backlog skips old audio; short notification sounds still play
 
 ## Phone: Share screen (be controlled)
 
