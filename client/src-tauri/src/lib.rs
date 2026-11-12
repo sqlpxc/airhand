@@ -279,7 +279,11 @@ fn on_console_destroyed(app: &AppHandle) {
         switch_services(app, Mode::Host);
     }
     #[cfg(target_os = "macos")]
-    show_in_dock(app, false);
+    {
+        // 全屏中被关掉时菜单栏和程序坞还藏着
+        fullscreen::reset(app);
+        show_in_dock(app, false);
+    }
     let dirs: Vec<PathBuf> =
         std::mem::take(&mut *app.state::<AppState>().webview_dirs.lock().unwrap());
     for d in dirs {
@@ -503,6 +507,12 @@ fn set_fullscreen(window: tauri::WebviewWindow, on: bool) -> Result<(), Problem>
     fullscreen::set(&window, on).map_err(Problem::failed)
 }
 
+/// 控制台窗口是不是全屏（包括 macOS 上自己铺满屏幕的全屏，见 [`fullscreen`]）
+#[tauri::command]
+fn window_fullscreen(window: tauri::WebviewWindow) -> Result<bool, Problem> {
+    fullscreen::is_on(&window).map_err(Problem::failed)
+}
+
 #[tauri::command]
 async fn switch_to_host(app: AppHandle) -> Result<(), Problem> {
     let a = app.clone();
@@ -561,6 +571,7 @@ pub fn run() {
             set_language,
             clipboard_text,
             set_fullscreen,
+            window_fullscreen,
             switch_to_host,
             devices_load,
             devices_save,

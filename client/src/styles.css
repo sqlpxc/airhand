@@ -140,9 +140,10 @@ h3 {
     radial-gradient(800px 600px at -10% 108%, rgba(123, 92, 255, 0.1), transparent 60%),
     var(--bg);
 }
-/* 全屏只看远程画面 */
+/* 全屏只看远程画面。macOS 带刘海的屏幕：刘海那一条留黑边，内容放到它下面（高度由 src-tauri/src/fullscreen.rs 给出） */
 .app.immersive {
   background: #000;
+  padding-top: var(--fullscreen-top, 0px);
 }
 .main {
   flex: 1;

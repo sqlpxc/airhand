@@ -108,8 +108,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 # NSAlert 等：卸载时的确认对话框（src/uninstall.rs），NSApplication、NSButton 这些 Tauri 本来就打开了
 objc2-app-kit = { version = "0.3", default-features = false, features = [
-  "std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSCursor", "NSGraphicsContext", "NSImage",
-  "NSImageRep", "NSPasteboard", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics",
+  "std", "NSAlert", "NSApplication", "NSButton", "NSColor", "NSControl", "NSCursor", "NSGraphics", "NSGraphicsContext",
+  "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation",
+  "objc2-core-graphics",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
   "std", "CFArray", "CFBase", "CFCGTypes", "CFData", "CFDictionary", "CFMessagePort", "CFNumber",

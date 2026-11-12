@@ -73,11 +73,11 @@ class DesktopConsole extends ConsoleLink implements Backend {
     return invoke<void>("set_fullscreen", { on });
   }
 
+  // 不用 isFullscreen：macOS 上的全屏是自己把窗口铺满屏幕（见 src-tauri/src/fullscreen.rs），它不知道，进全屏时窗口一变大就会被当成退出了
   onWindowFullscreenExit(cb: () => void) {
-    const w = getCurrentWindow();
     return unlistenLater(
-      w.onResized(async () => {
-        if (!(await w.isFullscreen())) cb();
+      getCurrentWindow().onResized(async () => {
+        if (!(await invoke<boolean>("window_fullscreen"))) cb();
       }),
     );
   }
