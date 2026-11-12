@@ -117,6 +117,15 @@ export const IconCpu = (p: P) =>
       <path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3" />
     </>,
   );
+/** 说明（ⓘ）：鼠标停在上面看详细说明 */
+export const IconInfo = (p: P) =>
+  base(
+    p,
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5.5M12 7.5h.01" />
+    </>,
+  );
 export const IconWarn = (p: P) =>
   base(p, <path d="M12 3.5l9.5 16.5h-19L12 3.5zM12 10v4.5M12 17.5h.01" />);
 export const IconHistory = (p: P) =>

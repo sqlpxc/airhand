@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { Codec, QualitySettings, VideoPriority } from "../lib/api";
 import { useT } from "../lib/i18n";
 import { CODEC_PRIORITY, codecUsable } from "../lib/codec";
@@ -6,6 +6,7 @@ import { ENHANCE_LEVELS } from "../lib/enhance";
 import { CODEC_LABEL, PRESETS, codecHint, matchPreset, presetDesc, presetName, presetSettings } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
 import { store, useSession, useStore } from "../lib/store";
+import { IconInfo } from "./Icons";
 import { Popover } from "./Popover";
 
 const FPS = [15, 24, 30, 60, 90, 120];
@@ -32,6 +33,23 @@ const fromSlider = (v: number) => {
 export const fmtKbps = (k: number) =>
   k >= 1000 ? `${(k / 1000).toFixed(k >= 10000 ? 0 : 1)} Mbps` : `${Math.round(k)} kbps`;
 
+/**
+ * 左边一列的名称。有说明的带一个 ⓘ，鼠标停在名称上显示说明：说明文字不再平铺在面板里，窗口矮时也放得下。
+ * `htmlFor`：点名称就切换右边的开关
+ */
+function Label({ text, hint, htmlFor }: { text: string; hint?: string; htmlFor?: string }) {
+  return (
+    <label className="qp-label" title={hint} htmlFor={htmlFor}>
+      {text}
+      {hint && <IconInfo size={12} />}
+    </label>
+  );
+}
+
+/**
+ * 画质面板：预设一行，下面是发给对方的各项设置（左名称 / 右控件，一项一行），最后是只影响本机显示的画面增强。
+ * 标题与底部的编码器信息固定，中间放不下时滚动（高度上限见 Popover 的 --pop-max-h）
+ */
 export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
   const t = useT();
   useSession(s);
@@ -39,6 +57,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const enhance = useStore((st) => st.enhance);
   const [draftKbps, setDraftKbps] = useState(s.settings.bitrateKbps);
   const timer = useRef<number | undefined>(undefined);
+  const adaptiveId = useId();
   const cur = s.settings;
   const preset = matchPreset(cur);
   const priority = cur.priority ?? "latency";
@@ -49,14 +68,21 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const codecOk = (c: Codec) => codecUsable(c, decoders, s.hostCodecs);
   // 高亮对方实际在用的格式（与工具栏一致）：请求的格式对方建不起来时会回退到 H.264
   const activeCodec = s.encoder?.codec ?? cur.codec;
+  const priorityHint = PRIORITIES.map((p) => `${t(`quality.priority.${p}`)} · ${t(`quality.priority.${p}.hint`)}`).join("\n\n");
+  const encoderLine =
+    s.encoder &&
+    t("quality.encoder", {
+      name: s.encoder.name,
+      kind: s.encoder.hardware ? t("quality.hardware") : t("quality.software"),
+      size: `${s.encoder.width}×${s.encoder.height}`,
+    });
 
   return (
     <Popover className="quality-panel" onClose={onClose}>
-      <div className="pop-title">{t("quality.title")}</div>
+      <div className="qp-head pop-title">{t("quality.title")}</div>
 
-      <div className="field">
-        <label>{t("quality.preset")}</label>
-        <div className="segmented wrap">
+      <div className="qp-body">
+        <div className="segmented wrap" role="group" aria-label={t("quality.preset")}>
           {PRESETS.map((p) => (
             <button
               key={p.id}
@@ -71,126 +97,103 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
             {t("quality.custom")}
           </button>
         </div>
-      </div>
 
-      <div className="field">
-        <label>{t("quality.resolution")}</label>
-        <div className="segmented">
-          {RES.map((r) => (
-            <button key={r.v} className={cur.maxShort === r.v ? "active" : ""} onClick={() => apply({ maxShort: r.v })}>
-              {r.label ?? t("quality.native")}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="field">
-        <label>{t("quality.priority")}</label>
-        <div className="segmented">
-          {PRIORITIES.map((p) => (
-            <button
-              key={p}
-              className={priority === p ? "active" : ""}
-              title={t(`quality.priority.${p}.hint`)}
-              onClick={() => apply({ priority: p })}
-            >
-              {t(`quality.priority.${p}`)}
-            </button>
-          ))}
-        </div>
-        <div className="muted small">{t(`quality.priority.${priority}.hint`)}</div>
-      </div>
-
-      {/* 本机显示的偏好，不发给对方；所有连接通用（见 enhance.ts） */}
-      <div className="field">
-        <label>{t("quality.enhance")}</label>
-        <div className="segmented">
-          {ENHANCE_LEVELS.map((l) => (
-            <button key={l} className={enhance === l ? "active" : ""} onClick={() => store.setEnhance(l)}>
-              {t(`quality.enhance.${l}`)}
-            </button>
-          ))}
-        </div>
-        <div className="muted small">{t("quality.enhance.hint")}</div>
-      </div>
-
-      <div className="field">
-        <label>{t("quality.fps")}</label>
-        <div className="segmented">
-          {FPS.map((f) => (
-            <button key={f} className={cur.fps === f ? "active" : ""} onClick={() => apply({ fps: f })}>
-              {f}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="field">
-        <label>
-          {t("quality.bitrate")} <span className="value">{fmtKbps(draftKbps)}</span>
-        </label>
-        <input
-          type="range"
-          min={0}
-          max={100}
-          step={0.5}
-          value={toSlider(draftKbps)}
-          onChange={(e) => {
-            const k = fromSlider(Number(e.target.value));
-            setDraftKbps(k);
-            clearTimeout(timer.current);
-            timer.current = window.setTimeout(() => apply({ bitrateKbps: k }), 250);
-          }}
-        />
-        <div className="range-legend muted small">
-          <span>0.5 Mbps</span>
-          <span>{t("quality.idleHint")}</span>
-          <span>50 Mbps</span>
-        </div>
-      </div>
-
-      <div className="field">
-        <label>{t("quality.codec")}</label>
-        <div className="codec-list">
-          {CODEC_PRIORITY.map((c) => {
-            const ok = codecOk(c);
-            const why = !decoders.includes(c) ? t("quality.noDecoder") : t("quality.noEncoder");
-            return (
-              <button
-                key={c}
-                className={`codec-opt ${activeCodec === c ? "active" : ""}`}
-                disabled={!ok}
-                onClick={() => apply({ codec: c })}
-                title={ok ? codecHint(c) : why}
-              >
-                <span className="codec-name">{CODEC_LABEL[c]}</span>
-                <span className="codec-hint">{ok ? codecHint(c) : t("quality.unavailable")}</span>
+        <div className="qp-grid">
+          <Label text={t("quality.resolution")} />
+          <div className="segmented">
+            {RES.map((r) => (
+              <button key={r.v} className={cur.maxShort === r.v ? "active" : ""} onClick={() => apply({ maxShort: r.v })}>
+                {r.label ?? t("quality.native")}
               </button>
-            );
-          })}
+            ))}
+          </div>
+
+          <Label text={t("quality.fps")} />
+          <div className="segmented">
+            {FPS.map((f) => (
+              <button key={f} className={cur.fps === f ? "active" : ""} onClick={() => apply({ fps: f })}>
+                {f}
+              </button>
+            ))}
+          </div>
+
+          <Label text={t("quality.bitrate")} hint={`0.5 ~ 50 Mbps · ${t("quality.idleHint")}`} />
+          <div className="qp-bitrate">
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={0.5}
+              value={toSlider(draftKbps)}
+              aria-label={t("quality.bitrate")}
+              onChange={(e) => {
+                const k = fromSlider(Number(e.target.value));
+                setDraftKbps(k);
+                clearTimeout(timer.current);
+                timer.current = window.setTimeout(() => apply({ bitrateKbps: k }), 250);
+              }}
+            />
+            <span className="qp-value">{fmtKbps(draftKbps)}</span>
+          </div>
+
+          <Label text={t("quality.adaptive")} hint={t("quality.adaptiveHint")} htmlFor={adaptiveId} />
+          <input
+            id={adaptiveId}
+            type="checkbox"
+            className="switch"
+            checked={cur.adaptive}
+            onChange={(e) => apply({ adaptive: e.target.checked })}
+          />
+
+          <Label text={t("quality.codec")} />
+          <div className="segmented">
+            {CODEC_PRIORITY.map((c) => {
+              const ok = codecOk(c);
+              const why = !decoders.includes(c) ? t("quality.noDecoder") : t("quality.noEncoder");
+              return (
+                <button
+                  key={c}
+                  className={activeCodec === c ? "active" : ""}
+                  disabled={!ok}
+                  onClick={() => apply({ codec: c })}
+                  title={ok ? codecHint(c) : why}
+                >
+                  {CODEC_LABEL[c]}
+                </button>
+              );
+            })}
+          </div>
+
+          <Label text={t("quality.priority")} hint={priorityHint} />
+          <div className="segmented">
+            {PRIORITIES.map((p) => (
+              <button
+                key={p}
+                className={priority === p ? "active" : ""}
+                title={t(`quality.priority.${p}.hint`)}
+                onClick={() => apply({ priority: p })}
+              >
+                {t(`quality.priority.${p}`)}
+              </button>
+            ))}
+          </div>
+
+          {/* 本机显示的偏好，不发给对方；所有连接通用（见 enhance.ts） */}
+          <div className="qp-section">{t("quality.local")}</div>
+          <Label text={t("quality.enhance")} hint={t("quality.enhance.hint")} />
+          <div className="segmented">
+            {ENHANCE_LEVELS.map((l) => (
+              <button key={l} className={enhance === l ? "active" : ""} onClick={() => store.setEnhance(l)}>
+                {t(`quality.enhance.${l}`)}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      <label className="toggle-row">
-        <span>
-          <b>{t("quality.adaptive")}</b>
-          <span className="muted small">{t("quality.adaptiveHint")}</span>
-        </span>
-        <input
-          type="checkbox"
-          className="switch"
-          checked={cur.adaptive}
-          onChange={(e) => apply({ adaptive: e.target.checked })}
-        />
-      </label>
-
-      {s.encoder && (
-        <div className="encoder-line muted small">
-          {t("quality.encoder", {
-            name: s.encoder.name,
-            kind: s.encoder.hardware ? t("quality.hardware") : t("quality.software"),
-            size: `${s.encoder.width}×${s.encoder.height}`,
-          })}
+      {encoderLine && (
+        <div className="qp-foot" title={encoderLine}>
+          {encoderLine}
         </div>
       )}
     </Popover>

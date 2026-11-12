@@ -1877,28 +1877,102 @@ kbd {
   transform: translate(-50%, 0);
 }
 
-/* ───────── 画质面板 ───────── */
+/* ───────── 画质面板 ─────────
+ * 标题、底部的编码器信息固定，中间滚动；高度不超过弹出层下面剩下的空间（--pop-max-h，见 Popover.tsx） */
 .quality-panel {
-  width: 400px;
-  padding: 16px 18px 14px;
+  width: 392px;
+  max-width: calc(100vw - 16px);
+  max-height: var(--pop-max-h, calc(100vh - 120px));
   display: flex;
   flex-direction: column;
-  gap: 15px;
 }
-.field {
+.qp-head {
+  flex: none;
+  padding: 14px 16px 10px;
+}
+.qp-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 16px 14px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 14px;
 }
-.field > label {
-  display: flex;
-  justify-content: space-between;
+.quality-panel .segmented button {
+  padding: 5px 6px;
+  font-size: 12px;
+}
+/* 左名称 / 右控件：名称列按最长的名称定宽，各行的控件左端对齐 */
+.qp-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  column-gap: 14px;
+  row-gap: 9px;
+}
+.qp-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 12px;
   color: var(--text-2);
+  white-space: nowrap;
 }
-.field .value {
-  color: var(--text);
+.qp-label svg {
+  color: var(--text-3);
+}
+.qp-label:hover svg {
+  color: var(--text-2);
+}
+.qp-label[for] {
+  cursor: pointer;
+}
+.qp-grid .switch {
+  justify-self: end;
+}
+.qp-bitrate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+}
+.qp-bitrate input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+.qp-value {
+  min-width: 62px;
+  text-align: right;
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
+}
+/* 分组小标题：下面的设置只影响本机，不发给对方 */
+.qp-section {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.qp-section::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line-2);
+}
+.qp-foot {
+  flex: none;
+  padding: 9px 16px 11px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 input[type="range"] {
   -webkit-appearance: none;
@@ -1917,61 +1991,6 @@ input[type="range"]::-webkit-slider-thumb {
   background: #fff;
   box-shadow: 0 0 0 4px rgba(91, 124, 255, 0.45);
   cursor: pointer;
-}
-.range-legend {
-  display: flex;
-  justify-content: space-between;
-  color: var(--text-3);
-}
-.codec-list {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
-}
-.codec-opt {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 3px;
-  padding: 9px 10px;
-  border-radius: 11px;
-  border: 1px solid var(--edge);
-  background: var(--well);
-  text-align: left;
-  transition: all 0.12s;
-}
-.codec-opt:hover:not(:disabled) {
-  border-color: var(--edge-2);
-}
-.codec-opt.active {
-  border-color: rgba(123, 92, 255, 0.7);
-  background: rgba(123, 92, 255, 0.14);
-}
-.codec-name {
-  font-weight: 600;
-  font-size: 12.5px;
-}
-.codec-hint {
-  font-size: 10.5px;
-  color: var(--text-3);
-}
-.toggle-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  cursor: pointer;
-}
-.toggle-row > span {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 13px;
-}
-.encoder-line {
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
-  color: var(--text-3);
 }
 
 /* ───────── 多屏总览 ───────── */
