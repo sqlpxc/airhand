@@ -17,6 +17,26 @@ function fakeCanvas() {
   return { canvas, fire, locks };
 }
 
+/** 假的 document：指针锁定马上成功、马上解除（要在创建 RemoteInput 之前装上） */
+function fakeLockDocument(canvas: any) {
+  const handlers = new Map<string, () => void>();
+  const doc: any = {
+    pointerLockElement: null,
+    addEventListener(name: string, fn: () => void) { handlers.set(name, fn); },
+    exitPointerLock() { doc.pointerLockElement = null; handlers.get("pointerlockchange")?.(); },
+  };
+  canvas.requestPointerLock = () => {
+    doc.pointerLockElement = canvas;
+    handlers.get("pointerlockchange")?.();
+    return Promise.resolve();
+  };
+  (globalThis as any).document = doc;
+  return () => { delete (globalThis as any).document; };
+}
+
+const LOCK_SHORTCUT = { code: "KeyM", ctrlKey: true, altKey: true, shiftKey: true, metaKey: false, repeat: false };
+const ESC = { code: "Escape", repeat: false };
+
 test("pending input cannot leak into a replacement session", async () => {
   const batches: unknown[] = [];
   const input = new RemoteInput({ addEventListener() {} } as any, () => true, events => batches.push(events));
@@ -138,5 +158,65 @@ test("手动锁定的快捷键不发给被控端", async () => {
   assert.deepEqual(batches, []);
   fire("keydown", m);
   assert.equal(input.manualLock, false);
+  input.dispose();
+});
+
+test("全屏时 Esc 交给了网页：锁定时短按照常发给对方，长按在本地解除，按住时不发自动重复", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const batches: any[][] = [];
+  const { canvas, fire } = fakeCanvas();
+  t.after(fakeLockDocument(canvas));
+  const input = new RemoteInput(canvas, () => true, events => batches.push(events));
+  input.interactive = true;
+  fire("keydown", LOCK_SHORTCUT);
+  fire("keyup", LOCK_SHORTCUT);
+  assert.equal(input.locked, true);
+  const escEdges = [{ type: "key", code: "Escape", down: true }, { type: "key", code: "Escape", down: false }];
+
+  // 短按：发给对方（游戏要用），不解除
+  fire("keydown", ESC);
+  t.mock.timers.tick(500);
+  fire("keyup", ESC);
+  t.mock.timers.tick(1000);
+  await Promise.resolve();
+  assert.equal(input.locked, true);
+  assert.deepEqual(batches.flat(), escEdges);
+  batches.length = 0;
+
+  // 长按：按下照常发，按够 1 秒解除；从按下到松开都不发自动重复
+  fire("keydown", ESC);
+  fire("keydown", { ...ESC, repeat: true });
+  t.mock.timers.tick(999);
+  assert.equal(input.locked, true);
+  t.mock.timers.tick(1);
+  assert.equal(input.locked, false);
+  assert.equal(input.manualLock, false);
+  assert.equal(input.relative, false);
+  fire("keydown", { ...ESC, repeat: true });
+  fire("keyup", ESC);
+  await Promise.resolve();
+  assert.deepEqual(batches.flat(), escEdges);
+  input.dispose();
+});
+
+test("快捷键也能解除自动锁定（被控端光标隐藏着），点一下又锁定", async (t) => {
+  const { canvas, fire } = fakeCanvas();
+  t.after(fakeLockDocument(canvas));
+  const input = new RemoteInput(canvas, () => true, () => {});
+  input.interactive = true;
+  const click = { button: 0, buttons: 1, clientX: 0, clientY: 0, pointerId: 1, movementX: 0, movementY: 0 };
+  input.setRemoteCursorHidden(true);
+  fire("pointerdown", click);
+  assert.equal(input.locked, true);
+  assert.equal(input.manualLock, false);
+
+  fire("keydown", LOCK_SHORTCUT);
+  fire("keyup", LOCK_SHORTCUT);
+  assert.equal(input.locked, false);
+  // 和按 Esc 一样：到下一次点击之前不自动锁定，发绝对坐标
+  assert.equal(input.relative, false);
+
+  fire("pointerdown", click);
+  assert.equal(input.locked, true);
   input.dispose();
 });

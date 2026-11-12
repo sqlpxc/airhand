@@ -14,6 +14,13 @@
 // * 被控端光标重新出现：自动锁定的解除锁定，本机指针回到锁定时的位置（游戏也会把光标放回原处）；
 // * 用户按 Esc 解除了锁定：到下一次点击之前不再自动锁定，指针照常显示；
 // * 手动锁定（Ctrl+Alt+Shift+M 或工具栏）：不管被控端光标，直到再切换一次或者按 Esc。
+//
+// 怎么解除：
+// * 浏览器自己的 Esc：只在 Esc 没被键盘锁定时有用。全屏时键盘整个被锁定（见 actions.ts），
+//   Esc 交给网页、发给对方（游戏要用），浏览器不再用它解除锁定，而这时指针也碰不到顶端、叫不出工具栏；
+// * 所以锁定时长按 Esc（ESC_HOLD_MS）由这里自己解除：短按照常马上发给对方，按住期间不发自动重复；
+// * Ctrl+Alt+Shift+M：正在发相对移动（手动或自动锁定）就解除，否则手动锁定。
+// 这两种解除和浏览器的 Esc 一样：手动锁定结束，自动锁定到下一次点击之前不再来。
 import type { InputEvent, MouseButton } from "./api";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
@@ -28,8 +35,10 @@ const AUTO_LOCK_AFTER_MS = 300;
  * 否则等到那个时候再发合并好的。指针事件的频率不超过 1000 / MOVE_INTERVAL_MS 时每一下都不用等
  */
 const MOVE_INTERVAL_MS = 8;
+/** 锁定时按住 Esc 这么久就解除锁定（见文件开头） */
+const ESC_HOLD_MS = 1000;
 
-/** 手动锁定 / 解锁鼠标的快捷键：Ctrl+Alt+Shift+M */
+/** 锁定 / 解除鼠标的快捷键：Ctrl+Alt+Shift+M */
 export function isLockShortcut(e: KeyboardEvent): boolean {
   return e.code === "KeyM" && e.ctrlKey && e.altKey && e.shiftKey && !e.metaKey;
 }
@@ -72,6 +81,10 @@ export class RemoteInput {
   private raw = false;
   /** 还不够一个计数的移动量 */
   private frac = { x: 0, y: 0 };
+  /** 锁定时按下了 Esc、还没松开：不发它的自动重复 */
+  private escHeld = false;
+  /** 按住 Esc 够久就解除锁定的定时器 */
+  private escTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** 鼠标的方式变了（相对移动 / 锁定），界面据此刷新指针和工具栏 */
   onModeChange: (() => void) | null = null;
@@ -86,6 +99,7 @@ export class RemoteInput {
     this._interactive = v;
     if (!v) {
       this.manual = false;
+      this.cancelEscHold();
       this.unlock();
     }
   }
@@ -118,6 +132,7 @@ export class RemoteInput {
     this.remoteHidden = false;
     this.hiddenMoveSince = null;
     this.userUnlocked = false;
+    this.cancelEscHold();
     this.unlock();
   }
   dispose() { this.manual = false; this.reset(); this.abort.abort(); }
@@ -186,6 +201,32 @@ export class RemoteInput {
       this.unlock();
     }
     this.onModeChange?.();
+  }
+
+  /** 用户解除锁定（长按 Esc、快捷键）：和浏览器的 Esc 一样，手动锁定结束，自动锁定到下一次点击之前不再来 */
+  release() {
+    this.manual = false;
+    if (this.remoteHidden) this.userUnlocked = true;
+    this.hiddenMoveSince = null;
+    this.frac = { x: 0, y: 0 };
+    this.unlock();
+    this.onModeChange?.();
+  }
+
+  /** 锁定时按下了 Esc：开始计时，按住够久就解除 */
+  private holdEsc() {
+    this.cancelEscHold();
+    this.escHeld = true;
+    this.escTimer = setTimeout(() => {
+      this.escTimer = undefined;
+      // 这期间可能已经解除了（例如游戏打开菜单，光标出现了）
+      if (this.relative) this.release();
+    }, ESC_HOLD_MS);
+  }
+  private cancelEscHold() {
+    this.escHeld = false;
+    clearTimeout(this.escTimer);
+    this.escTimer = undefined;
   }
 
   private lock() {
@@ -326,9 +367,17 @@ export class RemoteInput {
       e.preventDefault(); e.stopPropagation();
       if (!e.code || e.code === "Unidentified") return;
       if (isLockShortcut(e)) {
-        if (!e.repeat) this.toggleLock();
+        if (!e.repeat) {
+          if (this.relative) this.release();
+          else this.toggleLock();
+        }
         this.swallowed.add(e.code);
         return;
+      }
+      // 锁定时的 Esc（全屏时浏览器不再用它解除锁定）：照常发给对方，按住够久就解除，松开之前不发自动重复
+      if (e.code === "Escape" && (this.escHeld || this.locked)) {
+        if (e.repeat) return;
+        this.holdEsc();
       }
       if (IS_MAC && e.code === "CapsLock") return this.tapCaps();
       if (e.repeat && !this.pressed.has(e.code)) return;
@@ -340,6 +389,7 @@ export class RemoteInput {
       e.preventDefault(); e.stopPropagation();
       if (!e.code || e.code === "Unidentified") return;
       if (this.swallowed.delete(e.code)) return;
+      if (e.code === "Escape") this.cancelEscHold();
       if (IS_MAC && e.code === "CapsLock") return this.tapCaps();
       this.pressed.delete(e.code);
       const events: InputEvent[] = [];
@@ -353,7 +403,7 @@ export class RemoteInput {
       events.push({ type: "key", code: e.code, down: false });
       this.enqueue(events, true);
     });
-    on("blur", () => this.releaseAll());
+    on("blur", () => { this.cancelEscHold(); this.releaseAll(); });
   }
 
   private tapCaps() {

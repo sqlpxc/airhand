@@ -893,6 +893,8 @@ export class RemoteSession {
 
   /** 用户手动锁定了鼠标（发相对移动） */
   get mouseLocked(): boolean { return this.input.manualLock; }
+  /** 本机指针锁定在画面上了（手动或自动） */
+  get pointerLocked(): boolean { return this.input.locked; }
 
   /** 手动锁定 / 解锁鼠标（工具栏；快捷键 Ctrl+Alt+Shift+M 由 input.ts 处理）。要在点击里调用 */
   toggleMouseLock() {

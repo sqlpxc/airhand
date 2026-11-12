@@ -173,6 +173,16 @@ export function SessionView({ s }: { s: RemoteSession }) {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // 第一次锁定鼠标时（包括被控端隐藏光标时自动锁定、按快捷键）提示怎么解除：
+  // 全屏时 Esc 发给了对方，指针也碰不到顶端叫出工具栏
+  const pointerLocked = s.pointerLocked;
+  const lockHinted = useRef(false);
+  useEffect(() => {
+    if (!pointerLocked || lockHinted.current) return;
+    lockHinted.current = true;
+    setToast(t("session.mouseLocked"));
+  }, [pointerLocked]);
+
   const fullscreen = async () => {
     setMenu(null);
     await toggleFullscreen();
