@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! 线上（画面通道）：长度 u32 LE | 头（现在 24 字节）| 负载
-//! 线上（声音数据报）：会话 ID | 种类 |（加密的）头 | 负载
+//! 线上（声音数据报）：会话 ID | 种类 |（加密的）{ 长度 u32 LE | 头 | 负载 } × 1~3（见下面的"声音数据报"）
 //! 交给界面（WebView / 浏览器 / Android）：  头（现在 24 字节）| 负载
 //! ```
 //!
@@ -15,11 +15,6 @@
 //! 三边都用 `crates/airhand-link/tests/protocol.json` 里的样例检查）。
 //! 光标（[`HostMsg::Cursor`](crate::session::HostMsg::Cursor) / [`HostMsg::CursorImage`](crate::session::HostMsg::CursorImage)）
 //! 由控制端合并成同样格式的光标包（[`cursor_packet`]）交给界面。
-//!
-//! 声音包一包一个 QUIC 数据报（[`crate::datagram`]，不带长度前缀）：丢了的不重传，后面的包也不用等它。
-//! 一个包最多 [`MAX_AUDIO_PACKET`]（放得进一个数据报），被控端的 Opus 编码器按 [`MAX_OPUS_PACKET`] 限长，
-//! 放不下的（只可能来自不能限长的编码器）丢掉，由解码器的丢包补偿盖过去。
-//! 数据报可能乱序，控制端按采集时刻（相同时按序号）丢掉迟到的包。
 //!
 //! 头（小端）：
 //!
@@ -56,6 +51,24 @@
 //! 都没有就是形状没变。槽位只在一个会话里有效，重连之后界面要清空。
 //!
 //! 编码格式不认识的画面包（[`VideoHeader::decode`] 返回 `None`）三边都丢掉，不猜成某种格式送进解码器。
+//!
+//! # 声音数据报
+//!
+//! 声音走 QUIC 数据报（[`crate::datagram`]）：丢了的不重传，后面的包也不用等它。丢了也要补得回来，所以每个数据报
+//! 除了最新的一包，还带着之前一两包的副本（冗余，和 WebRTC 的 RED 一样）。数据报的明文（[`audio_datagram`] /
+//! [`audio_packets`]）是一个或几个声音包，每个前面是 `u32 LE` 长度（和画面通道上的帧一样），按采集先后排列，
+//! **最后一个是最新的**：
+//!
+//! * 连着丢了几个数据报，下一个到的时候把缺的那几包一起带来：只比原来晚 20、40 ms（抖动缓冲盖得住），不用等重传；
+//!   中转、直连换路时，旧路上还没到的包也这样补上；
+//! * 带几包由发的一方决定（放得下才带，见 [`audio_datagram`]），收的一方不管；静音之后的第一包（`start`）
+//!   不带之前的：那是上一段声音的，早就过时了；
+//! * 控制端按采集时刻（相同时按序号）只收比收过的都新的包：副本、乱序和迟到的包都在这里丢掉，交给界面的
+//!   还是一个一个的声音包，界面不知道有冗余；
+//! * 里面不是声音包的（以后的版本可能放别的）跳过；长度前缀不对的整个数据报丢掉。
+//!
+//! 一个包最多 [`MAX_AUDIO_PACKET`]（带上长度前缀、单独一包放得进一个数据报），被控端的 Opus 编码器按
+//! [`MAX_OPUS_PACKET`] 限长，放不下的（只可能来自不能限长的编码器）丢掉，由解码器的丢包补偿盖过去。
 
 use crate::session::{Codec, CursorShape};
 
@@ -63,9 +76,11 @@ use crate::session::{Codec, CursorShape};
 pub const HEADER_LEN: usize = 24;
 /// 画面包上限（一个 4K 关键帧也远小于这个值）
 pub const MAX_VIDEO_PACKET: usize = 32 * 1024 * 1024;
-/// 声音包（头 + Opus 包）上限：加密之后正好放得进一个数据报（[`crate::datagram::MAX`]）
-pub const MAX_AUDIO_PACKET: usize =
+/// 声音数据报的明文（[`audio_datagram`]）上限：加密之后正好放得进一个数据报（[`crate::datagram::MAX`]）
+pub const MAX_AUDIO_DATAGRAM: usize =
     crate::datagram::MAX - crate::datagram::HEADER - crate::handshake::SEAL_OVERHEAD;
+/// 声音包（头 + Opus 包）上限：带上长度前缀，单独一包放得进一个声音数据报
+pub const MAX_AUDIO_PACKET: usize = MAX_AUDIO_DATAGRAM - crate::framing::PREFIX;
 /// 一个 Opus 包最多这么大（被控端的编码器按它限长，见模块说明）
 pub const MAX_OPUS_PACKET: usize = MAX_AUDIO_PACKET - HEADER_LEN;
 
@@ -214,6 +229,45 @@ impl AudioHeader {
     }
 }
 
+/// 拼一个声音数据报的明文（见模块说明的"声音数据报"）：最新的一包 `latest`，和它之前的几包 `earlier`
+/// （副本，从新到旧）里放得下的（从新的开始，放不下就不再往前带）。包都不带长度前缀。
+/// `latest` 单独都放不下（超过 [`MAX_AUDIO_PACKET`]）时为 `None`
+pub fn audio_datagram<'a>(
+    latest: &[u8],
+    earlier: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<Vec<u8>> {
+    let size = |p: &[u8]| crate::framing::PREFIX + p.len();
+    let mut room = MAX_AUDIO_DATAGRAM.checked_sub(size(latest))?;
+    let mut copies = Vec::new();
+    for p in earlier {
+        let Some(left) = room.checked_sub(size(p)) else {
+            break;
+        };
+        room = left;
+        copies.push(p);
+    }
+    let mut buf = Vec::with_capacity(MAX_AUDIO_DATAGRAM - room);
+    for p in copies.into_iter().rev().chain([latest]) {
+        buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        buf.extend_from_slice(p);
+    }
+    Some(buf)
+}
+
+/// 解开声音数据报的明文（见模块说明的"声音数据报"）：里面的包，按采集先后排列（最后一个是最新的），不带长度前缀。
+/// 长度前缀不对（超出了剩下的字节、超过 [`MAX_AUDIO_PACKET`]）、一个包都没有时为 `None`：整个数据报丢掉。
+/// 包是什么不管（声音包之外的跳过、迟到的丢掉，由收的一方决定）
+pub fn audio_packets(plain: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut packets = Vec::with_capacity(3);
+    let mut rest = plain;
+    while !rest.is_empty() {
+        let (p, r) = crate::framing::split(rest, MAX_AUDIO_PACKET).ok()??;
+        packets.push(p);
+        rest = r;
+    }
+    (!packets.is_empty()).then_some(packets)
+}
+
 /// 交给界面的光标（[`cursor_packet`]）。由控制端合并线上的光标消息得到，不在线上传
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorState {
@@ -259,7 +313,7 @@ pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
 
 /// 线上的一个媒体包（加密之前）：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
 /// 多留了加密开销（标签和计数）的容量：原地加密时不用重新分配（画面包可能有几 MiB）。
-/// 声音包也用它（发成数据报时去掉长度前缀），发送队列里画面、声音是同一种东西
+/// 声音包也用它（发成数据报时和之前几包的副本拼在一起，见 [`audio_datagram`]），发送队列里画面、声音是同一种东西
 pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
     let len = HEADER_LEN + payload.iter().map(|p| p.len()).sum::<usize>();
     let mut buf = Vec::with_capacity(4 + len + crate::handshake::SEAL_OVERHEAD);
@@ -357,6 +411,80 @@ mod tests {
         let wire = frame(&h.encode(), &[&[1, 2, 3]]);
         assert_eq!(AudioHeader::decode(&wire[4..]), Some(h));
         assert_eq!(payload(&wire[4..]), Some(&[1, 2, 3][..]));
+    }
+
+    fn audio(seq: u32, start: bool, opus: usize) -> Vec<u8> {
+        let h = AudioHeader {
+            seq,
+            start,
+            capture_us: seq as u64 * 20_000,
+        };
+        frame(&h.encode(), &[&vec![seq as u8; opus]])[4..].to_vec()
+    }
+
+    fn seqs(plain: &[u8]) -> Vec<u32> {
+        audio_packets(plain)
+            .unwrap()
+            .iter()
+            .map(|p| AudioHeader::decode(p).unwrap().seq)
+            .collect()
+    }
+
+    /// 声音数据报：最新的一包在最后，之前的副本按先后排在前面，放得下几包带几包
+    #[test]
+    fn audio_datagrams_carry_earlier_packets_that_fit() {
+        let (a, b, c) = (
+            audio(1, true, 240),
+            audio(2, false, 240),
+            audio(3, false, 240),
+        );
+        let only = audio_datagram(&c, []).unwrap();
+        assert_eq!(only.len(), 4 + c.len());
+        assert_eq!(audio_packets(&only).unwrap(), [&c[..]]);
+        let all = audio_datagram(&c, [&b[..], &a[..]]).unwrap();
+        assert_eq!(seqs(&all), [1, 2, 3]);
+        assert_eq!(audio_packets(&all).unwrap(), [&a[..], &b[..], &c[..]]);
+        assert!(all.len() <= MAX_AUDIO_DATAGRAM);
+
+        // 放不下就不再往前带（从新的开始带）
+        let big = audio(2, false, 600);
+        let some = audio_datagram(&c, [&big[..], &a[..]]).unwrap();
+        assert_eq!(seqs(&some), [2, 3]);
+        let none = audio_datagram(&big, [&big[..]]).unwrap();
+        assert_eq!(seqs(&none), [2]);
+
+        // 最大的包单独正好放得下，再大就不行
+        let max = audio(9, false, MAX_OPUS_PACKET);
+        assert_eq!(max.len(), MAX_AUDIO_PACKET);
+        assert_eq!(
+            audio_datagram(&max, [&a[..]]).unwrap().len(),
+            MAX_AUDIO_DATAGRAM
+        );
+        assert!(audio_datagram(&audio(9, false, MAX_OPUS_PACKET + 1), []).is_none());
+    }
+
+    /// 长度前缀不对的整个数据报丢掉；什么样的字节都不能让它崩溃
+    #[test]
+    fn malformed_audio_datagrams_are_dropped() {
+        let plain = audio_datagram(&audio(2, false, 100), [&audio(1, false, 100)[..]]).unwrap();
+        assert!(audio_packets(&[]).is_none());
+        for cut in 1..plain.len() {
+            if cut != 4 + audio(1, false, 100).len() {
+                assert!(audio_packets(&plain[..cut]).is_none(), "{cut}");
+            }
+        }
+        let mut huge = plain.clone();
+        huge[..4].copy_from_slice(&(MAX_AUDIO_PACKET as u32 + 1).to_le_bytes());
+        assert!(audio_packets(&huge).is_none());
+        // 空的包、不是声音的包照样切出来（收的一方跳过）
+        assert_eq!(audio_packets(&[0, 0, 0, 0]).unwrap(), [&[0u8; 0][..]]);
+        for i in 0..plain.len() {
+            let mut m = plain.clone();
+            for b in [0x00, 0x01, 0x7f, 0xff] {
+                m[i] = b;
+                let _ = audio_packets(&m);
+            }
+        }
     }
 
     #[test]

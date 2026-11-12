@@ -1,15 +1,17 @@
 //! 控制端收被控端的东西：控制、大块、画面三条通道，声音数据报和控制数据报，解密之后交出来（[`HostReceiver`]）。
 //! 被控端的探测（`HostDatagram::Probe`）在这里就从原来的那条路弹回去，不交出来。
 
+use std::collections::VecDeque;
+
 use airhand_proto::SessionLane;
 use airhand_proto::datagram;
-use airhand_proto::media::{AudioHeader, Kind};
 use airhand_proto::session::{ControllerDatagram, HostDatagram, HostMsg};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::audio::Unbundler;
 use crate::lanes::Via;
 use crate::merge::Merge;
 use crate::paths::DatagramSender;
@@ -32,7 +34,8 @@ pub enum FromHost {
         direct: bool,
         gap: bool,
     },
-    /// 声音包（`airhand_proto::media` 格式：头 + Opus 包），原样交给界面
+    /// 声音包（`airhand_proto::media` 格式：头 + Opus 包），原样交给界面。一个数据报里带着之前几包的副本，
+    /// 拆开之后只交出没收过的（丢了的包这样补回来，见 `crate::audio`），一个一个、按采集先后
     Audio(Vec<u8>),
 }
 
@@ -54,7 +57,9 @@ pub struct HostReceiver {
     video_open: bool,
     audio_open: bool,
     datagrams_open: bool,
-    audio_order: AudioOrder,
+    unbundler: Unbundler,
+    /// 从声音数据报里拆出来、还没交出去的声音包
+    audio_out: VecDeque<Vec<u8>>,
 }
 
 impl HostReceiver {
@@ -79,13 +84,18 @@ impl HostReceiver {
             video_open: true,
             audio_open: true,
             datagrams_open: true,
-            audio_order: AudioOrder::default(),
+            unbundler: Unbundler::default(),
+            audio_out: VecDeque::new(),
         }
     }
 
     /// 下一样东西。控制消息优先；控制通道结束了就是会话结束了（其它通道先结束不算）。可以放在 `select!` 里
     pub async fn recv(&mut self) -> Result<FromHost> {
         loop {
+            // 一个声音数据报里补回来的几包（最多几个）先交完
+            if let Some(p) = self.audio_out.pop_front() {
+                return Ok(FromHost::Audio(p));
+            }
             tokio::select! {
                 biased;
                 m = next_msg::<HostMsg>(&mut self.control, SessionLane::Control) => {
@@ -106,11 +116,7 @@ impl HostReceiver {
                     None => self.bulk_open = false,
                 },
                 d = self.audio.0.recv(), if self.audio_open => match d {
-                    Some(d) => {
-                        if let Some(p) = self.open_audio(&d) {
-                            return Ok(FromHost::Audio(p));
-                        }
-                    }
+                    Some(d) => self.open_audio(&d),
                     None => self.audio_open = false,
                 },
                 f = self.video.next(), if self.video_open => match f? {
@@ -128,74 +134,22 @@ impl HostReceiver {
         }
     }
 
-    /// 声音数据报：解开、检查是声音包、不是迟到的。解不开的（被篡改、重放的）、迟到的都丢掉这一包
-    fn open_audio(&mut self, d: &[u8]) -> Option<Vec<u8>> {
-        let mut p = d.get(datagram::HEADER..)?.to_vec();
-        if let Err(e) = self.audio.1.open(&mut p) {
-            debug!("dropped an audio packet: {e:#}");
-            return None;
-        }
-        (Kind::of(&p) == Some(Kind::Audio) && self.audio_order.accept(&p)).then_some(p)
-    }
-}
-
-/// 数据报可能乱序：采集时刻在一个会话内不倒退，即使采集器重启、序号从头算也一样。
-/// `start` 只描述静音段边界，不能让迟到的首包重置顺序。相同采集时刻用序号消歧（允许绕回）。
-#[derive(Default)]
-struct AudioOrder {
-    last: Option<AudioHeader>,
-}
-
-impl AudioOrder {
-    fn accept(&mut self, packet: &[u8]) -> bool {
-        let Some(h) = AudioHeader::decode(packet) else {
-            return false;
+    /// 声音数据报：解开，拆出里面没收过的声音包（放进 `audio_out`）。解不开的（被篡改、重放的）整个丢掉
+    fn open_audio(&mut self, d: &[u8]) {
+        let Some(sealed) = d.get(datagram::HEADER..) else {
+            return;
         };
-        if let Some(last) = self.last
-            && (h.capture_us < last.capture_us
-                || (h.capture_us == last.capture_us && h.seq.wrapping_sub(last.seq) as i32 <= 0))
-        {
-            return false;
+        let mut plain = sealed.to_vec();
+        if let Err(e) = self.audio.1.open(&mut plain) {
+            debug!("dropped an audio datagram: {e:#}");
+            return;
         }
-        self.last = Some(h);
-        true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn audio(seq: u32, start: bool, capture_us: u64) -> Vec<u8> {
-        AudioHeader {
-            seq,
-            start,
-            capture_us,
+        let recovered = self.unbundler.unbundle(&plain, &mut self.audio_out);
+        if recovered > 0 {
+            debug!(
+                recovered,
+                "recovered audio packets that didn't arrive on their own"
+            );
         }
-        .encode()
-        .to_vec()
-    }
-
-    #[test]
-    fn late_audio_cannot_rewind_playback_even_when_it_starts_a_segment() {
-        let mut o = AudioOrder::default();
-        // 首包丢了或迟到：先收到了第三包。
-        assert!(o.accept(&audio(3, false, 60_000)));
-        assert!(!o.accept(&audio(1, true, 20_000)));
-        assert!(!o.accept(&audio(2, false, 40_000)));
-        assert!(!o.accept(&audio(3, false, 60_000)));
-        assert!(o.accept(&audio(4, false, 80_000)));
-        // 采集器重启，首包也可能丢失：用采集时钟分辨新流与迟到的旧流。
-        assert!(o.accept(&audio(2, false, 1_000_000)));
-        assert!(!o.accept(&audio(1, true, 980_000)));
-        assert!(!o.accept(&audio(5, false, 100_000)));
-        assert!(o.accept(&audio(3, false, 1_020_000)));
-        // 相同采集时刻（时钟精度不够）仍能按序号丢重复、识别绕回。
-        let mut o = AudioOrder::default();
-        assert!(o.accept(&audio(u32::MAX, true, 0)));
-        assert!(o.accept(&audio(0, false, 0)));
-        assert!(!o.accept(&audio(u32::MAX, true, 0)));
-        assert!(!o.accept(&audio(0, true, 0)));
-        assert!(!o.accept(&[]));
     }
 }

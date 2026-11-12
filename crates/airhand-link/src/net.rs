@@ -220,7 +220,8 @@ pub fn transport_config() -> TransportConfig {
     t.stream_receive_window(VarInt::from_u32(16 * 1024 * 1024));
     t.receive_window(VarInt::from_u32(64 * 1024 * 1024));
     t.send_window(64 * 1024 * 1024);
-    // 声音数据报（约 12 KB/s）：网络跟不上时宁可丢掉旧的，也不要在发送缓冲里越积越晚（缓冲满了 quinn 丢最旧的）
+    // 声音数据报（带着之前两包的副本，约 40 KB/s）：网络跟不上时宁可丢掉旧的，也不要在发送缓冲里越积越晚
+    // （缓冲满了 quinn 丢最旧的）
     t.datagram_send_buffer_size(64 * 1024);
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t

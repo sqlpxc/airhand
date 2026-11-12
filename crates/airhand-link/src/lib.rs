@@ -16,12 +16,15 @@
 //! * [`Problem`]：显示给用户的问题，以类型而不是文字的形式传给界面。
 //!
 //! 两端的消息通道用同一种发送队列（`queue`：只留最新值的槽位 + 有界的队列），时钟在 `clock`。
+//! 声音数据报的冗余（带上之前几包的副本、收的一方拆开补洞）在 `audio`。
 //!
 //! # feature
 //!
 //! 除了 [`wire`] 和 [`udp`]，都在默认打开的 `client` 里。中转服务器关掉它（`default-features = false`）、只用这两个：
 //! 读写几帧不用把 Noise、SPAKE2 这些它用不到的库也编译进去。
 
+#[cfg(feature = "client")]
+mod audio;
 #[cfg(feature = "client")]
 mod clock;
 #[cfg(feature = "console")]

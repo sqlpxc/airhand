@@ -3,8 +3,6 @@
 
 use airhand_proto::SessionLane;
 use airhand_proto::datagram;
-use airhand_proto::framing;
-use airhand_proto::media;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use quinn::{Connection, SendDatagramError, SendStream};
@@ -13,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::queue::LaneReceiver;
+use crate::audio::Bundler;
 use crate::lanes::open_lane;
 use crate::paths::Paths;
 use crate::secure::Sealer;
@@ -106,26 +105,25 @@ async fn write_direct(
     Ok(())
 }
 
-/// 声音：`rx` 里排好队的声音包（[`media::frame`] 编好的，带长度前缀）加密后发成数据报，
-/// 发在画面走的那条路上（[`Paths::media`]）。放不进一个数据报的（[`media::MAX_AUDIO_PACKET`]）丢掉
+/// 声音：`rx` 里排好队的声音包（`media::frame` 编好的，带长度前缀）连同之前几包的副本（[`Bundler`]）
+/// 加密后发成数据报，发在画面走的那条路上（[`Paths::media`]）。单独一包都放不进一个数据报的
+/// （`media::MAX_AUDIO_PACKET`）丢掉
 async fn write_audio(
     paths: Paths,
     session_id: u64,
     mut rx: mpsc::Receiver<Bytes>,
     mut sealer: Sealer,
 ) -> Result<()> {
+    let mut bundler = Bundler::default();
     while let Some(framed) = rx.recv().await {
-        let packet = framed.get(framing::PREFIX..).unwrap_or_default();
-        if packet.len() > media::MAX_AUDIO_PACKET {
-            debug!(
-                len = packet.len(),
-                "dropped an audio packet too large for a datagram"
-            );
+        let len = framed.len();
+        let Some(plain) = bundler.bundle(framed) else {
+            debug!(len, "dropped an audio packet too large for a datagram");
             continue;
-        }
+        };
         let direct = paths.media();
         let conn = direct.as_ref().unwrap_or(paths.relay());
-        let d = sealer.seal_datagram(session_id, datagram::AUDIO, packet)?;
+        let d = sealer.seal_datagram(session_id, datagram::AUDIO, &plain)?;
         match conn.send_datagram(Bytes::from(d)) {
             Ok(()) => {}
             Err(SendDatagramError::ConnectionLost(e)) if direct.is_none() => return Err(e.into()),
