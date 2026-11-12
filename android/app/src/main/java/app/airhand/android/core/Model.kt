@@ -178,7 +178,8 @@ data class EncoderInfo(val codec: Codec, val name: String, val hardware: Boolean
 /** 被控端发来的提示（`NoticeView`） */
 data class Notice(val kind: String, val detail: String? = null, val screen: Boolean = false, val input: Boolean = false)
 
-data class Stats(val fps: Float, val kbps: Float, val rttMs: Float?, val width: Int, val height: Int)
+/** `direct`：画面是从直连来的（两台设备之间打通的路，不经过服务器），否则经过中转 */
+data class Stats(val fps: Float, val kbps: Float, val rttMs: Float?, val width: Int, val height: Int, val direct: Boolean)
 
 /**
  * 被控端是哪种系统：决定默认的操作方式、快捷键和导航键。

@@ -199,6 +199,9 @@
     <string name="disconnect_title">断开连接？</string>
     <string name="disconnect_text">断开与“%1$s”的连接。</string>
     <string name="latency_ms">延迟 %1$d ms</string>
+    <!-- 画面走的路：直连不经过服务器，中转经过服务器 -->
+    <string name="path_direct">直连</string>
+    <string name="path_relayed">中转</string>
     <string name="clipboard_received">已复制对方的剪贴板内容</string>
     <string name="audio_playback_failed">无法播放声音：%1$s</string>
     <string name="menu_keyboard">键盘</string>

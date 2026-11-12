@@ -448,6 +448,8 @@ private fun MainMenu(
                 stats?.let { "${it.fps.roundToInt()} fps" },
                 stats?.rttMs?.let { stringResource(R.string.latency_ms, it.roundToInt()) },
                 stats?.let { if (it.kbps >= 1000) "%.1f Mbps".format(it.kbps / 1000) else "${it.kbps.roundToInt()} kbps" },
+                // 画面走的路：收到画面之后才知道
+                stats?.takeIf { it.width > 0 }?.let { stringResource(if (it.direct) R.string.path_direct else R.string.path_relayed) },
             )
             Text(
                 parts.joinToString(" · ").ifEmpty { Code.format(session.code) },

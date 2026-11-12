@@ -202,6 +202,9 @@
     <string name="disconnect_title">Disconnect?</string>
     <string name="disconnect_text">Disconnect from “%1$s”.</string>
     <string name="latency_ms">%1$d ms</string>
+    <!-- 画面走的路：直连不经过服务器，中转经过服务器 -->
+    <string name="path_direct">Direct</string>
+    <string name="path_relayed">Relayed</string>
     <string name="clipboard_received">Copied the remote clipboard</string>
     <string name="audio_playback_failed">Can\'t play the sound: %1$s</string>
     <string name="menu_keyboard">Keyboard</string>

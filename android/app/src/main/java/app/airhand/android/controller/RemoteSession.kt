@@ -467,6 +467,7 @@ class RemoteSession(
                 if (e.isNull("rttMs")) null else e.optDouble("rttMs").toFloat(),
                 e.optInt("width"),
                 e.optInt("height"),
+                e.optBoolean("direct"),
             )
             "notice" -> {
                 val o = e.optJSONObject("notice") ?: return
