@@ -5,8 +5,8 @@ plugins {
 }
 
 // 产品版本与桌面客户端一致（client/src-tauri/tauri.conf.json）
-val appVersion = "0.2.2"
-val appVersionCode = 4
+val appVersion = "0.2.3"
+val appVersionCode = 5
 
 /** 构建参数：先找 Gradle 属性（-Pairhand.server=...），再找环境变量（AIRHAND_SERVER） */
 fun setting(prop: String, env: String): String? =

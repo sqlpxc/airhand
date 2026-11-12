@@ -1,7 +1,7 @@
 [package]
 name = "airhand-android"
 description = "Airhand Android core: relay link, controller sessions and the host service, exposed to Kotlin through JNI"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "MIT"
 publish = false
