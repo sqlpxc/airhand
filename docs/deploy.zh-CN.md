@@ -11,9 +11,9 @@
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `AIRHAND_LISTEN` | `0.0.0.0:4433` | 监听地址（UDP） |
-| `AIRHAND_CERT` / `AIRHAND_KEY` | `/data/cert.pem` / `/data/key.pem` | 证书路径，不存在时自动生成 |
+| `AIRHAND_CERT` / `AIRHAND_KEY` | 服务端程序旁边的 `data/cert.pem` / `data/key.pem`（Docker 镜像里是 `/data/cert.pem` / `/data/key.pem`） | 证书路径，不存在时自动生成；`data/` 文件夹不存在时自动创建 |
 | `AIRHAND_CERT_NAMES` | `airhand,localhost` | 自动生成证书时写入的 SAN |
-| `AIRHAND_DB` | 证书旁边的 `airhand.db` | SQLite 数据库，存固定的控制码（控制码、被控端密钥的哈希、最后在线时间）。丢了它，离线的被控端的控制码就可能分给别人（没人占用的话仍然能取回）。打不开时服务器把控制码记在内存里，并在日志里报错 |
+| `AIRHAND_DB` | 证书旁边的 `airhand.db`（默认就是服务端程序旁边的 `data/airhand.db`） | SQLite 数据库，存固定的控制码（控制码、被控端密钥的哈希、最后在线时间）。丢了它，离线的被控端的控制码就可能分给别人（没人占用的话仍然能取回）。打不开时服务器把控制码记在内存里，并在日志里报错 |
 | `AIRHAND_MAX_SESSIONS` | `4` | 每台被控端同时允许的控制端数量 |
 | `AIRHAND_MAX_CONNS_PER_IP` | `128` | 同一个 IPv4 地址 / IPv6 的 /64 同时最多几条连接（网页控制台每个标签页一条；很多被控端共用一个出口 IP 时调大） |
 | `AIRHAND_NEW_CODES_PER_IP` | `30` | 同一个 IPv4 地址 / IPv6 的 /48 每 10 分钟最多分配几个新控制码（取回原来的控制码不算） |

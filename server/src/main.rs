@@ -2,9 +2,9 @@
 //!
 //! 环境变量：
 //! * `AIRHAND_LISTEN`        监听地址，默认 `0.0.0.0:4433`（UDP）
-//! * `AIRHAND_CERT`          证书路径，默认 `/data/cert.pem`（不存在则自动生成）
-//! * `AIRHAND_KEY`           私钥路径，默认 `/data/key.pem`
-//! * `AIRHAND_DB`            SQLite 数据库（固定控制码的绑定表，见 [`codes`]），默认和证书放在同一个目录（`/data/airhand.db`）
+//! * `AIRHAND_CERT`          证书路径，默认 `data/cert.pem`，`data` 是服务端程序旁边的文件夹（不存在则自动创建，证书不存在则自动生成）
+//! * `AIRHAND_KEY`           私钥路径，默认 `data/key.pem`（同上）
+//! * `AIRHAND_DB`            SQLite 数据库（固定控制码的绑定表，见 [`codes`]），默认和证书放在同一个目录（默认 `data/airhand.db`）
 //! * `AIRHAND_CERT_NAMES`    自动生成证书时的 SAN，逗号分隔，默认 `airhand,localhost`
 //! * `AIRHAND_MAX_SESSIONS`  每台被控端最多同时被几个控制端连接，默认 4
 //! * `AIRHAND_MAX_CONNS_PER_IP` 同一个来源（IPv4 地址 / IPv6 的 /64）最多同时有几条连接，默认 128
@@ -36,6 +36,26 @@ fn env_or(key: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// 服务端程序旁边的 `data` 文件夹：证书、私钥和数据库默认都放在这里，不放在系统目录里。
+/// 这里只算出路径，文件夹在真正要写文件时才创建（见 `tls::load_or_generate` 和 `codes`），
+/// 所以三个路径都用环境变量指到别处时，程序旁边不会多出一个空文件夹。
+/// 取不到程序自己的路径时退回当前目录下的 `data`。
+fn default_data_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("data")))
+        .unwrap_or_else(|| PathBuf::from("data"))
+}
+
+/// 和 [`env_or`] 一样（没设置、或者只有空白就用默认值），但是给路径用的
+fn env_path(key: &str, default: PathBuf) -> PathBuf {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(default)
 }
 
 /// 针对实时画面优化的传输参数（客户端见 `crates/airhand-link/src/net.rs`）。
@@ -95,8 +115,9 @@ async fn main() -> Result<()> {
     let listen: SocketAddr = env_or("AIRHAND_LISTEN", "0.0.0.0:4433")
         .parse()
         .context("invalid AIRHAND_LISTEN")?;
-    let cert_path = PathBuf::from(env_or("AIRHAND_CERT", "/data/cert.pem"));
-    let key_path = PathBuf::from(env_or("AIRHAND_KEY", "/data/key.pem"));
+    let data_dir = default_data_dir();
+    let cert_path = env_path("AIRHAND_CERT", data_dir.join("cert.pem"));
+    let key_path = env_path("AIRHAND_KEY", data_dir.join("key.pem"));
     let db_path = match std::env::var("AIRHAND_DB") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
         _ => cert_path

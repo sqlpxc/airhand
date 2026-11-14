@@ -11,9 +11,9 @@ Environment variables (see `docker-compose.yml`):
 | Variable | Default | Description |
 |---|---|---|
 | `AIRHAND_LISTEN` | `0.0.0.0:4433` | Listen address (UDP) |
-| `AIRHAND_CERT` / `AIRHAND_KEY` | `/data/cert.pem` / `/data/key.pem` | Certificate paths; generated automatically if missing |
+| `AIRHAND_CERT` / `AIRHAND_KEY` | `data/cert.pem` / `data/key.pem` next to the server binary (`/data/cert.pem` / `/data/key.pem` in the Docker image) | Certificate paths; generated automatically if missing; the `data/` folder is created if it doesn't exist |
 | `AIRHAND_CERT_NAMES` | `airhand,localhost` | SANs written into an auto-generated certificate |
-| `AIRHAND_DB` | `airhand.db` next to the certificate | SQLite database with the fixed control codes (code, hash of the host's secret, last seen). Without it, codes of hosts that are offline could go to other hosts (a host still gets its code back if nobody took it). If it can't be opened the server keeps the codes in memory and logs an error |
+| `AIRHAND_DB` | `airhand.db` next to the certificate (by default `data/airhand.db` next to the server binary) | SQLite database with the fixed control codes (code, hash of the host's secret, last seen). Without it, codes of hosts that are offline could go to other hosts (a host still gets its code back if nobody took it). If it can't be opened the server keeps the codes in memory and logs an error |
 | `AIRHAND_MAX_SESSIONS` | `4` | Max simultaneous controllers per host |
 | `AIRHAND_MAX_CONNS_PER_IP` | `128` | Max simultaneous connections per IPv4 address / IPv6 /64 (a web console uses one per browser tab; raise it if many hosts share one public IP) |
 | `AIRHAND_NEW_CODES_PER_IP` | `30` | Max fresh control codes per IPv4 address / IPv6 /48 per 10 minutes (getting an existing code back doesn't count) |
