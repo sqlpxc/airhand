@@ -46,6 +46,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
@@ -80,7 +81,6 @@ import app.airhand.android.core.ServerState
 import app.airhand.android.host.HostService
 import app.airhand.android.host.HostState
 import app.airhand.android.host.InputService
-import app.airhand.android.host.Viewer
 import app.airhand.android.ui.ConfirmDialog
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.SectionTitle
@@ -93,7 +93,8 @@ import kotlinx.coroutines.launch
  * "共享本机"页：让别人看 / 操作这台手机。
  *
  * 没开始时：说明 + 一个大按钮"开始共享"（系统会弹出录屏确认）。
- * 共享中：大字显示控制码（复制 / 分享），谁在看（可以全部断开），更换控制码，停止共享。
+ * 共享中：大字显示控制码（复制 / 分享），配对码（第一次连接本机的设备要输入；可以换一个、忘掉配对过的），
+ * 谁在看（可以全部断开），更换控制码，停止共享。
  * 下面始终是需要的权限，每一项说明用途、状态和"去开启"。
  */
 @Composable
@@ -105,6 +106,8 @@ fun ShareTab(modifier: Modifier, snackbar: SnackbarHostState) {
     var confirmStop by remember { mutableStateOf(false) }
     var confirmNewCode by remember { mutableStateOf(false) }
     var confirmKick by remember { mutableStateOf(false) }
+    var confirmForget by remember { mutableStateOf(false) }
+    val pairing by app.pairing.flow.collectAsState()
     var showA11yGuide by remember { mutableStateOf(false) }
     val perms = rememberPermissions()
 
@@ -192,7 +195,13 @@ fun ShareTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 },
                 onShare = {
                     st.code?.let { c ->
-                        val text = ctx.getString(R.string.share_code_message, Code.format(c))
+                        // 配对码也一起发：对方第一次连接时要用（之后只要控制码）
+                        val p = pairing?.takeIf { !it.locked }?.code
+                        val text = if (p != null) {
+                            ctx.getString(R.string.share_codes_message, Code.format(c), Code.format(p))
+                        } else {
+                            ctx.getString(R.string.share_code_message, Code.format(c))
+                        }
                         ctx.startActivity(
                             Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), null),
                         )
@@ -200,8 +209,17 @@ fun ShareTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 },
             )
 
-            // 有人请求连接：最要紧，放在最上面
-            st.requests.forEach { r -> RequestCard(r) }
+            PairingCard(
+                code = pairing?.code,
+                locked = pairing?.locked == true,
+                paired = pairing?.paired?.size ?: 0,
+                onCopy = {
+                    pairing?.code?.let { app.clipboard.write(Code.format(it)) }
+                    scope.launch { snackbar.showSnackbar(ctx.getString(R.string.copied)) }
+                },
+                onNewCode = { HostService.newPairingCode() },
+                onForget = { confirmForget = true },
+            )
 
             SectionTitle(stringResource(R.string.share_viewers))
             Card(
@@ -226,7 +244,12 @@ fun ShareTab(modifier: Modifier, snackbar: SnackbarHostState) {
                                 Spacer(Modifier.width(12.dp))
                                 Column(Modifier.weight(1f)) {
                                     Text(v.name.ifBlank { stringResource(R.string.unknown_device) }, style = MaterialTheme.typography.bodyLarge)
-                                    Text(v.ip, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    // 安全码：对方显示的是同一个，不一样就是中间有人
+                                    Text(
+                                        "${v.ip} · " + stringResource(R.string.session_safety, v.safety),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
                                 }
                             }
                         }
@@ -343,45 +366,77 @@ fun ShareTab(modifier: Modifier, snackbar: SnackbarHostState) {
             },
         )
     }
+    if (confirmForget) {
+        ConfirmDialog(
+            title = stringResource(R.string.share_forget_paired_title),
+            text = stringResource(R.string.share_forget_paired_text),
+            confirm = stringResource(R.string.forget),
+            destructive = true,
+            onDismiss = { confirmForget = false },
+            onConfirm = {
+                confirmForget = false
+                app.forgetPaired()
+            },
+        )
+    }
     if (showA11yGuide) {
         AccessibilityGuide(onDismiss = { showA11yGuide = false })
     }
 }
 
-/** 连接请求：谁、从哪里，允许 / 拒绝 */
+/**
+ * 配对码：第一次连接本机的设备除了控制码还要输入它（配对之后记住那台设备，以后只要控制码）。
+ * 有人多次输错时配对暂停，换一个配对码才恢复（规则在 Rust 的 airhand_link::host::pairing）
+ */
 @Composable
-private fun RequestCard(r: Viewer) {
-    val ctx = LocalContext.current
+private fun PairingCard(
+    code: String?,
+    locked: Boolean,
+    paired: Int,
+    onCopy: () -> Unit,
+    onNewCode: () -> Unit,
+    onForget: () -> Unit,
+) {
     Card(
         Modifier
             .fillMaxWidth()
             .padding(start = 16.dp, end = 16.dp, top = 12.dp),
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) {
-        Column(Modifier.padding(20.dp)) {
-            Text(
-                stringResource(R.string.request_title, r.name.ifBlank { stringResource(R.string.unknown_device) }),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Spacer(Modifier.height(4.dp))
-            val what = stringResource(if (InputService.isEnabled(ctx)) R.string.request_wants_control else R.string.request_wants_view)
-            Text(
-                stringResource(R.string.request_text, what, r.ip, HostService.REQUEST_TIMEOUT_S),
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            // 安全码：对方屏幕上显示的是同一个，不一样就是中间有人
-            r.safety?.let {
-                Spacer(Modifier.height(4.dp))
-                Text(stringResource(R.string.request_safety, it), style = MaterialTheme.typography.bodyMedium)
-            }
-            Spacer(Modifier.height(16.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = { HostService.approve(r.id, false) }, modifier = Modifier.weight(1f)) {
-                    Text(stringResource(R.string.request_decline))
+        Column(Modifier.padding(start = 20.dp, end = 12.dp, top = 16.dp, bottom = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(stringResource(R.string.share_pairing), style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        code?.let { Code.format(it) } ?: "––– –––",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (locked || code == null) 0.45f else 1f),
+                    )
                 }
-                Button(onClick = { HostService.approve(r.id, true) }, modifier = Modifier.weight(1f)) {
-                    Text(stringResource(R.string.request_allow))
+                IconButton(onClick = onCopy, enabled = code != null && !locked) {
+                    Icon(Icons.Outlined.ContentCopy, stringResource(R.string.copy))
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            if (locked) {
+                Text(stringResource(R.string.share_pairing_locked), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            } else {
+                Text(
+                    stringResource(R.string.share_pairing_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onNewCode, enabled = code != null) {
+                    Text(stringResource(R.string.share_pairing_new))
+                }
+                Spacer(Modifier.weight(1f))
+                if (paired > 0) {
+                    TextButton(onClick = onForget) {
+                        Text(pluralStringResource(R.plurals.share_forget_paired, paired, paired), color = MaterialTheme.colorScheme.error)
+                    }
                 }
             }
         }

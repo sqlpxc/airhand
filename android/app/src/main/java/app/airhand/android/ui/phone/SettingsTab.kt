@@ -42,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -115,13 +116,14 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
             if (saved != null) stringResource(R.string.settings_current_code, Code.format(saved)) else stringResource(R.string.settings_no_code),
             enabled = saved != null,
         ) { dialog = "newCode" }
-
-        Toggle(
+        // 配对过的设备：它们只用控制码就能连本机；忘掉之后要重新输入配对码
+        val paired = app.pairing.flow.collectAsState().value?.paired?.size ?: 0
+        Item(
             Icons.Outlined.VerifiedUser,
-            stringResource(R.string.require_approval),
-            stringResource(R.string.require_approval_desc),
-            s.requireApproval,
-        ) { v -> app.updateSettings { it.copy(requireApproval = v) } }
+            stringResource(R.string.settings_paired),
+            if (paired > 0) pluralStringResource(R.plurals.settings_paired_count, paired, paired) else stringResource(R.string.settings_paired_none),
+            enabled = paired > 0,
+        ) { dialog = "forgetPaired" }
 
         SectionTitle(stringResource(R.string.settings_remote))
         Item(Icons.Outlined.HighQuality, stringResource(R.string.default_quality), presetName(Preset.of(s.preset))) { dialog = "preset" }
@@ -209,11 +211,24 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 if (host.running) {
                     HostService.newCode()
                 } else {
-                    // 没在共享：忘掉保存的控制码，下次共享时服务器分配新的（旧的绑定 180 天不用会被清理）
+                    // 没在共享：忘掉保存的控制码，下次共享时服务器分配新的（旧的绑定 180 天不用会被清理）；
+                    // 配对也全部重来（和共享时更换控制码一样）：新的配对码，配对过的都忘掉
                     app.hostCodes.save(null)
+                    app.pairing.save(null)
                     HostState.update { it.copy(code = null) }
                     scope.launch { snackbar.showSnackbar(ctx.getString(R.string.settings_code_reset)) }
                 }
+            },
+        )
+        "forgetPaired" -> ConfirmDialog(
+            title = stringResource(R.string.share_forget_paired_title),
+            text = stringResource(R.string.share_forget_paired_text),
+            confirm = stringResource(R.string.forget),
+            destructive = true,
+            onDismiss = { dialog = null },
+            onConfirm = {
+                dialog = null
+                app.forgetPaired()
             },
         )
         "preset" -> ChoiceDialog(

@@ -79,13 +79,13 @@ test("连接：先把 ch 绑到画面上再发 connect，回复之后告诉 Work
   const ch = call.ch;
 
   // 回复之前就到的事件
-  h.text({ type: "event", ch, event: { type: "awaitingApproval" } });
+  h.text({ type: "event", ch, event: { type: "clipboard", text: "hi" } });
   h.text({ type: "reply", id: call.id, ok: { sid: 5 } });
   assert.equal((await connected).sid, 5);
   assert.deepEqual(plain(h.posted.at(-1)), { t: "sid", ch, sid: 5 });
   // 别的 ch 的事件不给它
-  h.text({ type: "event", ch: ch + 1, event: { type: "awaitingApproval" } });
-  assert.deepEqual(events.map((e) => e.type), ["awaitingApproval"]);
+  h.text({ type: "event", ch: ch + 1, event: { type: "clipboard", text: "hi" } });
+  assert.deepEqual(events.map((e) => e.type), ["clipboard"]);
 
   // 高频的不带 id；其它的等回复
   void h.link.command({ cmd: "input", sid: 5, events: [{ type: "releaseAll" }] });
@@ -100,7 +100,7 @@ test("连接：先把 ch 绑到画面上再发 connect，回复之后告诉 Work
   assert.equal(events.at(-1).type, "closed");
   assert.deepEqual(plain(h.posted.at(-1)), { t: "unbind", ch });
   // 结束之后的事件不再给它
-  h.text({ type: "event", ch, event: { type: "awaitingApproval" } });
+  h.text({ type: "event", ch, event: { type: "clipboard", text: "hi" } });
   assert.equal(events.length, 2);
 });
 

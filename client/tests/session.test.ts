@@ -89,12 +89,12 @@ test("文字分块保留 emoji 的代理对，每块都能独立编码成 UTF-8"
 test("Closed before connect reply cannot resurrect SID, erase reason or remember a device", async () => {
   const h = sessionHarness();
   const connecting = h.session.start();
-  h.event({ type: "closed", reason: { kind: "declined" }, retry: false });
+  h.event({ type: "closed", reason: { kind: "codeChanged" }, retry: false });
   h.resolve();
   await connecting;
   assert.equal(h.session.state, "closed");
   assert.equal(h.session.sid, null);
-  assert.equal(h.session.closedReason.kind, "declined");
+  assert.equal(h.session.closedReason.kind, "codeChanged");
   assert.deepEqual(h.calls, [["disconnect", 7]]);
 });
 

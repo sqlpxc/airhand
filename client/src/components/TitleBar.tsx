@@ -169,7 +169,7 @@ function TabStrip() {
   );
 }
 
-const BUSY = new Set(["connecting", "reconnecting", "approving"]);
+const BUSY = new Set(["connecting", "reconnecting"]);
 
 function SessionTab({
   s,

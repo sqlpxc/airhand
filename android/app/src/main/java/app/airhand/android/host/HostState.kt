@@ -5,10 +5,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** 连到本机的设备（`id` 是会话 id；`safety` 是端到端加密的安全码，对方显示的是同一个，握手之前为 null） */
-data class Viewer(val id: String, val name: String, val ip: String, val safety: String? = null)
+/**
+ * 连到本机的设备：`id` 是会话 id，`key` 是它在端到端握手里的公钥（同一台设备重连也一样），
+ * `safety` 是端到端加密的安全码（对方显示的是同一个），`justPaired`：这次刚用配对码配对
+ */
+data class Viewer(
+    val id: String,
+    val key: String,
+    val name: String,
+    val ip: String,
+    val safety: String,
+    val justPaired: Boolean = false,
+)
 
-/** 本机作为被控端的状态（界面观察，[HostService] 更新） */
+/** 本机作为被控端的状态（界面观察，[HostService] 更新）。配对码在 [app.airhand.android.data.PairingStore] 里 */
 data class HostStatus(
     /** 正在共享（前台服务在运行） */
     val running: Boolean = false,
@@ -16,8 +26,6 @@ data class HostStatus(
     val code: String? = null,
     val server: ServerState = ServerState.Connecting,
     val viewers: List<Viewer> = emptyList(),
-    /** 在等本机用户同意的连接请求 */
-    val requests: List<Viewer> = emptyList(),
     /** 有人在看画面 */
     val streaming: Boolean = false,
     /** 共享停止的原因（例如在系统里停止了录屏），显示一次 */

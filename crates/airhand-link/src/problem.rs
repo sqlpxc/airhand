@@ -40,8 +40,7 @@ pub enum Problem {
     InvalidCode,
     /// 控制码不存在或对方不在线
     CodeNotFound,
-    /// 尝试过于频繁：猜错控制码太多次、短时间内向同一台被控端发起了太多次连接（服务器限速），
-    /// 或者对方已经有好几个连接请求在等它的用户回答（[`ByeReason::TooManyRequests`]）。过一会儿再试，不自动重连
+    /// 尝试过于频繁：猜错控制码太多次、短时间内向同一台被控端发起了太多次连接（服务器限速）。过一会儿再试，不自动重连
     RateLimited,
     /// 对方的会话数已满
     HostBusy,
@@ -54,7 +53,7 @@ pub enum Problem {
     /// 对方的身份（端到端加密的公钥）和之前记下的不一样：对方重装过、换了身份，或者有人在中间冒充它。
     /// 不自动重连；用户确认之后忘掉记下的身份再连
     HostKeyChanged,
-    /// 对方要求配对码：这台控制端还没和它配对过（配对码显示在对方的托盘菜单里）
+    /// 对方要求配对码：这台控制端还没和它配对过（配对码显示在对方那里：电脑的托盘菜单、手机的"共享本机"页）
     PairingRequired,
     /// 配对码不对
     PairingFailed,
@@ -74,10 +73,6 @@ pub enum Problem {
     Kicked,
     /// 被控端的用户更换了控制码
     CodeChanged,
-    /// 被控端的用户拒绝了这次连接
-    Declined,
-    /// 被控端的用户一直没有回应连接请求
-    Unanswered,
     /// 会话已结束
     SessionEnded,
 
@@ -111,15 +106,13 @@ impl Problem {
         matches!(self, Problem::Incompatible { .. })
     }
 
-    /// 对方有意结束（或者对方的用户没有同意）的会话，要用户来决定的问题（身份变了、要配对码……），
+    /// 对方有意结束的会话，要用户来决定的问题（身份变了、要配对码……），
     /// 或者对方让过一会儿再试（马上重连只会再被回绝），不应该自动重连
     pub fn is_final(&self) -> bool {
         matches!(
             self,
             Problem::Kicked
                 | Problem::CodeChanged
-                | Problem::Declined
-                | Problem::Unanswered
                 | Problem::RateLimited
                 | Problem::HostKeyChanged
                 | Problem::PairingRequired
@@ -169,10 +162,6 @@ impl fmt::Display for Problem {
             Problem::HostUnresponsive => f.write_str("the host stopped responding"),
             Problem::Kicked => f.write_str("the user at the host disconnected all controllers"),
             Problem::CodeChanged => f.write_str("the user at the host changed the control code"),
-            Problem::Declined => f.write_str("the user at the host declined the connection"),
-            Problem::Unanswered => {
-                f.write_str("the user at the host didn't answer the connection request")
-            }
             Problem::SessionEnded => f.write_str("session ended"),
             Problem::NoSession => f.write_str("no such session"),
             Problem::NoClipboardText => f.write_str("no text on the local clipboard"),
@@ -204,9 +193,6 @@ impl From<ByeReason> for Problem {
         match r {
             ByeReason::Kicked => Problem::Kicked,
             ByeReason::CodeChanged => Problem::CodeChanged,
-            ByeReason::Declined => Problem::Declined,
-            ByeReason::Unanswered => Problem::Unanswered,
-            ByeReason::TooManyRequests => Problem::RateLimited,
             // 对方版本新增的原因：会话照样结束
             ByeReason::Unknown(_) => Problem::HostEnded,
         }

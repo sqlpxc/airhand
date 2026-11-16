@@ -45,8 +45,6 @@ export function sessionStateText(s: RemoteSession): string {
       return t("common.reconnecting");
     case "waiting":
       return t("common.waiting");
-    case "approving":
-      return t("common.approving");
     case "connecting":
       return t("common.connecting");
     case "closed":

@@ -5,7 +5,7 @@ use airhand_link::Problem;
 use airhand_link::controller::{
     ConnectOptions, ControllerService, Frontend, SessionEvent, SessionUi, UiClosed, establish,
 };
-use airhand_link::host::{Access, Gate, HostStreams, Incoming, Request, Router};
+use airhand_link::host::{Gate, HostStreams, Incoming, Request, Router};
 use airhand_link::lanes::open_lane;
 use airhand_link::net::{LinkConfig, Signal, connect_signal};
 use airhand_link::secure::{self, Identity, Initiator, InitiatorParams};
@@ -26,18 +26,15 @@ use super::registry::MAX_WAITING;
 use super::tokens::{ct_eq, hmac_sha256};
 use super::*;
 
-/// 谁都让进来的被控端（测试用）
-struct OpenGate(Identity);
+/// 认得所有控制端的被控端（测试用：省掉配对）
+struct KnownGate(Identity);
 
-impl Gate for OpenGate {
+impl Gate for KnownGate {
     fn identity(&self) -> Identity {
         self.0.clone()
     }
-    fn access(&self) -> Access {
-        Access::Open
-    }
     fn is_known(&self, _: &PublicKey) -> bool {
-        false
+        true
     }
 }
 
@@ -66,7 +63,6 @@ fn incoming(
         code,
         peer,
         kick,
-        approvals: Default::default(),
         direct: None,
         frames: host.version >= airhand_proto::SIGNAL_FRAMES,
     };
@@ -90,7 +86,7 @@ fn initiate(code: u32) -> (Initiator, Vec<u8>) {
 
 /// 回应这个被控端收到的会话请求：端到端握手、打开会话。会话一直开着，直到任务被中止
 fn answer(sig: Signal, code: u32) -> tokio::task::JoinHandle<()> {
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     tokio::spawn(async move {
         let mut sessions = Vec::new();
         let mut buf = Vec::new();
@@ -374,7 +370,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     let grant = ask_with(&mut ctrl, 2, id.code, None, init).await.unwrap();
     let msg = next(&mut host).await;
     let (inc, _kick) = incoming(&host, &host_router, id.code, msg);
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     let (io, link) = tokio::join!(
         HostStreams::open(&inc, 2, 16, &gate),
         establish(&ctrl_router, &ctrl.conn, grant.session_id, initiator)
@@ -566,7 +562,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
         let msg = next(&mut host).await;
         let (inc, _kick) = incoming(&host, &router, id.code, msg);
         let session_id = inc.session_id;
-        let gate = OpenGate(Identity::generate());
+        let gate = KnownGate(Identity::generate());
         let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
         let (ack_tx, mut acks) = mpsc::unbounded_channel();
         io.incoming.set_acks(Arc::new(AckTx(ack_tx)));
@@ -679,7 +675,7 @@ async fn two_video_streams_travel_through_the_relay() {
         let msg = next(&mut host).await;
         let (inc, _kick) = incoming(&host, &router, id.code, msg);
         let session_id = inc.session_id;
-        let gate = OpenGate(Identity::generate());
+        let gate = KnownGate(Identity::generate());
         let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
         let (ack_tx, mut acks) = mpsc::unbounded_channel();
         io.incoming.set_acks(Arc::new(AckTx(ack_tx)));
@@ -840,7 +836,7 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         let grant = ask_with(&mut ctrl, 1, id.code, None, init).await.unwrap();
         let msg = next(&mut host).await;
         let (inc, _kick) = incoming(&host, &host_router, id.code, msg);
-        let gate = OpenGate(Identity::generate());
+        let gate = KnownGate(Identity::generate());
         let (host_io, link) = tokio::join!(
             HostStreams::open(&inc, 2, 16, &gate),
             establish(&ctrl_router, &ctrl.conn, grant.session_id, initiator)
@@ -1548,7 +1544,7 @@ async fn controller_service_gets_audio_over_datagrams() {
             }
         }
     };
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     let (router, _router) = Router::start(&host.conn);
     let accepting = async {
         let msg = next(&mut host).await;
@@ -1619,8 +1615,8 @@ async fn new_codes_are_limited_per_network() {
     assert_eq!(back, a);
 }
 
-/// 控制码对了的连接请求也限速（按来源和控制码），不然知道控制码的人反复发起连接，就能一直占满被控端的会话槽位、
-/// 让它不停地问本机用户。带凭证的也算，换一条连接也一样；被拒绝的请求到不了被控端、不占槽位、不算猜错；
+/// 控制码对了的连接请求也限速（按来源和控制码），不然知道控制码的人反复发起连接，就能一直占满被控端的会话槽位。
+/// 带凭证的也算，换一条连接也一样；被拒绝的请求到不了被控端、不占槽位、不算猜错；
 /// 别的被控端不受影响
 #[tokio::test]
 async fn sessions_are_limited_per_source_and_code() {
@@ -1824,7 +1820,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
             }
         }
     };
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     let host_endpoint = host.endpoint.local_addr().unwrap();
     let accepting = async {
         let msg = next(&mut host).await;

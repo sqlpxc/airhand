@@ -1,7 +1,8 @@
 //! 界面语言：简体中文 / 英文。
 //!
-//! * 默认跟随系统界面语言：系统是中文就用中文，其它语言（或识别不出来）一律用英文；
-//! * 托盘菜单和控制台都可以切换。**不写进配置文件**，只在本次运行期间有效；
+//! * 托盘菜单和控制台都可以切换，选的语言记在 config.toml 的 `language` 里（见 [`crate::config`]，
+//!   Windows 安装版由服务里的被控端写），下次启动接着用；
+//! * 没选过就跟随系统界面语言：系统是中文就用中文，其它语言（或识别不出来）一律用英文；
 //! * 托盘和窗口标题按当前语言生成（用 [`tr!`]）；控制台的文字在前端（`src/lib/i18n.ts`）；
 //! * 发给界面的问题与提示都是类型（见 [`crate::problem`]），显示时才按语言变成文字；日志始终是英文。
 
@@ -30,16 +31,25 @@ impl Lang {
         }
     }
 
-    /// 前端使用的代码（`"zh"` / `"en"`）
+    /// 前端和配置文件使用的代码（`"zh"` / `"en"`）
     pub fn code(self) -> &'static str {
         match self {
             Lang::Zh => "zh",
             Lang::En => "en",
         }
     }
+
+    /// [`Lang::code`] 反过来（配置文件里的 `language`），认不出来时为 `None`
+    pub fn from_code(code: &str) -> Option<Lang> {
+        match code.trim() {
+            "zh" => Some(Lang::Zh),
+            "en" => Some(Lang::En),
+            _ => None,
+        }
+    }
 }
 
-/// 0 = 尚未确定（第一次使用时读取系统语言）
+/// 0 = 尚未确定（第一次使用时读配置文件里选过的，没有就读系统语言）
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
 fn decode(v: u8) -> Option<Lang> {
@@ -54,7 +64,7 @@ pub fn current() -> Lang {
     if let Some(l) = decode(CURRENT.load(Ordering::Relaxed)) {
         return l;
     }
-    let l = system();
+    let l = crate::config::settings().language.unwrap_or_else(system);
     // 多个线程同时第一次调用时，以先写入的为准（用户已经切换过就不会被覆盖）
     match CURRENT.compare_exchange(0, l as u8, Ordering::Relaxed, Ordering::Relaxed) {
         Ok(_) => l,
@@ -62,7 +72,7 @@ pub fn current() -> Lang {
     }
 }
 
-/// 切换界面语言，返回是否有变化。
+/// 切换界面语言（只是这个进程里的，记进配置文件的是 [`crate::config::save_language`]），返回是否有变化。
 pub fn set(lang: Lang) -> bool {
     CURRENT.swap(lang as u8, Ordering::Relaxed) != lang as u8
 }
@@ -199,6 +209,17 @@ mod tests {
             posix_lang(env(&[("LANG", ""), ("LC_ALL", "zh_SG")])),
             Lang::Zh
         );
+    }
+
+    /// 配置文件里的 `language` 只认这两个代码
+    #[test]
+    fn codes() {
+        for l in [Lang::Zh, Lang::En] {
+            assert_eq!(Lang::from_code(l.code()), Some(l));
+        }
+        for c in ["", "zh-CN", "EN", "system"] {
+            assert_eq!(Lang::from_code(c), None, "{c}");
+        }
     }
 
     #[test]

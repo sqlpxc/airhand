@@ -60,7 +60,7 @@ pub struct HostStatus {
     pub code: Option<u32>,
     /// 正在控制本机的控制端
     pub controllers: Vec<Controller>,
-    /// 配对码（6 位数字，见 `airhand_proto::handshake` 的"配对"）。`None`：不要配对码（config.toml 的 `access = "open"`）
+    /// 配对码（6 位数字，见 `airhand_proto::handshake` 的"配对"）。`None`：还不知道（被控端还没启动、托盘还没连上服务里的被控端）
     #[serde(default)]
     pub pairing: Option<String>,
     /// 有人多次输错配对码，配对暂停了：本机用户换一个配对码才恢复

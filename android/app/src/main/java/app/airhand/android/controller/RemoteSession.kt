@@ -55,12 +55,11 @@ data class CursorState(
 /**
  * 一个远程会话（看 / 操作一台设备）。连接、断线重连、等对方上线都在这里，界面只观察 [phase] 等状态。
  *
- * * 对方要先问它的用户（手机默认这样）：[Phase.Approving]，同意之后才是 [Phase.Live]；
- * * 第一次连接失败（控制码不对、对方不在线、对方拒绝……）：[Phase.Failed]，回到首页显示原因；
+ * * 第一次连接失败（控制码不对、对方不在线、要配对码……）：[Phase.Failed]，回到首页显示原因；
  * * 连上之后断了：带着重连凭证自动重连（[Phase.Reconnecting]）；对方离线了就等它上线（[Phase.WaitingHost]）；
  * * 对方断开了我们 / 换了控制码：[Phase.Ended]，不再重连。
  *
- * 对方同意、开始会话时把设备（和重连凭证）记进"我的设备"，下次点一下就能连；对方不在线时也能等它上线。
+ * 开始会话时把设备（和重连凭证）记进"我的设备"，下次点一下就能连；对方不在线时也能等它上线。
  */
 class RemoteSession(
     private val app: AirhandApp,
@@ -75,9 +74,6 @@ class RemoteSession(
 ) {
     sealed interface Phase {
         data object Connecting : Phase
-
-        /** 连上了，在等对方的用户同意 */
-        data object Approving : Phase
         data object Live : Phase
         data class Reconnecting(val reason: Problem) : Phase
         data class WaitingHost(val reason: Problem?) : Phase
@@ -455,7 +451,6 @@ class RemoteSession(
                 val best = pickCodec(codecs)
                 if (quality.value.codec != best) setQuality(quality.value.copy(codec = best)) else refreshSettings()
             }
-            "awaitingApproval" -> _phase.value = Phase.Approving
             "encoder" -> encoder.value = EncoderInfo(
                 Codec.fromWire(e.optString("codec")) ?: Codec.H264,
                 e.optString("name"),

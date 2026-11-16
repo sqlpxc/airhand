@@ -151,7 +151,8 @@ mod tests {
     fn stalled_kotlin_can_resume_and_ack_video_after_audio_overflows() {
         let q = SessionQueue::default();
         let mut flow = FlowState::default();
-        q.event(SessionEvent::AwaitingApproval).unwrap();
+        q.event(SessionEvent::Clipboard { text: "hi".into() })
+            .unwrap();
         // 在途的帧最多这么多
         for seq in 1..=MAX_WINDOW {
             let p = VideoHeader {
@@ -183,7 +184,7 @@ mod tests {
         }
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&q.pop(Duration::ZERO).unwrap()).unwrap()["type"],
-            "awaitingApproval"
+            "clipboard"
         );
         let mut audio = Vec::new();
         while let Some(p) = q.pop(Duration::ZERO) {
@@ -206,10 +207,14 @@ mod tests {
                 q.reliable(vec![0; RELIABLE_BYTES]).unwrap();
             } else {
                 for _ in 0..RELIABLE_MESSAGES {
-                    q.event(SessionEvent::AwaitingApproval).unwrap();
+                    q.event(SessionEvent::Clipboard { text: "hi".into() })
+                        .unwrap();
                 }
             }
-            assert!(q.event(SessionEvent::AwaitingApproval).is_err());
+            assert!(
+                q.event(SessionEvent::Clipboard { text: "hi".into() })
+                    .is_err()
+            );
             assert!(q.packet(vec![1]).is_err());
             let end: serde_json::Value =
                 serde_json::from_slice(&q.pop(Duration::ZERO).unwrap()).unwrap();

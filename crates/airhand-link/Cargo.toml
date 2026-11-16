@@ -69,7 +69,7 @@ spake2 = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # rt、macros：#[tokio::test]（只有 wire 的时候也要能跑它的测试）；test-util：测试里让时间跳着走
-# （等 60 秒的同意、30 秒的失联不用真的等）
+# （等 10 秒的确认、30 秒的失联不用真的等）
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 serde_json = "1"
 

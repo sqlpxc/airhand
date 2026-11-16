@@ -15,6 +15,7 @@ import app.airhand.android.controller.RemoteSession
 import app.airhand.android.core.Native
 import app.airhand.android.data.DeviceStore
 import app.airhand.android.data.HostCodeStore
+import app.airhand.android.data.PairingStore
 import app.airhand.android.data.Settings
 import app.airhand.android.data.SettingsStore
 import app.airhand.android.host.HostService
@@ -28,6 +29,8 @@ class AirhandApp : Application() {
     lateinit var devices: DeviceStore
         private set
     lateinit var hostCodes: HostCodeStore
+        private set
+    lateinit var pairing: PairingStore
         private set
     lateinit var controller: ControllerClient
         private set
@@ -46,6 +49,7 @@ class AirhandApp : Application() {
         settings = SettingsStore(this)
         devices = DeviceStore(this)
         hostCodes = HostCodeStore(this)
+        pairing = PairingStore(this)
         controller = ControllerClient(settings)
         clipboard = Clipboard(this)
 
@@ -74,6 +78,11 @@ class AirhandApp : Application() {
         if (s != null && _session.value === s) _session.value = null
     }
 
+    /** 忘掉配对过的控制端：在共享就交给 Rust（它改完发回来再保存），没在共享就直接改保存的 */
+    fun forgetPaired() {
+        if (!HostService.forgetPaired()) pairing.forget()
+    }
+
     /** 改设置。服务器、证书指纹、本机名称变了要重新连接（清掉第一次连接时记下的指纹也算） */
     fun updateSettings(f: (Settings) -> Settings) {
         val old = settings.value
@@ -84,8 +93,6 @@ class AirhandApp : Application() {
             endSession()
             controller.restart()
             HostService.restartIfRunning(this)
-        } else if (old.requireApproval != now.requireApproval) {
-            HostService.setApproval(now.requireApproval)
         }
     }
 

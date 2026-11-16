@@ -314,7 +314,7 @@ fn host_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Resul
 }
 
 /// 配对（见 [`crate::host::gate`]）：配对码，暂停了的话提示换一个；配对过的控制端可以全部忘掉。
-/// 不要配对码（config.toml 的 `access = "open"`）时什么也不显示
+/// 还不知道配对码（托盘还没连上服务里的被控端）时什么也不显示
 fn pairing_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Result<()> {
     let Some(pairing) = &st.host.pairing else {
         return Ok(());

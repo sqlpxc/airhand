@@ -24,16 +24,10 @@
 //! # 会话开始
 //!
 //! 控制通道上先做端到端握手（见 [`crate::handshake`]）：双方确认对方的身份、协商会话版本和能力位，
-//! 被控端决定让不让这个控制端连（配对过的、输对了配对码的、或者被控端允许任何人连）。
+//! 被控端决定让不让这个控制端连（配对过的、输对了配对码的；只凭控制码进不来）。
 //! 画质设置和要不要声音在控制端的介绍里（[`crate::handshake::ControllerIntro`]），被控端一开始就按它建编码器，
 //! 不用先按默认设置建一个、等设置到了再重建（硬件编码器初始化就要上百毫秒，还要多发一个关键帧）。
-//! 握手之后被控端通常马上发 [`HostMsg::Hello`]，之后开始发画面。
-//!
-//! 被控端也可以先请坐在它面前的人同意（[`HostMsg::AwaitingApproval`]，例如手机默认这样做）：
-//! 同意之后才发 `Hello` 和画面，拒绝或者超时没人理会就发 [`HostMsg::Bye`]（[`ByeReason::Declined`] /
-//! [`ByeReason::Unanswered`]）。等待期间照常回应 Ping，控制端不会把它当成失联。
-//! 同时在等回答的请求有上限：再来的被控端不问，直接发 `Bye`（[`ByeReason::TooManyRequests`]）。
-//! 被控端认得出同意过的控制端（端到端握手里控制端的公钥），断线重连时可以不再询问。
+//! 握手之后被控端马上发 [`HostMsg::Hello`]，之后开始发画面。
 //!
 //! # 鼠标
 //!
@@ -146,12 +140,10 @@ use crate::cbor::open_enum;
 /// 被控端 → 控制端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum HostMsg {
-    /// 会话开始（需要本机用户同意时，同意之后才发）
+    /// 会话开始
     #[n(1)]
     Hello(#[n(0)] HostHello),
-    /// 正在等被控端的用户同意这次连接（见模块说明）
-    #[n(2)]
-    AwaitingApproval,
+    // 2：以前的"等被控端的用户同意"，已经去掉了，编号不再用
     /// 显示器列表或者正在看的显示器变了。
     #[n(4)]
     Displays {
@@ -252,7 +244,6 @@ impl HostMsg {
         match self {
             HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => SessionLane::Bulk,
             HostMsg::Hello(_)
-            | HostMsg::AwaitingApproval
             | HostMsg::Displays { .. }
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
@@ -325,12 +316,7 @@ open_enum! {
         Kicked = 0 => "kicked",
         /// 被控端的用户更换了控制码（所有控制端随之断开）
         CodeChanged = 1 => "codeChanged",
-        /// 被控端的用户拒绝了这次连接
-        Declined = 2 => "declined",
-        /// 被控端的用户一直没有回应连接请求
-        Unanswered = 3 => "unanswered",
-        /// 被控端上已经有好几个连接请求在等它的用户回答，这一个没有问（过一会儿再试）
-        TooManyRequests = 4 => "tooManyRequests",
+        // 2–4：以前请本机用户同意时的拒绝 / 没人回答 / 请求太多，已经去掉了，编号不再用
     }
 }
 

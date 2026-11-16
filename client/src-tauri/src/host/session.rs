@@ -1,4 +1,4 @@
-//! 被控端的单个远控会话：桌面版的 [`Platform`]。协议层的事（同意流程、Pong、失联检测、踢人时发 Bye、
+//! 被控端的单个远控会话：桌面版的 [`Platform`]。协议层的事（Pong、失联检测、踢人时发 Bye、
 //! 画质设置的校验）在 [`airhand_link::host::serve`]，这里只管采集、编码、注入输入、剪贴板、声音、
 //! 控制端的麦克风（见 [`super::mic`]），以及定时检查权限和显示器有没有变化。
 //!
@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_link::host::{
-    Acks, Admission, Flows, Incoming, MicSink, Outbox, Platform, Request, Senders, Start,
-    resolve_view, serve,
+    Acks, Flows, Incoming, MicSink, Outbox, Platform, Request, Senders, Start, resolve_view, serve,
 };
 use airhand_proto::MAX_STREAMS;
 use airhand_proto::session::{
@@ -120,8 +119,6 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
         VIDEO_QUEUE,
         audio::QUEUE,
         |admitted, senders| {
-            // 桌面被控端不请本机用户同意（无人值守），gate 不会要求它
-            debug_assert_ne!(admitted.admission, Admission::NeedsApproval);
             let mut desktop = Desktop::new(session_id, senders);
             desktop.identity = Some((gate.clone(), ip, admitted.clone()));
             desktop.mic.negotiated = admitted

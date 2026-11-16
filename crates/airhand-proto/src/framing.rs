@@ -158,7 +158,6 @@ mod tests {
     #[test]
     fn roundtrip() {
         let msgs = vec![
-            HostMsg::AwaitingApproval,
             HostMsg::Notice(Some(Notice::CaptureFailed {
                 detail: "AcquireNextFrame: 0x887A0026".into(),
             })),
@@ -264,12 +263,12 @@ mod tests {
         }
         let mut wire = encode(&Future::Hologram { depth: 3 });
         wire.extend(encode(&FutureNotice::Notice(Smell::Burnt { how: 1 })));
-        wire.extend(encode(&HostMsg::Bye(ByeReason::Declined)));
+        wire.extend(encode(&HostMsg::Bye(ByeReason::CodeChanged)));
         let mut r = &wire[..];
         let m: HostMsg = next(&mut r);
         assert!(matches!(m, HostMsg::Notice(None)), "{m:?}");
         let m: HostMsg = next(&mut r);
-        assert!(matches!(m, HostMsg::Bye(ByeReason::Declined)));
+        assert!(matches!(m, HostMsg::Bye(ByeReason::CodeChanged)));
         let Decoded::<HostMsg>::Unknown(v) =
             decode(&to_vec(&Future::Hologram { depth: 3 })).unwrap()
         else {
@@ -412,12 +411,11 @@ mod tests {
         }
     }
 
-    /// 会话开始、等待同意、触摸和系统操作
+    /// 会话开始、结束、触摸和系统操作
     #[test]
     fn session_start_and_touch_roundtrip() {
         let mut wire = Vec::new();
-        wire.extend(encode(&HostMsg::AwaitingApproval));
-        wire.extend(encode(&HostMsg::Bye(ByeReason::Declined)));
+        wire.extend(encode(&HostMsg::Bye(ByeReason::Kicked)));
         wire.extend(encode(&HostMsg::Hello(HostHello {
             hostname: "Pixel".into(),
             os: "Android 15".into(),
@@ -432,10 +430,8 @@ mod tests {
             streams: 1,
         })));
         let mut r = &wire[..];
-        let a: HostMsg = next(&mut r);
-        assert!(matches!(a, HostMsg::AwaitingApproval));
         let b: HostMsg = next(&mut r);
-        assert!(matches!(b, HostMsg::Bye(ByeReason::Declined)));
+        assert!(matches!(b, HostMsg::Bye(ByeReason::Kicked)));
         let h: HostMsg = next(&mut r);
         assert!(
             matches!(h, HostMsg::Hello(ref h) if h.platform == Platform::Android && h.touch

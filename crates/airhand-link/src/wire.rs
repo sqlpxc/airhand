@@ -191,7 +191,7 @@ mod tests {
             },
         }
         let mut wire = Vec::new();
-        write_msg(&mut wire, &HostMsg::AwaitingApproval)
+        write_msg(&mut wire, &HostMsg::Bye(ByeReason::Kicked))
             .await
             .unwrap();
         write_msg(&mut wire, &Future::Hologram { depth: 3 })
@@ -200,7 +200,7 @@ mod tests {
         write_msg(&mut wire, &HostMsg::Bye(ByeReason::CodeChanged))
             .await
             .unwrap();
-        let mut expected = framing::encode(&HostMsg::AwaitingApproval);
+        let mut expected = framing::encode(&HostMsg::Bye(ByeReason::Kicked));
         expected.extend(framing::encode(&Future::Hologram { depth: 3 }));
         expected.extend(framing::encode(&HostMsg::Bye(ByeReason::CodeChanged)));
         assert_eq!(wire, expected);
@@ -211,7 +211,7 @@ mod tests {
             Box::new(one_byte_at_a_time(&wire)),
         ] {
             let m: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
-            assert!(matches!(m, HostMsg::AwaitingApproval));
+            assert!(matches!(m, HostMsg::Bye(ByeReason::Kicked)));
             let m: HostMsg = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap().unwrap();
             assert!(matches!(m, HostMsg::Bye(ByeReason::CodeChanged)));
             let end: Option<HostMsg> = read_msg(&mut r, 1 << 20, &mut buf).await.unwrap();

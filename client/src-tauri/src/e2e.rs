@@ -438,7 +438,6 @@ async fn e2e_roundtrip() {
             // 这个协议级的控制端不建直连（不回答，被控端就一直走中转）
             HostMsg::Direct(_) => {}
             HostMsg::Displays { .. } => {}
-            HostMsg::AwaitingApproval => panic!("桌面被控端不会请本机用户同意"),
             HostMsg::Mic { state, detail } => {
                 println!("麦克风: {state:?} {detail:?}");
                 rep.mic = Some(state);

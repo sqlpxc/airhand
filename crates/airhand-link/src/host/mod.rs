@@ -1,15 +1,16 @@
 //! 被控端：与服务器的连接（注册、取回控制码、断开所有控制端、更换控制码），以及每个会话。
 //!
 //! 桌面版（`client/src-tauri/src/host/`）和 Android（`android/native/src/host/`）共用这里，协议层的事只有这一份；
-//! 采集、编码、注入输入、请本机用户同意这些各平台不同的事情由它们实现 [`Platform`]：
+//! 采集、编码、注入输入这些各平台不同的事情由它们实现 [`Platform`]：
 //!
 //! * [`run`]：一直连着服务器（掉线自动重连，取回原来的控制码），每来一个控制端就调用 `session` 开始一个会话；
 //!   发生了什么通过 [`HostEvents`] 告诉外面（托盘、Android 的界面）；
-//! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：同意流程（同时在等本机用户回答的请求有上限，
-//!   [`ApprovalSlots`]）、失联检测、踢人时发 Bye、画质设置的校验，控制端的请求换成 [`Request`] 交给 [`Platform`]；
+//! * [`serve`]（[`session`]）：一个会话从端到端握手到结束：失联检测、踢人时发 Bye、画质设置的校验，
+//!   控制端的请求换成 [`Request`] 交给 [`Platform`]；
 //! * [`HostStreams`]：会话的链路（写任务在 `write`）。先回答端到端握手（[`crate::secure::respond`]，控制端的第一条消息在
-//!   [`Incoming::init`] 里）：让不让这个控制端进来由平台给的 [`Gate`] 决定（配对过的、输对配对码的、本机用户同意的……），
-//!   发出决定就开始，控制端确认了才显示它、才请本机用户同意（重放的握手消息走不到这一步）。
+//!   [`Incoming::init`] 里）：让不让这个控制端进来由平台给的 [`Gate`] 决定（配对过的、输对配对码的），
+//!   发出决定就开始，控制端确认了才显示它（重放的握手消息走不到这一步）。
+//!   配对码、配对过的控制端、未成功尝试的预算在 [`pairing`]（桌面版和 Android 共用，保存在哪里由平台决定）。
 //!   过时的输入在读任务里就换成了"释放所有按键"（见 [`InputClock`]）；
 //!   Ping（控制数据报）在读任务里回 Pong，画面确认在读任务里交给平台的 [`Acks`]，控制端麦克风的声音交给平台的
 //!   [`MicSink`]，都不等会话的主循环；
@@ -21,6 +22,7 @@
 
 mod clock;
 mod cursor;
+pub mod pairing;
 pub mod queue;
 pub mod session;
 mod streams;
@@ -47,13 +49,13 @@ use crate::net::{self, LinkConfig, Reconnect, Report};
 use crate::tasks::OwnedTask;
 use crate::wire::{read_msg, write_msg};
 
-pub use crate::secure::{Access, Admission, Gate};
+pub use crate::secure::{Admission, Gate};
 pub use clock::InputClock;
 pub use cursor::CursorCache;
+pub use pairing::{Paired, Pairing, PairingState, PairingStore};
 pub use queue::{Encoded, Outbox, SendError};
 pub use session::{
-    APPROVAL_TIMEOUT, Acks, ApprovalSlots, Flows, MAX_PENDING_APPROVALS, MicSink, PEER_TIMEOUT,
-    Platform, Request, Senders, Start, resolve_view, serve,
+    Acks, Flows, MicSink, PEER_TIMEOUT, Platform, Request, Senders, Start, resolve_view, serve,
 };
 pub use streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 
@@ -107,8 +109,6 @@ pub struct Incoming {
     pub peer: Peer,
     /// 本机用户断开所有控制端时收到原因：会话应发 Bye 然后结束
     pub kick: watch::Receiver<ByeReason>,
-    /// 在等本机用户回答的连接请求的名额，这个被控端服务的所有会话共用（见 [`MAX_PENDING_APPROVALS`]）
-    pub approvals: ApprovalSlots,
     /// 直连（见 [`crate::direct`]）：这条服务器连接上的 [`DirectHub`] 和服务器看到的本机地址；`None`：不建直连
     pub direct: Option<HostLink>,
     /// 服务器转发帧流（和它商定的信令版本不低于 `airhand_proto::SIGNAL_FRAMES`）：控制端也支持的话，
@@ -142,13 +142,9 @@ pub async fn run<E, S, F>(
         reclaim,
         rekey: false,
     };
-    let approvals = ApprovalSlots::default();
     loop {
         reconnect.begin();
-        let result = connect_once(
-            &link, keep, &mut id, &*events, &session, &mut cmds, &approvals,
-        )
-        .await;
+        let result = connect_once(&link, keep, &mut id, &*events, &session, &mut cmds).await;
         events.offline();
         reconnect.end("host", result).await;
     }
@@ -171,7 +167,6 @@ async fn connect_once<E, S, F>(
     events: &E,
     session: &S,
     cmds: &mut mpsc::UnboundedReceiver<HostCmd>,
-    approvals: &ApprovalSlots,
 ) -> Result<()>
 where
     E: HostEvents,
@@ -258,7 +253,6 @@ where
                         code,
                         peer,
                         kick: kick_tx.subscribe(),
-                        approvals: approvals.clone(),
                         direct: direct.as_ref().map(|(hub, _)| HostLink {
                             hub: hub.clone(),
                             observed,

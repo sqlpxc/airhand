@@ -10,14 +10,14 @@
 //!
 //! * **配置文件 `config.toml`**（见 [`Settings`]）：可以手动改服务器地址和指纹；还保存着服务器分配的控制码
 //!   （固定不变，见 `airhand_proto::signal` 的"固定控制码"）、控制台的"我的设备"（见 [`crate::devices`]），
-//!   Windows 上还有开机自动启动（macOS 上是登录时自动启动的记录，见 [`autostart_default_pending`]）。
-//!   所有数据都只在这一个文件里。位置（见 [`path`]）：
+//!   Windows 上还有开机自动启动（macOS 上是登录时自动启动的记录，见 [`autostart_default_pending`]），
+//!   托盘菜单、控制台里选的界面语言（`language`，见 [`crate::i18n`]）。所有数据都只在这一个文件里。位置（见 [`path`]）：
 //!   * Windows：程序所在目录（安装目录）。文件由系统服务里的被控端维护（见 [`crate::winsvc`]），
 //!     托盘进程没有写权限，控制台保存设备时经命名管道交给它写；
 //!   * macOS：`~/Library/Application Support/app.airhand.client/`；Linux：`~/.config/airhand/`。只有本账户能读写（600）。
 //! * 文件由 Airhand 维护，手动修改的内容和注释都会保留；改了设置要重新启动 Airhand 才生效。
 //! * 文件不存在时（第一次运行、被删掉了）按默认配置重新生成：启动时检查一次，运行中每隔几秒检查一次（[`keep_file`]），
-//!   控制码、开机自动启动、我的设备、记下的服务器指纹从删掉之前的内容接着用，不会丢。
+//!   控制码、开机自动启动、界面语言、我的设备、记下的服务器指纹从删掉之前的内容接着用，不会丢。
 //! * 没有设置服务器证书指纹时，第一次连上服务器时记下它的指纹（`[server_trust]`，见 [`FileTrust`]），
 //!   之后证书变了就拒绝连接。
 //! * 端到端加密（见 `airhand_proto::handshake`）：本机作为被控端的身份密钥和配对码（`[host]`）、配对过的控制端
@@ -30,11 +30,13 @@ use std::time::Duration;
 
 use airhand_link::LinkConfig;
 use airhand_link::net::{MemoryTrust, Trust, TrustStore, format_fingerprint, parse_fingerprint};
-use airhand_link::secure::{Access, Identity};
+use airhand_link::secure::Identity;
 use airhand_proto::signal::Reclaim;
 use anyhow::Result;
 use toml_edit::{DocumentMut, Item};
 use tracing::{error, info, warn};
+
+use crate::i18n::Lang;
 
 /// 编译进程序的中转服务器地址 `host:port`（UDP），`config.toml` 里没有设置时使用。
 pub const DEFAULT_SERVER: &str = match option_env!("AIRHAND_SERVER") {
@@ -101,8 +103,8 @@ pub struct Settings {
     pub server_fp: String,
     /// 开机自动启动（`autostart`，Windows 安装版）。macOS 上以系统设置为准，这一项只是记录（见 [`autostart_default_pending`]）
     pub autostart: bool,
-    /// 没配对过的控制端怎么办（`access`）：要配对码（默认），或者知道控制码就能连
-    pub access: Access,
+    /// 界面语言（`language`）：托盘菜单、控制台里选过的。`None`：没选过，跟随系统语言
+    pub language: Option<Lang>,
     /// 服务器分配的控制码和加密过的密钥（`[code]`），用 [`Settings::code`] 解开
     saved_code: Option<(i64, String)>,
 }
@@ -113,7 +115,7 @@ impl Default for Settings {
             server: DEFAULT_SERVER.to_string(),
             server_fp: DEFAULT_SERVER_FP.to_string(),
             autostart: true,
-            access: Access::Pairing,
+            language: None,
             saved_code: None,
         }
     }
@@ -184,6 +186,8 @@ pub fn persistent() -> bool {
 }
 
 /// 进程启动时读到的配置（之后的修改，例如更换控制码，由各自的模块记在内存里）。
+///
+/// 第一次用到界面语言时也会读它（[`crate::i18n::current`]），所以读配置时不能用 `tr!`
 pub fn settings() -> &'static Settings {
     static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
         let Some(path) = path() else {
@@ -218,16 +222,11 @@ fn parse(text: &str) -> Result<Settings> {
     if let Some(v) = doc.get("autostart").and_then(|v| v.as_bool()) {
         s.autostart = v;
     }
-    // 只有写明了 "open" 才不要配对码：写错了的按更安全的来
-    if let Some(v) = doc.get("access").and_then(|v| v.as_str()) {
-        s.access = match v.trim() {
-            "open" => Access::Open,
-            "pairing" => Access::Pairing,
-            other => {
-                warn!("config.toml: unknown access {other:?}, using \"pairing\"");
-                Access::Pairing
-            }
-        };
+    if let Some(v) = doc.get("language").and_then(|v| v.as_str()) {
+        s.language = Lang::from_code(v);
+        if s.language.is_none() {
+            warn!("config.toml: unknown language {v:?}, following the system language");
+        }
     }
     if let Some(t) = doc.get("code").and_then(|v| v.as_table_like()) {
         let code = t.get("code").and_then(|v| v.as_integer());
@@ -352,10 +351,9 @@ fn template() -> String {
 /// Windows 的模板：文件在安装目录里，由系统服务维护
 #[cfg(windows)]
 fn template_windows(server: &str, fp: &str) -> String {
-    let access = access_comment();
     tr!(
         r#"# Airhand 配置文件。修改后要重新启动 Airhand 才生效（托盘菜单"退出"，然后再打开 Airhand）。
-# 这个文件由 Airhand 维护（保存控制码、开机自动启动、控制台的"我的设备"），手动修改的内容和注释都会保留。
+# 这个文件由 Airhand 维护（保存控制码、开机自动启动、界面语言、控制台的"我的设备"），手动修改的内容和注释都会保留。
 # 不小心删掉了也没关系：Airhand 会按默认配置重新生成，控制码和我的设备不会丢。
 
 # 中转服务器地址 host:port（UDP）。不设置时使用编译进程序的地址：{server}
@@ -364,8 +362,6 @@ fn template_windows(server: &str, fp: &str) -> String {
 # 中转服务器证书的 SHA-256 指纹（服务器日志里打印的 64 位十六进制，可以用 : 或空格分隔）。
 # 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
-
-{access}
 
 # 开机自动启动：开机后被控端服务自动运行（登录之前也能被控制），登录后显示托盘图标。托盘菜单里也可以切换
 autostart = true
@@ -376,7 +372,7 @@ autostart = true
 [code]
 "#,
         r#"# Airhand configuration. Restart Airhand after editing it (tray menu "Quit", then open Airhand again).
-# Airhand maintains this file (it saves the control code, the autostart setting and the console's "My devices"); your edits and comments are kept.
+# Airhand maintains this file (it saves the control code, the autostart setting, the UI language and the console's "My devices"); your edits and comments are kept.
 # If it gets deleted by accident, Airhand recreates it with the default settings, keeping the control code and your devices.
 
 # Relay server address host:port (UDP). Without it the address built into the program is used: {server}
@@ -385,8 +381,6 @@ autostart = true
 # SHA-256 fingerprint of the relay server certificate (the 64 hex digits printed in the server log, `:` and spaces are allowed).
 # "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
-
-{access}
 
 # Start with Windows: the host service runs after boot (the computer can be controlled before anyone signs in),
 # and the tray icon shows up after signing in. Can also be changed in the tray menu
@@ -403,7 +397,6 @@ autostart = true
 /// macOS / Linux 的模板：文件在用户自己的目录里，没有开机自动启动
 #[cfg(not(windows))]
 fn template_user(server: &str, fp: &str) -> String {
-    let access = access_comment();
     let quit = if cfg!(target_os = "macos") {
         tr!(
             "菜单栏图标的菜单里选\"退出\"",
@@ -414,7 +407,7 @@ fn template_user(server: &str, fp: &str) -> String {
     };
     tr!(
         r#"# Airhand 配置文件。修改后要重新启动 Airhand 才生效（{quit}，然后再打开 Airhand）。
-# 这个文件由 Airhand 维护（保存控制码和控制台的"我的设备"），手动修改的内容和注释都会保留。
+# 这个文件由 Airhand 维护（保存控制码、界面语言和控制台的"我的设备"），手动修改的内容和注释都会保留。
 # 不小心删掉了也没关系：Airhand 会按默认配置重新生成，控制码和我的设备不会丢。
 # 里面的控制码能用来控制电脑，所以只有你的账户能读写这个文件（权限 600），不要发给别人。
 
@@ -425,15 +418,13 @@ fn template_user(server: &str, fp: &str) -> String {
 # 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
 
-{access}
-
 # 本机的控制码：第一次连上服务器时由服务器分配，之后一直使用同一个（重启、掉线、升级都不变）。
 # 菜单里"更换控制码"会换一个新的；删掉 code 和 secret 则下次启动时重新分配。
 # secret 是取回这个控制码的凭据
 [code]
 "#,
         r#"# Airhand configuration. Restart Airhand after editing it ({quit}, then open Airhand again).
-# Airhand maintains this file (it saves the control code and the console's "My devices"); your edits and comments are kept.
+# Airhand maintains this file (it saves the control code, the UI language and the console's "My devices"); your edits and comments are kept.
 # If it gets deleted by accident, Airhand recreates it with the default settings, keeping the control code and your devices.
 # The control codes in it can be used to control computers, so only your account can read and write it (mode 600). Don't share it.
 
@@ -444,21 +435,11 @@ fn template_user(server: &str, fp: &str) -> String {
 # "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
 
-{access}
-
 # This computer's control code: assigned by the server the first time, then always the same (across restarts, disconnects and upgrades).
 # "Change control code" in the menu gets a new one; delete code and secret to get a new one at the next start.
 # secret proves to the server that this computer owns the code
 [code]
 "#
-    )
-}
-
-/// 模板里 `access` 的说明
-fn access_comment() -> String {
-    tr!(
-        "# 没配对过的控制端能不能连本机。会话是端到端加密的，中转服务器看不到画面和键盘输入，但它知道所有控制码：\n#   \"pairing\"：第一次连接时要输入托盘菜单里的配对码（配对码不经过服务器），配对之后记住它（默认）；\n#   \"open\"：知道控制码就能连。服务器也知道控制码，所以这等于信任中转服务器\n# access = \"pairing\"",
-        "# Whether controllers that haven't paired with this computer may connect. Sessions are end-to-end encrypted, so the relay server can't see the screen or keystrokes, but it does know every control code:\n#   \"pairing\": the first connection needs the pairing code shown in the tray menu (it never goes through the server); paired controllers are remembered (default);\n#   \"open\": the control code alone is enough. The server knows it too, so this means trusting the relay server\n# access = \"pairing\""
     )
 }
 
@@ -489,7 +470,7 @@ fn last() -> MutexGuard<'static, Option<String>> {
 }
 
 /// 按模板（默认配置）生成配置文件的内容。`before` 是文件被删掉之前的内容：服务器等设置回到默认，
-/// 状态接着用——开机自动启动（Windows）、本机的控制码、我的设备。只搬值，模板里的说明和顺序不动
+/// 状态接着用——开机自动启动（Windows）、选过的界面语言、本机的控制码、我的设备。只搬值，模板里的说明和顺序不动
 fn regenerate(before: Option<&str>) -> Result<DocumentMut> {
     let mut doc: DocumentMut = template().parse()?;
     let Some(old) = before.and_then(|t| t.parse::<DocumentMut>().ok()) else {
@@ -500,6 +481,13 @@ fn regenerate(before: Option<&str>) -> Result<DocumentMut> {
         && (doc.contains_key("autostart") || cfg!(target_os = "macos"))
     {
         put_autostart(&mut doc, on);
+    }
+    if let Some(lang) = old
+        .get("language")
+        .and_then(Item::as_str)
+        .and_then(Lang::from_code)
+    {
+        put_language(&mut doc, lang);
     }
     if let (Some(from), Some(to)) = (
         old.get("code").and_then(Item::as_table_like),
@@ -720,16 +708,48 @@ pub fn autostart_default_pending() -> bool {
         .is_some_and(|doc| !doc.contains_key("autostart"))
 }
 
-/// 写入 `autostart`。已经有了就只改值；没有（macOS 的模板里没有）时加上一段说明，放在文件开头的说明后面
-/// （直接插入的话 toml_edit 会把它排在整个文件的第一行，开头的说明前面）
+/// 写入 `autostart`（macOS 的模板里没有，加上时带一段说明）
 fn put_autostart(doc: &mut DocumentMut, on: bool) {
-    if let Some(item) = doc.get_mut("autostart") {
-        *item = toml_edit::value(on);
+    put_setting(doc, "autostart", toml_edit::value(on), autostart_note);
+}
+
+/// 保存选的界面语言（托盘菜单、控制台里切换的）
+pub fn save_language(lang: Lang) -> Result<()> {
+    edit(|doc| {
+        put_language(doc, lang);
+        Ok(())
+    })
+}
+
+/// 写入 `language`（模板里没有：没选过就跟随系统语言。加上时带一段说明）
+fn put_language(doc: &mut DocumentMut, lang: Lang) {
+    put_setting(
+        doc,
+        "language",
+        toml_edit::value(lang.code()),
+        language_note,
+    );
+}
+
+/// `language` 前面的说明
+fn language_note() -> String {
+    tr!(
+        "# 界面语言：\"zh\"（简体中文）或 \"en\"（English），在托盘菜单或控制台里切换时记下。删掉这一项就跟随系统语言\n",
+        "# UI language: \"zh\" (Simplified Chinese) or \"en\" (English), saved when you switch it in the tray menu or the console. Delete this line to follow the system language\n"
+    )
+}
+
+/// 写入文件开头的一项设置（`key = value`）。已经有了就只改值；没有（模板里没有）时加上 `note()` 这段说明，
+/// 排在已有的设置后面；一项设置都没有时放在文件开头的说明后面
+/// （直接插入的话 toml_edit 会把它排在整个文件的第一行，开头的说明前面）
+fn put_setting(doc: &mut DocumentMut, key: &str, value: Item, note: fn() -> String) {
+    if let Some(item) = doc.get_mut(key) {
+        *item = value;
         return;
     }
-    let note = autostart_note();
+    let note = note();
     // 文件开头的说明属于排在最前面的那一项：已经有别的值（例如用户写了 server）时是那个值，
-    // 否则是第一个表（模板里的 [code]），这时在最后一个空行处分开，前半段（开头的说明）移到 autostart 前面
+    // 否则是第一个表（模板里的 [code]），这时在最后一个空行处分开，前半段（开头的说明）移到这一项前面
     let has_values = doc.iter().any(|(_, item)| item.is_value());
     let mut prefix = format!("\n{note}");
     if !has_values
@@ -750,8 +770,8 @@ fn put_autostart(doc: &mut DocumentMut, on: bool) {
             .decor_mut()
             .set_prefix(format!("\n{}", tail.trim_start_matches('\n')));
     }
-    doc.insert("autostart", toml_edit::value(on));
-    if let Some(mut key) = doc.as_table_mut().key_mut("autostart") {
+    doc.insert(key, value);
+    if let Some(mut key) = doc.as_table_mut().key_mut(key) {
         key.leaf_decor_mut().set_prefix(prefix);
     }
 }
@@ -794,29 +814,16 @@ fn put_devices(doc: &mut DocumentMut, list: &[crate::devices::Device]) {
 
 // ───────────────────────────── 端到端加密的身份和配对 ─────────────────────────────
 
-/// 配对过的一个控制端（`[[paired]]`）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Paired {
-    /// 公钥（64 位十六进制）
-    pub key: String,
-    /// 它配对时报的名称
-    pub name: String,
-    /// 配对的时间（Unix 毫秒）
-    pub since: i64,
-}
+pub use airhand_link::host::{Paired, PairingState};
 
 /// 本机作为被控端的端到端状态（`[host]` 和 `[[paired]]`）
 #[derive(Debug, Default)]
 pub struct HostSecurity {
     /// 身份密钥（私钥）；没有、解不开时为 `None`
     pub key: Option<[u8; 32]>,
-    /// 配对码
-    pub pairing: Option<String>,
-    /// 有人连续输错配对码，暂停了配对（本机用户换一个配对码才恢复）
-    pub pairing_locked: bool,
-    pub paired: Vec<Paired>,
+    /// 配对码（没有、解不开时是空的：换一个新的，配对过的控制端照样记得）、有没有暂停、配对过的控制端
+    pub pairing: PairingState,
 }
-
 /// 写在 `[host]` 前面的说明
 fn host_comment() -> String {
     tr!(
@@ -855,16 +862,17 @@ fn host_security_in(doc: &DocumentMut) -> HostSecurity {
             }
         };
         s.key = open("key", secret::Kind::HostKey).and_then(|b| <[u8; 32]>::try_from(b).ok());
-        s.pairing = open("pairing", secret::Kind::Pairing)
+        s.pairing.code = open("pairing", secret::Kind::Pairing)
             .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|p| airhand_proto::parse_pairing(&p));
-        s.pairing_locked = t
+            .and_then(|p| airhand_proto::parse_pairing(&p))
+            .unwrap_or_default();
+        s.pairing.locked = t
             .get("pairing_locked")
             .and_then(Item::as_bool)
             .unwrap_or(false);
     }
     if let Some(arr) = doc.get("paired").and_then(Item::as_array_of_tables) {
-        s.paired = arr
+        s.pairing.paired = arr
             .iter()
             .filter_map(|t| {
                 let key = t.get("key")?.as_str()?.trim().to_ascii_lowercase();
@@ -900,28 +908,21 @@ pub fn save_host_key(key: &[u8; 32]) -> Result<()> {
     })
 }
 
-/// 保存配对码和它有没有暂停
-pub fn save_pairing(code: &str, locked: bool) -> Result<()> {
-    let sealed = secret::seal_bytes(code.as_bytes(), secret::Kind::Pairing)?;
+/// 保存配对状态：配对码和它有没有暂停（`[host]`），配对过的控制端（`[[paired]]`，整个换掉）
+pub fn save_pairing_state(s: &PairingState) -> Result<()> {
+    let sealed = secret::seal_bytes(s.code.as_bytes(), secret::Kind::Pairing)?;
     edit(|doc| {
         let t = host_table(doc)?;
         t["pairing"] = toml_edit::value(sealed);
-        t["pairing_locked"] = toml_edit::value(locked);
-        Ok(())
-    })
-}
-
-/// 保存配对过的控制端（整个换掉）
-pub fn save_paired(list: &[Paired]) -> Result<()> {
-    edit(|doc| {
-        put_paired(doc, list);
+        t["pairing_locked"] = toml_edit::value(s.locked);
+        put_paired(doc, &s.paired);
         Ok(())
     })
 }
 
 fn put_paired(doc: &mut DocumentMut, list: &[Paired]) {
     let mut arr = toml_edit::ArrayOfTables::new();
-    for p in list.iter().take(MAX_PAIRED) {
+    for p in list.iter().take(airhand_link::host::pairing::MAX_PAIRED) {
         let mut t = toml_edit::Table::new();
         t["key"] = toml_edit::value(&p.key);
         t["name"] = toml_edit::value(&p.name);
@@ -940,9 +941,6 @@ fn put_paired(doc: &mut DocumentMut, list: &[Paired]) {
         doc.insert("paired", Item::ArrayOfTables(arr));
     }
 }
-
-/// 最多记住这么多个配对过的控制端（再多就忘掉最早的）
-pub const MAX_PAIRED: usize = 64;
 
 fn host_table(doc: &mut DocumentMut) -> Result<&mut toml_edit::Table> {
     let item = doc.entry("host").or_insert_with(|| {
@@ -1309,21 +1307,87 @@ mod tests {
         assert!(text.contains(&paired_comment()));
         let s = host_security_in(&text.parse().unwrap());
         assert_eq!(s.key, Some(key));
-        assert_eq!(s.pairing.as_deref(), Some("482913"));
-        assert!(s.pairing_locked);
-        assert_eq!(s.paired, paired);
+        let state = PairingState {
+            code: "482913".into(),
+            locked: true,
+            paired: paired.clone(),
+        };
+        assert_eq!(s.pairing, state);
         // 设置不受影响
         assert_eq!(parse(&text).unwrap(), Settings::default());
         // 文件被删掉之后重新生成：身份和配对都还在
         let again = regenerate(Some(&text)).unwrap();
         let s = host_security_in(&again);
         assert_eq!(s.key, Some(key));
-        assert_eq!(s.paired, paired);
+        assert_eq!(s.pairing, state);
 
-        // access：只有写明了 open 才不要配对码
-        assert_eq!(parse("access = \"open\"").unwrap().access, Access::Open);
-        assert_eq!(parse("access = \"opne\"").unwrap().access, Access::Pairing);
-        assert_eq!(parse("").unwrap().access, Access::Pairing);
+        // 一次保存整个配对状态：更换控制码之后没有配对过的了，[[paired]] 也没了，身份不动
+        let mut doc = again;
+        let next = PairingState {
+            code: "731205".into(),
+            locked: false,
+            paired: Vec::new(),
+        };
+        let sealed = secret::seal_bytes(next.code.as_bytes(), secret::Kind::Pairing).unwrap();
+        let t = host_table(&mut doc).unwrap();
+        t["pairing"] = toml_edit::value(sealed);
+        t["pairing_locked"] = toml_edit::value(next.locked);
+        put_paired(&mut doc, &next.paired);
+        let text = doc.to_string();
+        assert!(!text.contains("[[paired]]"));
+        let s = host_security_in(&text.parse().unwrap());
+        assert_eq!((s.key, s.pairing), (Some(key), next));
+    }
+
+    /// 选过的界面语言：写在设置后面、带一段说明，再选只改值；文件被删掉重新生成时接着用；没写、写错了就跟随系统语言
+    #[test]
+    fn language_is_saved() {
+        assert_eq!(parse("").unwrap().language, None);
+        assert_eq!(parse("language = \"en\"").unwrap().language, Some(Lang::En));
+        assert_eq!(
+            parse("language = \" zh \"").unwrap().language,
+            Some(Lang::Zh)
+        );
+        assert_eq!(parse("language = \"fr\"").unwrap().language, None);
+
+        let tpl = template();
+        let mut doc: DocumentMut = tpl.parse().unwrap();
+        put_language(&mut doc, Lang::En);
+        let text = doc.to_string();
+        let note = language_note();
+        let note = note.lines().next().unwrap();
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("missing {s:?}"));
+        assert!(
+            text.starts_with(tpl.lines().next().unwrap()),
+            "开头的说明不在第一行了"
+        );
+        assert!(at(note) < at("language = \"en\""));
+        assert!(at("language = \"en\"") < at("[code]"));
+        // Windows 的模板里有 autostart：排在它后面
+        #[cfg(windows)]
+        assert!(at("autostart = true") < at(note));
+        for line in tpl.lines().filter(|l| !l.is_empty()) {
+            assert!(text.contains(line), "少了 {line:?}");
+        }
+        assert_eq!(parse(&text).unwrap().language, Some(Lang::En));
+
+        put_language(&mut doc, Lang::Zh);
+        let text = doc.to_string();
+        assert_eq!(text.matches(note).count(), 1);
+        assert_eq!(text.matches("language = ").count(), 1);
+        let s = parse(&text).unwrap();
+        assert_eq!(s.language, Some(Lang::Zh));
+        assert_eq!(
+            s,
+            Settings {
+                language: Some(Lang::Zh),
+                ..Settings::default()
+            }
+        );
+
+        let again = regenerate(Some(&text)).unwrap().to_string();
+        assert_eq!(parse(&again).unwrap().language, Some(Lang::Zh));
+        assert_eq!(again.matches("language = ").count(), 1);
     }
 
     /// 我的设备写在 [code] 后面，带一段说明；再次保存时整个换掉，说明只有一份；删光了就没有 [[device]]

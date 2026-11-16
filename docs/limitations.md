@@ -49,7 +49,7 @@
 
 Host (sharing the phone):
 
-- No pairing code: someone new is either asked about (with the safety code) or let in on the control code alone, if "Ask before someone connects" is off. Allowed controllers are only remembered until sharing stops
+- A paired device connects without anyone at the phone confirming it (a notification tells you each time). Paired devices can only be forgotten all at once (Share screen or Settings), not one by one
 - Each time sharing starts, screen recording must be confirmed on the phone (a system rule), and sharing can't resume by itself after the system kills the app
 - Remote control uses accessibility gestures, so apps that handle touches themselves (games…) may react less precisely
 - Typing only works in regular text fields (arrow keys and Tab need Android 13+)

@@ -224,8 +224,6 @@ pub enum SessionEvent {
         touch: bool,
         actions: Vec<SystemAction>,
     },
-    /// 被控端在等它的用户同意这次连接（同意之后才会收到 `Hello` 和画面）
-    AwaitingApproval,
     /// 第 `stream` 路画面的编码器（重新）建好了
     Encoder {
         stream: u8,
@@ -592,9 +590,6 @@ pub(super) async fn run(
                         actions: h.actions.into_iter().filter(|a| a.is_known()).collect(),
                     });
                 }
-                HostMsg::AwaitingApproval => {
-                    let _ = out.event(SessionEvent::AwaitingApproval);
-                }
                 HostMsg::Displays {
                     displays,
                     current,
@@ -923,10 +918,6 @@ mod tests {
             json!({ "type": "clipboard", "text": "hi" })
         );
         assert_eq!(
-            serde_json::to_value(SessionEvent::AwaitingApproval).unwrap(),
-            json!({ "type": "awaitingApproval" })
-        );
-        assert_eq!(
             serde_json::to_value(SessionEvent::Mic {
                 state: MicState::NoDevice,
                 detail: None
@@ -996,12 +987,12 @@ mod tests {
         assert_eq!(serde_json::to_value(&s).unwrap()["direct"], json!(true));
         assert_eq!(serde_json::to_value(&s).unwrap()["fec"], json!(true));
         let c = SessionEvent::Closed {
-            reason: Problem::from(airhand_proto::session::ByeReason::Declined),
+            reason: Problem::from(airhand_proto::session::ByeReason::CodeChanged),
             retry: false,
         };
         assert_eq!(
             serde_json::to_value(&c).unwrap(),
-            json!({ "type": "closed", "reason": { "kind": "declined" }, "retry": false })
+            json!({ "type": "closed", "reason": { "kind": "codeChanged" }, "retry": false })
         );
     }
 }

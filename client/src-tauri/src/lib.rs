@@ -8,7 +8,7 @@
 //! * 配置和数据只有一个 `config.toml`（见 [`config`]）：服务器设置、本机的控制码、控制台的"我的设备"
 //!   （见 [`devices`]）。Windows 在安装目录，macOS 在 `~/Library/Application Support/app.airhand.client/`，
 //!   Linux 在 `~/.config/airhand/`；被删掉了会自动重新生成。其余运行时产生的文件退出时删除（见 [`ephemeral`]）；
-//! * 界面支持中文 / 英文，默认跟随系统语言（见 [`i18n`]）。
+//! * 界面支持中文 / 英文，默认跟随系统语言，选过的记在 `config.toml` 里（见 [`i18n`]）。
 
 // 最先声明：其它模块都要用到 `tr!`
 #[macro_use]
@@ -264,13 +264,35 @@ fn console_title() -> String {
     tr!("Airhand 控制台", "Airhand Console")
 }
 
-/// 切换界面语言（托盘菜单或控制台）。
+/// 切换界面语言（托盘菜单或控制台），记进配置文件：选过一次之后不再跟随系统语言。
 fn set_lang(app: &AppHandle, lang: Lang) {
+    let state = app.state::<AppState>();
     if i18n::set(lang) {
         info!(?lang, "switching UI language");
     }
+    // 选的和现在的一样也记下：可能只是碰巧和系统语言一样，用户选的是它
+    save_language(&state, lang);
     // 总是通知状态循环刷新托盘菜单：勾选项被点击时系统会自动翻转勾选状态，需要重建菜单恢复
-    app.state::<AppState>().hub.send_modify(|_| {});
+    state.hub.send_modify(|_| {});
+}
+
+/// 把选的界面语言记进 config.toml。Windows 安装版：配置文件由服务里的被控端维护，经命名管道交给它写
+/// （它也换成这个语言：它写进配置文件的说明按这个语言写）
+fn save_language(state: &AppState, lang: Lang) {
+    #[cfg(windows)]
+    if state.service_mode {
+        if let Some(Hosting::Service(link)) = &state.services.lock().unwrap().host {
+            link.send(winsvc::ipc::ToAgent::SetLanguage { lang });
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = state;
+    std::thread::spawn(move || {
+        if let Err(e) = config::save_language(lang) {
+            warn!("can't save the UI language: {e:#}");
+        }
+    });
 }
 
 fn on_console_destroyed(app: &AppHandle) {

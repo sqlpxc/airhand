@@ -583,22 +583,6 @@ export function SessionView({ s }: { s: RemoteSession }) {
                   </button>
                 </div>
               </div>
-            ) : s.state === "approving" ? (
-              <div className="overlay-card">
-                <span className="spinner large" />
-                <div className="overlay-title">{t("session.approving", { name: title })}</div>
-                <div className="muted small">{t("session.approvingHint")}</div>
-                {s.safety && (
-                  <div className="muted small" title={t("session.safetyHint")}>
-                    {t("session.safety", { code: s.safety })}
-                  </div>
-                )}
-                <div className="overlay-actions">
-                  <button className="ghost-btn" onClick={() => closeTab(s.id)}>
-                    {t("session.close")}
-                  </button>
-                </div>
-              </div>
             ) : s.state === "waiting" ? (
               <div className="overlay-card">
                 <span className="spinner large" />

@@ -46,8 +46,6 @@ object Messages {
         "hostUnresponsive" -> R.string.problem_host_unresponsive
         "kicked" -> R.string.problem_kicked
         "codeChanged" -> R.string.problem_code_changed
-        "declined" -> R.string.problem_declined
-        "unanswered" -> R.string.problem_unanswered
         "sessionEnded" -> R.string.problem_session_ended
         "noSession" -> R.string.problem_no_session
         "noClipboardText" -> R.string.problem_no_clipboard_text

@@ -105,10 +105,6 @@ export type Problem =
   | { kind: "hostUnresponsive" }
   | { kind: "kicked" }
   | { kind: "codeChanged" }
-  /** 被控端的用户拒绝了连接 */
-  | { kind: "declined" }
-  /** 被控端的用户一直没有回应连接请求 */
-  | { kind: "unanswered" }
   | { kind: "sessionEnded" }
   // 其它
   | { kind: "noSession" }
@@ -244,8 +240,6 @@ export type SessionEvent =
       /** 支持的系统操作 */
       actions: SystemAction[];
     }
-  /** 被控端在等它的用户同意这次连接，同意之后才会收到 hello */
-  | { type: "awaitingApproval" }
   | { type: "displays"; displays: DisplayInfo[]; current: number; shown: number[] }
   | {
       type: "stats";

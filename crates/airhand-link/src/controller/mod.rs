@@ -275,7 +275,7 @@ struct Mic {
 
 struct Inner {
     cfg: Arc<LinkConfig>,
-    /// 本机的身份（端到端握手里的静态密钥）：被控端据此认出配对过、同意过的控制端
+    /// 本机的身份（端到端握手里的静态密钥）：被控端据此认出配对过的控制端
     identity: Identity,
     rt: Handle,
     live: Mutex<Option<Live>>,

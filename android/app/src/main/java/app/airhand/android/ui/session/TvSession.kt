@@ -261,6 +261,7 @@ fun TvSession(session: RemoteSession, view: RemoteView, onExit: () -> Unit) {
 private fun InfoBar(session: RemoteSession, name: String, modifier: Modifier) {
     val stats by session.stats.collectAsState()
     val encoder by session.encoder.collectAsState()
+    val safety by session.safety.collectAsState()
     val parts = listOfNotNull(
         name.ifBlank { null },
         encoder?.let { "${it.codec.label} ${it.width}×${it.height}" },
@@ -271,6 +272,8 @@ private fun InfoBar(session: RemoteSession, name: String, modifier: Modifier) {
         stats?.takeIf { it.width > 0 }?.let { stringResource(if (it.direct) R.string.path_direct else R.string.path_relayed) },
         // 画面正在用前向纠错（丢包恢复）
         stats?.takeIf { it.width > 0 && it.fec }?.let { stringResource(R.string.path_fec) },
+        // 安全码：对方显示的是同一个，不一样就是中间有人
+        safety?.let { stringResource(R.string.session_safety, it) },
     )
     Text(
         parts.joinToString("  ·  "),

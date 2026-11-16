@@ -36,13 +36,13 @@ cargo test
 ./gradlew testDebugUnitTest -Pairhand.abis=x86_64
 ```
 
-测试 Android 被控端不需要第二台手机：`android/native` 里有一个协议级的控制端，在电脑上连上手机的控制码，统计画面 / 声音，还可以点一下、打字：
+测试 Android 被控端不需要第二台手机：`android/native` 里有一个协议级的控制端，在电脑上连上手机的控制码，统计画面 / 声音，还可以点一下、打字。每次运行都是新的控制端身份，所以要带上手机“共享本机”页里的配对码：
 
 ```bash
 # android/native/（模拟器里的应用把服务器设为 10.0.2.2:4433 就能连到本机的服务器）
-cargo run --example probe -- <手机的控制码> 8 --tap 0.5,0.5 --text hello --audio
-# 多点触摸和系统操作：双指张开、打开快捷设置（手机设置了“连接前先问我”时要先在手机上允许，计时从允许开始）
-cargo run --example probe -- <手机的控制码> 6 --pinch --action QuickSettings
+cargo run --example probe -- <手机的控制码> 8 --tap 0.5,0.5 --text hello --audio --pairing <配对码>
+# 多点触摸和系统操作：双指张开、打开快捷设置
+cargo run --example probe -- <手机的控制码> 6 --pinch --action QuickSettings --pairing <配对码>
 ```
 
 macOS 上，屏幕 / 声音采集（`sck_capture`、`loopback_captures_tone`、端到端测试里的画面和声音）和键鼠注入（`mac_move_to_center`）的测试需要先在“系统设置 → 隐私与安全性”里给运行测试的终端授予“屏幕与系统录音”和“辅助功能”权限。没有权限时 `sck_capture`、`loopback_captures_tone`、`mac_move_to_center` 会直接跳过；端到端测试会检查被控端发来的是“缺少权限”的提示而不是“采集失败”，然后跳过画面和声音的检查（剪贴板、Ping、断开等其余部分照常检查）。

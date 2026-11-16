@@ -33,7 +33,7 @@ pub use airhand_proto::handshake::Negotiated;
 
 use crate::Problem;
 
-/// 握手的每一步最多等这么久（被控端的用户同意不在握手里，在之后的会话里）
+/// 握手的每一步最多等这么久
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ───────────────────────────── 身份 ─────────────────────────────
@@ -680,17 +680,6 @@ fn handshake_problem(e: HandshakeError, pattern: Pattern, theirs: Option<&[Patte
     }
 }
 
-/// 被控端怎么对待没配对过的控制端
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    /// 知道控制码就能连（等于信任中转服务器：服务器知道所有控制码）
-    Open,
-    /// 请本机用户同意（同意之后在这次运行里记住它）
-    Approval,
-    /// 要配对码（配对之后记住它）
-    Pairing,
-}
-
 /// 一个已占名额的配对尝试。实现必须把失败和在途尝试一起计入本机预算；
 /// 丢弃（包括超时、取消、格式错误）算一次未成功尝试。换配对码后旧尝试不能提交。
 pub trait PairingAttempt: Send {
@@ -699,15 +688,17 @@ pub trait PairingAttempt: Send {
     fn complete(self: Box<Self>, key: PublicKey, name: &str) -> bool;
 }
 
-/// 被控端：自己是谁，认得哪些控制端，配对尝试的本机预算（各平台自己保存）。
+/// 被控端：自己是谁，认得哪些控制端，配对尝试的本机预算（见 [`crate::host::pairing`]，各平台自己保存）。
+///
+/// 没配对过的控制端都要输入配对码：没有"知道控制码就能连"（服务器知道所有控制码，那样它自己就能连上来），
+/// 也没有"请本机用户同意"
 pub trait Gate: Send + Sync + 'static {
     fn identity(&self) -> Identity;
-    fn access(&self) -> Access;
-    /// 原子地占一个配对名额；None 表示不接受配对或预算已用完。
+    /// 原子地占一个配对名额；None 表示现在不接受配对（暂停了、预算已用完）。
     fn begin_pairing(&self) -> Option<Box<dyn PairingAttempt + '_>> {
         None
     }
-    /// 这个控制端配对过（或者本机用户这次运行里同意过）
+    /// 这个控制端配对过
     fn is_known(&self, key: &PublicKey) -> bool;
 }
 
@@ -716,16 +707,12 @@ pub trait Gate: Send + Sync + 'static {
 pub enum Admission {
     /// 刚刚用配对码配对成功
     Paired,
-    /// 配对过的 / 本机用户同意过的
+    /// 配对过的
     Known,
-    /// 被控端允许任何知道控制码的人连
-    Open,
-    /// 还要请本机用户同意（会话里先发 `AwaitingApproval`）
-    NeedsApproval,
 }
 
 /// 被控端握手的结果。控制端还没确认（见 `airhand_proto::handshake` 的"确认"）：`opener` 解开的第一帧必须是
-/// [`Confirm`]，在那之前不能显示"谁在连"、不能请本机用户同意
+/// [`Confirm`]，在那之前不能显示"谁在连"
 pub struct Responded {
     pub secured: Secured,
     /// 控制通道上被控端 → 控制端的发送端（已经发出了决定，计数接着往下数）
@@ -879,11 +866,7 @@ where
     } else if p.gate.is_known(&secured.peer) {
         Some(Admission::Known)
     } else {
-        match p.gate.access() {
-            Access::Open => Some(Admission::Open),
-            Access::Approval => Some(Admission::NeedsApproval),
-            Access::Pairing => None,
-        }
+        None
     };
     let refused = if !compatible {
         Some(Refusal::Incompatible)
@@ -967,17 +950,15 @@ mod tests {
 
     struct TestGate {
         me: Identity,
-        access: Access,
         code: Mutex<Option<String>>,
         failures: AtomicU32,
         known: Mutex<HashSet<PublicKey>>,
     }
 
     impl TestGate {
-        fn new(access: Access, code: Option<&str>) -> Self {
+        fn new(code: Option<&str>) -> Self {
             Self {
                 me: Identity::generate(),
-                access,
                 code: Mutex::new(code.map(Into::into)),
                 failures: AtomicU32::new(0),
                 known: Mutex::default(),
@@ -988,9 +969,6 @@ mod tests {
     impl Gate for TestGate {
         fn identity(&self) -> Identity {
             self.me.clone()
-        }
-        fn access(&self) -> Access {
-            self.access
         }
         fn begin_pairing(&self) -> Option<Box<dyn PairingAttempt + '_>> {
             Some(Box::new(TestAttempt {
@@ -1099,14 +1077,16 @@ mod tests {
 
     #[tokio::test]
     async fn first_contact_then_known_key() {
-        let gate = TestGate::new(Access::Open, None);
+        let gate = TestGate::new(None);
         let me = Identity::generate();
+        // 被控端认得这个控制端（配对过），控制端还不知道被控端的公钥（例如删掉了设备）：XX
+        gate.known.lock().unwrap().insert(*me.public());
         let (c, h) = run(&gate, &me, None, None).await;
         let (c, h) = (c.unwrap(), h.unwrap());
         assert_eq!(c.secured.peer, *gate.me.public());
         assert_eq!(h.secured.peer, *me.public());
         assert_eq!(c.secured.safety, h.secured.safety);
-        assert_eq!(h.admission, Admission::Open);
+        assert_eq!(h.admission, Admission::Known);
         assert_eq!(h.intro.name, "ctl");
         // 开始时的画质、声音和看哪个显示器在介绍里
         assert_eq!((h.intro.settings.fps, h.intro.audio), (60, true));
@@ -1143,7 +1123,9 @@ mod tests {
         assert_eq!(&payload[24..], b"first");
         // 控制通道：被控端的发送端接着决定往下数，控制端的发送端接着确认往下数
         let (mut h_send, mut c_recv) = (h.sealer, c.opener);
-        let mut f = framing::encode(&airhand_proto::session::HostMsg::AwaitingApproval);
+        let mut f = framing::encode(&airhand_proto::session::HostMsg::Bye(
+            airhand_proto::session::ByeReason::Kicked,
+        ));
         h_send.seal_frame(&mut f).unwrap();
         let mut p = f[4..].to_vec();
         c_recv.open(&mut p).unwrap();
@@ -1166,7 +1148,7 @@ mod tests {
     /// 被控端的公钥和记着的不一样：不连，也不能不验证地换成新的；输对配对码才认新的身份
     #[tokio::test]
     async fn a_different_host_key_needs_pairing_again() {
-        let gate = TestGate::new(Access::Open, Some("123456"));
+        let gate = TestGate::new(Some("123456"));
         let me = Identity::generate();
         let stale = *Identity::generate().public();
         let (c, h) = run(&gate, &me, Some(stale), None).await;
@@ -1181,7 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn pairing() {
-        let gate = TestGate::new(Access::Pairing, Some("482913"));
+        let gate = TestGate::new(Some("482913"));
         let me = Identity::generate();
         // 没配对过：被控端要求配对码
         let (c, h) = run(&gate, &me, None, None).await;
@@ -1210,10 +1192,10 @@ mod tests {
     }
 
     /// 中转把录下来的 IK 第 1 条消息重放给被控端：被控端照样回答（它分不出来），但重放的一方拿不出确认，
-    /// 被控端不会当成那个配对过的控制端进来了（不显示、不请本机用户同意）
+    /// 被控端不会当成那个配对过的控制端进来了（不显示、不提醒本机用户）
     #[tokio::test]
     async fn a_replayed_first_message_cannot_confirm() {
-        let gate = TestGate::new(Access::Pairing, None);
+        let gate = TestGate::new(None);
         let me = Identity::generate();
         gate.known.lock().unwrap().insert(*me.public());
         // 一次真的握手，录下控制端的第 1 条消息
@@ -1247,7 +1229,7 @@ mod tests {
     /// 被控端不会控制端用的模式（以后的版本加的）：回答它会哪些，控制端据此判断该更新哪一边
     #[tokio::test]
     async fn an_unknown_pattern_is_answered_with_the_known_ones() {
-        let gate = TestGate::new(Access::Open, None);
+        let gate = TestGate::new(None);
         let ((mut cr, _cw), (hr, mut hw)) = pipes();
         let init = framing::to_vec(&HandshakeInit {
             pattern: Pattern::Unknown(7),
@@ -1290,18 +1272,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn approval_is_left_to_the_session() {
-        let gate = TestGate::new(Access::Approval, None);
-        let (c, h) = run(&gate, &Identity::generate(), None, None).await;
-        assert!(c.is_ok());
-        assert_eq!(h.unwrap().admission, Admission::NeedsApproval);
-    }
-
     /// 中间人：篡改握手消息，连不上
     #[tokio::test]
     async fn tampering_is_detected() {
-        let gate = TestGate::new(Access::Open, None);
+        let gate = TestGate::new(None);
         let me = Identity::generate();
         let intro = test_intro();
         let (initiator, init) = initiate(params(&me, None, None, &intro)).unwrap();

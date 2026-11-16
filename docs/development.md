@@ -37,13 +37,13 @@ cargo test
 ./gradlew testDebugUnitTest -Pairhand.abis=x86_64
 ```
 
-Testing the Android host doesn't need a second phone: `android/native` has a protocol-level controller that connects to the phone's code from a computer, counts frames / audio, and can tap and type:
+Testing the Android host doesn't need a second phone: `android/native` has a protocol-level controller that connects to the phone's code from a computer, counts frames / audio, and can tap and type. Each run is a new controller identity, so pass the pairing code from the phone's Share screen tab:
 
 ```bash
 # android/native/ (an app in the emulator reaches a server on this computer at 10.0.2.2:4433)
-cargo run --example probe -- <phone's control code> 8 --tap 0.5,0.5 --text hello --audio
-# multi-touch and system actions: pinch out, open quick settings (with "Ask before someone connects" on, allow it on the phone first; timing starts then)
-cargo run --example probe -- <phone's control code> 6 --pinch --action QuickSettings
+cargo run --example probe -- <phone's control code> 8 --tap 0.5,0.5 --text hello --audio --pairing <pairing code>
+# multi-touch and system actions: pinch out, open quick settings
+cargo run --example probe -- <phone's control code> 6 --pinch --action QuickSettings --pairing <pairing code>
 ```
 
 On macOS the screen / audio capture tests (`sck_capture`, `loopback_captures_tone`, video and audio in the end-to-end test) and the input injection test (`mac_move_to_center`) need the Screen & System Audio Recording and Accessibility permissions for the terminal that runs them (System Settings → Privacy & Security). Without them `sck_capture`, `loopback_captures_tone` and `mac_move_to_center` skip themselves; the end-to-end test checks that the host reports the missing permission (rather than a capture failure) and then skips the video and audio checks (clipboard, ping, disconnect and the rest are still checked).

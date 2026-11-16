@@ -39,7 +39,7 @@ function Tile({ s }: { s: RemoteSession }) {
         <CanvasHost s={s} interactive={false} />
         {s.state !== "live" && (
           <div className="tile-overlay">
-            {s.state === "closed" || s.state === "waiting" || s.state === "approving" ? (
+            {s.state === "closed" || s.state === "waiting" ? (
               <span>{sessionStateText(s)}</span>
             ) : (
               <span className="spinner" />

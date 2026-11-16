@@ -67,8 +67,7 @@ impl Place {
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
             HostMsg::Hello(_) => queued(Some(DISPLAYS)),
             HostMsg::Cursor { .. } => Place::Latest(CURSOR),
-            HostMsg::AwaitingApproval
-            | HostMsg::Notice(_)
+            HostMsg::Notice(_)
             | HostMsg::Encoder(_)
             | HostMsg::CursorImage { .. }
             | HostMsg::Clipboard { .. }
@@ -350,7 +349,6 @@ mod tests {
             (displays("a"), SessionLane::Control),
             (hello("a"), SessionLane::Control),
             (notice(), SessionLane::Control),
-            (HostMsg::AwaitingApproval, SessionLane::Control),
             (HostMsg::Bye(ByeReason::Kicked), SessionLane::Control),
             (
                 HostMsg::Mic {

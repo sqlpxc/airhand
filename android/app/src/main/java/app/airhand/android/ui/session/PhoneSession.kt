@@ -441,6 +441,7 @@ private fun MainMenu(
     val avSyncOn by session.avSyncOn.collectAsState()
     val mouseLock by session.mouseLock.collectAsState()
     val hostOs by session.hostOs.collectAsState()
+    val safety by session.safety.collectAsState()
 
     Row(Modifier.padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         OsAvatar(hostOs, 40.dp)
@@ -462,6 +463,14 @@ private fun MainMenu(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // 安全码：对方显示的是同一个（电脑在托盘里，手机在"共享本机"页），不一样就是中间有人
+            safety?.let {
+                Text(
+                    stringResource(R.string.session_safety, it),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         IconButton(onClick = onClose) { Icon(Icons.Outlined.Close, stringResource(R.string.close)) }
     }

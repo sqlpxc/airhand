@@ -1,8 +1,8 @@
 // 界面语言：简体中文 / 英文。
 //
-// 当前语言由 Rust 端决定（默认跟随系统语言，不是中文就用英文；托盘菜单里也能切换），
-// 打开控制台时通过 window.__AIRHAND_LANG__ 注入，之后的切换通过 "lang-changed" 事件同步。
-// 与其它状态一样不持久化。词条在 src/locales/。
+// 当前语言由 Rust 端决定（选过的记在 config.toml 的 language 里，没选过就跟随系统语言，不是中文就用英文；
+// 托盘菜单里也能切换），打开控制台时通过 window.__AIRHAND_LANG__ 注入，之后的切换通过 "lang-changed" 事件同步。
+// 切换时调用 api.setLanguage，由 Rust 端记进配置文件（网页版控制台没有配置文件，不保存）。词条在 src/locales/。
 import { useSyncExternalStore } from "react";
 import en from "../locales/en.ts";
 import zh from "../locales/zh.ts";

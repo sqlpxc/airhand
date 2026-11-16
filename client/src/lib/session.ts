@@ -46,8 +46,7 @@ import { renderPlan, type Area, type EnhanceLevel } from "./enhance";
 import { hitTest, layoutTiles, placeDisplays, type Rect } from "./screens";
 
 /** waiting = 对方掉线了，等它重新上线（服务器会通知，见 hostOnline） */
-/** `approving`：连上了，在等对方的用户同意（之后收到 hello 才是 `live`） */
-export type SessionState = "connecting" | "approving" | "live" | "reconnecting" | "waiting" | "closed";
+export type SessionState = "connecting" | "live" | "reconnecting" | "waiting" | "closed";
 export type ScaleMode = "fit" | "native";
 
 export interface Stats {
@@ -365,7 +364,7 @@ export class RemoteSession {
     this.sid = info.sid;
     this.hostName = info.hostName;
     this.hostOs = info.hostOs;
-    // 收到对方的 hello 才算开始（对方可能要先问它的用户，见 onEvent 的 awaitingApproval）；
+    // 收到对方的 hello 才算开始；
     // hello 也可能比这里先到，那时已经是 live 了
     this.retries = 0;
     this.closedReason = null;
@@ -520,9 +519,6 @@ export class RemoteSession {
 
   private onEvent(ev: SessionEvent) {
     switch (ev.type) {
-      case "awaitingApproval":
-        this.state = "approving";
-        break;
       case "hello":
         this.state = "live";
         this.hostName = ev.hostname;

@@ -135,7 +135,7 @@ impl ControllerReceiver {
 
 /// 读任务自己处理的事（见模块说明）：
 ///
-/// * Ping：马上回 Pong。同意之前也回：控制端不会把等待当成失联；
+/// * Ping：马上回 Pong（会话的主循环忙着的时候也回：控制端不会把它当成失联）；
 /// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
 /// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
 /// * 画面收得怎么样的报告（`ControllerDatagram::Report`）：交给画面的 [`Chooser`]（用不用纠错、配多少冗余）；
@@ -294,7 +294,7 @@ impl Writer {
 }
 
 /// 端到端握手之后，被控端知道的这个控制端（见 [`crate::secure::respond`]）。它还没有确认
-/// （[`ControllerReceiver::confirmation`]）：确认之前不要在托盘、Android 的列表里显示它，不要请本机用户同意
+/// （[`ControllerReceiver::confirmation`]）：确认之前不要在托盘、Android 的列表里显示它，不要提醒本机用户
 #[derive(Debug, Clone)]
 pub struct Admitted {
     /// 控制端的公钥（它的身份）
@@ -304,7 +304,7 @@ pub struct Admitted {
     pub os: String,
     /// 安全码：控制端显示的是同一个，两边的人可以对一下（见 `airhand_proto::handshake`）
     pub safety: String,
-    /// 为什么让它进来；[`Admission::NeedsApproval`] 时会话要先请本机用户同意
+    /// 为什么让它进来（刚配对的还是配对过的）
     pub admission: Admission,
     /// 选定的会话版本、双方都支持的会话能力位
     pub negotiated: Negotiated,
@@ -487,7 +487,7 @@ impl HostStreams {
         ))
     }
 
-    /// 会话开始了（发了 Hello）时通知它（`notify_one`）：这时才开始建直连，不把本机的地址告诉还没被同意的控制端
+    /// 会话开始了（发了 Hello）时通知它（`notify_one`）：这时才开始建直连
     pub fn started(&self) -> Arc<Notify> {
         self.started.clone()
     }

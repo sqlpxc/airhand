@@ -11,7 +11,6 @@ const en: Record<MsgKey, Msg> = {
   "common.disconnect": "Disconnect",
   "common.reconnecting": "Reconnecting…",
   "common.waiting": "Waiting for it to come back",
-  "common.approving": "Waiting for approval",
   "common.thisComputer": "This computer",
 
   "tabs.new": "New connection",
@@ -77,7 +76,7 @@ const en: Record<MsgKey, Msg> = {
   "connect.quality": "Quality",
   "connect.clear": "Clear",
   "connect.pairing": "Pairing code",
-  "connect.pairingHint": "The 6-digit pairing code in the remote computer's tray menu. Once paired, that computer remembers this one",
+  "connect.pairingHint": "The 6-digit pairing code shown on the remote device (in the tray menu on a computer, under Share screen in Airhand on a phone). Once paired, it remembers this computer",
   "connect.customQuality": "Custom quality",
 
   "devices.title": "My devices",
@@ -197,13 +196,11 @@ const en: Record<MsgKey, Msg> = {
   "session.reconnect": "Reconnect",
   "session.pairAndReconnect": "Pair and reconnect",
   "session.safety": "Safety code {code}",
-  "session.safetyHint": "End-to-end encrypted. If the remote computer's tray shows the same safety code, nobody is in between",
+  "session.safetyHint": "End-to-end encrypted. If the remote device shows the same safety code (in the tray menu on a computer, under Share screen on a phone), nobody is in between",
   "session.close": "Close",
   "session.reconnecting": "Reconnecting…",
   "session.connecting": "Connecting…",
   "session.waiting": "Waiting for the remote computer to come back…",
-  "session.approving": "Waiting for {name} to accept…",
-  "session.approvingHint": "A request popped up on the other device; the session starts once it's accepted there",
   "action.back": "Back",
   "action.home": "Home",
   "action.recents": "Recent apps",
@@ -305,10 +302,10 @@ const en: Record<MsgKey, Msg> = {
   "problem.serverTimeout": "The server didn't respond in time",
   "problem.hostOffline": "The remote computer is offline",
   "problem.hostKeyChanged":
-    "The remote computer's identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Once you've confirmed it was reinstalled, enter its current pairing code to pair again (a phone has no pairing code: remove it from My devices and connect again)",
-  "problem.pairingRequired": "First connection to this computer: enter its pairing code, shown in the Airhand tray menu on that computer",
-  "problem.pairingFailed": "Wrong pairing code, check the one in the remote computer's tray menu",
-  "problem.pairingUnavailable": "The remote computer paused pairing (too many wrong codes): ask its user to pick a new pairing code in the tray menu",
+    "The remote device's identity differs from the last connection: it may have reinstalled Airhand, or someone may be impersonating it. Once you've confirmed it was reinstalled, enter its current pairing code to pair again",
+  "problem.pairingRequired": "First connection to this device: enter its pairing code, shown on that device (in the Airhand tray menu on a computer, under Share screen in Airhand on a phone)",
+  "problem.pairingFailed": "Wrong pairing code, check the one shown on the remote device",
+  "problem.pairingUnavailable": "The remote device paused pairing (too many wrong codes): ask its user to pick a new pairing code",
   "problem.peerIncompatible": (p) =>
     Number(p.peer) > Number(p.ours)
       ? "Incompatible with the remote computer: it's newer, please update Airhand on this computer"
@@ -317,8 +314,6 @@ const en: Record<MsgKey, Msg> = {
   "problem.hostUnresponsive": "The remote computer stopped responding",
   "problem.kicked": "The remote user disconnected you",
   "problem.codeChanged": "The remote user changed the control code",
-  "problem.declined": "The remote user declined the connection",
-  "problem.unanswered": "The remote user didn't answer the connection request",
   "problem.sessionEnded": "Session ended",
   "problem.noSession": "Session not found",
   "problem.noClipboardText": "No text on the local clipboard",

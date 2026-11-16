@@ -6,11 +6,11 @@
 //!                                [--text 文字] [--audio] [--server host:port] [--pairing 配对码]
 //! ```
 //!
-//! 每次运行是一个新的控制端身份（端到端加密）：被控端要配对码的话用 `--pairing`。
+//! 每次运行是一个新的控制端身份（端到端加密），被控端没见过它：要用 `--pairing` 带上手机"共享本机"页里的配对码。
 //!
 //! `--tap 0.5,0.5` 在画面中间点一下（归一化坐标，默认用鼠标左键，加 `--touch` 改用触摸）；
 //! `--pinch` 在画面中间双指张开；`--action` 发系统操作；`--text` 打字；`--audio` 打开声音。
-//! 计时从被控端同意（收到 Hello）开始。
+//! 计时从会话开始（收到 Hello）算起。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ struct Counters {
     cursor: AtomicU64,
     size: Mutex<(Codec, u16, u16)>,
     events: Mutex<Vec<String>>,
-    /// 收到了被控端的 Hello（被控端的用户同意了）
+    /// 收到了被控端的 Hello（会话开始了）
     hello: std::sync::atomic::AtomicBool,
 }
 
@@ -165,10 +165,10 @@ fn main() {
         svc.command(Command::Input { sid, events })
             .unwrap_or_else(|p| panic!("input failed: {p}"))
     };
-    // 被控端可能要先请它的用户同意：等到 Hello 再开始计时
+    // 等到 Hello（会话开始了）再开始计时
     let asked = std::time::Instant::now();
     while !counters.hello.load(Ordering::Relaxed) {
-        if asked.elapsed() > Duration::from_secs(70) {
+        if asked.elapsed() > Duration::from_secs(15) {
             println!("no Hello from the host");
             break;
         }

@@ -764,7 +764,6 @@ kbd {
   background: var(--good);
 }
 .dot.connecting,
-.dot.approving,
 .dot.reconnecting,
 .dot.waiting {
   background: var(--ok);

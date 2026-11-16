@@ -145,8 +145,7 @@ private fun TvHome(onSettings: () -> Unit) {
         }
     }
 
-    val busy = phase is RemoteSession.Phase.Connecting || phase is RemoteSession.Phase.Approving
-    val approving = phase is RemoteSession.Phase.Approving
+    val busy = phase is RemoteSession.Phase.Connecting
     val waitingCode = session?.code.takeIf { phase is RemoteSession.Phase.WaitingHost }
 
     fun connect(c: String) {
@@ -267,7 +266,7 @@ private fun TvHome(onSettings: () -> Unit) {
                 }
             }
             Text(
-                error ?: if (approving) stringResource(R.string.approving_tv) else "",
+                error ?: "",
                 color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 modifier = Modifier.padding(top = 6.dp).height(22.dp),

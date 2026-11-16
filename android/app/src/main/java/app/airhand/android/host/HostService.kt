@@ -24,8 +24,8 @@ import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Problem
 import app.airhand.android.core.ServerState
-import app.airhand.android.core.optStringOrNull
 import app.airhand.android.data.HostCode
+import app.airhand.android.data.Pairing
 import app.airhand.android.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -61,7 +61,8 @@ class HostService : Service() {
         when (intent?.action) {
             ACTION_START -> start(intent)
             ACTION_STOP -> stopSharing(null)
-            ACTION_APPROVE -> intent.getStringExtra(EXTRA_ID)?.let { approve(it, intent.getBooleanExtra(EXTRA_ALLOW, false)) }
+            // 通知里的"全部断开"：共享已经停了（通知留着的时候）就没什么可断的
+            ACTION_KICK_ALL -> if (projection == null) stopSelf() else kickAll()
             else -> if (projection == null) stopSelf()
         }
         return START_NOT_STICKY
@@ -118,9 +119,10 @@ class HostService : Service() {
             .put("input", InputService.isEnabled(this))
             .put("touch", Injector.touchSupported)
             .put("actions", JSONArray(Injector.supportedActions()))
-            .put("approval", s.requireApproval)
-            // 本机的端到端加密身份：同意过的控制端在这次共享里重连时认得出来
+            // 本机的端到端加密身份：配对过的控制端靠它认出本机
             .put("identity", app.settings.identity())
+            // 配对码、配对过的控制端（没有的话 Rust 生成配对码，用 pairing 事件交回来保存）
+            .put("pairing", app.pairing.value?.toJson() ?: JSONObject.NULL)
         val h = try {
             Native.hostStart(cfg.toString())
         } catch (e: IllegalArgumentException) {
@@ -180,17 +182,24 @@ class HostService : Service() {
             }
             "controllers" -> {
                 val list = e.optJSONArray("list") ?: JSONArray()
-                val all = (0 until list.length()).map { list.getJSONObject(it) }
-                fun pick(key: String) = all.filter { it.optBoolean(key) }.map {
-                    Viewer(it.optString("id"), it.optString("name"), it.optString("ip"), it.optStringOrNull("safety"))
+                val viewers = (0 until list.length()).map { list.getJSONObject(it) }.map {
+                    Viewer(
+                        it.optString("id"),
+                        it.optString("key"),
+                        it.optString("name"),
+                        it.optString("ip"),
+                        it.optString("safety"),
+                        it.optBoolean("justPaired"),
+                    )
                 }
-                val viewers = pick("active")
-                val requests = pick("pending")
-                HostState.update { it.copy(viewers = viewers, requests = requests) }
+                val before = HostState.value.viewers.map { it.id }.toSet()
+                HostState.update { it.copy(viewers = viewers) }
                 if (viewers.isEmpty()) releaseWakeLock() else acquireWakeLock()
                 updateNotification()
-                showRequests(requests)
+                // 有设备连上来了：提醒手机前的人（配对过的连上来不用谁点允许，所以要让人知道）
+                for (v in viewers) if (v.id !in before) notifyConnected(v)
             }
+            "pairing" -> e.optJSONObject("state")?.let { app.pairing.save(Pairing.parse(it)) }
             "video" -> {
                 val active = e.optBoolean("active")
                 capture?.setActive(active)
@@ -216,73 +225,57 @@ class HostService : Service() {
         }
     }
 
-    /** 回答连接请求 */
-    private fun approve(id: String, allow: Boolean) {
+    private fun kickAll() {
         val h = handle
-        if (h != 0L) Native.hostCall(h, JSONObject().put("op", "approve").put("id", id).put("allow", allow).toString())
-        // 先撤下通知（Rust 那边处理完会再发一次列表）
-        cancelRequest(id)
+        if (h != 0L) Native.hostCall(h, JSONObject().put("op", "kickAll").toString())
     }
 
-    /** 连接请求的通知：每个请求一条，带"拒绝 / 允许"；处理掉（或者对方走了）就撤下 */
-    private val shownRequests = HashSet<String>()
+    private fun connectionNotificationId(key: String) = CONNECTION_NOTIFICATION + (key.hashCode() and 0xffff)
 
-    private fun showRequests(requests: List<Viewer>) {
-        val ids = requests.map { it.id }.toSet()
-        for (id in shownRequests - ids) cancelRequest(id)
-        for (r in requests) if (r.id !in shownRequests) postRequest(r)
-    }
-
-    private fun requestNotificationId(id: String) = REQUEST_NOTIFICATION + (id.hashCode() and 0xffff)
-
-    private fun postRequest(r: Viewer) {
-        shownRequests += r.id
+    /**
+     * 提醒手机前的人有设备连上来了：谁、从哪里、能不能操作、安全码，带"全部断开"。
+     * 同一台设备（同一个公钥）一条：断线重连时更新那一条，不再响一次。断开之后通知留着，看得到谁来过
+     */
+    private fun notifyConnected(v: Viewer) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(REQUEST_CHANNEL) == null) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(CONNECTION_CHANNEL) == null) {
             nm.createNotificationChannel(
-                NotificationChannel(REQUEST_CHANNEL, getString(R.string.request_channel), NotificationManager.IMPORTANCE_HIGH),
+                NotificationChannel(CONNECTION_CHANNEL, getString(R.string.connections_channel), NotificationManager.IMPORTANCE_HIGH),
             )
         }
-        fun answer(allow: Boolean) = PendingIntent.getService(
-            this, (r.id.hashCode() shl 1) + if (allow) 1 else 0,
-            Intent(this, HostService::class.java).setAction(ACTION_APPROVE).putExtra(EXTRA_ID, r.id).putExtra(EXTRA_ALLOW, allow),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
         val open = PendingIntent.getActivity(
             this, 2,
             Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_TAB, MainActivity.TAB_SHARE)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val name = r.name.ifBlank { getString(R.string.unknown_device) }
-        val what = getString(if (InputService.isEnabled(this)) R.string.request_wants_control else R.string.request_wants_view)
+        val kick = PendingIntent.getService(
+            this, 3, Intent(this, HostService::class.java).setAction(ACTION_KICK_ALL),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val name = v.name.ifBlank { getString(R.string.unknown_device) }
+        val what = getString(if (InputService.isEnabled(this)) R.string.connected_can_control else R.string.connected_can_view)
         // 安全码：控制端显示的是同一个，本机用户可以和对方对一下（见 airhand_proto::handshake）
-        val text = getString(R.string.request_text, what, r.ip, REQUEST_TIMEOUT_S) +
-            (r.safety?.let { "\n" + getString(R.string.request_safety, it) } ?: "")
+        val text = getString(R.string.connected_text, what, v.ip, v.safety)
         val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, REQUEST_CHANNEL)
+            Notification.Builder(this, CONNECTION_CHANNEL)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this).setPriority(Notification.PRIORITY_HIGH).setDefaults(Notification.DEFAULT_ALL)
         }
         val n = b.setSmallIcon(R.drawable.ic_stat_airhand)
-            .setContentTitle(getString(R.string.request_title, name))
+            .setContentTitle(getString(if (v.justPaired) R.string.connected_paired_title else R.string.connected_title, name))
             .setContentText(text)
             .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(open)
-            .setCategory(Notification.CATEGORY_CALL)
-            .setOngoing(true)
-            .addAction(Notification.Action.Builder(null, getString(R.string.request_decline), answer(false)).build())
-            .addAction(Notification.Action.Builder(null, getString(R.string.request_allow), answer(true)).build())
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setShowWhen(true)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .addAction(Notification.Action.Builder(null, getString(R.string.share_kick_all), kick).build())
             .build()
-        nm.notify(requestNotificationId(r.id), n)
+        nm.notify(connectionNotificationId(v.key), n)
     }
-
-    private fun cancelRequest(id: String) {
-        shownRequests -= id
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(requestNotificationId(id))
-    }
-
     /** 有人在看时保持屏幕亮着（息屏后录不到画面） */
     @Suppress("DEPRECATION")
     private fun acquireWakeLock() {
@@ -301,7 +294,6 @@ class HostService : Service() {
 
     private fun stopSharing(reason: String?) {
         if (instance === this) instance = null
-        for (id in shownRequests.toList()) cancelRequest(id)
         stopNative()
         capture?.release()
         capture = null
@@ -378,14 +370,9 @@ class HostService : Service() {
         private const val TAG = "airhand"
         private const val ACTION_START = "app.airhand.android.START"
         private const val ACTION_STOP = "app.airhand.android.STOP"
-        private const val ACTION_APPROVE = "app.airhand.android.APPROVE"
-        private const val EXTRA_ID = "id"
-        private const val EXTRA_ALLOW = "allow"
-        private const val REQUEST_CHANNEL = "requests"
-        private const val REQUEST_NOTIFICATION = 1000
-
-        /** 本机用户这么久没回答就当作拒绝（与 Rust 的 APPROVAL_TIMEOUT 相同） */
-        const val REQUEST_TIMEOUT_S = 60
+        private const val ACTION_KICK_ALL = "app.airhand.android.KICK_ALL"
+        private const val CONNECTION_CHANNEL = "connections"
+        private const val CONNECTION_NOTIFICATION = 1000
         private const val EXTRA_RESULT_CODE = "resultCode"
         private const val EXTRA_DATA = "data"
         private const val CHANNEL = "sharing"
@@ -409,19 +396,22 @@ class HostService : Service() {
             }
         }
 
-        /** 回答连接请求（界面上的"允许 / 拒绝"） */
-        fun approve(id: String, allow: Boolean) {
-            instance?.approve(id, allow)
-        }
-
-        fun setApproval(required: Boolean) {
-            val h = instance?.handle ?: return
-            if (h != 0L) Native.hostCall(h, JSONObject().put("op", "approval").put("required", required).toString())
-        }
-
         fun kickAll() {
+            instance?.kickAll()
+        }
+
+        /** 换一个配对码（在共享时才有配对码可换） */
+        fun newPairingCode() {
             val h = instance?.handle ?: return
-            if (h != 0L) Native.hostCall(h, JSONObject().put("op", "kickAll").toString())
+            if (h != 0L) Native.hostCall(h, JSONObject().put("op", "newPairingCode").toString())
+        }
+
+        /** 忘掉配对过的控制端。没在共享时返回 false：调用方直接改保存的（[AirhandApp.forgetPaired]） */
+        fun forgetPaired(): Boolean {
+            val h = instance?.handle ?: return false
+            if (h == 0L) return false
+            Native.hostCall(h, JSONObject().put("op", "forgetPaired").toString())
+            return true
         }
 
         fun newCode() {

@@ -16,23 +16,22 @@ pub mod audio;
 mod session;
 pub mod video;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airhand_link::ServerState;
-use airhand_link::host::{Access, Encoded, Gate, HostCmd, HostEvents, Outbox};
-use airhand_link::secure::Identity;
+use airhand_link::host::{
+    Admission, Encoded, Gate, HostCmd, HostEvents, Outbox, Pairing, PairingState, PairingStore,
+};
+use airhand_link::secure::{Identity, PairingAttempt};
 use airhand_proto::handshake::PublicKey;
 use airhand_proto::session::{Codec, DisplayInfo, EncoderInfo, HostMsg, Notice, SystemAction};
 use airhand_proto::signal::Reclaim;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::info;
 
 use crate::ctl::LinkSettings;
 use crate::queue::Queue;
@@ -60,9 +59,10 @@ pub struct HostConfig {
     /// 能执行的系统操作（返回、主页……，随系统版本不同）
     #[serde(default)]
     pub actions: Vec<SystemAction>,
-    /// 有人连接时先请本机用户同意
+    /// 上次保存的配对状态（配对码、暂停了没有、配对过的控制端，见 [`airhand_link::host::pairing`]）。
+    /// 没有时生成一个配对码，用 `pairing` 事件交给 Kotlin 保存
     #[serde(default)]
-    pub approval: bool,
+    pub pairing: Option<PairingState>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,10 +91,10 @@ pub enum Op {
     Audio { failure: Option<String> },
     /// 手机的剪贴板有新文本（Android 10 起应用在后台读不到剪贴板，只有前台时才会有）
     Clipboard { text: String },
-    /// 本机用户回答了连接请求（`id` 是 controllers 事件里的 id）
-    Approve { id: String, allow: bool },
-    /// 打开 / 关闭"有人连接时先请我同意"
-    Approval { required: bool },
+    /// 换一个配对码（暂停了的配对随之恢复）
+    NewPairingCode,
+    /// 忘掉所有配对过的控制端
+    ForgetPaired,
 }
 
 /// 会话开始时告诉控制端的信息，以及之后的变化
@@ -121,15 +121,21 @@ pub(crate) struct Shared {
     /// 带着走哪条通道（见 `airhand_link::host::queue`）
     pub broadcast: broadcast::Sender<Encoded>,
     controllers: Mutex<Vec<ControllerView>>,
-    /// 有人连接时先请本机用户同意
-    approval: AtomicBool,
-    /// 正在问本机用户的会话：回答从这里交给会话
-    pending: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
-    /// 这次共享里本机用户同意过的控制端（它们在端到端握手里的公钥）：断线重连时不再问。
-    /// 公钥是加密握手认证过的，服务器冒充不了（以前用的是明文的设备标识，服务器看得见、能照抄）
-    trusted: Mutex<HashSet<PublicKey>>,
+    /// 配对码和配对过的控制端（认的是它们在端到端握手里的公钥，服务器冒充不了），由 Kotlin 保存
+    pairing: Pairing,
     /// 本机的端到端加密身份
     identity: Identity,
+}
+
+/// 配对状态交给 Kotlin：`{"type":"pairing","state":{code, locked, paired}}`，它保存下来、显示在"共享本机"页，
+/// 下次开始共享时放在 [`HostConfig::pairing`] 里传回来
+struct KotlinStore(Arc<Queue<String>>);
+
+impl PairingStore for KotlinStore {
+    fn changed(&self, state: &PairingState) {
+        self.0
+            .push(json!({ "type": "pairing", "state": state }).to_string());
+    }
 }
 
 fn as_string<S: serde::Serializer>(v: &u64, s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -142,15 +148,16 @@ pub(crate) struct ControllerView {
     /// 会话 id。是随机的 u64，转成字符串（Kotlin 的 JSON 解析会把超过 Long 的数字变成浮点数）
     #[serde(serialize_with = "as_string")]
     id: u64,
+    /// 控制端的公钥（64 位十六进制）：同一台设备断线重连也是它，Kotlin 按它更新同一条提醒
+    key: String,
     /// 控制端在加密握手里确认过的名称
     pub name: String,
     ip: String,
-    /// 安全码：控制端显示的是同一个，请本机用户同意时一起显示（见 `airhand_proto::handshake`）。握手之前为 null
-    pub safety: Option<String>,
-    /// 在等本机用户同意
-    pub pending: bool,
-    /// 已经开始（看得到画面）
-    pub active: bool,
+    /// 安全码：控制端显示的是同一个，两边的人可以对一下（见 `airhand_proto::handshake`）
+    pub safety: String,
+    /// 这次刚用配对码配对（不是之前配对过的）
+    #[serde(rename = "justPaired")]
+    pub just_paired: bool,
 }
 
 impl Shared {
@@ -172,6 +179,7 @@ impl Shared {
         self.event(json!({ "type": "controllers", "list": list }));
     }
 
+    /// 控制端确认了握手：在列表里显示它（Kotlin 随之提醒本机用户有人连上来了）
     pub fn admitted(
         &self,
         session_id: u64,
@@ -180,59 +188,29 @@ impl Shared {
     ) {
         self.controllers.lock().unwrap().push(ControllerView {
             id: session_id,
+            key: hex(&admitted.key),
             name: admitted.name.clone(),
             ip: ip.to_string(),
-            safety: Some(admitted.safety.clone()),
-            pending: false,
-            active: false,
+            safety: admitted.safety.clone(),
+            just_paired: admitted.admission == Admission::Paired,
         });
         self.report_controllers();
     }
-
-    pub fn update_controller(&self, id: u64, f: impl FnOnce(&mut ControllerView)) {
-        let mut list = self.controllers.lock().unwrap();
-        if let Some(c) = list.iter_mut().find(|c| c.id == id) {
-            f(c);
-            drop(list);
-            self.report_controllers();
-        }
-    }
-
-    pub fn approval_required(&self) -> bool {
-        self.approval.load(Ordering::Relaxed)
-    }
-
-    pub fn add_pending(&self, id: u64, tx: oneshot::Sender<bool>) {
-        self.pending.lock().unwrap().insert(id, tx);
-    }
-
-    /// 会话不再等回答了（已经回答、超时或者断开）
-    pub fn take_pending(&self, id: u64) -> Option<oneshot::Sender<bool>> {
-        self.pending.lock().unwrap().remove(&id)
-    }
-
-    /// 本机用户同意了这个控制端：这次共享里它断线重连不再问
-    pub fn trust(&self, key: PublicKey) {
-        self.trusted.lock().unwrap().insert(key);
-    }
 }
 
-/// 手机不用配对码：没见过的控制端请本机用户同意（同意之后这次共享里记住它），或者知道控制码就能连（关掉了"先请我同意"）
+/// 和桌面版一样：没配对过的控制端都要输入配对码（显示在"共享本机"页），配对过的直接连上。
+/// 只凭控制码进不来：服务器知道所有控制码
 impl Gate for Shared {
     fn identity(&self) -> Identity {
         self.identity.clone()
     }
 
-    fn access(&self) -> Access {
-        if self.approval_required() {
-            Access::Approval
-        } else {
-            Access::Open
-        }
+    fn begin_pairing(&self) -> Option<Box<dyn PairingAttempt + '_>> {
+        self.pairing.begin()
     }
 
     fn is_known(&self, key: &PublicKey) -> bool {
-        self.trusted.lock().unwrap().contains(key)
+        self.pairing.is_known(key)
     }
 }
 
@@ -247,6 +225,9 @@ impl Host {
         let events = Arc::new(Queue::new(1024));
         let link = Arc::new(cfg.link.link(events.clone())?);
         let identity = cfg.link.identity(&events);
+        let pairing = Pairing::new(cfg.pairing, KotlinStore(events.clone()));
+        // 现在的配对状态给"共享本机"页显示（新生成的配对码上面已经发过一次，再发一次也没关系）
+        KotlinStore(events.clone()).changed(&pairing.state());
         let (broadcast, _) = broadcast::channel(32);
         let shared = Arc::new(Shared {
             info: Mutex::new(Info {
@@ -266,9 +247,7 @@ impl Host {
             events,
             broadcast,
             controllers: Mutex::default(),
-            approval: AtomicBool::new(cfg.approval),
-            pending: Mutex::default(),
-            trusted: Mutex::default(),
+            pairing,
             identity,
         });
         let reclaim = cfg.reclaim.and_then(|s| {
@@ -362,15 +341,8 @@ impl Host {
                     sh.broadcast(&HostMsg::Clipboard { text });
                 }
             }
-            Op::Approve { id, allow } => {
-                if let Some(tx) = id.parse().ok().and_then(|id| sh.take_pending(id)) {
-                    let _ = tx.send(allow);
-                }
-            }
-            Op::Approval { required } => {
-                info!(required, "approval setting changed");
-                sh.approval.store(required, Ordering::Relaxed);
-            }
+            Op::NewPairingCode => sh.pairing.new_code(),
+            Op::ForgetPaired => sh.pairing.forget(),
         }
         Ok(())
     }
@@ -411,9 +383,11 @@ impl HostEvents for Shared {
         self.report_controllers();
     }
 
-    fn kicked(&self, _cmd: HostCmd) {
-        // 断开了的设备要重新请本机用户同意
-        self.trusted.lock().unwrap().clear();
+    fn kicked(&self, cmd: HostCmd) {
+        // 更换控制码：配对码也换一个、配对过的全部忘掉（和桌面版一样）；只是断开所有控制端的话，配对过的还能连回来
+        if cmd == HostCmd::NewCode {
+            self.pairing.reset();
+        }
     }
 }
 
@@ -425,15 +399,15 @@ mod tests {
     fn controller_ids_are_strings() {
         let v = ControllerView {
             id: u64::MAX,
+            key: "ab".repeat(32),
             name: "PC".into(),
             ip: "1.2.3.4".into(),
-            safety: Some("482-913".into()),
-            pending: true,
-            active: false,
+            safety: "482-913".into(),
+            just_paired: true,
         };
         assert_eq!(
             serde_json::to_value(&v).unwrap(),
-            json!({ "id": "18446744073709551615", "name": "PC", "ip": "1.2.3.4", "safety": "482-913", "pending": true, "active": false })
+            json!({ "id": "18446744073709551615", "key": "ab".repeat(32), "name": "PC", "ip": "1.2.3.4", "safety": "482-913", "justPaired": true })
         );
     }
 
@@ -443,13 +417,14 @@ mod tests {
             r#"{"server":"127.0.0.1:4433","fingerprint":"","name":"Pixel 8","os":"Android 15",
                 "version":"0.1.0","reclaim":{"code":123456,"secret":"00112233445566778899aabbccddeeff"},
                 "displays":[{"index":0,"name":"Screen","x":0,"y":0,"width":1080,"height":2400,"primary":true}],
-                "codecs":["h264","h265"],"input":false,"touch":true,"actions":["back","home","volumeUp"],"approval":true}"#,
+                "codecs":["h264","h265"],"input":false,"touch":true,"actions":["back","home","volumeUp"],
+                "pairing":{"code":"482913","locked":false,"paired":[{"key":"ab","name":"PC","since":1}]}}"#,
         )
         .unwrap();
         assert_eq!(cfg.link.name, "Pixel 8");
         assert_eq!(cfg.codecs, [Codec::H264, Codec::H265]);
         assert_eq!(cfg.reclaim.unwrap().code, 123456);
-        assert!(cfg.touch && cfg.approval);
+        assert!(cfg.touch);
         assert_eq!(
             cfg.actions,
             [
@@ -458,6 +433,8 @@ mod tests {
                 SystemAction::VolumeUp
             ]
         );
+        let pairing = cfg.pairing.unwrap();
+        assert_eq!((pairing.code.as_str(), pairing.paired.len()), ("482913", 1));
 
         for op in [
             r#"{"op":"kickAll"}"#,
@@ -468,10 +445,32 @@ mod tests {
             r#"{"op":"clipboard","text":"hi"}"#,
             r#"{"op":"encoder","info":{"codec":"h264","name":"c2.qti.avc.encoder","hardware":true,"width":1080,"height":2400}}"#,
             r#"{"op":"displays","displays":[]}"#,
-            r#"{"op":"approve","id":"18303851325851793452","allow":true}"#,
-            r#"{"op":"approval","required":false}"#,
+            r#"{"op":"newPairingCode"}"#,
+            r#"{"op":"forgetPaired"}"#,
         ] {
             serde_json::from_str::<Op>(op).unwrap_or_else(|e| panic!("{op}: {e}"));
         }
+    }
+
+    /// 配对状态交给 Kotlin：开始时一次（没有配对码就生成一个），之后每次变化一次；更换控制码时配对也重来
+    #[test]
+    fn pairing_state_goes_to_kotlin() {
+        let events = Arc::new(Queue::new(16));
+        let pairing = Pairing::new(None, KotlinStore(events.clone()));
+        let next = |events: &Queue<String>| -> PairingState {
+            let v: serde_json::Value =
+                serde_json::from_str(&events.pop(Duration::ZERO).unwrap()).unwrap();
+            assert_eq!(v["type"], "pairing");
+            serde_json::from_value(v["state"].clone()).unwrap()
+        };
+        assert_eq!(next(&events), pairing.state());
+        pairing.new_code();
+        let s = next(&events);
+        assert_eq!(s, pairing.state());
+        assert_eq!(s.code.len(), airhand_proto::PAIRING_DIGITS);
+        let key = *Identity::generate().public();
+        assert!(pairing.begin().unwrap().complete(key, "PC"));
+        assert_eq!(next(&events).paired[0].name, "PC");
+        assert!(events.pop(Duration::ZERO).is_none());
     }
 }

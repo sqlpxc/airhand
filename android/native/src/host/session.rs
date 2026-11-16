@@ -1,9 +1,8 @@
 //! 被控端的单个远控会话：手机的 [`Platform`]（对应桌面版的 `client/src-tauri/src/host/session.rs`）。
 //!
-//! 协议层的事（请本机用户同意的流程、Pong、失联检测、踢人时发 Bye、画质设置的校验）和桌面版一样在
-//! [`airhand_link::host::serve`]。手机默认要先请坐在它面前的人同意：认不认识这个控制端看的是它在端到端握手里的
-//! 公钥（服务器冒充不了），要不要问由 [`Shared`] 的 `Gate` 决定，怎么问在这里（交给 Kotlin 显示，回答经
-//! [`super::Op::Approve`] 回来）。
+//! 协议层的事（Pong、失联检测、踢人时发 Bye、画质设置的校验）和桌面版一样在 [`airhand_link::host::serve`]。
+//! 让不让这个控制端进来和桌面版一样看配对（[`Shared`] 的 `Gate`）：配对过的直接连上，控制端确认了握手之后
+//! Kotlin 提醒手机前的人有人连上来了（[`Platform::confirmed`]）。
 //!
 //! 采集、编码、注入输入都在 Kotlin 那边：画面、声音由 [`Shared`] 的分发器交给会话，控制端的输入和剪贴板变成给 Kotlin 的事件，
 //! 显示器、编码器、权限这些变化经广播（[`Shared::broadcast`]）发给所有会话。
@@ -14,13 +13,12 @@ use airhand_link::host::{
     Acks, Admitted, Encoded, Outbox, Platform, Request, SendError, Senders, Start, serve,
 };
 use airhand_proto::SessionLane;
-use airhand_proto::handshake::PublicKey;
 use airhand_proto::session::{HostHello, HostMsg, InputEvent, Notice};
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{info, warn};
+use tokio::sync::{broadcast, mpsc};
+use tracing::warn;
 
 use super::{Shared, audio, video};
 use airhand_link::host::Incoming;
@@ -35,8 +33,8 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
         video::QUEUE,
         audio::QUEUE,
         move |admitted, senders| {
-            // 控制端确认了握手才发布身份（Platform::confirmed）；pending/active 由下面的协议阶段更新。
-            let mut phone = Phone::new(sh, id, admitted.key, senders);
+            // 控制端确认了握手才在列表里显示它、提醒本机用户（Platform::confirmed）
+            let mut phone = Phone::new(sh, id, senders);
             phone.publish = Some((ip, admitted.clone()));
             phone
         },
@@ -48,23 +46,20 @@ pub async fn run(inc: Incoming, shared: Arc<Shared>) -> Result<()> {
 pub(crate) struct Phone {
     shared: Arc<Shared>,
     id: u64,
-    /// 控制端的公钥：本机用户同意了就记住它（这次共享里断线重连不再问）
-    key: PublicKey,
     out: Outbox,
     video: mpsc::Sender<Bytes>,
     audio: mpsc::Sender<Bytes>,
-    /// 发给所有会话的消息：会话开始之后才订阅（同意之前不转发，Hello 里带着那时的状态）
+    /// 发给所有会话的消息：会话开始时订阅（Hello 里带着那时的状态，之后的变化从这里来）
     broadcasts: Option<broadcast::Receiver<Encoded>>,
     /// 控制端确认了握手时在列表里显示的（[`Platform::confirmed`]）
     publish: Option<(std::net::IpAddr, Admitted)>,
 }
 
 impl Phone {
-    pub(crate) fn new(shared: Arc<Shared>, id: u64, key: PublicKey, senders: Senders) -> Self {
+    pub(crate) fn new(shared: Arc<Shared>, id: u64, senders: Senders) -> Self {
         Self {
             shared,
             id,
-            key,
             out: senders.out,
             // 手机只有一块屏幕：只有第 0 路画面
             video: senders
@@ -82,7 +77,6 @@ impl Phone {
 /// 会话随时可能在某个 await 处被取消（断网、更换控制码、停止共享）：清理工作放在 Drop 里
 impl Drop for Phone {
     fn drop(&mut self) {
-        self.shared.take_pending(self.id);
         self.shared.video.remove(self.id);
         self.shared.audio.unsubscribe(self.id);
         self.shared
@@ -125,27 +119,10 @@ impl Platform for Phone {
         })
     }
 
-    fn ask(&mut self, admitted: &Admitted) -> oneshot::Receiver<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.shared.add_pending(self.id, tx);
-        self.shared.update_controller(self.id, |c| c.pending = true);
-        info!(session_id = self.id, safety = %admitted.safety, "asking the local user");
-        rx
-    }
-
-    fn answered(&mut self, allowed: bool) {
-        if allowed {
-            self.shared.trust(self.key);
-        }
-    }
-
-    /// 控制端确认了握手：这时才在列表里显示它。不用同意的会话这时已经开始了（看得到画面）
+    /// 控制端确认了握手：这时才在列表里显示它（Kotlin 随之提醒本机用户）。会话这时已经开始了（看得到画面）
     fn confirmed(&mut self) {
         if let Some((ip, admitted)) = self.publish.take() {
             self.shared.admitted(self.id, ip, &admitted);
-            if self.broadcasts.is_some() {
-                self.shared.update_controller(self.id, |c| c.active = true);
-            }
         }
     }
 
@@ -153,11 +130,6 @@ impl Platform for Phone {
         let sh = &self.shared;
         // 先订阅再读现在的状态：之后的变化都会收到，之前的都在 Hello 里
         self.broadcasts = Some(sh.broadcast.subscribe());
-        sh.take_pending(self.id);
-        sh.update_controller(self.id, |c| {
-            c.pending = false;
-            c.active = true;
-        });
         {
             let info = sh.info.lock().unwrap();
             self.out.send(&HostMsg::Hello(HostHello {
@@ -266,11 +238,11 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn cancellation_releases_subscriptions_and_pending_approval() {
+    async fn cancellation_releases_subscriptions() {
         let cfg: HostConfig = serde_json::from_value(json!({
             "server": "127.0.0.1:1", "fingerprint": "", "name": "test", "os": "test",
             "version": "test", "reclaim": null, "displays": [], "codecs": ["h264"],
-            "input": false, "approval": true
+            "input": false
         }))
         .unwrap();
         let host = Host::start(cfg).unwrap();
@@ -278,34 +250,17 @@ mod tests {
         let (video_tx, _video_rx) = mpsc::channel(video::QUEUE);
         let (audio_tx, _audio_rx) = mpsc::channel(audio::QUEUE);
         let (out, _control, _bulk) = queue::channel();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (answer_tx, answer_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let mut phone = Phone::new(
                 sh.clone(),
                 7,
-                [0; 32],
                 Senders {
                     out,
                     video: vec![video_tx],
                     audio: audio_tx,
                 },
             );
-            let admitted = Admitted {
-                key: [0; 32],
-                name: String::new(),
-                os: String::new(),
-                safety: String::new(),
-                admission: airhand_link::host::Admission::NeedsApproval,
-                negotiated: airhand_proto::handshake::Negotiated {
-                    version: 1,
-                    features: Default::default(),
-                },
-                settings: Default::default(),
-                audio: true,
-                view: Vec::new(),
-            };
-            answer_tx.send(phone.ask(&admitted)).unwrap();
             phone
                 .start(Start {
                     settings: Default::default(),
@@ -314,9 +269,6 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            // 会话开始时去掉了等回答的登记：再登记一次，看取消时会不会清掉
-            let (pending_tx, pending_rx) = oneshot::channel();
-            sh.add_pending(7, pending_tx);
             // 一帧占在途字节上限的 2/5：发了两帧之后就放不下了
             let big = vec![0; airhand_link::flow::FlowState::default().window_bytes() * 2 / 5];
             for i in 0..3 {
@@ -330,17 +282,13 @@ mod tests {
                     8,
                 );
             }
-            ready_tx.send(pending_rx).unwrap();
+            ready_tx.send(()).unwrap();
             std::future::pending::<()>().await;
         });
-        let mut asked = answer_rx.await.unwrap();
-        // 会话开始时不再等回答
-        assert!(asked.try_recv().is_err());
-        let pending = ready_rx.await.unwrap();
+        ready_rx.await.unwrap();
         assert!(!host.shared.video.wait_window(Duration::ZERO));
         task.abort();
         let _ = task.await;
-        assert!(pending.await.is_err());
         assert!(host.shared.video.wait_window(Duration::ZERO));
         let mut video_off = false;
         let mut audio_off = false;
@@ -354,5 +302,62 @@ mod tests {
             released |= v["type"] == "input" && v["events"][0]["type"] == "releaseAll";
         }
         assert!(video_off && audio_off && released);
+    }
+
+    /// 控制端确认了握手才出现在列表里（Kotlin 这时提醒本机用户），带着安全码，刚配对的标出来
+    #[tokio::test]
+    async fn confirmed_controllers_are_listed() {
+        let cfg: HostConfig = serde_json::from_value(json!({
+            "server": "127.0.0.1:1", "fingerprint": "", "name": "test", "os": "test",
+            "version": "test", "reclaim": null, "displays": [], "codecs": ["h264"],
+            "input": false
+        }))
+        .unwrap();
+        let host = Host::start(cfg).unwrap();
+        let (video_tx, _video_rx) = mpsc::channel(video::QUEUE);
+        let (audio_tx, _audio_rx) = mpsc::channel(audio::QUEUE);
+        let (out, _control, _bulk) = queue::channel();
+        let mut phone = Phone::new(
+            host.shared.clone(),
+            9,
+            Senders {
+                out,
+                video: vec![video_tx],
+                audio: audio_tx,
+            },
+        );
+        phone.publish = Some((
+            "10.0.0.2".parse().unwrap(),
+            Admitted {
+                key: [0; 32],
+                name: "PC".into(),
+                os: "Windows".into(),
+                safety: "482-913".into(),
+                admission: airhand_link::host::Admission::Paired,
+                negotiated: airhand_proto::handshake::Negotiated {
+                    version: 1,
+                    features: Default::default(),
+                },
+                settings: Default::default(),
+                audio: false,
+                view: Vec::new(),
+            },
+        ));
+        let lists = |host: &Host| -> Vec<serde_json::Value> {
+            std::iter::from_fn(|| host.poll_event(Duration::ZERO))
+                .map(|e| serde_json::from_str::<serde_json::Value>(&e).unwrap())
+                .filter(|v| v["type"] == "controllers")
+                .collect()
+        };
+        assert!(lists(&host).is_empty());
+        phone.confirmed();
+        let got = lists(&host);
+        assert_eq!(
+            got[0]["list"],
+            json!([{ "id": "9", "key": "00".repeat(32), "name": "PC", "ip": "10.0.0.2", "safety": "482-913", "justPaired": true }])
+        );
+        // 只发布一次
+        phone.confirmed();
+        assert!(lists(&host).is_empty());
     }
 }

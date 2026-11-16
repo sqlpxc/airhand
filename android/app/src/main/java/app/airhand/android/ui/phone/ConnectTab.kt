@@ -137,8 +137,7 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
         focus.clearFocus()
     }
 
-    val busyCode = session?.code.takeIf { phase is RemoteSession.Phase.Connecting || phase is RemoteSession.Phase.Approving }
-    val approvingCode = session?.code.takeIf { phase is RemoteSession.Phase.Approving }
+    val busyCode = session?.code.takeIf { phase is RemoteSession.Phase.Connecting }
     val waitingCode = session?.code.takeIf { phase is RemoteSession.Phase.WaitingHost }
 
     LazyColumn(modifier, contentPadding = PaddingValues(bottom = 24.dp)) {
@@ -220,25 +219,13 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
                             if (busyCode != null && busyCode == Code.parse(code)) {
                                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
                                 Spacer(Modifier.width(10.dp))
-                                Text(stringResource(if (approvingCode != null) R.string.approving_short else R.string.connecting))
+                                Text(stringResource(R.string.connecting))
                             } else {
                                 Text(stringResource(R.string.connect))
                             }
                         }
                     }
                 }
-            }
-        }
-
-        // 对方要先同意（手机默认这样）：说明在等什么，可以取消
-        val sa = session
-        if (sa != null && phase is RemoteSession.Phase.Approving) {
-            item {
-                ApprovingCard(
-                    name = sa.hostName.collectAsState().value.ifBlank { Code.format(sa.code) },
-                    os = sa.hostOs.collectAsState().value,
-                    onCancel = { app.endSession(sa) },
-                )
             }
         }
 
@@ -355,30 +342,6 @@ fun ConnectTab(modifier: Modifier, snackbar: SnackbarHostState, onOpenSettings: 
                 }) { Text(stringResource(R.string.open_settings)) }
             },
         )
-    }
-}
-
-@Composable
-private fun ApprovingCard(name: String, os: String, onCancel: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 4.dp),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
-    ) {
-        Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(contentAlignment = Alignment.Center) {
-                OsAvatar(os, 40.dp)
-                CircularProgressIndicator(Modifier.size(44.dp), strokeWidth = 2.dp)
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(stringResource(R.string.approving_title, name), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(stringResource(R.string.approving_text), style = MaterialTheme.typography.bodySmall)
-            }
-            TextButton(onClick = onCancel) { Text(stringResource(R.string.cancel)) }
-        }
     }
 }
 

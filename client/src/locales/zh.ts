@@ -12,7 +12,6 @@ export default {
   "common.disconnect": "断开",
   "common.reconnecting": "正在重连…",
   "common.waiting": "等待对方上线",
-  "common.approving": "等待对方同意",
   "common.thisComputer": "本机",
 
   // 标签栏（也是窗口的标题栏）
@@ -81,7 +80,7 @@ export default {
   "connect.quality": "画质",
   "connect.clear": "清空",
   "connect.pairing": "配对码",
-  "connect.pairingHint": "对方托盘菜单里的 6 位配对码。配对之后这台电脑记住本机，下次不用再输",
+  "connect.pairingHint": "对方显示的 6 位配对码（电脑在托盘菜单里，手机在 Airhand 的“共享本机”页）。配对之后对方记住本机，下次不用再输",
   "connect.customQuality": "自定义画质",
 
   // 我的设备（新建连接页）
@@ -205,13 +204,11 @@ export default {
   "session.reconnect": "重新连接",
   "session.pairAndReconnect": "配对并重新连接",
   "session.safety": "安全码 {code}",
-  "session.safetyHint": "端到端加密。对方电脑的托盘里显示的安全码相同，就说明中间没有人",
+  "session.safetyHint": "端到端加密。对方显示的安全码相同（电脑在托盘菜单里，手机在“共享本机”页），就说明中间没有人",
   "session.close": "关闭",
   "session.reconnecting": "正在重新连接…",
   "session.connecting": "正在连接…",
   "session.waiting": "等待对方重新上线…",
-  "session.approving": "等待 {name} 同意…",
-  "session.approvingHint": "对方设备上弹出了连接请求，对方同意后开始",
   // 系统操作（对方是手机时的快捷键菜单）
   "action.back": "返回",
   "action.home": "主页",
@@ -316,10 +313,10 @@ export default {
   "problem.hostOffline": "对方已离线",
   // 端到端加密（见 Rust 的 airhand_proto::handshake）
   "problem.hostKeyChanged":
-    "对方电脑的身份和上次连接时不一样：可能是对方重装了 Airhand，也可能有人在冒充它。确认是对方重装之后，输入对方现在的配对码重新配对（手机没有配对码：在我的设备里删掉它再连）",
-  "problem.pairingRequired": "第一次连接这台电脑，需要配对码：在对方电脑的 Airhand 托盘菜单里可以看到",
-  "problem.pairingFailed": "配对码不对，请核对对方托盘菜单里的配对码",
-  "problem.pairingUnavailable": "对方暂停了配对（有人多次输错配对码）：请对方在托盘菜单里换一个配对码",
+    "对方的身份和上次连接时不一样：可能是对方重装了 Airhand，也可能有人在冒充它。确认是对方重装之后，输入对方现在的配对码重新配对",
+  "problem.pairingRequired": "第一次连接这台设备，需要配对码：电脑在对方的 Airhand 托盘菜单里，手机在对方 Airhand 的“共享本机”页",
+  "problem.pairingFailed": "配对码不对，请核对对方显示的配对码",
+  "problem.pairingUnavailable": "对方暂停了配对（有人多次输错配对码）：请对方换一个配对码",
   "problem.peerIncompatible": (p) =>
     Number(p.peer) > Number(p.ours) ? "与对方电脑的版本不兼容：对方较新，请更新本机的 Airhand" : "与对方电脑的版本不兼容：对方较旧，请对方更新 Airhand",
   // 会话
@@ -327,8 +324,6 @@ export default {
   "problem.hostUnresponsive": "对方电脑无响应",
   "problem.kicked": "对方断开了你的连接",
   "problem.codeChanged": "对方更换了控制码",
-  "problem.declined": "对方拒绝了连接请求",
-  "problem.unanswered": "对方一直没有回应连接请求",
   "problem.sessionEnded": "会话已结束",
   // 其它
   "problem.noSession": "会话不存在",
