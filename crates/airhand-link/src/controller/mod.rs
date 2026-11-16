@@ -72,7 +72,9 @@ use crate::wire::{read_msg, write_msg};
 use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media;
-use airhand_proto::session::{ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings};
+use airhand_proto::session::{
+    ControllerMsg, InputEvent, MAX_CLIPBOARD_TEXT, QualitySettings, StreamView,
+};
 use airhand_proto::signal::{ClientMsg, ResumeToken, ServerMsg, SessionGrant, connect_outcome};
 use airhand_proto::{MAX_SIGNAL_MSG, Role};
 use anyhow::{Result, anyhow};
@@ -139,14 +141,22 @@ pub enum Command {
         sid: u32,
         settings: QualitySettings,
     },
-    /// 请被控端马上编一个关键帧（解码器出错、刚切回这个会话）
+    /// 请被控端马上给第 `stream` 路画面编一个关键帧（解码器出错、刚切回这个会话）
     Keyframe {
         sid: u32,
+        #[serde(default)]
+        stream: u8,
     },
-    /// 切换到被控端的另一个显示器
+    /// 只看被控端的第 `index` 个显示器（这一路画面的大小只看画质设置）
     Display {
         sid: u32,
         index: u8,
+    },
+    /// 看被控端的哪几个显示器：第 `i` 项是第 `i` 路画面，带着它按显示的大小要的短边上限
+    /// （见 `airhand_proto::session` 的"多屏"）
+    View {
+        sid: u32,
+        streams: Vec<StreamView>,
     },
     /// 开启 / 关闭被控端的声音
     Audio {
@@ -170,10 +180,12 @@ pub enum Command {
         sid: u32,
         enabled: bool,
     },
-    /// 界面收到了第 `seq` 帧画面（累积确认），见 [`SessionUi::packet`]
+    /// 界面收到了第 `stream` 路画面的第 `seq` 帧（累积确认），见 [`SessionUi::packet`]
     Ack {
         sid: u32,
         seq: u32,
+        #[serde(default)]
+        stream: u8,
     },
     /// 断开会话（先松开所有按着的键）
     Disconnect {
@@ -187,8 +199,9 @@ impl Command {
         match self {
             Command::Input { sid, .. }
             | Command::Settings { sid, .. }
-            | Command::Keyframe { sid }
+            | Command::Keyframe { sid, .. }
             | Command::Display { sid, .. }
+            | Command::View { sid, .. }
             | Command::Audio { sid, .. }
             | Command::Mic { sid, .. }
             | Command::Clipboard { sid, .. }
@@ -222,6 +235,9 @@ pub struct ConnectOptions {
     /// 开始时要不要声音（同上）
     #[serde(default)]
     pub audio: bool,
+    /// 开始时看哪几个显示器（同上，见 [`Command::View`]）；空的是只看主显示器
+    #[serde(default)]
+    pub view: Vec<StreamView>,
 }
 
 #[derive(Clone)]
@@ -242,8 +258,8 @@ struct SessionHandle {
     task: AbortHandle,
     /// 桌面版：是否同步剪贴板
     clipboard: Option<Arc<AtomicBool>>,
-    /// 画面帧什么时候到的：确认时带上（见 [`session::Arrivals`]）
-    arrivals: Arc<Mutex<session::Arrivals>>,
+    /// 每一路画面的帧什么时候到的：确认时带上（见 [`session::Arrivals`]）
+    arrivals: Arc<Mutex<Vec<session::Arrivals>>>,
     /// 画面确认（控制数据报）
     feedback: Arc<session::Feedback>,
     /// 麦克风的声音包；被控端不支持（没协商到 MIC）时为 `None`
@@ -341,6 +357,7 @@ impl ControllerService {
             &self.inner.cfg.os,
             opts.settings,
             opts.audio,
+            opts.view,
         );
         let (initiator, init) = secure::initiate(InitiatorParams {
             code,
@@ -398,7 +415,7 @@ impl ControllerService {
             .await
             .map_err(|e| Problem::from_error(e, Problem::failed))?;
         let (peer, safety) = (link.peer, link.safety.clone());
-        let arrivals = Arc::new(Mutex::new(session::Arrivals::default()));
+        let arrivals = Arc::new(Mutex::new(session::arrivals()));
 
         let sid = self.inner.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = queue::channel();
@@ -498,13 +515,26 @@ impl ControllerService {
             Command::Settings { sid, settings } => {
                 (sid, ControllerMsg::Settings(settings.sanitized()))
             }
-            Command::Keyframe { sid } => {
+            Command::Keyframe { sid, stream } => {
                 let sessions = self.inner.sessions.lock().unwrap();
                 let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-                let after = s.arrivals.lock().unwrap().last();
-                return s.tx.send(ControllerMsg::RequestKeyframe { after });
+                // 没有这一路（界面的毛病）：不要
+                let Some(after) = s
+                    .arrivals
+                    .lock()
+                    .unwrap()
+                    .get(stream as usize)
+                    .map(|a| a.last())
+                else {
+                    return Ok(());
+                };
+                return s.tx.send(ControllerMsg::RequestKeyframe { after, stream });
             }
             Command::Display { sid, index } => (sid, ControllerMsg::SelectDisplay { index }),
+            Command::View { sid, mut streams } => {
+                streams.truncate(airhand_proto::MAX_STREAMS as usize);
+                (sid, ControllerMsg::View { streams })
+            }
             Command::Audio { sid, enabled } => (sid, ControllerMsg::Audio { enabled }),
             Command::Mic { sid, enabled } => {
                 let sessions = self.inner.sessions.lock().unwrap();
@@ -529,7 +559,7 @@ impl ControllerService {
                 }
                 return Ok(());
             }
-            Command::Ack { sid, seq } => return self.ack(sid, seq),
+            Command::Ack { sid, seq, stream } => return self.ack(sid, stream, seq),
             Command::Disconnect { sid } => {
                 self.disconnect(sid);
                 return Ok(());
@@ -544,17 +574,26 @@ impl ControllerService {
         s.tx.send(msg)
     }
 
-    /// 界面收到了这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的，
+    /// 界面收到了第 `stream` 路的这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的，
     /// 带着这一帧开始从网络上到达的时刻，发成控制数据报（见 `ControllerDatagram::Ack`）
-    pub fn ack(&self, sid: u32, seq: u32) -> Result<(), Problem> {
+    pub fn ack(&self, sid: u32, stream: u8, seq: u32) -> Result<(), Problem> {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-        let Some(arrived) = s.arrivals.lock().unwrap().take(seq) else {
+        let arrived = s
+            .arrivals
+            .lock()
+            .unwrap()
+            .get_mut(stream as usize)
+            .and_then(|a| a.take(seq));
+        let Some(arrived) = arrived else {
             // 不是这个会话交出去的帧（界面的毛病），或者已经确认过了：确认是累积的，不用再发
-            debug!(sid, seq, "ignoring an acknowledgement for an unknown frame");
+            debug!(
+                sid,
+                stream, seq, "ignoring an acknowledgement for an unknown frame"
+            );
             return Ok(());
         };
-        s.feedback.ack(seq, arrived);
+        s.feedback.ack(stream, seq, arrived);
         Ok(())
     }
 

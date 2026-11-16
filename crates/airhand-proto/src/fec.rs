@@ -7,12 +7,14 @@
 //! 每块一个数据报：
 //!
 //! ```text
-//! 会话 ID u64 | 种类 u8（= 2）| 计数 u64 | 长度 u32 | 第几块 u16 | k u16 | r u16 | 标志 u8 | 这一块（S 字节）
+//! 会话 ID u64 | 种类 u8（= 2）| 计数 u64 | 长度 u32 | 第几块 u16 | k u16 | r u16 | 标志 u8 | 第几路 u8 | 这一块（S 字节）
 //! ```
 //!
 //! 都是小端：
 //!
-//! * 计数：这一帧的密封单元的计数（密封单元末尾也有）：哪些块是同一帧的；
+//! * 计数：这一帧的密封单元的计数（密封单元末尾也有）：哪些块是同一帧的。每一路画面的计数各数各的；
+//! * 第几路：这一帧是第几路画面的（多屏同时显示时每个显示器一路，见 [`crate::session`] 的"多屏"）：收的一方交给那一路拼、
+//!   用那一路的密钥解密。不小于 [`crate::MAX_STREAMS`] 的整个丢掉；
 //! * 长度：密封单元有多长（拼回来之后去掉补的 0）；
 //! * 第几块：`0..k` 是原来的块，`k..k + r` 是冗余；
 //! * 标志：bit0 [`PREV_FEC`]：前一帧（计数减 1）也是这样发的。前一帧的数据报一个都没到时，收的一方据此知道它不会再来了
@@ -29,11 +31,11 @@
 use crate::datagram;
 
 /// 种类后面的头有多长
-pub const HEADER: usize = 19;
+pub const HEADER: usize = 20;
 /// 整个头（会话 ID、种类和 [`HEADER`]）有多长
 pub const FULL_HEADER: usize = datagram::HEADER + HEADER;
-/// 一块最长多少字节：数据报正好是 [`datagram::MAX`]
-pub const MAX_SHARD: usize = datagram::MAX - FULL_HEADER;
+/// 一块最长多少字节：数据报不超过 [`datagram::MAX`]（块长要是偶数）
+pub const MAX_SHARD: usize = (datagram::MAX - FULL_HEADER) & !1;
 /// 密封单元最长多少字节：再大的帧（很少见，多半是关键帧）走帧流
 pub const MAX_FRAME: usize = 1 << 20;
 /// 一帧最多切成这么多块
@@ -45,6 +47,8 @@ const _: () = assert!(
     MAX_SHARD.is_multiple_of(2),
     "shards must have an even length"
 );
+// 数据报差不多是上限那么长（块长是偶数，最多空出一个字节）
+const _: () = assert!(datagram::MAX - (FULL_HEADER + MAX_SHARD) < 2);
 
 /// `k` 块原来的块最多配这么多块冗余：一倍，块很少时最多 4 块
 pub const fn max_repair(k: usize) -> usize {
@@ -74,8 +78,18 @@ pub struct Fragment<'a> {
     pub r: u16,
     /// [`PREV_FEC`] 等
     pub flags: u8,
+    /// 第几路画面（小于 [`crate::MAX_STREAMS`]）
+    pub stream: u8,
     /// 这一块
     pub shard: &'a [u8],
+}
+
+/// 一个纠错数据报是第几路画面的（不用解析整个头：收的一方先按它交给那一路）；不是纠错数据报、短得不像时为 `None`
+pub fn stream_of(d: &[u8]) -> Option<u8> {
+    if datagram::kind(d)? != datagram::VIDEO {
+        return None;
+    }
+    d.get(FULL_HEADER - 1).copied()
 }
 
 impl<'a> Fragment<'a> {
@@ -100,6 +114,7 @@ impl<'a> Fragment<'a> {
         d.extend_from_slice(&self.k.to_le_bytes());
         d.extend_from_slice(&self.r.to_le_bytes());
         d.push(self.flags);
+        d.push(self.stream);
         d.extend_from_slice(self.shard);
         d
     }
@@ -118,6 +133,7 @@ impl<'a> Fragment<'a> {
             k: u16_at(14),
             r: u16_at(16),
             flags: h[18],
+            stream: h[19],
             shard: &d[FULL_HEADER..],
         };
         let (len, k, r, s) = (f.len as usize, f.k as usize, f.r as usize, f.shard.len());
@@ -128,7 +144,8 @@ impl<'a> Fragment<'a> {
             && (k - 1) * s < len
             && len <= k * s
             && r <= max_repair(k)
-            && (f.index as usize) < k + r;
+            && (f.index as usize) < k + r
+            && f.stream < crate::MAX_STREAMS;
         fits.then_some(f)
     }
 }
@@ -139,7 +156,7 @@ mod tests {
 
     #[test]
     fn shards_cover_the_frame_evenly() {
-        for len in [1, 2, 3, 100, 971, 972, 973, 1000, 1945, 50_000, MAX_FRAME] {
+        for len in [1, 2, 3, 100, 969, 970, 971, 1000, 1945, 50_000, MAX_FRAME] {
             let (s, k) = shard_size(len);
             assert!(s.is_multiple_of(2) && s <= MAX_SHARD, "{len}: {s}");
             assert!((k - 1) * s < len && len <= k * s, "{len}: {k} × {s}");
@@ -163,16 +180,19 @@ mod tests {
             k: 2,
             r: 1,
             flags: PREV_FEC,
+            stream: 1,
             shard: &shard,
         };
         let d = f.encode(42);
         assert_eq!(d.len(), FULL_HEADER + 500);
         assert_eq!(datagram::session(&d), Some(42));
         assert_eq!(datagram::kind(&d), Some(datagram::VIDEO));
+        assert_eq!(stream_of(&d), Some(1));
         let back = Fragment::parse(&d).unwrap();
         assert_eq!(back, f);
         assert!(back.prev_fec() && back.is_repair());
-        // 数据报正好是上限那么长
+        // 没有这一路
+        assert!(bad_stream(&f));
         let full = [0u8; MAX_SHARD];
         let big = Fragment {
             len: MAX_SHARD as u32,
@@ -182,7 +202,7 @@ mod tests {
             shard: &full,
             ..f
         };
-        assert_eq!(big.encode(1).len(), datagram::MAX);
+        assert!(big.encode(1).len() <= datagram::MAX);
         assert!(Fragment::parse(&big.encode(1)).is_some());
 
         let bad = |g: Fragment| Fragment::parse(&g.encode(1)).is_none();
@@ -209,9 +229,19 @@ mod tests {
         let mut audio = d.clone();
         audio[8] = datagram::AUDIO;
         assert!(Fragment::parse(&audio).is_none());
+        assert_eq!(stream_of(&audio), None);
         assert!(Fragment::parse(&d[..FULL_HEADER]).is_none());
         // 不认识的标志位不管
         let newer = Fragment { flags: 0x80, ..f };
         assert!(!Fragment::parse(&newer.encode(1)).unwrap().prev_fec());
+    }
+
+    /// 第几路超出了 [`crate::MAX_STREAMS`] 的整个丢掉
+    fn bad_stream(f: &Fragment) -> bool {
+        let g = Fragment {
+            stream: crate::MAX_STREAMS,
+            ..*f
+        };
+        Fragment::parse(&g.encode(1)).is_none()
     }
 }

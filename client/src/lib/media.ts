@@ -3,7 +3,9 @@
 //
 // 头（小端）+ 数据：
 //   0 类型 u8（1 画面 / 2 光标 / 3 声音）  1 标志 u8  2 编码格式 u8（光标：槽位）  3 头的长度 u8（现在是 24）
-//   4 序号 u32  8 宽 u16  10 高 u16  12 热点 x u16  14 热点 y u16  16 采集时间 u64（微秒，被控端时钟）
+//   4 序号 u32  8 宽 u16  10 高 u16  12 热点 x u16（画面：第几路 u8）  14 热点 y u16  16 采集时间 u64（微秒，被控端时钟）
+//
+// 画面的第几路：同时看对方的好几个显示器时每个显示器一路（见 airhand_proto::session 的"多屏"），交给那一路的解码器。
 //
 // 头可以变长：以后的版本把新字段加在第 24 字节之后，负载从"头的长度"处开始。所以负载一定从第 3 个字节给出的位置取
 // （payload），不认识的标志位、保留字节、24 字节之后的部分都不管；头的长度不对的包丢掉（kind 为 0）。
@@ -25,6 +27,8 @@ const CODECS: Codec[] = ["h264", "h265", "av1"];
 
 export interface VideoHeader {
   seq: number;
+  /** 第几路画面（只看一个显示器时是 0）；序号、确认都是每一路各算各的 */
+  stream: number;
   key: boolean;
   codec: Codec;
   width: number;
@@ -75,6 +79,7 @@ export function videoHeader(dv: DataView): VideoHeader | null {
   if (codec === undefined) return null;
   return {
     seq: dv.getUint32(4, true),
+    stream: videoStream(dv),
     key: (dv.getUint8(1) & 1) !== 0,
     codec,
     width: dv.getUint16(8, true),
@@ -102,6 +107,11 @@ export function cursorHeader(dv: DataView): CursorHeader {
       : null,
     cached: (flags & 4) !== 0,
   };
+}
+
+/** 画面包是第几路画面的（编码格式不认识也读得出来：收到就要确认） */
+export function videoStream(dv: DataView): number {
+  return dv.getUint8(12);
 }
 
 /** 画面包的序号（收到就要确认）；不是画面包时为 null */

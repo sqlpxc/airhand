@@ -130,8 +130,12 @@ class ProtocolTest {
         assertSame(want["audio"], Commands.audio(3, true))
         assertSame(want["clipboard"], Commands.clipboard(3, "hi"))
         assertSame(want["disconnect"], Commands.disconnect(3))
-        // Android 不用的：画面确认走 Native.ctlAck，剪贴板由自己同步，还不能把手机的麦克风交给对方
-        assertEquals(setOf("ack", "clipboardSync", "mic"), want.keys - setOf("input", "settings", "keyframe", "display", "audio", "clipboard", "disconnect"))
+        // Android 不用的：画面确认走 Native.ctlAck，剪贴板由自己同步，还不能把手机的麦克风交给对方，
+        // 只看对方的一个显示器（同时看几个是 view）
+        assertEquals(
+            setOf("ack", "clipboardSync", "mic", "view"),
+            want.keys - setOf("input", "settings", "keyframe", "display", "audio", "clipboard", "disconnect"),
+        )
     }
 
     /** connect：控制码加上连接选项（和桌面版、网页版一样的 ConnectOptions） */

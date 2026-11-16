@@ -84,9 +84,11 @@ fn session_messages_keep_their_wire_encoding() {
     golden(ControllerDatagram::Ping { t: 5 }, "82008105");
     golden(ControllerDatagram::Echo { t: 7 }, "82028107");
     golden(
+        // 第 0 路画面（多屏之前只有它）不写路的序号：字节和 v9 一样
         ControllerDatagram::Ack {
             seq: 99,
             arrived: 1000,
+            stream: 0,
         },
         "82018218631903e8",
     );
@@ -139,7 +141,13 @@ fn session_messages_keep_their_wire_encoding() {
         },
         "8201820581820680",
     );
-    golden(ControllerMsg::RequestKeyframe { after: 5 }, "82048105");
+    golden(
+        ControllerMsg::RequestKeyframe {
+            after: 5,
+            stream: 0,
+        },
+        "82048105",
+    );
     golden(
         ControllerMsg::Settings(QualitySettings::default()),
         "82038185181e190fa0190438f500",

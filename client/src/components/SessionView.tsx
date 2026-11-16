@@ -205,6 +205,8 @@ export function SessionView({ s }: { s: RemoteSession }) {
 
   const st = s.stats;
   const live = s.state === "live";
+  // 同时看着好几个显示器（多屏）
+  const showingAll = s.allDisplays && s.shown.length > 1;
   const rtt = st.rttMs != null ? Math.round(st.rttMs) : null;
   const rttClass = rtt == null ? "" : rtt < 60 ? "good" : rtt < 150 ? "ok" : "bad";
 
@@ -287,16 +289,19 @@ export function SessionView({ s }: { s: RemoteSession }) {
             <div className="menu-anchor">
               <button className="tb-btn" onClick={() => toggleMenu("display")} title={t("session.switchDisplay")}>
                 <IconMonitor size={17} />
-                <span>{t("session.display", { n: s.currentDisplay + 1 })}</span>
+                <span>
+                  {showingAll ? t("session.allDisplays") : t("session.display", { n: s.currentDisplay + 1 })}
+                </span>
                 <IconChevron size={14} />
               </button>
               {menu === "display" && (
-                <Dropdown onClose={closeMenu}>
+                <Dropdown onClose={closeMenu} className="display-menu">
                   {s.displays.map((d) => (
                     <button
                       key={d.index}
-                      className={`dd-item ${d.index === s.currentDisplay ? "active" : ""}`}
+                      className={`dd-item ${(showingAll ? s.shown.includes(d.index) : d.index === s.currentDisplay) ? "active" : ""}`}
                       onClick={() => {
+                        // 点一个显示器：只看它
                         s.selectDisplay(d.index);
                         closeMenu();
                         s.focus();
@@ -311,6 +316,29 @@ export function SessionView({ s }: { s: RemoteSession }) {
                       </span>
                     </button>
                   ))}
+                  {s.canShowAll && (
+                    <>
+                      <div className="dd-sep" />
+                      <label className="dd-item toggle">
+                        <span>
+                          {t("session.showAll")}
+                          <span className="muted small block">{t("session.showAllHint")}</span>
+                          {s.displays.length > s.maxStreams && (
+                            <span className="muted small block">{t("session.showAllLimit", { n: s.maxStreams })}</span>
+                          )}
+                        </span>
+                        <input
+                          type="checkbox"
+                          className="switch"
+                          checked={s.allDisplays}
+                          onChange={(e) => {
+                            s.setAllDisplays(e.target.checked);
+                            s.focus();
+                          }}
+                        />
+                      </label>
+                    </>
+                  )}
                 </Dropdown>
               )}
             </div>

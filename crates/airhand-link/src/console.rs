@@ -15,7 +15,7 @@
 //!   加上对会话的操作 [`Command`]（和 Android 一样）。带 `id` 的会收到回复；不带的（输入事件这类高频消息）不回复。
 //!   一条连接上的命令按收到的先后执行（例如按下和松开）；
 //! * 二进制，不走 JSON、不回复：
-//!   * 画面确认（每帧都有）：`1u8 | sid u32 LE | seq u32 LE`（[`parse_ack`]）；
+//!   * 画面确认（每帧都有）：`1u8 | sid u32 LE | seq u32 LE | 第几路 u8`（[`parse_ack`]；第 0 路可以不写最后一个字节）；
 //!   * 麦克风的声音包（每 20 ms 一个，见 [`crate::controller`] 的"麦克风"）：`2u8 | sid u32 LE | 声音包`（[`parse_mic`]，
 //!     声音包是 `airhand_proto::media` 的格式：头 + Opus 包）。
 //!
@@ -95,13 +95,19 @@ pub struct Setup {
     pub clipboard: Option<fn() -> Box<dyn ClipboardSync>>,
 }
 
-/// 控制台发来的二进制画面确认 `1u8 | sid u32 LE | seq u32 LE` → `(sid, seq)`
-pub fn parse_ack(b: &[u8]) -> Option<(u32, u32)> {
-    let [BINARY_ACK, s0, s1, s2, s3, q0, q1, q2, q3] = *b else {
+/// 控制台发来的二进制画面确认 `1u8 | sid u32 LE | seq u32 LE | 第几路 u8` → `(sid, 第几路, seq)`。
+/// 第 0 路可以不写最后一个字节
+pub fn parse_ack(b: &[u8]) -> Option<(u32, u8, u32)> {
+    let (head, stream) = match b.len() {
+        10 => (&b[..9], b[9]),
+        _ => (b, 0),
+    };
+    let [BINARY_ACK, s0, s1, s2, s3, q0, q1, q2, q3] = *head else {
         return None;
     };
     Some((
         u32::from_le_bytes([s0, s1, s2, s3]),
+        stream,
         u32::from_le_bytes([q0, q1, q2, q3]),
     ))
 }
@@ -254,8 +260,8 @@ where
             match msg {
                 WsMessage::Text(text) => console.handle(&text),
                 WsMessage::Binary(b) => {
-                    if let Some((sid, seq)) = parse_ack(&b) {
-                        let _ = console.svc.ack(sid, seq);
+                    if let Some((sid, stream, seq)) = parse_ack(&b) {
+                        let _ = console.svc.ack(sid, stream, seq);
                     } else if let Some((sid, packet)) = parse_mic(&b) {
                         let _ = console.svc.mic(sid, packet);
                     }
@@ -432,8 +438,18 @@ mod tests {
     /// 前端（client/src/lib/ack.ts 的 ackMessage）发的二进制确认
     #[test]
     fn binary_acks() {
-        assert_eq!(parse_ack(&[1, 3, 0, 0, 0, 0x2a, 1, 0, 0]), Some((3, 298)));
+        assert_eq!(
+            parse_ack(&[1, 3, 0, 0, 0, 0x2a, 1, 0, 0, 2]),
+            Some((3, 2, 298))
+        );
+        // 第 0 路可以不写
+        assert_eq!(
+            parse_ack(&[1, 3, 0, 0, 0, 0x2a, 1, 0, 0]),
+            Some((3, 0, 298))
+        );
         assert_eq!(parse_ack(&[2, 3, 0, 0, 0, 0x2a, 1, 0, 0]), None);
+        assert_eq!(parse_ack(&[2, 3, 0, 0, 0, 0x2a, 1, 0, 0, 0]), None);
+        assert_eq!(parse_ack(&[1, 3, 0, 0, 0, 0x2a, 1, 0, 0, 0, 0]), None);
         assert_eq!(parse_ack(&[1, 3, 0, 0, 0]), None);
         assert_eq!(parse_ack(&[]), None);
     }
@@ -562,7 +578,11 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                InputEvent::MouseMove { x: 0.5, y: 0.25 },
+                InputEvent::MouseMove {
+                    x: 0.5,
+                    y: 0.25,
+                    stream: 0
+                },
                 InputEvent::MouseDelta { dx: -2, dy: 3 },
                 InputEvent::ReleaseAll
             ]
@@ -573,7 +593,11 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"ack","sid":2,"seq":99}"#).unwrap();
         assert!(matches!(
             r.call,
-            Call::Session(Command::Ack { sid: 2, seq: 99 })
+            Call::Session(Command::Ack {
+                sid: 2,
+                seq: 99,
+                stream: 0
+            })
         ));
         let r: Request = serde_json::from_str(r#"{"id":4,"cmd":"ping"}"#).unwrap();
         assert!(matches!(r.call, Call::Ping));

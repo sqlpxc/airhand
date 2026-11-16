@@ -57,6 +57,7 @@ AIRHAND_CERT=target/e2e/cert.pem AIRHAND_KEY=target/e2e/key.pem ./target/debug/a
 # client/src-tauri/
 cargo test --lib e2e_roundtrip -- --ignored --nocapture   # 画面（增量帧走前向纠错）/ 编码切换 / 剪贴板 / 声音 / Ping / 断开
 cargo test --lib e2e_reconnect -- --ignored --nocapture   # 服务器重启后取回控制码、更换控制码
+cargo test --lib e2e_multi_display -- --ignored --nocapture  # 同时看两个显示器、再改回只看一个（只有一个显示器时跳过）
 cargo test --lib e2e_mic -- --ignored --nocapture         # Windows：控制端的麦克风经过中转放进 Steam Streaming Microphone
 ```
 

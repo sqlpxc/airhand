@@ -6,7 +6,8 @@
 //! 直连上由 [`accept_direct`] 做（一条直连只属于一个会话）。数据报也一样按会话 ID 和种类分发。
 //!
 //! 一个会话在收的一端是一个 [`Inbox`]：每条通道一个信箱（中转、直连上来的流都放进来，交给 [`crate::merge::Merge`]
-//! 合并），声音、控制、画面（纠错）数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
+//! 合并；画面的每一路是一条通道），声音、控制数据报各一个信箱，画面（纠错）数据报每一路一个。
+//! 往里放东西的是 [`Feed`]（两条路各拿一个）。
 //!
 //! 画面还可以是**帧流**（[`open_frame`]，会话头带 `SessionHeader::FRAME`，见 `airhand_proto::session` 的"帧流"）：
 //! 每帧一条流，同一条通道上来很多条。它们和普通的流放进同一个信箱，带着 [`LaneStream::frame`]。
@@ -59,36 +60,50 @@ const EARLY_TTL: Duration = Duration::from_secs(10);
 /// 往一个会话放东西（见模块说明）
 #[derive(Clone)]
 pub struct Feed {
-    lanes: [mpsc::UnboundedSender<LaneStream>; SessionLane::ALL.len()],
+    /// 按通道的编号（[`SessionLane::number`]）
+    lanes: [mpsc::UnboundedSender<LaneStream>; SessionLane::COUNT],
     audio: mpsc::Sender<Bytes>,
     control: mpsc::Sender<(Via, Bytes)>,
-    video: mpsc::Sender<(Via, Bytes)>,
+    /// 画面的每一路
+    video: Vec<mpsc::Sender<(Via, Bytes)>>,
 }
 
 /// 一个会话收的一端（见模块说明）
 pub struct Inbox {
     pub control: LaneStreams,
-    pub video: LaneStreams,
+    /// 画面的每一路（第 `i` 项是第 `i` 路，一共 [`airhand_proto::MAX_STREAMS`] 路）
+    pub video: Vec<LaneStreams>,
     pub bulk: LaneStreams,
     /// 声音数据报（整个数据报，还是密文）
     pub audio: mpsc::Receiver<Bytes>,
     /// 控制数据报（同上）和它从哪条路来（探测要从同一条路弹回去）。直连通着时 Ping、Pong、确认两条路各来一份，
     /// 后到的那份解密时被当成重放丢掉
     pub datagrams: mpsc::Receiver<(Via, Bytes)>,
-    /// 画面的纠错数据报（整个数据报）和它从哪条路来：交给画面的合并（见 `crate::fec`）
-    pub fec: mpsc::Receiver<(Via, Bytes)>,
+    /// 画面的纠错数据报（整个数据报）和它从哪条路来，每一路一个：交给那一路画面的合并（见 `crate::fec`）
+    pub fec: Vec<mpsc::Receiver<(Via, Bytes)>>,
     /// 直连上来的流、数据报也放进来
     pub feed: Feed,
 }
 
 impl Inbox {
     pub fn new() -> Self {
-        let (control_tx, control) = mpsc::unbounded_channel();
-        let (video_tx, video) = mpsc::unbounded_channel();
-        let (bulk_tx, bulk) = mpsc::unbounded_channel();
+        let (lanes, mut streams): (Vec<_>, Vec<_>) = (0..SessionLane::COUNT)
+            .map(|_| mpsc::unbounded_channel())
+            .unzip();
+        let mut take = |lane: SessionLane| {
+            let (_, rx) = mpsc::unbounded_channel();
+            std::mem::replace(&mut streams[lane.number() as usize], rx)
+        };
+        let control = take(SessionLane::Control);
+        let bulk = take(SessionLane::Bulk);
+        let video = (0..airhand_proto::MAX_STREAMS)
+            .map(|s| take(SessionLane::Video(s)))
+            .collect();
         let (audio_tx, audio) = mpsc::channel(AUDIO_QUEUE);
         let (datagrams_tx, datagrams) = mpsc::channel(CONTROL_QUEUE);
-        let (fec_tx, fec) = mpsc::channel(VIDEO_QUEUE);
+        let (fec_tx, fec) = (0..airhand_proto::MAX_STREAMS)
+            .map(|_| mpsc::channel(VIDEO_QUEUE))
+            .unzip();
         Self {
             control,
             video,
@@ -97,7 +112,9 @@ impl Inbox {
             datagrams,
             fec,
             feed: Feed {
-                lanes: [control_tx, video_tx, bulk_tx],
+                lanes: lanes
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("one sender per lane")),
                 audio: audio_tx,
                 control: datagrams_tx,
                 video: fec_tx,
@@ -126,7 +143,7 @@ impl Feed {
             return stop(recv);
         }
         let s = LaneStream { recv, via, frame };
-        if let Err(mpsc::error::SendError(s)) = self.lanes[lane as usize].send(s) {
+        if let Err(mpsc::error::SendError(s)) = self.lanes[lane.number() as usize].send(s) {
             stop(s.recv);
         }
     }
@@ -141,7 +158,11 @@ impl Feed {
                 let _ = self.control.try_send((via, d));
             }
             Some(datagram::VIDEO) => {
-                let _ = self.video.try_send((via, d));
+                // 交给它那一路（头里写着是第几路）；没有那一路的丢掉
+                let to = airhand_proto::fec::stream_of(&d).and_then(|s| self.video.get(s as usize));
+                if let Some(tx) = to {
+                    let _ = tx.try_send((via, d));
+                }
             }
             _ => {}
         }

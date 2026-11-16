@@ -52,8 +52,8 @@ pub use clock::InputClock;
 pub use cursor::CursorCache;
 pub use queue::{Encoded, Outbox, SendError};
 pub use session::{
-    APPROVAL_TIMEOUT, Acks, ApprovalSlots, MAX_PENDING_APPROVALS, MicSink, PEER_TIMEOUT, Platform,
-    Request, Senders, Start, serve,
+    APPROVAL_TIMEOUT, Acks, ApprovalSlots, Flows, MAX_PENDING_APPROVALS, MicSink, PEER_TIMEOUT,
+    Platform, Request, Senders, Start, resolve_view, serve,
 };
 pub use streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 

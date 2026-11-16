@@ -37,6 +37,20 @@ export const contract = {
       "sid": 3
     },
     {
+      "cmd": "view",
+      "sid": 3,
+      "streams": [
+        {
+          "display": 1,
+          "maxShort": 720
+        },
+        {
+          "display": 0,
+          "maxShort": 0
+        }
+      ]
+    },
+    {
       "cmd": "audio",
       "enabled": true,
       "sid": 3

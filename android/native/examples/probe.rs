@@ -61,7 +61,7 @@ impl SessionUi for Ui {
                 *c.size.lock().unwrap() = (v.codec, v.width, v.height);
                 // 浏览器模式：收到就确认
                 if let Some((svc, sid)) = self.1.lock().unwrap().as_ref() {
-                    let _ = svc.ack(*sid, v.seq);
+                    let _ = svc.ack(*sid, v.stream, v.seq);
                 }
             }
             Some(Kind::Cursor) => {
@@ -189,7 +189,7 @@ fn main() {
     } else if let Some((x, y)) = tap {
         println!("tap at {x},{y}");
         input(vec![
-            InputEvent::MouseMove { x, y },
+            InputEvent::MouseMove { x, y, stream: 0 },
             InputEvent::MouseButton {
                 button: MouseButton::Left,
                 down: true,

@@ -91,7 +91,7 @@ impl MacInjector {
         self.check_permission();
         for ev in events {
             match ev {
-                InputEvent::MouseMove { x, y } => {
+                InputEvent::MouseMove { x, y, .. } => {
                     let p = self.global_point(display, *x, *y);
                     self.mouse_move(p);
                 }
@@ -511,13 +511,21 @@ mod tests {
             .unwrap();
         let m = macos::display(d.index).unwrap();
         let mut inj = MacInjector::default();
-        inj.handle(&[InputEvent::MouseMove { x: 0.5, y: 0.5 }], &d);
+        inj.handle(
+            &[InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                stream: 0,
+            }],
+            &d,
+        );
         std::thread::sleep(Duration::from_millis(100));
         let after = here();
         inj.handle(
             &[InputEvent::MouseMove {
                 x: ((before.x - m.x) / m.points_w) as f32,
                 y: ((before.y - m.y) / m.points_h) as f32,
+                stream: 0,
             }],
             &d,
         );

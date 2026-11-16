@@ -238,6 +238,10 @@ pub struct ControllerIntro {
     /// 开始时要不要声音（之后的变化是 `ControllerMsg::Audio`）
     #[n(6)]
     pub audio: bool,
+    /// 开始时看哪几个显示器（见 [`crate::session`] 的"多屏"；之后的变化是 `ControllerMsg::View`）。
+    /// 空的是只看主显示器（第一次连的时候控制端还不知道对方有哪些显示器）
+    #[cbor(n(7), default)]
+    pub view: Vec<crate::session::StreamView>,
 }
 
 /// 被控端的决定（加密，见 [`HandshakeReply::verdict`]）

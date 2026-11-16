@@ -91,6 +91,8 @@ impl OpenH264Encoder {
                 hardware: false,
                 width: w,
                 height: h,
+                // 第几路画面由编码管线填（见 pipeline）
+                stream: 0,
             },
             kbps,
             epoch: Instant::now(),

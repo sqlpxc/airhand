@@ -11,8 +11,8 @@
 use airhand_link::controller::{Command, ConnectOptions};
 use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
-    Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, SystemAction,
-    TouchPhase, VideoPriority, VideoTransport,
+    Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, StreamView,
+    SystemAction, TouchPhase, VideoPriority, VideoTransport,
 };
 use serde_json::{Value, json};
 
@@ -27,7 +27,12 @@ fn packet(header: &[u8], payload: &[u8]) -> Vec<u8> {
 
 fn inputs() -> Vec<InputEvent> {
     vec![
-        InputEvent::MouseMove { x: 0.5, y: 0.25 },
+        // 第 0 路画面上的位置不写 stream（只看一个显示器的界面不用管它）
+        InputEvent::MouseMove {
+            x: 0.5,
+            y: 0.25,
+            stream: 0,
+        },
         InputEvent::MouseDelta { dx: -3, dy: 7 },
         InputEvent::MouseButton {
             button: MouseButton::Right,
@@ -87,11 +92,25 @@ fn commands() -> Vec<(Value, Command)> {
         ),
         (
             json!({ "cmd": "keyframe", "sid": 3 }),
-            Command::Keyframe { sid: 3 },
+            Command::Keyframe { sid: 3, stream: 0 },
         ),
         (
             json!({ "cmd": "display", "sid": 3, "index": 1 }),
             Command::Display { sid: 3, index: 1 },
+        ),
+        // 多屏同时显示：第 i 项是第 i 路画面（Android 只看一个显示器，不用它）
+        (
+            json!({ "cmd": "view", "sid": 3, "streams": [{ "display": 1, "maxShort": 720 }, { "display": 0, "maxShort": 0 }] }),
+            Command::View {
+                sid: 3,
+                streams: vec![
+                    StreamView {
+                        display: 1,
+                        max_short: 720,
+                    },
+                    StreamView::display(0),
+                ],
+            },
         ),
         (
             json!({ "cmd": "audio", "sid": 3, "enabled": true }),
@@ -123,7 +142,11 @@ fn commands() -> Vec<(Value, Command)> {
         ),
         (
             json!({ "cmd": "ack", "sid": 3, "seq": 99 }),
-            Command::Ack { sid: 3, seq: 99 },
+            Command::Ack {
+                sid: 3,
+                seq: 99,
+                stream: 0,
+            },
         ),
         (
             json!({ "cmd": "disconnect", "sid": 3 }),
@@ -148,6 +171,7 @@ fn connect_options() -> (Value, ConnectOptions) {
             pairing: Some("482913".into()),
             settings: settings(),
             audio: true,
+            view: Vec::new(),
         },
     )
 }
@@ -156,6 +180,7 @@ fn fixture() -> Value {
     let capture_us = 123_456_789_012u64;
     let video = VideoHeader {
         seq: 9,
+        stream: 0,
         key: true,
         codec: Codec::AV1,
         width: 1920,
@@ -170,6 +195,7 @@ fn fixture() -> Value {
     };
     let delta = VideoHeader {
         seq: 10,
+        stream: 0,
         key: false,
         codec: Codec::H265,
         width: 1280,
@@ -180,9 +206,21 @@ fn fixture() -> Value {
     // 带参考帧扩展的增量帧（协议 v10，头的长度是 30）：界面不用管它，照样按头的长度找负载
     let referenced = VideoHeader {
         seq: 11,
+        stream: 0,
         reference: Some(10),
         capture_us: capture_us + 33_333,
         ..delta
+    };
+    // 第 1 路画面（多屏同时显示）的关键帧：第几路在第 12 个字节，界面交给那一路的解码器
+    let second = VideoHeader {
+        seq: 1,
+        stream: 1,
+        key: true,
+        codec: Codec::H264,
+        width: 1280,
+        height: 1024,
+        capture_us: capture_us + 5_000,
+        reference: None,
     };
     let shape = CursorShape {
         width: 2,
@@ -249,6 +287,11 @@ fn fixture() -> Value {
                 "name": "delta frame with a reference", "hex": hex(&packet(&referenced.encode(), &[2, 3])),
                 "kind": 1, "seq": 11, "key": false, "codec": "h265", "width": 1280, "height": 720,
                 "captureUs": capture_us + 33_333, "payload": "0203"
+            },
+            {
+                "name": "keyframe of the second stream", "hex": hex(&packet(&second.encode(), &[4])),
+                "kind": 1, "seq": 1, "stream": 1, "key": true, "codec": "h264", "width": 1280, "height": 1024,
+                "captureUs": capture_us + 5_000, "payload": "04"
             },
             {
                 "name": "audio", "hex": hex(&packet(&audio.encode(), &[0xfc, 0xff, 0xfe])),
@@ -394,7 +437,9 @@ fn media_packets_decode() {
     assert_eq!(media::payload(&v), Some(&[7, 8, 9][..]));
     let r = unhex(f["media"][2]["hex"].as_str().unwrap());
     assert_eq!(VideoHeader::decode(&r).unwrap().reference, Some(10));
-    let a = unhex(f["media"][3]["hex"].as_str().unwrap());
+    let s = unhex(f["media"][3]["hex"].as_str().unwrap());
+    assert_eq!(VideoHeader::decode(&s).unwrap().stream, 1);
+    let a = unhex(f["media"][4]["hex"].as_str().unwrap());
     assert!(AudioHeader::decode(&a).unwrap().start);
     for m in f["media"].as_array().unwrap() {
         let p = unhex(m["hex"].as_str().unwrap());

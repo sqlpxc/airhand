@@ -534,11 +534,15 @@ impl Capturer for DxgiCapturer {
             self.hw_cursor = info.PointerPosition.Visible.as_bool();
         }
         if info.LastMouseUpdateTime != 0 || !self.hw_cursor {
-            update.cursor_visibility = Some(if self.hw_cursor {
+            let visibility = if self.hw_cursor {
                 CursorVisibility::Shown
             } else {
                 software_cursor(&self.desktop)
-            });
+            };
+            update.cursor_visibility = Some(visibility);
+            // 硬件光标不在这块显示器上、显示着：它在别的显示器上（见 software_cursor）。同时看好几个显示器时
+            // 这块显示器报的不算数（见 CursorSnapshot::here）
+            update.cursor_here = Some(self.hw_cursor || visibility != CursorVisibility::Shown);
         }
         if info.PointerShapeBufferSize > 0 {
             update.cursor_shape = self.pointer_shape(info.PointerShapeBufferSize);

@@ -1,4 +1,4 @@
-//! 编码管线（每个会话一个线程）：取最新帧 → 节流 → 在途控制 → 编码 → 发送。
+//! 编码管线（每个会话的每一路画面一个线程，见 `airhand_proto::session` 的"多屏"）：取最新帧 → 节流 → 在途控制 → 编码 → 发送。
 //!
 //! 低延迟的关键：
 //! * 永远只编码**最新**的一帧，旧帧直接丢弃，不排队；
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_link::flow::Flow;
-use airhand_link::host::{CursorCache, Outbox, SendError};
+use airhand_link::host::{Outbox, SendError};
 use airhand_link::refs::Plan;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{HostMsg, Notice, QualitySettings};
@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::capture::{self, Frame};
+use super::cursor::{Reported, SharedCursor};
 use super::encoder::{Encoder, LtrControl};
 use super::pace::Pacer;
 
@@ -50,21 +51,38 @@ struct Ctrl {
     last_key: AtomicU32,
     stop: AtomicBool,
     flow: Arc<Flow>,
-    /// 控制端缓存了哪些光标形状（整个会话一份）
-    cursors: Arc<Mutex<CursorCache>>,
+    /// 会话的光标（整个会话一份，几路画面谁报的算数见 [`SharedCursor`]）
+    cursor: Arc<Mutex<SharedCursor>>,
+}
+
+/// 一路画面的编码管线要的东西
+pub struct Config {
+    /// 第几路画面（写进画面包头和编码器信息）
+    pub stream: u8,
+    /// 看哪个显示器
+    pub display: u8,
+    /// 这一路的画质（短边上限已经和这一路按显示的大小要的取了较严的）
+    pub settings: QualitySettings,
+    /// 这一路画面的发送队列
+    pub video: mpsc::Sender<Bytes>,
+    /// 控制消息（编码器、采集失败和光标状态走控制通道，光标图像走大块通道：形状图像有几十 KB，不能挡控制消息）
+    pub out: Outbox,
+    /// 这一路的在途控制和码率（会话一开始就建好，换显示器时接着用）
+    pub flow: Arc<Flow>,
+    pub cursor: Arc<Mutex<SharedCursor>>,
 }
 
 impl Pipeline {
-    /// `video`：画面流的发送队列；`out`：控制消息（编码器、采集失败和光标状态走控制通道，光标图像走大块通道：
-    /// 形状图像有几十 KB，不能挡控制消息）；`cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
-    pub fn start(
-        display: u8,
-        settings: QualitySettings,
-        video: mpsc::Sender<Bytes>,
-        out: Outbox,
-        flow: Arc<Flow>,
-        cursors: Arc<Mutex<CursorCache>>,
-    ) -> Self {
+    pub fn start(config: Config) -> Self {
+        let Config {
+            stream,
+            display,
+            settings,
+            video,
+            out,
+            flow,
+            cursor,
+        } = config;
         let ctrl = Arc::new(Ctrl {
             settings: Mutex::new(settings),
             settings_ver: AtomicU64::new(0),
@@ -72,12 +90,12 @@ impl Pipeline {
             last_key: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             flow,
-            cursors,
+            cursor,
         });
         let c = ctrl.clone();
         let thread = std::thread::Builder::new()
-            .name("airhand-encoder".into())
-            .spawn(move || run(c, display, video, out))
+            .name(format!("airhand-encoder-{stream}"))
+            .spawn(move || run(c, stream, display, video, out))
             .expect("spawn encoder");
         Self {
             ctrl,
@@ -154,7 +172,7 @@ fn send_msg_cancellable(out: &Outbox, stop: &AtomicBool, msg: &HostMsg) -> bool 
     }
 }
 
-fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
+fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
@@ -177,7 +195,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     // 补画质：还要补几次、最早什么时候补
     let mut refine_left = 0u8;
     let mut refine_due = Instant::now();
-    info!(screen, ?settings, "encoding pipeline started");
+    info!(stream, screen, ?settings, "encoding pipeline started");
 
     // 控制通道的队列满了（网络跟不上）就等着，直到管线被停下
     let send = |msg: &HostMsg| send_msg_cancellable(&out, &ctrl.stop, msg);
@@ -228,6 +246,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
 
         // 光标变化：可见性和形状引用走控制通道（只留最新值）；控制端还没有的形状（动画光标第一次转到的帧）
         // 先把图像排进大块通道，和剪贴板共用：队列满了不等，下一轮再发最新形状（见 CursorCache）。
+        // 同时看好几个显示器时只听光标所在的那一路（见 SharedCursor）
         if cs > cursor_seq {
             cursor_seq = cs;
             cursor_pending = true;
@@ -238,9 +257,19 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 Some(s) if c.shape_seq > shape_seq => Some(s.as_ref()),
                 _ => None,
             };
-            match ctrl.cursors.lock().unwrap().send(&out, c.visibility, shape) {
-                Ok(()) => {
+            let reported =
+                ctrl.cursor
+                    .lock()
+                    .unwrap()
+                    .report(stream, c.here, &out, c.visibility, shape);
+            match reported {
+                Ok(Reported::Sent) => {
                     shape_seq = c.shape_seq;
+                    cursor_pending = false;
+                }
+                // 不归这一路管：之后归它管的时候形状要重发一遍（别的一路可能换过形状）
+                Ok(Reported::Ignored) => {
+                    shape_seq = 0;
                     cursor_pending = false;
                 }
                 Err(e) => {
@@ -319,7 +348,9 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 gpu_failures < 2,
             ) {
                 Ok(e) => {
-                    if !send(&HostMsg::Encoder(e.info().clone())) {
+                    let mut info = e.info().clone();
+                    info.stream = stream;
+                    if !send(&HostMsg::Encoder(info)) {
                         break;
                     }
                     enc = Some(e);
@@ -392,6 +423,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 }
                 let header = VideoHeader {
                     seq,
+                    stream,
                     key: ef.key,
                     codec: info.codec,
                     width: info.width as u16,
@@ -428,7 +460,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         }
         last_frame = Some(frame);
     }
-    info!(screen, "encoding pipeline stopped");
+    info!(stream, screen, "encoding pipeline stopped");
 }
 
 #[cfg(test)]

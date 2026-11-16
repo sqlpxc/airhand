@@ -236,6 +236,7 @@ mod tests {
         assert_eq!(rx.unbundle(&[1, 2, 3], &mut out), 0);
         let video = airhand_proto::media::VideoHeader {
             seq: 1,
+            stream: 0,
             key: true,
             codec: airhand_proto::session::Codec::H264,
             width: 2,

@@ -54,6 +54,15 @@ export interface DisplayInfo {
   primary: boolean;
 }
 
+/**
+ * 一路画面看哪个显示器（airhand_proto::session::StreamView，见那里的"多屏"）：`display` 是 DisplayInfo.index，
+ * `maxShort` 是按这一路显示的大小要的短边上限（0 = 不限，和画质设置里的取较严的）
+ */
+export interface StreamView {
+  display: number;
+  maxShort: number;
+}
+
 export type ServerState =
   | { state: "connecting" }
   | { state: "connected" }
@@ -189,6 +198,8 @@ export interface ConnectOptions {
   settings: QualitySettings;
   /** 开始时要不要声音（同上） */
   audio: boolean;
+  /** 开始时看哪几个显示器（第 i 项是第 i 路画面）；不带、空的是只看主显示器（第一次连时还不知道对方有哪些显示器） */
+  view?: StreamView[];
 }
 
 /** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
@@ -220,7 +231,12 @@ export type SessionEvent =
       os: string;
       version: string;
       displays: DisplayInfo[];
+      /** 第 0 路画面是哪个显示器 */
       current: number;
+      /** 每一路画面是哪个显示器（第 i 项是第 i 路） */
+      shown: number[];
+      /** 对方最多能同时发几路画面（同时看几个显示器） */
+      maxStreams: number;
       codecs: Codec[];
       platform: Platform;
       /** 能接收多点触摸（控制台用鼠标，不发触摸） */
@@ -230,7 +246,7 @@ export type SessionEvent =
     }
   /** 被控端在等它的用户同意这次连接，同意之后才会收到 hello */
   | { type: "awaitingApproval" }
-  | { type: "displays"; displays: DisplayInfo[]; current: number }
+  | { type: "displays"; displays: DisplayInfo[]; current: number; shown: number[] }
   | {
       type: "stats";
       fps: number;
@@ -244,7 +260,8 @@ export type SessionEvent =
       /** 这一秒里有画面是纠错的数据报拼回来的（前向纠错正在用） */
       fec: boolean;
     }
-  | { type: "encoder"; codec: Codec; name: string; hardware: boolean; width: number; height: number }
+  /** 第 stream 路画面的编码器 */
+  | { type: "encoder"; stream: number; codec: Codec; name: string; hardware: boolean; width: number; height: number }
   | { type: "notice"; notice: RemoteNotice }
   /** 被控端复制的文本（只有网页版会收到，由 backend/web.ts 处理） */
   | { type: "clipboard"; text: string }
@@ -258,8 +275,8 @@ export type TouchPhase = "down" | "move" | "up" | "cancel";
 
 /** 与 airhand_proto::session::InputEvent 对应（以 type 区分） */
 export type InputEvent =
-  /** 移到这个位置（0..1，相对当前显示器的画面） */
-  | { type: "mouseMove"; x: number; y: number }
+  /** 移到这个位置（0..1，相对第 stream 路画面；第 0 路不写） */
+  | { type: "mouseMove"; x: number; y: number; stream?: number }
   /** 相对移动（被控端光标隐藏时，例如游戏里转视角）：鼠标的原始计数，约等于被控端的像素 */
   | { type: "mouseDelta"; dx: number; dy: number }
   | { type: "mouseButton"; button: MouseButton; down: boolean }
@@ -275,10 +292,12 @@ export type InputEvent =
 export type Command =
   | { cmd: "input"; sid: number; events: InputEvent[] }
   | { cmd: "settings"; sid: number; settings: QualitySettings }
-  /** 请被控端马上编一个关键帧 */
-  | { cmd: "keyframe"; sid: number }
-  /** 切换到被控端的另一个显示器 */
+  /** 请被控端马上给第 stream 路画面编一个关键帧（不写是第 0 路） */
+  | { cmd: "keyframe"; sid: number; stream?: number }
+  /** 只看被控端的第 index 个显示器 */
   | { cmd: "display"; sid: number; index: number }
+  /** 看被控端的哪几个显示器：第 i 项是第 i 路画面（多屏同时显示） */
+  | { cmd: "view"; sid: number; streams: StreamView[] }
   /** 开启 / 关闭被控端的声音 */
   | { cmd: "audio"; sid: number; enabled: boolean }
   /** 打开 / 关闭本机的麦克风（打开之后 Worker 把编好的声音包发给控制端服务，见 media.ts 的 micMessage） */
@@ -288,7 +307,7 @@ export type Command =
   /** 打开 / 关闭剪贴板同步 */
   | { cmd: "clipboardSync"; sid: number; enabled: boolean }
   /** 收到了第 seq 帧画面（累积确认；控制台的 Worker 收到画面时自己发，走二进制，见 ack.ts） */
-  | { cmd: "ack"; sid: number; seq: number }
+  | { cmd: "ack"; sid: number; seq: number; stream?: number }
   | { cmd: "disconnect"; sid: number };
 
 /** 控制台与控制端服务之间的通道。会话的部分两种运行方式共用（console.ts 的 ConsoleLink） */

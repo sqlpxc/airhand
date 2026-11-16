@@ -24,7 +24,10 @@ test("媒体包：头和数据按 media.ts 解析，负载从头里写的长度�
     assert.equal(hex(media.payload(pkt, dv)), m.payload, m.name);
     if (m.kind === media.VIDEO) {
       const h = media.videoHeader(dv);
-      assert.deepEqual(h, { seq: m.seq, key: m.key, codec: m.codec, width: m.width, height: m.height, captureUs: m.captureUs }, m.name);
+      // 第几路画面（多屏）：样例里不写就是第 0 路
+      const stream = m.stream ?? 0;
+      assert.deepEqual(h, { seq: m.seq, stream, key: m.key, codec: m.codec, width: m.width, height: m.height, captureUs: m.captureUs }, m.name);
+      assert.equal(media.videoStream(dv), stream);
       assert.equal(media.videoSeq(dv), m.seq);
     } else if (m.kind === media.AUDIO) {
       assert.deepEqual(media.audioHeader(dv), { seq: m.seq, start: m.start, captureUs: m.captureUs }, m.name);
@@ -66,7 +69,11 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
   const button = { type: "mouseButton", button: "right", down: true };
   assert.deepEqual(events[2], button);
   const cmds = commands.map((c) => c.cmd).sort();
-  assert.deepEqual(cmds, ["ack", "audio", "clipboard", "clipboardSync", "disconnect", "display", "input", "keyframe", "mic", "settings"]);
+  assert.deepEqual(cmds, ["ack", "audio", "clipboard", "clipboardSync", "disconnect", "display", "input", "keyframe", "mic", "settings", "view"]);
+  // 多屏：第 i 项是第 i 路画面，每一路带着按显示的大小要的短边上限
+  const view = commands.find((c) => c.cmd === "view");
+  assert.deepEqual(view, { cmd: "view", sid: 3, streams: [{ display: 1, maxShort: 720 }, { display: 0, maxShort: 0 }] });
+  assert.ok(fixture.media.some((m: { stream?: number }) => (m.stream ?? 0) > 0), "有一个不是第 0 路的画面包");
   const settings = commands.find((c) => c.cmd === "settings");
   assert.deepEqual(settings, {
     cmd: "settings",

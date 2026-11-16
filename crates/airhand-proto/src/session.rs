@@ -111,6 +111,28 @@
 //!   同样带着之前几包的副本，见 [`crate::media`] 的"声音数据报"）；关掉时也发 [`ControllerMsg::Mic`]。
 //!   被控端只在打开着的时候接（同一时刻只给一个控制端，后来的是 [`MicState::Busy`]）；
 //! * 被控端没有声音放进去的时候虚拟麦克风里是静音。
+//!
+//! # 多屏
+//!
+//! 被控端有好几个显示器时，控制端可以同时看、同时操作其中几个（默认只看一个）。每个显示器是一**路**画面：
+//!
+//! * 第 `i` 路走画面通道的第 `i` 路（[`crate::SessionLane::Video`]，每一路一条通道、一把密钥、一串计数），
+//!   画面包头里也写着它是第几路（[`crate::media`] 的头）。每一路有自己的编码器、在途控制和码率、参考帧、帧流、
+//!   纠错，和只有一路时一模一样，互不影响：一路丢了帧只恢复这一路；
+//! * 控制端用 [`ControllerMsg::View`] 说看哪几个显示器（第 `i` 项是第 `i` 路），以及每一路按显示的大小要多大的画面
+//!   （[`StreamView::max_short`]，和画质设置里的短边上限取较严的）。开始时看哪几个在握手里
+//!   （[`crate::handshake::ControllerIntro::view`]，空的是只看主显示器）。被控端最多同时发 [`HostHello::streams`] 路
+//!   （不超过 [`crate::MAX_STREAMS`]），多出来的、重复的、不存在的显示器不要。[`ControllerMsg::SelectDisplay`] 是只看一个
+//!   显示器的简便说法（这一路的大小只看画质设置）；
+//! * 被控端在 [`HostMsg::Displays`] 里告诉控制端现在每一路是哪个显示器（[`HostMsg::Displays::shown`]，显示器插拔时
+//!   跟着它走，拔掉了就不要那一路）；
+//! * 和画面有关的反馈都带着是第几路：确认（[`ControllerDatagram::Ack::stream`]）、等不到帧了
+//!   （[`ControllerDatagram::Lost::stream`]）、收得怎么样（[`ControllerDatagram::Report`]）、要关键帧
+//!   （[`ControllerMsg::RequestKeyframe::stream`]）、编码器（[`EncoderInfo::stream`]）；
+//! * 绝对坐标的鼠标移动说的是第几路画面上的位置（[`InputEvent::MouseMove::stream`]）。键盘、相对移动和画面无关；
+//! * 画质设置（帧率、码率、编码格式……）对每一路分别生效；光标、声音、剪贴板是整个会话一份。
+//!
+//! 第 0 路的这些字段都是 0、不写进线上的数组：只看一个显示器时和没有多屏之前发的字节一样。
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -130,13 +152,17 @@ pub enum HostMsg {
     /// 正在等被控端的用户同意这次连接（见模块说明）
     #[n(2)]
     AwaitingApproval,
-    /// 显示器列表或当前显示器变化。
+    /// 显示器列表或者正在看的显示器变了。
     #[n(4)]
     Displays {
         #[n(0)]
         displays: Vec<DisplayInfo>,
+        /// 第 0 路画面是哪个显示器（`displays` 里的序号）
         #[n(1)]
         current: u8,
+        /// 每一路画面是哪个显示器：第 `i` 项是第 `i` 路（见模块说明的"多屏"），第 0 项就是 `current`
+        #[cbor(n(2), default)]
+        shown: Vec<u8>,
     },
     /// 给控制端的提示（例如采集失败）。不认识的提示（对方版本新增的）是 `None`：不显示。发的时候总是 `Some`
     #[n(5)]
@@ -236,6 +262,11 @@ impl HostMsg {
             | HostMsg::Mic { .. } => SessionLane::Control,
         }
     }
+}
+
+/// 第 0 路（只看一个显示器时）的这一项不写进线上的数组（见模块说明的"多屏"）
+pub(crate) fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// 被控端给控制端的提示。
@@ -361,6 +392,10 @@ pub struct EncoderInfo {
     pub width: u32,
     #[n(4)]
     pub height: u32,
+    /// 第几路画面的编码器（见模块说明的"多屏"）
+    #[cbor(n(5), skip_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stream: u8,
 }
 
 #[derive(Encode, Decode, Debug, Clone)]
@@ -374,6 +409,7 @@ pub struct HostHello {
     pub version: String,
     #[n(3)]
     pub displays: Vec<DisplayInfo>,
+    /// 第 0 路画面是哪个显示器（`displays` 里的序号）
     #[n(4)]
     pub current_display: u8,
     /// 被控端可用的编码格式（硬件或软件）。控制端不认识的（`Unknown`）不用管
@@ -388,6 +424,52 @@ pub struct HostHello {
     /// 支持的系统操作（[`InputEvent::System`]），控制端只显示这些。控制端不认识的（`Unknown`）不显示
     #[n(8)]
     pub actions: Vec<SystemAction>,
+    /// 每一路画面是哪个显示器（见 [`HostMsg::Displays::shown`]）
+    #[cbor(n(9), default)]
+    pub shown: Vec<u8>,
+    /// 最多能同时发几路画面（同时看几个显示器，见模块说明的"多屏"）。不超过 [`crate::MAX_STREAMS`]；0 和 1 一样：
+    /// 只能看一个
+    #[cbor(n(10), default)]
+    pub streams: u8,
+}
+
+impl HostHello {
+    /// 最多能同时看几个显示器（至少 1 个，不超过 [`crate::MAX_STREAMS`]）
+    pub fn max_streams(&self) -> u8 {
+        self.streams.clamp(1, crate::MAX_STREAMS)
+    }
+}
+
+/// 一路画面看哪个显示器（[`ControllerMsg::View`]，见模块说明的"多屏"）。JSON（界面传来的）是 camelCase
+#[derive(Encode, Decode, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamView {
+    /// 显示器的序号（[`DisplayInfo::index`]）
+    #[n(0)]
+    pub display: u8,
+    /// 这一路画面的短边上限：控制端按它显示的大小算的（0 = 不限）。被控端和画质设置里的
+    /// [`QualitySettings::max_short`] 取较严的
+    #[cbor(n(1), default)]
+    #[serde(default)]
+    pub max_short: u16,
+}
+
+impl StreamView {
+    /// 第 `display` 个显示器，大小只看画质设置
+    pub fn display(display: u8) -> Self {
+        Self {
+            display,
+            max_short: 0,
+        }
+    }
+}
+
+/// 两个短边上限取较严的（0 = 不限）
+pub fn stricter_short(a: u16, b: u16) -> u16 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
 }
 
 open_enum! {
@@ -542,13 +624,17 @@ pub enum ControllerMsg {
     /// 画质设置变了（开始时的设置在握手里，见 [`crate::handshake::ControllerIntro`]）
     #[n(3)]
     Settings(#[n(0)] QualitySettings),
-    /// 要一个关键帧。`after`：控制端收到的最后一帧的序号（还没收到过时为 0），被控端在这之后发过关键帧就不再编
+    /// 要一个关键帧。`after`：控制端收到的这一路的最后一帧的序号（还没收到过时为 0），被控端在这之后发过关键帧就不再编
     /// （见模块说明的"关键帧"）
     #[n(4)]
     RequestKeyframe {
         #[n(0)]
         after: u32,
+        /// 第几路画面（见模块说明的"多屏"）
+        #[cbor(n(1), skip_if = "is_zero")]
+        stream: u8,
     },
+    /// 只看第 `index` 个显示器（[`ControllerMsg::View`] 的简便说法，这一路的大小只看画质设置）
     #[n(5)]
     SelectDisplay {
         #[n(0)]
@@ -576,6 +662,12 @@ pub enum ControllerMsg {
         #[n(0)]
         enabled: bool,
     },
+    /// 看哪几个显示器：第 `i` 项是第 `i` 路画面（见模块说明的"多屏"）。空的是只看主显示器
+    #[n(11)]
+    View {
+        #[n(0)]
+        streams: Vec<StreamView>,
+    },
 }
 
 impl ControllerMsg {
@@ -586,6 +678,7 @@ impl ControllerMsg {
             | Self::Settings(_)
             | Self::RequestKeyframe { .. }
             | Self::SelectDisplay { .. }
+            | Self::View { .. }
             | Self::Audio { .. }
             | Self::Direct(_)
             | Self::Mic { .. } => SessionLane::Control,
@@ -617,6 +710,9 @@ pub enum ControllerDatagram {
         seq: u32,
         #[n(1)]
         arrived: u64,
+        /// 第几路画面（见模块说明的"多屏"）：每一路各自确认
+        #[cbor(n(2), skip_if = "is_zero")]
+        stream: u8,
     },
     /// 回答 [`HostDatagram::Probe`]：`t` 原样带回，从收到探测的那条路发回去
     #[n(2)]
@@ -631,12 +727,20 @@ pub enum ControllerDatagram {
     Lost {
         #[n(0)]
         decoded: u32,
+        /// 第几路画面（见模块说明的"多屏"）：只恢复这一路
+        #[cbor(n(1), skip_if = "is_zero")]
+        stream: u8,
     },
-    /// 最近这段时间（[`REPORT_EVERY`]）画面收得怎么样（见模块说明的"前向纠错"），被控端据此决定用不用纠错、
-    /// 配多少冗余。只发给协商了 [`crate::features::session::FEC`] 的被控端；这段时间什么画面都没收到就不发。
-    /// 丢了就丢了（下一个报告是新的一段）
+    /// 最近这段时间（[`REPORT_EVERY`]）第 `stream` 路画面收得怎么样（见模块说明的"前向纠错"），被控端据此决定
+    /// 这一路用不用纠错、配多少冗余。只发给协商了 [`crate::features::session::FEC`] 的被控端；这段时间这一路什么画面
+    /// 都没收到就不发。丢了就丢了（下一个报告是新的一段）
     #[n(4)]
-    Report(#[n(0)] VideoReport),
+    Report {
+        #[n(0)]
+        report: VideoReport,
+        #[cbor(n(1), skip_if = "is_zero")]
+        stream: u8,
+    },
 }
 
 /// 控制端多久报告一次画面收得怎么样（[`ControllerDatagram::Report`]）
@@ -788,13 +892,16 @@ pub const MAX_TOUCH_POINTS: u8 = 10;
     rename_all_fields = "camelCase"
 )]
 pub enum InputEvent {
-    /// 移到这个位置：归一化坐标（0..=1），相对当前显示器画面
+    /// 移到这个位置：归一化坐标（0..=1），相对第 `stream` 路画面（见模块说明的"多屏"）
     #[n(0)]
     MouseMove {
         #[n(0)]
         x: f32,
         #[n(1)]
         y: f32,
+        #[cbor(n(2), skip_if = "is_zero")]
+        #[serde(default, skip_serializing_if = "is_zero")]
+        stream: u8,
     },
     /// 相对移动（被控端光标隐藏时，见模块说明）。单位是鼠标的原始计数，约等于被控端的一个像素；
     /// 被控端按真实鼠标的移动注入（游戏读到的就是这个移动量），不换算成坐标
@@ -865,8 +972,15 @@ impl InputEvent {
         let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
         for e in events.drain(..) {
             match (out.last_mut(), e) {
-                (Some(InputEvent::MouseMove { x, y }), InputEvent::MouseMove { x: nx, y: ny }) => {
-                    (*x, *y) = (nx, ny);
+                (
+                    Some(InputEvent::MouseMove { x, y, stream }),
+                    InputEvent::MouseMove {
+                        x: nx,
+                        y: ny,
+                        stream: ns,
+                    },
+                ) => {
+                    (*x, *y, *stream) = (nx, ny, ns);
                 }
                 (
                     Some(InputEvent::MouseDelta { dx, dy }),
@@ -898,9 +1012,11 @@ mod tests {
 
     #[test]
     fn coalesce_keeps_order_and_sums_deltas() {
+        let mv = |x, y, stream| InputEvent::MouseMove { x, y, stream };
         let mut v = vec![
-            InputEvent::MouseMove { x: 0.1, y: 0.1 },
-            InputEvent::MouseMove { x: 0.2, y: 0.3 },
+            mv(0.1, 0.1, 0),
+            // 移到另一路画面上：只留最后一个，连同它在哪一路
+            mv(0.2, 0.3, 1),
             InputEvent::MouseButton {
                 button: MouseButton::Right,
                 down: true,
@@ -917,7 +1033,7 @@ mod tests {
         assert_eq!(
             v,
             [
-                InputEvent::MouseMove { x: 0.2, y: 0.3 },
+                mv(0.2, 0.3, 1),
                 InputEvent::MouseButton {
                     button: MouseButton::Right,
                     down: true
@@ -1028,15 +1144,18 @@ mod tests {
         assert_eq!(q.sanitized().transport, VideoTransport::Auto);
 
         // 画面的报告：之前的被控端不认识这个控制数据报，跳过就是了（见 framing 的兼容规则）
-        let r = ControllerDatagram::Report(VideoReport {
+        let report = VideoReport {
             frames: 60,
             stalled: 2,
             fragments: 300,
             missing: 4,
             unrecovered: 1,
-        });
-        let back: ControllerDatagram = minicbor::decode(&minicbor::to_vec(r).unwrap()).unwrap();
-        assert_eq!(back, r);
+        };
+        for stream in [0, 3] {
+            let r = ControllerDatagram::Report { report, stream };
+            let back: ControllerDatagram = minicbor::decode(&minicbor::to_vec(r).unwrap()).unwrap();
+            assert_eq!(back, r);
+        }
         assert!(VideoReport::default().is_empty());
 
         // Bye(77)：[9, [77]]
@@ -1058,12 +1177,54 @@ mod tests {
             platform: Platform::Unknown(9),
             touch: true,
             actions: vec![SystemAction::Unknown(40), SystemAction::Home],
+            shown: vec![0],
+            streams: 9,
         };
         let back: HostHello = minicbor::decode(&minicbor::to_vec(&hello).unwrap()).unwrap();
         assert_eq!(back.codecs, hello.codecs);
         assert_eq!(back.platform.or_linux(), Platform::Linux);
         assert_eq!(back.actions, hello.actions);
         assert!(back.touch);
+        assert_eq!(back.shown, [0]);
+        // 最多几路不超过本端的上限；不说（0）就是只能看一个
+        assert_eq!(back.max_streams(), crate::MAX_STREAMS);
+        let one = HostHello { streams: 0, ..back };
+        assert_eq!(one.max_streams(), 1);
+
+        // 多屏：第 0 路的字段不写（和只有一路时的字节一样），别的路写上
+        let ack = |stream| ControllerDatagram::Ack {
+            seq: 5,
+            arrived: 6,
+            stream,
+        };
+        assert_eq!(minicbor::to_vec(ack(0)).unwrap(), [0x82, 1, 0x82, 5, 6]);
+        for m in [
+            ack(2),
+            ControllerDatagram::Lost {
+                decoded: 3,
+                stream: 1,
+            },
+        ] {
+            let back: ControllerDatagram = minicbor::decode(&minicbor::to_vec(m).unwrap()).unwrap();
+            assert_eq!(back, m);
+        }
+        let view = ControllerMsg::View {
+            streams: vec![
+                StreamView::display(1),
+                StreamView {
+                    display: 0,
+                    max_short: 720,
+                },
+            ],
+        };
+        let back: ControllerMsg = minicbor::decode(&minicbor::to_vec(&view).unwrap()).unwrap();
+        assert!(
+            matches!(back, ControllerMsg::View { ref streams } if streams.len() == 2 && streams[1].max_short == 720)
+        );
+        assert_eq!(view.lane(), SessionLane::Control);
+        assert_eq!(stricter_short(0, 720), 720);
+        assert_eq!(stricter_short(1080, 0), 1080);
+        assert_eq!(stricter_short(1080, 720), 720);
 
         // 麦克风的状态：新版本加的状态留着原值（控制端当作接不了），没有说明的不带 detail
         let mic = HostMsg::Mic {
@@ -1124,7 +1285,16 @@ mod tests {
             json!(["auto", "streams", "fec"])
         );
         let events = vec![
-            InputEvent::MouseMove { x: 0.5, y: 0.25 },
+            InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.25,
+                stream: 0,
+            },
+            InputEvent::MouseMove {
+                x: 0.0,
+                y: 1.0,
+                stream: 2,
+            },
             InputEvent::MouseButton {
                 button: MouseButton::Left,
                 down: true,
@@ -1145,6 +1315,7 @@ mod tests {
             v,
             json!([
                 { "type": "mouseMove", "x": 0.5, "y": 0.25 },
+                { "type": "mouseMove", "x": 0.0, "y": 1.0, "stream": 2 },
                 { "type": "mouseButton", "button": "left", "down": true },
                 { "type": "touch", "id": 1, "phase": "cancel", "x": 0.0, "y": 1.0 },
                 { "type": "system", "action": "quickSettings" },
@@ -1162,6 +1333,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value([MicState::NoDevice, MicState::Ready]).unwrap(),
             json!(["noDevice", "ready"])
+        );
+        assert_eq!(
+            serde_json::to_value(StreamView {
+                display: 1,
+                max_short: 720
+            })
+            .unwrap(),
+            json!({ "display": 1, "maxShort": 720 })
+        );
+        assert_eq!(
+            serde_json::from_value::<StreamView>(json!({ "display": 2 })).unwrap(),
+            StreamView::display(2)
         );
     }
 }

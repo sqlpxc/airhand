@@ -22,9 +22,9 @@ use airhand_proto::framing;
 use airhand_proto::handshake::{Confirm, Negotiated, PublicKey};
 use airhand_proto::session::{
     ControllerDatagram, ControllerMsg, DirectOffer, HostDatagram, InputEvent, MAX_CLIPBOARD_TEXT,
-    QualitySettings, VideoTransport,
+    QualitySettings, StreamView, VideoTransport,
 };
-use airhand_proto::{SessionLane, features};
+use airhand_proto::{MAX_STREAMS, SessionLane, features};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -56,8 +56,8 @@ use crate::transport::{next_msg, open_datagram};
 pub struct HostStreams {
     /// 控制消息（控制通道、大块通道）
     pub out: Outbox,
-    /// 画面包（[`airhand_proto::media::frame`] 编好的）
-    pub video: mpsc::Sender<Bytes>,
+    /// 画面包（[`airhand_proto::media::frame`] 编好的）：第 `i` 项是第 `i` 路（见 `airhand_proto::session` 的"多屏"）
+    pub video: Vec<mpsc::Sender<Bytes>>,
     /// 声音包（同上）
     pub audio: mpsc::Sender<Bytes>,
     /// 控制端的请求、确认
@@ -139,6 +139,7 @@ impl ControllerReceiver {
 /// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
 /// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
 /// * 画面收得怎么样的报告（`ControllerDatagram::Report`）：交给画面的 [`Chooser`]（用不用纠错、配多少冗余）；
+/// * 和画面有关的都带着是第几路（见 `airhand_proto::session` 的"多屏"），各交各的；没有的路不管；
 /// * 控制端麦克风的声音包：马上交给平台的 [`MicSink`]；
 /// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
 #[derive(Clone)]
@@ -148,10 +149,10 @@ pub(crate) struct Express {
     mic: Arc<OnceLock<Arc<dyn MicSink>>>,
     /// 上次收到控制端消息的时刻（tokio 的时钟：测试里可以拨）
     heard: Arc<Mutex<tokio::time::Instant>>,
-    /// 在途的帧流（画面用帧流时）
-    frames: Option<Arc<FrameStreams>>,
-    /// 画面走帧流还是纠错（双方都支持纠错时）
-    fec: Option<Arc<Chooser>>,
+    /// 每一路在途的帧流（画面用帧流时；不用时是空的）
+    frames: Vec<Arc<FrameStreams>>,
+    /// 每一路走帧流还是纠错（双方都支持纠错时；不然是空的）
+    fec: Vec<Arc<Chooser>>,
 }
 
 impl Express {
@@ -162,26 +163,26 @@ impl Express {
             acks: Arc::default(),
             mic: Arc::default(),
             heard: Arc::new(Mutex::new(tokio::time::Instant::now())),
-            frames: None,
-            fec: None,
+            frames: Vec::new(),
+            fec: Vec::new(),
         }
     }
 
-    /// 画面用帧流：确认了的帧流不用管了，等不到的帧放弃
-    fn with_frames(mut self, frames: Arc<FrameStreams>) -> Self {
-        self.frames = Some(frames);
+    /// 画面用帧流（每一路一个）：确认了的帧流不用管了，等不到的帧放弃
+    fn with_frames(mut self, frames: Vec<Arc<FrameStreams>>) -> Self {
+        self.frames = frames;
         self
     }
 
-    /// 画面可能走纠错：控制端的报告、确认、画质设置交给 `fec`
-    fn with_fec(mut self, fec: Arc<Chooser>) -> Self {
-        self.fec = Some(fec);
+    /// 画面可能走纠错（每一路一个）：控制端的报告、确认、画质设置交给 `fec`
+    fn with_fec(mut self, fec: Vec<Arc<Chooser>>) -> Self {
+        self.fec = fec;
         self
     }
 
-    /// 控制端的画质设置里画面怎么传（见 `airhand_proto::session` 的"前向纠错"）
+    /// 控制端的画质设置里画面怎么传（见 `airhand_proto::session` 的"前向纠错"）：每一路都是
     pub(crate) fn transport(&self, t: VideoTransport) {
-        if let Some(c) = &self.fec {
+        for c in &self.fec {
             c.set_mode(t);
         }
     }
@@ -203,28 +204,38 @@ impl Express {
         self.heard();
         match m {
             ControllerDatagram::Ping { t } => (self.pong)(t),
-            ControllerDatagram::Ack { seq, arrived } => {
+            // 没有这一路：不管
+            ControllerDatagram::Ack { stream, .. }
+            | ControllerDatagram::Lost { stream, .. }
+            | ControllerDatagram::Report { stream, .. }
+                if stream >= MAX_STREAMS => {}
+            ControllerDatagram::Ack {
+                seq,
+                arrived,
+                stream,
+            } => {
                 if let Some(acks) = self.acks.get() {
-                    acks.ack(seq, arrived);
+                    acks.ack(stream, seq, arrived);
                 }
-                if let Some(f) = &self.frames {
+                if let Some(f) = self.frames.get(stream as usize) {
                     f.acked(seq);
                 }
-                if let Some(c) = &self.fec {
+                if let Some(c) = self.fec.get(stream as usize) {
                     c.acked(seq, tokio::time::Instant::now());
                 }
             }
-            ControllerDatagram::Report(r) => {
-                if let Some(c) = &self.fec {
-                    c.report(r, tokio::time::Instant::now());
+            ControllerDatagram::Report { report, stream } => {
+                if let Some(c) = self.fec.get(stream as usize) {
+                    c.report(report, tokio::time::Instant::now());
                 }
             }
-            // 平台要恢复：之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）
-            ControllerDatagram::Lost { decoded } => {
-                let recover = self.acks.get().is_some_and(|a| a.lost(decoded));
-                if recover && let Some(f) = &self.frames {
+            // 平台要恢复：这一路之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）
+            ControllerDatagram::Lost { decoded, stream } => {
+                let recover = self.acks.get().is_some_and(|a| a.lost(stream, decoded));
+                if recover && let Some(f) = self.frames.get(stream as usize) {
                     let n = f.abandon(decoded);
                     debug!(
+                        stream,
                         decoded,
                         abandoned = n,
                         "the controller lost a frame, recovering"
@@ -249,8 +260,15 @@ pub(crate) fn request(m: ControllerMsg) -> Option<Request> {
             Request::Input(events)
         }
         ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
-        ControllerMsg::RequestKeyframe { after } => Request::Keyframe(Some(after)),
-        ControllerMsg::SelectDisplay { index } => Request::SelectDisplay(index),
+        ControllerMsg::RequestKeyframe { after, stream } => {
+            Request::Keyframe(Some((stream, after)))
+        }
+        ControllerMsg::SelectDisplay { index } => Request::View(vec![StreamView::display(index)]),
+        ControllerMsg::View { mut streams } => {
+            // 太长的不要（平台再按自己有几个显示器、能发几路去掉不要的，见 resolve_view）
+            streams.truncate(MAX_STREAMS as usize);
+            Request::View(streams)
+        }
         ControllerMsg::Clipboard { text } if text.len() > MAX_CLIPBOARD_TEXT => {
             warn!(len = text.len(), "ignoring an oversized clipboard text");
             return None;
@@ -263,7 +281,7 @@ pub(crate) fn request(m: ControllerMsg) -> Option<Request> {
 }
 
 /// 写任务（几条通道一起）
-pub struct Writer(pub(super) OwnedTask<Result<((), (), (), ())>>);
+pub struct Writer(pub(super) OwnedTask<Result<()>>);
 
 impl Writer {
     /// 等到写任务意外结束（可以放在 `select!` 里）
@@ -294,6 +312,8 @@ pub struct Admitted {
     pub settings: QualitySettings,
     /// 开始时要不要声音
     pub audio: bool,
+    /// 开始时看哪几个显示器（没检查过，见 [`super::resolve_view`]；空的是只看主显示器）
+    pub view: Vec<StreamView>,
 }
 
 impl HostStreams {
@@ -330,6 +350,12 @@ impl HostStreams {
             negotiated: r.negotiated,
             settings: r.intro.settings.sanitized(),
             audio: r.intro.audio,
+            view: r
+                .intro
+                .view
+                .into_iter()
+                .take(MAX_STREAMS as usize)
+                .collect(),
         };
         info!(
             session_id,
@@ -339,29 +365,43 @@ impl HostStreams {
             negotiated = ?admitted.negotiated,
             "end-to-end session established"
         );
-        let secured = r.secured;
+        let mut secured = r.secured;
         let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
         // 双方都支持、中转也支持：画面每帧一条帧流（见 airhand_proto::session 的"帧流"）
-        let frames = (admitted.negotiated.features.has(features::session::FRAMES) && inc.frames)
-            .then(|| Arc::new(FrameStreams::default()));
+        let use_frames = admitted.negotiated.features.has(features::session::FRAMES) && inc.frames;
         // 用着帧流、双方又都支持纠错：增量帧可能走纠错的数据报（见 airhand_proto::session 的"前向纠错"）
-        let fec = (frames.is_some() && admitted.negotiated.features.has(features::session::FEC))
-            .then(|| Arc::new(Chooser::new(admitted.settings.transport)));
-        let video_send = match &frames {
-            Some(f) => Video::Frames {
-                streams: f.clone(),
-                fec: fec.clone(),
-            },
-            None => Video::Stream(open_lane(conn, session_id, SessionLane::Video).await?),
-        };
+        let use_fec = use_frames && admitted.negotiated.features.has(features::session::FEC);
+        // 画面的每一路各有一套（见 airhand_proto::session 的"多屏"）：只看一个显示器时别的路闲着，什么都不发
+        let frames: Vec<Arc<FrameStreams>> = (0..MAX_STREAMS)
+            .filter(|_| use_frames)
+            .map(|_| Arc::default())
+            .collect();
+        let fec: Vec<Arc<Chooser>> = (0..MAX_STREAMS)
+            .filter(|_| use_fec)
+            .map(|_| Arc::new(Chooser::new(admitted.settings.transport)))
+            .collect();
         info!(
             session_id,
-            frames = frames.is_some(),
-            fec = fec.is_some(),
+            frames = use_frames,
+            fec = use_fec,
             "video lanes"
         );
         let (out, ctl_rx, bulk_rx) = queue::channel();
-        let (video_tx, video_rx) = mpsc::channel(video_queue);
+        let (video_tx, video): (Vec<_>, Vec<_>) = std::mem::take(&mut secured.video)
+            .into_iter()
+            .enumerate()
+            .map(|(stream, keys)| {
+                let how = match frames.get(stream) {
+                    Some(f) => Video::Frames {
+                        streams: f.clone(),
+                        fec: fec.get(stream).cloned(),
+                    },
+                    None => Video::Stream,
+                };
+                let (tx, rx) = mpsc::channel(video_queue);
+                (tx, (how, rx, keys.sealer))
+            })
+            .unzip();
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
         // 两条路：直连通了由直连任务接上，画面、声音走哪条也由它决定（没有直连时一直是中转）
         let paths = Paths::new(conn.clone());
@@ -370,7 +410,7 @@ impl HostStreams {
             paths: paths.clone(),
             control: (send, ctl_rx, r.sealer),
             bulk: (bulk_send, bulk_rx, secured.bulk.sealer),
-            video: (video_send, video_rx, secured.video.sealer),
+            video,
             audio: (audio_rx, secured.audio.sealer),
         })));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过信箱交给会话。
@@ -396,13 +436,9 @@ impl HostStreams {
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
         let pong = datagrams.clone();
-        let mut express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }));
-        if let Some(f) = frames {
-            express = express.with_frames(f);
-        }
-        if let Some(c) = fec {
-            express = express.with_fec(c);
-        }
+        let express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }))
+            .with_frames(frames)
+            .with_fec(fec);
         let incoming = ControllerReceiver::new(control_rx, bulk_rx, confirm_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
         let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
@@ -553,7 +589,7 @@ async fn read_all(r: Readers) -> Result<()> {
                 }
                 ControllerDatagram::Ack { .. }
                 | ControllerDatagram::Lost { .. }
-                | ControllerDatagram::Report(_) => {}
+                | ControllerDatagram::Report { .. } => {}
             }
             express.datagram(m);
         }
@@ -668,10 +704,10 @@ mod tests {
                 .unwrap();
         }
         assert!(bulk.try_send(Request::Clipboard("more".into())).is_err());
-        control.send(Request::SelectDisplay(7)).await.unwrap();
+        control.send(Request::Keyframe(None)).await.unwrap();
         assert!(matches!(
             incoming.recv().await,
-            Some(Request::SelectDisplay(7))
+            Some(Request::Keyframe(None))
         ));
         control
             .send(Request::Settings(QualitySettings::default()))
@@ -711,8 +747,23 @@ mod tests {
             None
         );
         assert_eq!(
-            request(ControllerMsg::RequestKeyframe { after: 7 }),
-            Some(Request::Keyframe(Some(7)))
+            request(ControllerMsg::RequestKeyframe {
+                after: 7,
+                stream: 2
+            }),
+            Some(Request::Keyframe(Some((2, 7))))
+        );
+        // 只看一个显示器是看哪几个显示器的简便说法；太长的不要
+        assert_eq!(
+            request(ControllerMsg::SelectDisplay { index: 3 }),
+            Some(Request::View(vec![StreamView::display(3)]))
+        );
+        let many: Vec<_> = (0..9).map(StreamView::display).collect();
+        assert_eq!(
+            request(ControllerMsg::View {
+                streams: many.clone()
+            }),
+            Some(Request::View(many[..MAX_STREAMS as usize].to_vec()))
         );
         assert_eq!(
             request(ControllerMsg::Mic { enabled: true }),
@@ -729,11 +780,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Log(Mutex<Vec<(u32, u64)>>);
+    struct Log(Mutex<Vec<(u8, u32, u64)>>);
 
     impl Acks for Log {
-        fn ack(&self, seq: u32, arrived: u64) {
-            self.0.lock().unwrap().push((seq, arrived));
+        fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+            self.0.lock().unwrap().push((stream, seq, arrived));
         }
     }
 
@@ -751,12 +802,19 @@ mod tests {
             oneshot::channel().1,
             express.clone(),
         );
-        let ack = |seq| ControllerDatagram::Ack { seq, arrived: 9 };
-        express.datagram(ack(1));
+        let ack = |seq, stream| ControllerDatagram::Ack {
+            seq,
+            arrived: 9,
+            stream,
+        };
+        express.datagram(ack(1, 0));
         let log = Arc::new(Log::default());
         incoming.set_acks(log.clone());
-        express.datagram(ack(2));
-        assert_eq!(*log.0.lock().unwrap(), [(2, 9)]);
+        express.datagram(ack(2, 0));
+        // 每一路各自确认；没有的路不管
+        express.datagram(ack(7, 1));
+        express.datagram(ack(8, MAX_STREAMS));
+        assert_eq!(*log.0.lock().unwrap(), [(0, 2, 9), (1, 7, 9)]);
 
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(incoming.silent_for(), Duration::from_secs(10));
@@ -773,43 +831,64 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reports_and_settings_reach_the_chooser() {
         use airhand_proto::session::VideoReport;
-        let c = Arc::new(Chooser::new(VideoTransport::Auto));
+        let c: Vec<_> = (0..2)
+            .map(|_| Arc::new(Chooser::new(VideoTransport::Auto)))
+            .collect();
         let express = Express::new(|_| {}).with_fec(c.clone());
         tokio::time::advance(Duration::from_secs(6)).await;
-        express.datagram(ControllerDatagram::Report(VideoReport {
+        let stalled = VideoReport {
             frames: 60,
             stalled: 10,
             ..Default::default()
-        }));
-        assert!(c.using());
+        };
+        // 第 1 路卡住了：只有它改用纠错
+        express.datagram(ControllerDatagram::Report {
+            report: stalled,
+            stream: 1,
+        });
+        assert!(!c[0].using() && c[1].using());
+        // 传输方式每一路都是
         express.transport(VideoTransport::Streams);
-        assert!(!c.using());
-        // 没有 Chooser（对方不支持纠错）：什么也不做
+        assert!(!c[1].using());
+        // 没有的路、没有 Chooser（对方不支持纠错）：什么也不做
+        express.datagram(ControllerDatagram::Report {
+            report: stalled,
+            stream: 3,
+        });
         let plain = Express::new(|_| {});
         plain.transport(VideoTransport::Fec);
-        plain.datagram(ControllerDatagram::Report(VideoReport::default()));
+        plain.datagram(ControllerDatagram::Report {
+            report: VideoReport::default(),
+            stream: 0,
+        });
     }
 
     /// 控制端等不到帧了：读任务马上交给平台；平台要恢复的话，之后的帧流放弃，确认了的帧流忘掉
     #[tokio::test]
     async fn lost_frames_abandon_their_streams_when_the_platform_recovers() {
-        struct Recover(Mutex<Vec<u32>>, bool);
+        struct Recover(Mutex<Vec<(u8, u32)>>, bool);
         impl Acks for Recover {
-            fn ack(&self, _: u32, _: u64) {}
-            fn lost(&self, decoded: u32) -> bool {
-                self.0.lock().unwrap().push(decoded);
+            fn ack(&self, _: u8, _: u32, _: u64) {}
+            fn lost(&self, stream: u8, decoded: u32) -> bool {
+                self.0.lock().unwrap().push((stream, decoded));
                 self.1
             }
         }
+        let lost = |decoded, stream| ControllerDatagram::Lost { decoded, stream };
         let (client, _server) = crate::tests::quic_pair().await;
         for recover in [false, true] {
-            let frames = Arc::new(FrameStreams::default());
+            // 两路画面：第 0 路的帧流不受第 1 路的影响
+            let (other, frames) = (
+                Arc::new(FrameStreams::default()),
+                Arc::new(FrameStreams::default()),
+            );
             for seq in 1..=4 {
                 frames.add_for_test(seq, client.open_uni().await.unwrap());
+                other.add_for_test(seq, client.open_uni().await.unwrap());
             }
-            let express = Express::new(|_| {}).with_frames(frames.clone());
+            let express = Express::new(|_| {}).with_frames(vec![other.clone(), frames.clone()]);
             // 平台还没接上：什么也不做
-            express.datagram(ControllerDatagram::Lost { decoded: 1 });
+            express.datagram(lost(1, 1));
             assert_eq!(frames.len_for_test(), 4);
             let platform = Arc::new(Recover(Mutex::default(), recover));
             let incoming = ControllerReceiver::new(
@@ -819,11 +898,16 @@ mod tests {
                 express.clone(),
             );
             incoming.set_acks(platform.clone());
-            express.datagram(ControllerDatagram::Ack { seq: 1, arrived: 0 });
+            express.datagram(ControllerDatagram::Ack {
+                seq: 1,
+                arrived: 0,
+                stream: 1,
+            });
             assert_eq!(frames.len_for_test(), 3);
-            express.datagram(ControllerDatagram::Lost { decoded: 2 });
-            assert_eq!(*platform.0.lock().unwrap(), [2]);
+            express.datagram(lost(2, 1));
+            assert_eq!(*platform.0.lock().unwrap(), [(1, 2)]);
             assert_eq!(frames.len_for_test(), if recover { 1 } else { 3 });
+            assert_eq!(other.len_for_test(), 4);
         }
     }
 
@@ -974,7 +1058,10 @@ mod tests {
             }));
             if genuine {
                 (&mut confirmed).await.unwrap();
-                assert_eq!(control_rx.recv().await, Some(Request::SelectDisplay(3)));
+                assert_eq!(
+                    control_rx.recv().await,
+                    Some(Request::View(vec![StreamView::display(3)]))
+                );
                 reader.abort();
             } else {
                 assert!(reader.await.unwrap().is_err());

@@ -58,6 +58,7 @@ AIRHAND_CERT=target/e2e/cert.pem AIRHAND_KEY=target/e2e/key.pem ./target/debug/a
 # client/src-tauri/
 cargo test --lib e2e_roundtrip -- --ignored --nocapture   # video (delta frames over forward error correction) / codec switching / clipboard / audio / ping / disconnect
 cargo test --lib e2e_reconnect -- --ignored --nocapture   # getting the code back after a server restart, changing the code
+cargo test --lib e2e_multi_display -- --ignored --nocapture  # showing two displays at once, then one (skipped with a single display)
 cargo test --lib e2e_mic -- --ignored --nocapture         # Windows: the controller's microphone through the relay into Steam Streaming Microphone
 ```
 

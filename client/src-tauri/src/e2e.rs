@@ -106,7 +106,7 @@ async fn open_session(
     req_id: u32,
 ) -> Established {
     let me = Identity::generate();
-    let intro = secure::controller_intro("e2e", "test", settings, audio);
+    let intro = secure::controller_intro("e2e", "test", settings, audio, Vec::new());
     let (initiator, init) = secure::initiate(InitiatorParams {
         code,
         me: &me,
@@ -352,20 +352,24 @@ async fn e2e_roundtrip() {
                 datagrams.send(&ControllerDatagram::Ack {
                     seq: v.seq,
                     arrived,
+                    stream: v.stream,
                 });
                 continue;
             }
             // 画面通道上别的事（和控制端服务一样处理）：解不了的替界面确认、等不到了报告、等太久了要关键帧
-            FromHost::VideoEvent(ev) => {
+            FromHost::VideoEvent(stream, ev) => {
                 match ev {
-                    Video::Skipped { seq, arrived } => {
-                        datagrams.send(&ControllerDatagram::Ack { seq, arrived })
-                    }
+                    Video::Skipped { seq, arrived } => datagrams.send(&ControllerDatagram::Ack {
+                        seq,
+                        arrived,
+                        stream,
+                    }),
                     Video::Lost { decoded } => {
-                        datagrams.send(&ControllerDatagram::Lost { decoded })
+                        datagrams.send(&ControllerDatagram::Lost { decoded, stream })
                     }
                     Video::Keyframe { after } => {
-                        ctl.send(&ControllerMsg::RequestKeyframe { after }).await
+                        ctl.send(&ControllerMsg::RequestKeyframe { after, stream })
+                            .await
                     }
                     Video::Frame(_) => {}
                 }
@@ -560,6 +564,182 @@ async fn e2e_roundtrip() {
         "会话没有被清理: {:?}",
         hub.borrow().host.controllers
     );
+}
+
+/// 多屏：同时看被控端的前两个显示器（每个显示器一路画面），再改回只看第二个。这台电脑只有一个显示器时只检查
+/// 被控端说了最多能发几路、只看得到那一个，然后跳过。和 `e2e_roundtrip` 一样要先启动服务器
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn e2e_multi_display() {
+    use airhand_proto::session::StreamView;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,quinn=warn")
+        .try_init();
+    let hub = status::new_hub();
+    let _host = HostService::start(hub.clone());
+    let (code, pairing) = wait_host(&hub).await;
+    let mut sig = airhand_link::net::connect_signal(&crate::config::link(), Role::Controller, None)
+        .await
+        .expect("控制端连接服务器");
+    let (router, _router) = Router::start(&sig.conn);
+    let settings = QualitySettings {
+        codec: Codec::H264,
+        fps: 30,
+        ..Default::default()
+    };
+    let link = open_session(
+        &mut sig,
+        &router,
+        code,
+        pairing.as_deref(),
+        settings,
+        false,
+        1,
+    )
+    .await;
+    let mut ctl = Ctl {
+        send: link.control.0,
+        sealer: link.control.1,
+    };
+    let datagrams = link.datagrams;
+    let mut recv = link.receiver;
+    let _registration = link.registration;
+
+    /// 每一路收到的帧：(第一帧是不是关键帧, 帧数, 最近一帧的宽高)
+    #[derive(Default, Debug, Clone, Copy)]
+    struct Got {
+        first_key: Option<bool>,
+        frames: u32,
+        size: (u16, u16),
+    }
+    let mut got = [Got::default(); airhand_proto::MAX_STREAMS as usize];
+    // 同时看两个显示器时收到的、被控端说的每一路是哪个显示器
+    let mut multi: Option<([Got; airhand_proto::MAX_STREAMS as usize], Vec<u8>)> = None;
+    let mut displays = Vec::new();
+    let mut shown = Vec::new();
+    let mut asked = 0u8;
+    let started = Instant::now();
+    let mut last_ping = Instant::now() - Duration::from_secs(1);
+    let mut step_at = Instant::now();
+    while started.elapsed() < Duration::from_secs(12) {
+        if last_ping.elapsed() > Duration::from_millis(500) {
+            last_ping = Instant::now();
+            datagrams.send(&ControllerDatagram::Ping { t: 1 });
+        }
+        // Hello 之后看前两个显示器；4 秒之后改回只看第二个
+        if asked == 1 && displays.len() >= 2 && step_at.elapsed() > Duration::from_secs(4) {
+            asked = 2;
+            step_at = Instant::now();
+            multi = Some((got, shown.clone()));
+            got = Default::default();
+            ctl.send(&ControllerMsg::View {
+                streams: vec![StreamView::display(1)],
+            })
+            .await;
+        }
+        let msg = match tokio::time::timeout(Duration::from_millis(500), recv.recv()).await {
+            Ok(m) => m.expect("读取会话消息"),
+            Err(_) => continue,
+        };
+        match msg {
+            FromHost::Video {
+                stream,
+                packet,
+                arrived,
+                ..
+            } => {
+                let v = VideoHeader::decode(&packet).expect("画面包的头");
+                assert_eq!(v.stream, stream);
+                let g = &mut got[stream as usize];
+                g.first_key.get_or_insert(v.key);
+                g.frames += 1;
+                g.size = (v.width, v.height);
+                datagrams.send(&ControllerDatagram::Ack {
+                    seq: v.seq,
+                    arrived,
+                    stream,
+                });
+            }
+            FromHost::VideoEvent(stream, Video::Skipped { seq, arrived }) => {
+                datagrams.send(&ControllerDatagram::Ack {
+                    seq,
+                    arrived,
+                    stream,
+                });
+            }
+            FromHost::VideoEvent(stream, Video::Lost { decoded }) => {
+                datagrams.send(&ControllerDatagram::Lost { decoded, stream });
+            }
+            FromHost::VideoEvent(stream, Video::Keyframe { after }) => {
+                ctl.send(&ControllerMsg::RequestKeyframe { after, stream })
+                    .await;
+            }
+            FromHost::Control(HostMsg::Hello(h)) => {
+                println!(
+                    "显示器 {:?}，最多同时 {} 路",
+                    h.displays
+                        .iter()
+                        .map(|d| (d.width, d.height))
+                        .collect::<Vec<_>>(),
+                    h.max_streams()
+                );
+                assert_eq!(h.max_streams(), airhand_proto::MAX_STREAMS);
+                assert_eq!(h.shown, [h.current_display]);
+                displays = h.displays;
+                if displays.len() < 2 {
+                    // 只有一个显示器：要看两个也只看得到一个
+                    ctl.send(&ControllerMsg::View {
+                        streams: vec![StreamView::display(0), StreamView::display(1)],
+                    })
+                    .await;
+                    asked = 9;
+                    continue;
+                }
+                asked = 1;
+                step_at = Instant::now();
+                ctl.send(&ControllerMsg::View {
+                    streams: vec![
+                        StreamView::display(0),
+                        StreamView {
+                            display: 1,
+                            max_short: 720,
+                        },
+                    ],
+                })
+                .await;
+            }
+            FromHost::Control(HostMsg::Displays { shown: s, .. }) => {
+                println!("每一路画面的显示器: {s:?}");
+                shown = s;
+            }
+            FromHost::Control(HostMsg::Bye(reason)) => panic!("意外的 Bye: {reason:?}"),
+            _ => {}
+        }
+        // 只有一个显示器时看一会儿就够了
+        if (asked == 2 || asked == 9) && step_at.elapsed() > Duration::from_secs(3) {
+            break;
+        }
+    }
+    println!("{got:?}");
+    if displays.len() < 2 {
+        println!("这台电脑只有一个显示器，跳过多屏的检查");
+        assert!(shown.is_empty() || shown == [0], "{shown:?}");
+        assert!(got[1].frames == 0, "只有一个显示器却收到了第二路画面");
+        return;
+    }
+    // 同时看两个：两路都从关键帧开始，第 1 路按它要的大小（短边不超过 720）
+    let (both, both_shown) = multi.expect("没有改回只看一个");
+    assert_eq!(both_shown, [0, 1]);
+    for (stream, g) in both.iter().take(2).enumerate() {
+        assert_eq!(g.first_key, Some(true), "第 {stream} 路");
+        assert!(g.frames >= 1, "第 {stream} 路没有画面");
+    }
+    assert!(both[1].size.0.min(both[1].size.1) <= 720, "{:?}", both[1]);
+    // 最后只看第二个显示器：第 0 路是它，从关键帧开始
+    assert_eq!(shown, [1]);
+    assert_eq!(got[0].first_key, Some(true));
+    assert!(got[0].frames >= 1);
+    let _ = ctl.send.finish();
 }
 
 /// 控制端的麦克风，从协议级的控制端一直到 Windows 上的虚拟麦克风（需要这台电脑上有 Steam Streaming Microphone，

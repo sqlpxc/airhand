@@ -26,7 +26,8 @@
 //! | 3    | u8      | **头的长度**（现在是 24） | 同左                         | 同左                 |
 //! | 4    | u32     | 帧序号               | 0                      | 包序号               |
 //! | 8    | u16 × 2 | 画面宽、高           | 形状宽、高             | 0                    |
-//! | 12   | u16 × 2 | 0                    | 热点 x、y              | 0                    |
+//! | 12   | u8      | 第几路画面（多屏）   | 热点 x（u16）          | 0                    |
+//! | 13   | u8 × 3  | 0                    | 热点 x 的高字节、热点 y | 0                    |
 //! | 16   | u64     | 采集时间（微秒）     | 0                      | 采集时间（微秒）     |
 //! | 头的长度 |     | 码流（Annex-B / OBU）| RGBA（非预乘）         | 一个 Opus 包         |
 //!
@@ -220,10 +221,13 @@ fn extensions(packet: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
 }
 
 /// 画面包的头
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VideoHeader {
-    /// 会话内的帧序号，控制端收到后确认（[`ControllerDatagram::Ack`](crate::session::ControllerDatagram::Ack)）
+    /// 这一路画面里的帧序号，控制端收到后确认（[`ControllerDatagram::Ack`](crate::session::ControllerDatagram::Ack)）
     pub seq: u32,
+    /// 第几路画面（多屏同时显示时每个显示器一路，见 [`crate::session`] 的"多屏"）：界面据此交给那一路的解码器。
+    /// 控制端检查它和这一帧来的通道（[`crate::SessionLane::Video`]）对得上
+    pub stream: u8,
     pub key: bool,
     pub codec: Codec,
     pub width: u16,
@@ -244,6 +248,7 @@ impl VideoHeader {
         h[4..8].copy_from_slice(&self.seq.to_le_bytes());
         h[8..10].copy_from_slice(&self.width.to_le_bytes());
         h[10..12].copy_from_slice(&self.height.to_le_bytes());
+        h[12] = self.stream;
         h[16..24].copy_from_slice(&self.capture_us.to_le_bytes());
         let mut len = HEADER_LEN;
         if let Some(r) = self.reference.filter(|_| !self.key) {
@@ -277,6 +282,7 @@ impl VideoHeader {
             .filter(|_| !key);
         Some(Self {
             seq: u32_at(packet, 4),
+            stream: packet[12],
             key,
             codec,
             width: u16_at(packet, 8),
@@ -430,6 +436,7 @@ mod tests {
     fn unknown_video_codec_preserves_the_header_and_ack_sequence() {
         let mut packet = VideoHeader {
             seq: 42,
+            stream: 0,
             key: true,
             codec: Codec::H264,
             width: 1920,
@@ -455,6 +462,7 @@ mod tests {
     fn the_reference_extension() {
         let delta = VideoHeader {
             seq: 10,
+            stream: 0,
             key: false,
             codec: Codec::H265,
             width: 1280,
@@ -488,6 +496,7 @@ mod tests {
     fn video_header_roundtrip() {
         let h = VideoHeader {
             seq: 9,
+            stream: 0,
             key: true,
             codec: Codec::AV1,
             width: 1920,
@@ -508,6 +517,12 @@ mod tests {
         bad[2] = 9;
         assert_eq!(VideoHeader::decode(&bad), None);
         assert_eq!(Kind::of(&p[..HEADER_LEN - 1]), None);
+        // 多屏：第几路在第 12 个字节（第 0 路和之前的头一样是 0）
+        assert_eq!(p[12], 0);
+        let second = VideoHeader { stream: 2, ..h };
+        let enc = second.encode();
+        assert_eq!(enc[12], 2);
+        assert_eq!(VideoHeader::decode(&enc), Some(second));
     }
 
     /// 以后的版本把头加长了：旧的读法照样找得到负载，不认识的部分跳过；头的长度不对的包丢掉

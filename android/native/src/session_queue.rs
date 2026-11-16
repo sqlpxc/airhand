@@ -156,6 +156,7 @@ mod tests {
         for seq in 1..=MAX_WINDOW {
             let p = VideoHeader {
                 seq,
+                stream: 0,
                 key: seq == 1,
                 codec: Codec::H264,
                 width: 1920,

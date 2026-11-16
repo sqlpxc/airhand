@@ -304,6 +304,7 @@ impl VideoHub {
         let seq = st.seq;
         let header = VideoHeader {
             seq,
+            stream: 0,
             key,
             codec,
             width,

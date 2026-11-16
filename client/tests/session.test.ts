@@ -7,9 +7,20 @@ import { ConnectionAttempt } from "../src/lib/connection-attempt.ts";
 import { renderPlan } from "../src/lib/enhance.ts";
 import { fitSize, stricter, viewMaxShort } from "../src/lib/fit.ts";
 import * as media from "../src/lib/media.ts";
+import { hitTest, layoutTiles, placeDisplays } from "../src/lib/screens.ts";
 
 /** 沙箱里建的对象原型不同，按 JSON 比较 */
 const plain = (v: unknown) => JSON.parse(JSON.stringify(v));
+
+/** 假的 canvas：记下样式，位置从样式里读（设备像素比例是 1） */
+function fakeCanvas() {
+  const style: any = {};
+  const px = (v: string | undefined) => parseFloat(v ?? "0") || 0;
+  return {
+    style,
+    getBoundingClientRect: () => ({ left: px(style.left), top: px(style.top), width: px(style.width), height: px(style.height) }),
+  };
+}
 
 // Load the actual session class with browser/backend dependencies replaced by
 // small fakes. This tests delivery ordering without a WebView or network.
@@ -23,7 +34,8 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   const timers: (() => void)[] = [];
   const storeState: any = { enhance: "off", decoders: ["h264"] };
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
-    fitSize, stricter, viewMaxShort, renderPlan, media, devicePixelRatio: 1,
+    fitSize, stricter, viewMaxShort, renderPlan, media, hitTest, layoutTiles, placeDisplays, devicePixelRatio: 1,
+    codecUsable: () => true, bestCodec: () => "h264",
     store: { get: () => storeState },
     toProblem: (e: any) => e,
     api: {
@@ -32,7 +44,12 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
         return connect ? connect(c, o.resume, o) : new Promise(res => { resolve = res; });
       },
       command: async (c: any) => {
-        calls.push(c.cmd === "settings" ? [c.cmd, c.sid, c.settings] : c.cmd === "mic" ? [c.cmd, c.sid, c.enabled] : [c.cmd, c.sid]);
+        calls.push(
+          c.cmd === "settings" ? [c.cmd, c.sid, c.settings]
+          : c.cmd === "mic" ? [c.cmd, c.sid, c.enabled]
+          : c.cmd === "view" ? [c.cmd, c.sid, plain(c.streams)]
+          : [c.cmd, c.sid],
+        );
       },
     },
     // 延时发送用的定时器：由测试手动触发
@@ -42,8 +59,13 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   const session = Object.create(sandbox.RemoteSession.prototype);
   Object.assign(session, {
     attempt: new ConnectionAttempt(), disposed: false, sid: null, state: "connecting", settings: {}, visible: true,
-    viewLimit: 0, viewLimitAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
-    view: { setSync() {}, setAudio() {}, setLayout() {}, dispose() {} }, frame: { w: 16, h: 9 }, input: { reset() {} },
+    sentView: null, viewAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
+    shown: [0], maxStreams: 1, allDisplays: false, wantName: null, sentLayouts: [],
+    // 第 0 路的 canvas（构造函数里建的）；之后要的假的 canvas 由 newCanvas 建
+    canvases: [fakeCanvas()], screen: { style: {}, getBoundingClientRect: () => ({ left: 0, top: 0 }) },
+    newCanvas() { const c = fakeCanvas(); this.canvases.push(c); return c; },
+    view: { setSync() {}, setAudio() {}, setLayout() {}, dispose() {}, addCanvas() {} }, frames: [{ w: 16, h: 9 }],
+    input: { reset() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
     onlineAt: -1, attemptAt: 0, retries: 0,
     emit() {}, syncAudio() {}, syncMic() {}, applySyncState() {}, onConnected() { calls.push("connected"); },
@@ -82,35 +104,79 @@ test("按显示区域请求分辨率：空闲时马上发，连续变化时停�
   Object.assign(s, {
     sid: 7, scaleMode: "fit", interactive: true,
     settings: { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: "h264" },
-    displays: [{ index: 0, width: 2880, height: 1800 }], viewport: { w: 1600, h: 1000 },
+    displays: [{ index: 0, name: "A", width: 2880, height: 1800 }], viewport: { w: 1600, h: 1000 },
   });
-  const sent = () => h.calls.filter((c) => c[0] === "settings").map((c) => c[2].maxShort);
+  const views = () => h.calls.filter((c) => c[0] === "view").map((c) => c[2]);
 
-  s.updateViewLimit();
-  assert.deepEqual(sent(), [1000], "空闲时马上发");
-  s.updateViewLimit();
-  assert.deepEqual(sent(), [1000], "没变不重发");
+  s.updateView();
+  assert.deepEqual(views(), [[{ display: 0, maxShort: 1000 }]], "空闲时马上发");
+  s.updateView();
+  assert.equal(views().length, 1, "没变不重发");
 
   // 拖动窗口：连续变化只在停下来之后发最后一次
   s.viewport = { w: 1500, h: 900 };
-  s.updateViewLimit();
+  s.updateView();
   s.viewport = { w: 1400, h: 850 };
-  s.updateViewLimit();
-  assert.deepEqual(sent(), [1000]);
+  s.updateView();
+  assert.equal(views().length, 1);
   h.timers.at(-1)!();
-  assert.deepEqual(sent(), [1000, 850]);
+  assert.deepEqual(views().at(-1), [{ display: 0, maxShort: 850 }]);
 
-  // 用户选的上限更严时按用户的
+  // 用户选的上限不和它混在一起：画质设置照原样发，被控端取较严的
   s.settings = { ...s.settings, maxShort: 720 };
   s.pushSettings();
-  assert.equal(sent().at(-1), 720);
+  assert.equal(h.calls.filter((c) => c[0] === "settings").at(-1)[2].maxShort, 720);
 
   // 原始大小：不按窗口限制
-  s.settings = { ...s.settings, maxShort: 0 };
   s.scaleMode = "native";
-  s.viewLimitAt = -Infinity;
-  s.updateViewLimit();
-  assert.equal(sent().at(-1), 0);
+  s.viewAt = -Infinity;
+  s.updateView();
+  assert.deepEqual(views().at(-1), [{ display: 0, maxShort: 0 }]);
+});
+
+test("多屏：同时看所有显示器时每一路按它在拼好的画面里的大小要分辨率，选了的那个在第 0 路；切换马上发", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  // 左边 4K、右边 1080p，底边对齐；窗口 2880×1080
+  const displays = [
+    { index: 0, name: "A", x: 0, y: 0, width: 3840, height: 2160, primary: true },
+    { index: 1, name: "B", x: 3840, y: 1080, width: 1920, height: 1080, primary: false },
+  ];
+  Object.assign(s, { sid: 7, scaleMode: "fit", interactive: true, viewport: { w: 2880, h: 1080 }, emit() {}, releaseAll() {} });
+  s.onEvent({ type: "hello", hostname: "pc", os: "Windows", version: "1", displays, current: 1, shown: [1], maxStreams: 4,
+    codecs: ["h264"], platform: "windows", touch: false, actions: [] });
+  const views = () => h.calls.filter((c) => c[0] === "view").map((c) => c[2]);
+  assert.equal(s.canShowAll, true);
+  // 只看一个：对方开始时给的那个
+  assert.deepEqual(views(), [[{ display: 1, maxShort: 0 }]]);
+  s.setAllDisplays(true);
+  // 拼起来 5760×2160，缩到 2880×1080（一半）：选了的 B 在第 0 路，短边各自减半（不低于 360）
+  assert.deepEqual(views().at(-1), [{ display: 1, maxShort: 540 }, { display: 0, maxShort: 1080 }]);
+  // 对方按这个开始发两路：画面按位置摆好，鼠标在哪一块上就是哪一路
+  s.onEvent({ type: "displays", displays, current: 1, shown: [1, 0] });
+  assert.equal(s.canvases.length, 2);
+  s.hostEl = { getBoundingClientRect: () => ({ width: 2880, height: 1080 }) };
+  s.frames = [{ w: 960, h: 540 }, { w: 1920, h: 1080 }];
+  s.applyCursor = () => {};
+  s.layout();
+  assert.equal(s.screen.style.width, "2880px");
+  const [b, a] = s.canvases.map((c: any) => c.getBoundingClientRect());
+  assert.deepEqual(plain(a), { left: 0, top: 0, width: 1920, height: 1080 });
+  assert.deepEqual(plain(b), { left: 1920, top: 540, width: 960, height: 540 });
+  assert.deepEqual(plain(s.locate(2000, 600)), { x: 80 / 960, y: 60 / 540, stream: 0 });
+  assert.deepEqual(plain(s.locate(100, 100)), { x: 100 / 1920, y: 100 / 1080, stream: 1 });
+  // 落在 B 上面的空白里：最近的是 B 的上边
+  assert.deepEqual(plain(s.locate(2400, 100)), { x: 0.5, y: 0, stream: 0 });
+  // 只看 A：马上发，一路
+  s.selectDisplay(0);
+  assert.deepEqual(views().at(-1), [{ display: 0, maxShort: 1080 }]);
+  assert.equal(s.allDisplays, false);
+  // 对方换了显示器的顺序（插拔）：按名字还是看 A（它现在是第 1 个）
+  s.onEvent({ type: "displays", displays: [displays[1], displays[0]], current: 1, shown: [1] });
+  assert.deepEqual(views().at(-1), [{ display: 1, maxShort: 1080 }]);
+  const sent = views().length;
+  s.onEvent({ type: "displays", displays: [displays[1], displays[0]], current: 1, shown: [1] });
+  assert.equal(views().length, sent, "没变不重发");
 });
 
 test("画面增强：只给正在操作的会话，关着时不发显示区域；增强时和 1:1 一样对齐到设备像素", () => {
@@ -120,15 +186,16 @@ test("画面增强：只给正在操作的会话，关着时不发显示区域�
   const style: any = {};
   const area = (width: number, height: number) => ({ getBoundingClientRect: () => ({ width, height }) });
   Object.assign(s, {
-    view: { setLayout: (a: any, l: string) => layouts.push([a, l]) },
+    view: { setLayout: (_stream: number, a: any, l: string) => layouts.push([a, l]) },
     hostEl: area(1920, 1080),
-    canvas: { style, getBoundingClientRect: () => ({ left: 10.3, top: 5.6 }) },
-    frame: { w: 1280, h: 720 }, scaleMode: "fit", interactive: true,
-    applyCursor() {}, updateViewLimit() {},
+    screen: { style, getBoundingClientRect: () => ({ left: 10.3, top: 5.6 }) },
+    frames: [{ w: 1280, h: 720 }], scaleMode: "fit", interactive: true,
+    applyCursor() {}, updateView() {},
   });
   s.layout();
   assert.deepEqual(plain(layouts), [[null, "off"]]);
   assert.equal(style.width, "1920px");
+  assert.equal(s.canvases[0].style.width, "1920px");
   assert.equal(style.left, "", "浏览器要放大，对齐也没用");
   // 关着时窗口变了不用告诉 Worker
   s.hostEl = area(1600, 900);
@@ -304,7 +371,7 @@ test("光标画在画面里（对方拖动、缩放窗口）：默认照样显�
   h.store.localCursor = true;
   const style: any = {};
   const hidden: boolean[] = [];
-  Object.assign(s, { canvas: { style }, input: { relative: false, setRemoteCursorHidden(h: boolean) { hidden.push(h); } } });
+  Object.assign(s, { screen: { style }, input: { relative: false, setRemoteCursorHidden(h: boolean) { hidden.push(h); } } });
   const push = (flags: number) => {
     const b = new Uint8Array(media.HEADER_LEN);
     b[0] = media.CURSOR;

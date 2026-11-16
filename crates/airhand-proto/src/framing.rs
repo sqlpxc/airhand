@@ -428,6 +428,8 @@ mod tests {
             platform: Platform::Android,
             touch: true,
             actions: vec![SystemAction::Back, SystemAction::VolumeDown],
+            shown: vec![0],
+            streams: 1,
         })));
         let mut r = &wire[..];
         let a: HostMsg = next(&mut r);
@@ -479,6 +481,12 @@ mod tests {
             ControllerDatagram::Ack {
                 seq: 9,
                 arrived: 77,
+                stream: 0,
+            },
+            ControllerDatagram::Ack {
+                seq: 9,
+                arrived: 77,
+                stream: 3,
             },
             ControllerDatagram::Echo { t: 3 },
         ] {

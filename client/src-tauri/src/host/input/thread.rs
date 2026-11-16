@@ -48,7 +48,8 @@ impl Inject for Injector {
 enum Job {
     Input {
         events: Vec<InputEvent>,
-        display: DisplayInfo,
+        /// 每一路画面对应的显示器（见 [`display_for`]）
+        displays: Vec<DisplayInfo>,
         /// 这一批的 [`cost`]
         cost: usize,
     },
@@ -98,9 +99,10 @@ impl InjectorThread {
         }
     }
 
-    /// 把一批输入排给注入线程，不等它注入。`display` 是现在的画面对应的显示器（坐标换算用）
-    pub fn handle(&mut self, events: Vec<InputEvent>, display: &DisplayInfo) {
-        if self.tx.is_none() {
+    /// 把一批输入排给注入线程，不等它注入。`displays`：现在每一路画面对应的显示器（第 `i` 项是第 `i` 路，
+    /// 坐标换算用，见 [`display_for`]），不能是空的
+    pub fn handle(&mut self, events: Vec<InputEvent>, displays: &[DisplayInfo]) {
+        if self.tx.is_none() || displays.is_empty() {
             return;
         }
         let cost = cost(&events);
@@ -123,7 +125,7 @@ impl InjectorThread {
         self.shared.queued.fetch_add(cost, Ordering::AcqRel);
         self.send(Job::Input {
             events,
-            display: display.clone(),
+            displays: displays.to_vec(),
             cost,
         });
     }
@@ -180,10 +182,10 @@ fn run<I: Inject>(mut injector: I, jobs: mpsc::Receiver<Job>, shared: &Shared) {
         match job {
             Job::Input {
                 events,
-                display,
+                displays,
                 cost,
             } => {
-                inject(&mut injector, &events, &display, shared);
+                inject(&mut injector, &events, &displays, shared);
                 shared.queued.fetch_sub(cost, Ordering::AcqRel);
             }
             Job::ReleaseAll => injector.release_all(),
@@ -192,17 +194,28 @@ fn run<I: Inject>(mut injector: I, jobs: mpsc::Receiver<Job>, shared: &Shared) {
     injector.release_all();
 }
 
+/// 一个输入事件按哪个显示器换算坐标（`displays` 的第 `i` 项是第 `i` 路画面的，见 `airhand_proto::session` 的"多屏"）：
+/// 绝对移动按它说的那一路（没有这一路的按第 0 路），别的（触摸）按第 0 路；键盘、相对移动用不到它
+fn display_for<'a>(event: &InputEvent, displays: &'a [DisplayInfo]) -> &'a DisplayInfo {
+    let stream = match event {
+        InputEvent::MouseMove { stream, .. } => *stream as usize,
+        _ => 0,
+    };
+    displays.get(stream).unwrap_or(&displays[0])
+}
+
 /// 注入一批输入。太长的文字（见 [`TEXT_PIECE`]）分成小段，会话结束了就不再往下输
 fn inject<I: Inject>(
     injector: &mut I,
     events: &[InputEvent],
-    display: &DisplayInfo,
+    displays: &[DisplayInfo],
     shared: &Shared,
 ) {
     for event in events {
         if shared.closed.load(Ordering::Acquire) {
             return;
         }
+        let display = display_for(event, displays);
         let InputEvent::Text { text } = event else {
             injector.handle(std::slice::from_ref(event), display);
             continue;
@@ -324,16 +337,37 @@ mod tests {
         }
     }
 
+    /// 多屏：绝对移动按它说的那一路画面的显示器换算，没有那一路时按第 0 路；别的事件按第 0 路
+    #[test]
+    fn moves_use_the_display_of_their_stream() {
+        let second = DisplayInfo {
+            index: 1,
+            name: "second".into(),
+            x: 1920,
+            ..display()
+        };
+        let displays = [display(), second];
+        let mv = |stream| InputEvent::MouseMove {
+            x: 0.5,
+            y: 0.5,
+            stream,
+        };
+        assert_eq!(display_for(&mv(1), &displays).name, "second");
+        assert_eq!(display_for(&mv(0), &displays).name, "test");
+        assert_eq!(display_for(&mv(3), &displays).name, "test");
+        assert_eq!(display_for(&key("KeyA", true), &displays).name, "test");
+    }
+
     /// 会话把输入交出去就返回，注入器还卡在前一批上也一样；注入的顺序就是交来的顺序
     #[test]
     fn handing_input_over_does_not_wait_for_the_injector() {
         let (mut thread, probe) = start();
         let d = display();
-        thread.handle(vec![text("slow")], &d);
+        thread.handle(vec![text("slow")], std::slice::from_ref(&d));
         assert_eq!(probe.next(), Call::Input(vec![text("slow")]));
-        thread.handle(vec![key("KeyA", true)], &d);
+        thread.handle(vec![key("KeyA", true)], std::slice::from_ref(&d));
         thread.release_all();
-        thread.handle(vec![key("KeyA", false)], &d);
+        thread.handle(vec![key("KeyA", false)], std::slice::from_ref(&d));
         assert!(probe.idle());
         probe.permit(3);
         assert_eq!(probe.next(), Call::Input(vec![key("KeyA", true)]));
@@ -346,10 +380,10 @@ mod tests {
     fn ending_the_session_drops_queued_input_and_releases_the_keys() {
         let (mut thread, probe) = start();
         let d = display();
-        thread.handle(vec![key("KeyA", true)], &d);
+        thread.handle(vec![key("KeyA", true)], std::slice::from_ref(&d));
         assert_eq!(probe.next(), Call::Input(vec![key("KeyA", true)]));
-        thread.handle(vec![text("never typed")], &d);
-        thread.handle(vec![text("neither is this")], &d);
+        thread.handle(vec![text("never typed")], std::slice::from_ref(&d));
+        thread.handle(vec![text("neither is this")], std::slice::from_ref(&d));
         drop(thread);
         probe.permit(1);
         assert_eq!(probe.next(), Call::ReleaseAll);
@@ -361,15 +395,18 @@ mod tests {
     fn a_backlog_that_is_too_long_is_cut_off_and_the_keys_are_released() {
         let (mut thread, probe) = start();
         let d = display();
-        thread.handle(vec![key("ShiftLeft", true)], &d);
+        thread.handle(vec![key("ShiftLeft", true)], std::slice::from_ref(&d));
         assert_eq!(probe.next(), Call::Input(vec![key("ShiftLeft", true)]));
-        thread.handle(vec![text(&"x".repeat(MAX_QUEUED))], &d);
+        thread.handle(
+            vec![text(&"x".repeat(MAX_QUEUED))],
+            std::slice::from_ref(&d),
+        );
         // 前面的还没注入完：排得下的也不收
-        thread.handle(vec![key("KeyB", true)], &d);
+        thread.handle(vec![key("KeyB", true)], std::slice::from_ref(&d));
         probe.permit(1);
         assert_eq!(probe.next(), Call::ReleaseAll);
         assert!(probe.idle());
-        thread.handle(vec![key("KeyC", true)], &d);
+        thread.handle(vec![key("KeyC", true)], std::slice::from_ref(&d));
         assert_eq!(probe.next(), Call::Input(vec![key("KeyC", true)]));
     }
 
@@ -378,7 +415,7 @@ mod tests {
     fn frontend_text_chunks_remain_cancellable_inside_a_batch() {
         let (mut thread, probe) = start();
         let piece = text(&"界".repeat(TEXT_PIECE));
-        thread.handle(vec![piece.clone(); 64], &display());
+        thread.handle(vec![piece.clone(); 64], &[display()]);
         assert_eq!(probe.next(), Call::Input(vec![piece]));
         drop(thread);
         probe.permit(1);
@@ -398,7 +435,7 @@ mod tests {
         ];
         let (mut thread, probe) = start();
         probe.permit(6);
-        thread.handle(batch.clone(), &display());
+        thread.handle(batch.clone(), &[display()]);
         assert_eq!(probe.next(), Call::Input(vec![key("ShiftLeft", true)]));
         let mut typed = String::new();
         for chars in [TEXT_PIECE, TEXT_PIECE, 7] {
@@ -420,7 +457,7 @@ mod tests {
 
         // 输第一段的时候会话结束了
         let (mut thread, probe) = start();
-        thread.handle(batch, &display());
+        thread.handle(batch, &[display()]);
         probe.permit(1);
         assert_eq!(probe.next(), Call::Input(vec![key("ShiftLeft", true)]));
         assert!(matches!(probe.next(), Call::Input(_)));

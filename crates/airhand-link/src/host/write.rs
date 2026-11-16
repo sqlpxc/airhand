@@ -1,9 +1,12 @@
 //! 被控端一个会话的写任务：控制、大块通道（两端共用的 [`write_lane`]），画面（[`write_video`]）和声音（[`write_audio`]）。
 //! 画面、声音走哪条路由直连任务决定（[`Paths::media`]，见 `crate::direct`），这里每一帧、每一包看一眼。
 //!
+//! 画面的每一路（多屏同时显示时每个显示器一路，见 `airhand_proto::session` 的"多屏"）一个写任务、一个加密端，
+//! 写在自己的通道上（`SessionLane::Video(第几路)`）；一路的写法和只有一路时一样。
+//!
 //! 画面有两种写法（见 `airhand_proto::session` 的"帧流"）：
 //!
-//! * 一条画面流（[`Video::Stream`]）：每条路上一条，帧一个接一个写进去；
+//! * 一条画面流（[`Video::Stream`]）：每条路上一条（发第一帧时才开），帧一个接一个写进去；
 //! * 帧流（[`Video::Frames`]，双方都支持、中转也支持时）：每帧开一条流，写完就结束。写好的流记在 [`FrameStreams`] 里，
 //!   控制端确认了就不用管了；控制端等不到了（`ControllerDatagram::Lost`），之后的帧整条流放弃（reset），
 //!   不再重传过时的数据；
@@ -32,6 +35,7 @@ use crate::fec::{self, Chooser};
 use crate::lanes::{open_frame, open_lane};
 use crate::paths::{Paths, send_datagram};
 use crate::secure::Sealer;
+use crate::tasks::try_join_all;
 use crate::transport::{WRITE_TIMEOUT, seal, write_lane, write_sealed};
 
 /// 本端各条通道的写任务要的东西
@@ -40,14 +44,15 @@ pub(super) struct Writers {
     pub paths: Paths,
     pub control: (SendStream, LaneReceiver, Sealer),
     pub bulk: (SendStream, LaneReceiver, Sealer),
-    pub video: (Video, mpsc::Receiver<Bytes>, Sealer),
+    /// 画面的每一路（第 `i` 项是第 `i` 路）
+    pub video: Vec<(Video, mpsc::Receiver<Bytes>, Sealer)>,
     pub audio: (mpsc::Receiver<Bytes>, Sealer),
 }
 
-/// 画面怎么写（见模块说明）
+/// 一路画面怎么写（见模块说明）
 pub(super) enum Video {
-    /// 中转上的那条画面流
-    Stream(SendStream),
+    /// 每条路上一条画面流
+    Stream,
     /// 每帧一条帧流；双方都支持纠错时有 `fec`：增量帧可能走纠错的数据报
     Frames {
         streams: Arc<FrameStreams>,
@@ -56,61 +61,68 @@ pub(super) enum Video {
 }
 
 /// 所有的写任务，一个出错就都结束
-pub(super) async fn write_all(w: Writers) -> Result<((), (), (), ())> {
+pub(super) async fn write_all(w: Writers) -> Result<()> {
     let Writers {
         session_id,
         paths,
         control: (control, ctl_rx, ctl_sealer),
         bulk: (bulk, bulk_rx, bulk_sealer),
-        video: (video, video_rx, video_sealer),
+        video,
         audio: (audio_rx, audio_sealer),
     } = w;
-    let video_paths = paths.clone();
-    let video = async move {
-        match video {
-            Video::Stream(relay) => {
-                write_video(relay, video_rx, video_sealer, session_id, video_paths).await
+    let video = video
+        .into_iter()
+        .enumerate()
+        .map(|(stream, (video, rx, sealer))| {
+            let to = Target {
+                session_id,
+                stream: stream as u8,
+                paths: paths.clone(),
+            };
+            async move {
+                match video {
+                    Video::Stream => write_video(rx, sealer, to).await,
+                    Video::Frames { streams, fec } => {
+                        write_frames(&streams, fec.as_deref(), rx, sealer, to).await
+                    }
+                }
             }
-            Video::Frames { streams, fec } => {
-                let to = Target {
-                    session_id,
-                    paths: video_paths,
-                };
-                write_frames(&streams, fec.as_deref(), video_rx, video_sealer, to).await
-            }
-        }
-    };
+        })
+        .collect();
     tokio::try_join!(
         write_lane(control, ctl_rx, ctl_sealer, Some(paths.clone())),
         write_lane(bulk, bulk_rx, bulk_sealer, None),
-        video,
+        try_join_all(video),
         write_audio(paths, session_id, audio_rx, audio_sealer)
-    )
+    )?;
+    Ok(())
 }
 
 /// 直连上一帧画面这么久写不进去，就当它断了（这一帧改从中转发）
 const DIRECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// 画面：`rx` 里排好队的画面包加密后写进现在走的那条路（[`Paths::media`]）。
+/// 一路画面：`rx` 里排好队的画面包加密后写进现在走的那条路（[`Paths::media`]）。
 /// 换路只在两帧之间生效，写到一半的帧照样写完：直连上已经写进去的帧照样送到，接收端按计数排好（见 [`crate::merge`]）。
 /// 往直连上写不进去（断了、堵死了）就放弃直连上的这条流（流里还没送到的帧随之丢了），这一帧改写进中转，
-/// 并告诉直连任务（[`Paths::report_broken`]）：它当直连断了（要关键帧、码率控制不再等那些帧）。中转上写不进去是错误：会话结束
-async fn write_video(
-    mut relay: SendStream,
-    mut rx: mpsc::Receiver<Bytes>,
-    mut sealer: Sealer,
-    session_id: u64,
-    paths: Paths,
-) -> Result<()> {
+/// 并告诉直连任务（[`Paths::report_broken`]）：它当直连断了（要关键帧、码率控制不再等那些帧）。中转上写不进去是错误：会话结束。
+/// 中转上的流发第一帧时才开：只看一个显示器时别的路不开流
+async fn write_video(mut rx: mpsc::Receiver<Bytes>, mut sealer: Sealer, to: Target) -> Result<()> {
+    let Target {
+        session_id,
+        stream,
+        paths,
+    } = to;
+    let lane = SessionLane::Video(stream);
+    let mut relay: Option<SendStream> = None;
     // 直连上画面的流：哪条连接上的（`stable_id`）
     let mut direct: Option<(usize, SendStream)> = None;
     while let Some(frame) = rx.recv().await {
         let sealed = seal(frame, &mut sealer)?;
         if let Some(conn) = paths.media() {
-            match write_direct(&conn, &mut direct, session_id, sealed.clone()).await {
+            match write_direct(&conn, &mut direct, session_id, lane, sealed.clone()).await {
                 Ok(()) => continue,
                 Err(e) => {
-                    debug!("writing video to the direct path failed: {e:#}");
+                    debug!(stream, "writing video to the direct path failed: {e:#}");
                     if let Some((_, mut s)) = direct.take() {
                         let _ = s.reset(0u32.into());
                     }
@@ -118,27 +130,33 @@ async fn write_video(
                 }
             }
         }
-        write_sealed(&mut relay, sealed).await?;
+        if relay.is_none() {
+            relay = Some(open_lane(paths.relay(), session_id, lane).await?);
+        }
+        write_sealed(relay.as_mut().expect("opened above"), sealed).await?;
     }
-    relay.finish()?;
+    if let Some(mut r) = relay {
+        r.finish()?;
+    }
     if let Some((_, mut s)) = direct {
         let _ = s.finish();
     }
     Ok(())
 }
 
-/// 往直连上写一帧画面（这条连接上还没有画面的流就开一条）
+/// 往直连上写一帧画面（这条连接上还没有这一路画面的流就开一条）
 async fn write_direct(
     conn: &Connection,
     direct: &mut Option<(usize, SendStream)>,
     session_id: u64,
+    lane: SessionLane,
     sealed: Bytes,
 ) -> Result<()> {
     if direct
         .as_ref()
         .is_none_or(|(id, _)| *id != conn.stable_id())
     {
-        let s = open_lane(conn, session_id, SessionLane::Video).await?;
+        let s = open_lane(conn, session_id, lane).await?;
         *direct = Some((conn.stable_id(), s));
     }
     let (_, s) = direct.as_mut().expect("opened above");
@@ -201,9 +219,10 @@ impl FrameStreams {
     }
 }
 
-/// 画面发给谁、走哪条路
+/// 画面发给谁、是第几路、走哪条路
 struct Target {
     session_id: u64,
+    stream: u8,
     paths: Paths,
 }
 
@@ -220,7 +239,12 @@ async fn write_frames(
     mut sealer: Sealer,
     to: Target,
 ) -> Result<()> {
-    let Target { session_id, paths } = to;
+    let Target {
+        session_id,
+        stream,
+        paths,
+    } = to;
+    let lane = SessionLane::Video(stream);
     // 上一帧的序号、是不是走的纠错（下一帧的数据报里要说，见 airhand_proto::fec 的 PREV_FEC）
     let mut prev: Option<u32> = None;
     let mut prev_fec = false;
@@ -236,7 +260,7 @@ async fn write_frames(
         if let Some(c) = fec {
             c.sent(seq, Instant::now());
             if let Some(r) = c.plan(sealed.len() - PREFIX, eligible) {
-                let d = fec::fragments(session_id, &sealed[PREFIX..], prev_fec, r)?;
+                let d = fec::fragments(session_id, stream, &sealed[PREFIX..], prev_fec, r)?;
                 prev_fec = true;
                 send_fragments(&paths, d).await?;
                 continue;
@@ -245,7 +269,7 @@ async fn write_frames(
         prev_fec = false;
         if let Some(conn) = paths.media() {
             let written = async {
-                let mut s = open_frame(&conn, session_id, SessionLane::Video).await?;
+                let mut s = open_frame(&conn, session_id, lane).await?;
                 tokio::time::timeout(DIRECT_WRITE_TIMEOUT, s.write_chunk(sealed.clone()))
                     .await
                     .context("the direct path stalled")??;
@@ -258,12 +282,12 @@ async fn write_frames(
                     continue;
                 }
                 Err(e) => {
-                    debug!("writing video to the direct path failed: {e:#}");
+                    debug!(stream, "writing video to the direct path failed: {e:#}");
                     paths.report_broken(&conn);
                 }
             }
         }
-        let mut s = open_frame(paths.relay(), session_id, SessionLane::Video).await?;
+        let mut s = open_frame(paths.relay(), session_id, lane).await?;
         let written = async {
             tokio::time::timeout(WRITE_TIMEOUT, s.write_chunk(sealed))
                 .await
@@ -274,7 +298,7 @@ async fn write_frames(
         match written.await {
             Ok(()) => streams.add(seq, s),
             Err(e) if paths.relay().close_reason().is_some() => return Err(e),
-            Err(e) => debug!(seq, "a video frame couldn't be written: {e:#}"),
+            Err(e) => debug!(stream, seq, "a video frame couldn't be written: {e:#}"),
         }
     }
     Ok(())
@@ -356,6 +380,7 @@ mod tests {
     fn video(seq: u32, key: bool, reference: Option<u32>, size: usize) -> Bytes {
         let h = VideoHeader {
             seq,
+            stream: 0,
             key,
             codec: Codec::H264,
             width: 8,
@@ -380,6 +405,80 @@ mod tests {
         }
     }
 
+    /// 真的 QUIC，两路画面（多屏同时显示）：每一路的帧流走自己的通道、纠错数据报按头里的第几路分开，
+    /// 控制端的两个合并各自按顺序交出自己那一路的帧，谁也不混进谁
+    #[tokio::test]
+    async fn two_streams_travel_independently() {
+        const SID: u64 = 78;
+        let (client, server) = crate::tests::quic_pair().await;
+        let (router, _task) = Router::start(&server);
+        let (mut inbox, _registration) = router.register(SID);
+        let mut merges = Vec::new();
+        let mut senders = Vec::new();
+        let mut writers = Vec::new();
+        for stream in 0..2u8 {
+            let (sealer, opener) = crate::secure::test_lane(false);
+            merges.push(
+                Merge::new(
+                    SessionLane::Video(stream),
+                    Policy::Video,
+                    opener,
+                    std::mem::replace(
+                        &mut inbox.video[stream as usize],
+                        mpsc::unbounded_channel().1,
+                    ),
+                )
+                .with_datagrams(std::mem::replace(
+                    &mut inbox.fec[stream as usize],
+                    mpsc::channel(1).1,
+                )),
+            );
+            let streams = Arc::new(FrameStreams::default());
+            let chooser = Arc::new(Chooser::new(VideoTransport::Fec));
+            let (tx, rx) = mpsc::channel(64);
+            senders.push(tx);
+            let to = Target {
+                session_id: SID,
+                stream,
+                paths: Paths::new(client.clone()),
+            };
+            writers.push(tokio::spawn(async move {
+                write_frames(&streams, Some(&chooser), rx, sealer, to).await
+            }));
+        }
+        // 两路交替着发：关键帧走帧流，之后的增量帧走纠错的数据报
+        for seq in 1..=5u32 {
+            for (stream, tx) in senders.iter().enumerate() {
+                let key = seq == 1;
+                let size = if key { 20_000 } else { 1500 * (stream + 1) };
+                let mut f = video(seq, key, (!key).then(|| seq - 1), size).to_vec();
+                f[4 + 12] = stream as u8;
+                tx.send(Bytes::from(f)).await.unwrap();
+            }
+        }
+        for (stream, m) in merges.iter_mut().enumerate() {
+            for seq in 1..=5u32 {
+                let f = loop {
+                    let v = tokio::time::timeout(Duration::from_secs(5), m.next_video())
+                        .await
+                        .expect("no frame")
+                        .unwrap()
+                        .unwrap();
+                    if let Out::Frame(f) = v {
+                        break f;
+                    }
+                };
+                let h = VideoHeader::decode(&f.data).unwrap();
+                assert_eq!((h.stream, h.seq), (stream as u8, seq));
+                assert_eq!(f.fec, seq > 1, "stream {stream} frame {seq}");
+            }
+        }
+        drop(senders);
+        for w in writers {
+            w.await.unwrap().unwrap();
+        }
+    }
+
     /// 真的 QUIC：写任务固定用纠错时，增量帧走纠错的数据报，关键帧、恢复帧（参考的不是前一帧）走帧流；
     /// 控制端的合并把两种按顺序交出来。改成帧流之后都走帧流
     #[tokio::test]
@@ -387,10 +486,15 @@ mod tests {
         const SID: u64 = 77;
         let (client, server) = crate::tests::quic_pair().await;
         let (router, _task) = Router::start(&server);
-        let (inbox, _registration) = router.register(SID);
+        let (mut inbox, _registration) = router.register(SID);
         let (sealer, opener) = crate::secure::test_lane(false);
-        let mut m = Merge::new(SessionLane::Video, Policy::Video, opener, inbox.video)
-            .with_datagrams(inbox.fec);
+        let mut m = Merge::new(
+            SessionLane::Video(0),
+            Policy::Video,
+            opener,
+            inbox.video.remove(0),
+        )
+        .with_datagrams(inbox.fec.remove(0));
         let streams = Arc::new(FrameStreams::default());
         let chooser = Arc::new(Chooser::new(VideoTransport::Fec));
         let (tx, rx) = mpsc::channel(64);
@@ -398,6 +502,7 @@ mod tests {
             let (streams, chooser) = (streams.clone(), chooser.clone());
             let to = Target {
                 session_id: SID,
+                stream: 0,
                 paths: Paths::new(client.clone()),
             };
             tokio::spawn(
@@ -452,10 +557,15 @@ mod tests {
         let (client, server, _relay) =
             crate::tests::lossy_quic_pair(0.05, Duration::from_millis(30)).await;
         let (router, _task) = Router::start(&server);
-        let (inbox, _registration) = router.register(SID);
+        let (mut inbox, _registration) = router.register(SID);
         let (sealer, opener) = crate::secure::test_lane(false);
-        let mut m = Merge::new(SessionLane::Video, Policy::Video, opener, inbox.video)
-            .with_datagrams(inbox.fec);
+        let mut m = Merge::new(
+            SessionLane::Video(0),
+            Policy::Video,
+            opener,
+            inbox.video.remove(0),
+        )
+        .with_datagrams(inbox.fec.remove(0));
         m.set_rtt(60.0);
         let stats = m.stats();
         let streams = Arc::new(FrameStreams::default());
@@ -465,6 +575,7 @@ mod tests {
             let (streams, chooser) = (streams.clone(), chooser.clone());
             let to = Target {
                 session_id: SID,
+                stream: 0,
                 paths: Paths::new(client.clone()),
             };
             crate::tasks::OwnedTask(tokio::spawn(async move {
@@ -534,10 +645,15 @@ mod tests {
         let (client, server, _relay) =
             crate::tests::lossy_quic_pair(0.0, Duration::from_millis(30)).await;
         let (router, _task) = Router::start(&server);
-        let (inbox, _registration) = router.register(SID);
+        let (mut inbox, _registration) = router.register(SID);
         let (sealer, opener) = crate::secure::test_lane(false);
-        let mut m = Merge::new(SessionLane::Video, Policy::Video, opener, inbox.video)
-            .with_datagrams(inbox.fec);
+        let mut m = Merge::new(
+            SessionLane::Video(0),
+            Policy::Video,
+            opener,
+            inbox.video.remove(0),
+        )
+        .with_datagrams(inbox.fec.remove(0));
         m.set_rtt(60.0);
         let stats = m.stats();
         let streams = Arc::new(FrameStreams::default());
@@ -547,6 +663,7 @@ mod tests {
             let (streams, chooser) = (streams.clone(), chooser.clone());
             let to = Target {
                 session_id: SID,
+                stream: 0,
                 paths: Paths::new(client.clone()),
             };
             crate::tasks::OwnedTask(tokio::spawn(async move {
@@ -596,8 +713,8 @@ mod tests {
         let (mut sealer, opener) = crate::secure::test_lane(false);
         let (_streams, no_streams) = mpsc::unbounded_channel();
         let (dtx, drx) = mpsc::channel(4096);
-        let mut m =
-            Merge::new(SessionLane::Video, Policy::Video, opener, no_streams).with_datagrams(drx);
+        let mut m = Merge::new(SessionLane::Video(0), Policy::Video, opener, no_streams)
+            .with_datagrams(drx);
         let lossy = tokio::spawn(async move {
             let mut n = 0u32;
             while let Ok(d) = server.read_datagram().await {
@@ -614,7 +731,7 @@ mod tests {
             let sealed = seal(f, &mut sealer).unwrap();
             let (_, k) = airhand_proto::fec::shard_size(sealed.len() - PREFIX);
             let r = fec::repair_count(k, 1.0 / 7.0);
-            let d = fec::fragments(1, &sealed[PREFIX..], prev_fec, r).unwrap();
+            let d = fec::fragments(1, 0, &sealed[PREFIX..], prev_fec, r).unwrap();
             prev_fec = true;
             send_fragments(&paths, d).await.unwrap();
         }

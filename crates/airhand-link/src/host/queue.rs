@@ -60,7 +60,7 @@ impl Place {
         let lane = match msg.lane() {
             SessionLane::Bulk => BULK,
             // 画面不是消息，不走这里
-            SessionLane::Control | SessionLane::Video => CONTROL,
+            SessionLane::Control | SessionLane::Video(_) => CONTROL,
         };
         let queued = |before| Place::Queued { lane, before };
         match msg {
@@ -274,6 +274,7 @@ mod tests {
         HostMsg::Displays {
             displays: vec![display(name)],
             current: 0,
+            shown: vec![0],
         }
     }
 
@@ -288,6 +289,8 @@ mod tests {
             platform: Platform::Linux,
             touch: false,
             actions: vec![],
+            shown: vec![0],
+            streams: 1,
         })
     }
 

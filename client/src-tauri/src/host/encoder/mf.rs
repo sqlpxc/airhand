@@ -619,6 +619,8 @@ impl MfEncoder {
                     hardware: true,
                     width: w,
                     height: h,
+                    // 第几路画面由编码管线填（见 pipeline）
+                    stream: 0,
                 },
                 seq_header,
                 need_input: 0,

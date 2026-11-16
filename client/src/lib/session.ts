@@ -8,6 +8,8 @@
 // * 鼠标移动按 8ms 合并，按键/点击立即发送；
 // * 不可见的会话自动降到 5fps，节省带宽与对端 CPU；
 // * 画面只缩放一次：按画面在窗口里显示的大小请求分辨率，收到后按 1:1 显示（见 fit.ts）；
+// * 多屏（可选，默认只看一个显示器）：同时看对方的好几个显示器，每个显示器一路画面、一个 canvas，
+//   按它们在对方桌面上的位置拼在一起（见 screens.ts），鼠标在哪一块上就操作哪个显示器；
 // * 画面增强（可选）：要放大时在 Worker 里用显卡放大、锐化，canvas 就是显示的大小（见 enhance.ts）；
 // * 只有当前正在查看的会话播放声音，其余会话通知被控端停止采集声音；
 // * 本机麦克风（可选，默认关）：也只发给当前正在查看的会话，被控端放进它的虚拟麦克风（见 mic.ts）；
@@ -25,6 +27,7 @@ import {
   type SessionEvent,
   type MicState,
   type Platform,
+  type StreamView,
   type SystemAction,
 } from "./api";
 import * as media from "./media";
@@ -38,8 +41,9 @@ import type { MediaView } from "./console";
 import { RECOVERS, type SessionNotice } from "./messages";
 import { CODEC_LABEL } from "./presets";
 import { store } from "./store";
-import { fitSize, stricter, viewMaxShort } from "./fit";
+import { fitSize, viewMaxShort } from "./fit";
 import { renderPlan, type Area, type EnhanceLevel } from "./enhance";
+import { hitTest, layoutTiles, placeDisplays, type Rect } from "./screens";
 
 /** waiting = 对方掉线了，等它重新上线（服务器会通知，见 hostOnline） */
 /** `approving`：连上了，在等对方的用户同意（之后收到 hello 才是 `live`） */
@@ -68,6 +72,8 @@ export interface EncoderState {
 }
 
 const BACKGROUND_FPS = 5;
+/** 一个会话最多同时看几个显示器（airhand_proto::MAX_STREAMS） */
+const MAX_STREAMS = 4;
 /** 显示区域的大小停下来这么久才按新大小请求分辨率（拖动窗口边框时不要每一下都让对方重建编码器） */
 const VIEW_LIMIT_DELAY_MS = 400;
 const MAX_RETRIES = 30;
@@ -92,7 +98,8 @@ let nextId = 1;
 export class RemoteSession {
   readonly id = `s${nextId++}`;
   readonly code: string;
-  readonly canvas: HTMLCanvasElement;
+  /** 画面：包着每一路画面的 canvas（只看一个显示器时只有一个）。键盘焦点、鼠标事件、锁定指针都在它上面 */
+  readonly screen: HTMLDivElement;
 
   state: SessionState = "connecting";
   /** 上次断开的原因（显示时才变成文字，见 messages.ts） */
@@ -102,7 +109,14 @@ export class RemoteSession {
   hostOs = "";
   hostVersion = "";
   displays: DisplayInfo[] = [];
+  /** 第 0 路画面是哪个显示器 */
   currentDisplay = 0;
+  /** 对方现在每一路画面是哪个显示器（第 i 项是第 i 路） */
+  shown: number[] = [0];
+  /** 对方最多能同时发几路画面（hello 之前不知道，当作 1） */
+  maxStreams = 1;
+  /** 同时看对方所有的显示器（用户开关，默认只看一个） */
+  allDisplays = false;
   hostCodecs: Codec[] = ["h264"];
   /** 对方报告的平台（hello 之前为 null，这时按 hostOs 猜） */
   hostPlatform: Platform | null = null;
@@ -147,8 +161,15 @@ export class RemoteSession {
 
   /** 画面和声音（在 Worker 里） */
   private readonly view: MediaView;
-  /** 画面的大小（像素） */
-  private frame = { w: 16, h: 9 };
+  /** 每一路画面的 canvas（第 i 项是第 i 路，要看哪一路之前建好、交给 Worker） */
+  private readonly canvases: HTMLCanvasElement[] = [];
+  /** 每一路画面的大小（像素） */
+  private frames: { w: number; h: number }[] = [{ w: 16, h: 9 }];
+  /**
+   * 只看一个显示器时看哪个（同时看所有的时候它是第 0 路）：用户选的，还没选过时是对方开始时给的。按名字记着：
+   * 对方插拔显示器时序号可能变
+   */
+  private wantName: string | null = null;
   /** Worker 最近报告的平均解码耗时、音画同步状态（随下一次 stats 事件显示） */
   private decodeMs = 0;
   private videoSync: AvSyncStats = { skewMs: null, videoDelayMs: 0, extraMs: 0 };
@@ -189,13 +210,16 @@ export class RemoteSession {
   private resizeObs: ResizeObserver | null = null;
   /** 画面的显示区域（设备像素）；还没挂到页面上时为 null */
   private viewport: { w: number; h: number } | null = null;
-  /** 按显示区域向被控端请求的短边上限（0 = 不限），与用户选的上限取较严的发过去 */
-  private viewLimit = 0;
-  private viewLimitTimer: number | undefined;
-  /** 最近一次想改 viewLimit 的时刻（与 performance.now() 同一时基） */
-  private viewLimitAt = -Infinity;
-  /** 最近告诉 Worker 的显示方式（见 sendLayout） */
-  private sentLayout = "";
+  /**
+   * 最近告诉被控端的看哪几个显示器（view 命令的 streams，每一路带着按显示区域要的短边上限，见 updateView）；
+   * 还没告诉过时为 null
+   */
+  private sentView: StreamView[] | null = null;
+  private viewTimer: number | undefined;
+  /** 最近一次想改显示区域要的大小的时刻（与 performance.now() 同一时基） */
+  private viewAt = -Infinity;
+  /** 最近告诉 Worker 的每一路画面的显示方式（见 sendLayout） */
+  private sentLayouts: string[] = [];
 
   // 输入
   private interactive = false;
@@ -231,14 +255,13 @@ export class RemoteSession {
       this.hostKey = saved.hostKey ?? null;
     }
     this.pairing = pairing ?? null;
-    this.canvas = document.createElement("canvas");
-    this.canvas.className = "remote-canvas";
-    this.canvas.tabIndex = 0;
-    this.canvas.width = this.frame.w;
-    this.canvas.height = this.frame.h;
-    this.view = api.view(this.canvas, {
-      size: (w, h) => {
-        this.frame = { w, h };
+    this.screen = document.createElement("div");
+    this.screen.className = "remote-screen";
+    this.screen.tabIndex = 0;
+    const first = this.newCanvas();
+    this.view = api.view(first, {
+      size: (stream, w, h) => {
+        this.frames[stream] = { w, h };
         this.layout();
       },
       cursor: (pkt) => this.onCursor(pkt),
@@ -251,9 +274,14 @@ export class RemoteSession {
         this.videoSync = sync;
       },
     });
-    this.input = new RemoteInput(this.canvas, () => this.sid !== null && !this.disposed, (events) => {
-      if (this.sid !== null) this.command({ cmd: "input", sid: this.sid, events });
-    });
+    this.input = new RemoteInput(
+      this.screen,
+      () => this.sid !== null && !this.disposed,
+      (events) => {
+        if (this.sid !== null) this.command({ cmd: "input", sid: this.sid, events });
+      },
+      (x, y) => this.locate(x, y),
+    );
     // 鼠标切换了绝对 / 相对、锁定了 / 解除了：本机指针显示与否、工具栏的状态跟着变
     this.input.onModeChange = () => {
       this.applyCursor();
@@ -301,13 +329,17 @@ export class RemoteSession {
     this.micOn = false;
     this.attemptAt = performance.now();
     let info;
-    // 开始时的画质和要不要声音在端到端握手里就告诉对方：它一开始就按这个建编码器，不用先建一个默认的再重建
+    // 开始时的画质、要不要声音、看哪几个显示器在端到端握手里就告诉对方：它一开始就按这个建编码器，
+    // 不用先建一个默认的再重建（重连时知道对方有哪些显示器；第一次连时不知道，对方先看主显示器）
     const sent = this.effectiveSettings();
     const audio = this.audioEnabled && this.foreground;
+    const view = this.wantedView();
+    this.ensureCanvases(view.length);
+    this.sentView = null;
     try {
       info = await api.connect(
         this.code,
-        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing, settings: sent, audio },
+        { resume: this.resume, hostKey: this.hostKey, pairing: this.pairing, settings: sent, audio, view },
         this.view,
         onEvent,
         this.clipboardSync,
@@ -337,8 +369,11 @@ export class RemoteSession {
     // hello 也可能比这里先到，那时已经是 live 了
     this.retries = 0;
     this.closedReason = null;
-    // 连接过程中设置变了（例如 Hello 先到，换了编码格式、按显示区域改了分辨率，那时还没有 sid 发不出去）：重发
+    // 连接过程中设置变了（例如 Hello 先到，换了编码格式，那时还没有 sid 发不出去）：重发
     if (!sameQuality(this.effectiveSettings(), sent)) this.pushSettings();
+    // 看哪几个显示器：对方按握手里的开始（空的是主显示器）。Hello 先到了的话，现在想看的可能已经不一样了
+    if (view.length) this.sentView = view;
+    this.updateView(true);
     // 对方已经按握手里说的开始（或者没有开始）发声音；连接期间变了（例如切换了标签）再告诉对方
     this.audioOn = audio;
     if (audio) this.audio.enable();
@@ -471,7 +506,7 @@ export class RemoteSession {
     clearTimeout(this.retryTimer);
     this.input.dispose();
     this.view.dispose();
-    clearTimeout(this.viewLimitTimer);
+    clearTimeout(this.viewTimer);
     if (this.sid !== null) this.command({ cmd: "disconnect", sid: this.sid });
     this.sid = null;
     this.state = "closed";
@@ -495,16 +530,18 @@ export class RemoteSession {
         this.hostPlatform = ev.platform;
         this.hostActions = ev.actions;
         this.hostVersion = ev.version;
-        this.displays = ev.displays;
-        this.currentDisplay = ev.current;
+        this.maxStreams = Math.max(1, ev.maxStreams ?? 1);
+        this.setShown(ev.displays, ev.current, ev.shown);
         this.hostCodecs = ev.codecs;
         this.fitCodec();
-        this.updateViewLimit();
+        this.layout();
+        this.updateView();
         break;
       case "displays":
-        this.displays = ev.displays;
-        this.currentDisplay = ev.current;
-        this.updateViewLimit();
+        this.setShown(ev.displays, ev.current, ev.shown);
+        this.layout();
+        // 同时看所有显示器时：对方插上了新的显示器也要看
+        this.updateView();
         break;
       case "stats":
         this.stats = {
@@ -520,6 +557,8 @@ export class RemoteSession {
         this.syncStats = this.videoSync;
         break;
       case "encoder":
+        // 工具栏、画质面板显示的是第 0 路画面的编码器（各路的画质设置一样）
+        if ((ev.stream ?? 0) !== 0) return;
         this.encoder = { codec: ev.codec, name: ev.name, hardware: ev.hardware, width: ev.width, height: ev.height };
         break;
       case "mic":
@@ -655,9 +694,10 @@ export class RemoteSession {
       this.setCursor("default");
       return;
     }
+    // 几路画面是按同一个比例缩放的（见 screens.ts）：按第 0 路算
     const display = this.displays[this.currentDisplay];
-    const srcWidth = display?.width || this.frame.w;
-    const cssWidth = this.canvas.getBoundingClientRect().width || this.frame.w;
+    const srcWidth = display?.width || this.frames[0].w;
+    const cssWidth = this.canvases[0].getBoundingClientRect().width || this.frames[0].w;
     // 远端物理像素 → 本地 CSS 像素；限制在 Chromium 支持的 128px 以内
     let scale = cssWidth / srcWidth;
     scale = Math.min(Math.max(scale, 0.35), 2, 128 / Math.max(c.w, c.h));
@@ -685,7 +725,7 @@ export class RemoteSession {
 
   private setCursor(css: string) {
     this.cursorCss = css;
-    this.canvas.style.cursor = css;
+    this.screen.style.cursor = css;
   }
 
   // ───────────────────────── 布局 ─────────────────────────
@@ -693,7 +733,7 @@ export class RemoteSession {
   attach(host: HTMLElement) {
     this.detach();
     this.hostEl = host;
-    host.appendChild(this.canvas);
+    host.appendChild(this.screen);
     this.resizeObs = new ResizeObserver(() => this.layout());
     this.resizeObs.observe(host);
     this.layout();
@@ -702,7 +742,7 @@ export class RemoteSession {
   detach() {
     this.resizeObs?.disconnect();
     this.resizeObs = null;
-    if (this.hostEl && this.canvas.parentElement === this.hostEl) this.hostEl.removeChild(this.canvas);
+    if (this.hostEl && this.screen.parentElement === this.hostEl) this.hostEl.removeChild(this.screen);
     this.hostEl = null;
   }
 
@@ -727,43 +767,82 @@ export class RemoteSession {
     return this.interactive ? store.get().enhance : "off";
   }
 
+  /**
+   * 摆好每一路画面：只有一路时和以前一样，画面在显示区域里 1:1 或等比缩放；好几路时按对方的显示器在桌面上的位置
+   * 拼在一起、整体缩放到显示区域里（screens.ts），每一路在自己那一块里再 1:1 或等比缩放
+   */
   private layout() {
     const host = this.hostEl;
     if (!host) return;
-    const { w: fw, h: fh } = this.frame;
     const dpr = devicePixelRatio || 1;
     const r = host.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) this.viewport = { w: Math.floor(r.width * dpr), h: Math.floor(r.height * dpr) };
-    // 画面的显示区域（设备像素；原始大小显示时不按窗口缩放），画面的显示大小，以及是否 1:1
+    // 画面的显示区域（设备像素；原始大小显示时不按窗口缩放）
     const area = this.nativeScale ? null : this.viewport;
-    let size = { w: fw, h: fh, exact: true };
-    if (area) size = fitSize(fw, fh, area.w, area.h);
-    // 画面增强时 canvas 就是显示的大小（Worker 按同样的算法放大好了），和 1:1 一样不能再让浏览器插值
     const enhance = this.enhanceLevel;
-    const enhanced = renderPlan(fw, fh, area, enhance).enhance;
-    const style = this.canvas.style;
-    style.width = `${size.w / dpr}px`;
-    style.height = `${size.h / dpr}px`;
-    style.left = style.top = "";
-    if ((size.exact || enhanced) && !this.nativeScale) {
-      // 1:1 显示时左上角要落在整数设备像素上：差半个像素浏览器也会插值，文字又糊了
-      const c = this.canvas.getBoundingClientRect();
-      const snap = (v: number) => (Math.round(v * dpr) - v * dpr) / dpr;
-      style.left = `${snap(c.left)}px`;
-      style.top = `${snap(c.top)}px`;
+    const n = this.streamCount;
+    // 每一路画面占的那一块（设备像素，相对整个画面的左上角）、整个画面的大小，以及要不要对齐到设备像素
+    let tiles: Rect[];
+    let box: { w: number; h: number };
+    let snap: boolean;
+    if (n === 1) {
+      const { w: fw, h: fh } = this.frames[0];
+      const size = area ? fitSize(fw, fh, area.w, area.h) : { w: fw, h: fh, exact: true };
+      tiles = [{ x: 0, y: 0, w: size.w, h: size.h }];
+      box = size;
+      // 1:1 显示，或者画面增强时 canvas 就是显示的大小（Worker 按同样的算法放大好了）：不能再让浏览器插值
+      snap = size.exact || renderPlan(fw, fh, area, enhance).enhance;
+      this.sendLayout(0, area, enhance);
+    } else {
+      const placed = layoutTiles(placeDisplays(this.shown.map((i) => this.displays[i])), area);
+      tiles = placed.tiles;
+      box = placed;
+      // 每一块都在整数设备像素上：整个画面对齐了，1:1 显示的那几路就不会发虚
+      snap = true;
     }
-    this.sendLayout(area, enhance);
+    const ss = this.screen.style;
+    ss.width = `${box.w / dpr}px`;
+    ss.height = `${box.h / dpr}px`;
+    this.canvases.forEach((c, i) => {
+      const st = c.style;
+      const tile = tiles[i];
+      if (i >= n || !tile) {
+        st.display = "none";
+        return;
+      }
+      st.display = "";
+      let size = { w: tile.w, h: tile.h };
+      if (n > 1) {
+        // 这一路的画面还没到：先按它的显示器的宽高比
+        const d = this.displays[this.shown[i]];
+        const { w: fw, h: fh } = this.frames[i] ?? { w: d.width, h: d.height };
+        size = fitSize(fw, fh, tile.w, tile.h);
+        this.sendLayout(i, area ? { w: tile.w, h: tile.h } : null, enhance);
+      }
+      st.left = `${(tile.x + Math.floor((tile.w - size.w) / 2)) / dpr}px`;
+      st.top = `${(tile.y + Math.floor((tile.h - size.h) / 2)) / dpr}px`;
+      st.width = `${size.w / dpr}px`;
+      st.height = `${size.h / dpr}px`;
+    });
+    ss.left = ss.top = "";
+    if (snap && !this.nativeScale) {
+      // 1:1 显示时左上角要落在整数设备像素上：差半个像素浏览器也会插值，文字又糊了
+      const c = this.screen.getBoundingClientRect();
+      const align = (v: number) => (Math.round(v * dpr) - v * dpr) / dpr;
+      ss.left = `${align(c.left)}px`;
+      ss.top = `${align(c.top)}px`;
+    }
     this.applyCursor();
-    this.updateViewLimit();
+    this.updateView();
   }
 
-  /** 告诉 Worker 画面怎么显示（变了才发）。不增强时显示区域用不上，不发：拖动窗口边框时不用每一下都重画 */
-  private sendLayout(area: Area | null, enhance: EnhanceLevel) {
+  /** 告诉 Worker 第 stream 路画面怎么显示（变了才发）。不增强时显示区域用不上，不发：拖动窗口边框时不用每一下都重画 */
+  private sendLayout(stream: number, area: Area | null, enhance: EnhanceLevel) {
     const shown = enhance === "off" ? null : area;
     const key = `${shown ? `${shown.w}x${shown.h}` : "-"}/${enhance}`;
-    if (key === this.sentLayout) return;
-    this.sentLayout = key;
-    this.view.setLayout(shown, enhance);
+    if (key === this.sentLayouts[stream]) return;
+    this.sentLayouts[stream] = key;
+    this.view.setLayout(stream, shown, enhance);
   }
 
   /** 原始大小（可滚动）显示 */
@@ -771,30 +850,105 @@ export class RemoteSession {
     return this.scaleMode === "native" && this.interactive;
   }
 
+  /** 现在显示几路画面：对方说的（显示器的序号都对得上、都有 canvas 时），至少一路 */
+  private get streamCount(): number {
+    const n = this.shown.length;
+    const ok = n <= this.canvases.length && this.shown.every((i) => i < this.displays.length);
+    return n > 1 && ok ? n : 1;
+  }
+
+  /** 对方说了现在的显示器列表和每一路画面是哪个显示器（对方没说的时候只有第 0 路） */
+  private setShown(displays: DisplayInfo[], current: number, shown: number[] | undefined) {
+    this.displays = displays;
+    this.currentDisplay = current;
+    this.shown = shown?.length ? shown : [current];
+    // 第一次：只看一个显示器时就看对方开始时给的那个（主显示器）
+    if (this.wantName === null) this.wantName = displays[current]?.name ?? null;
+    this.ensureCanvases(this.shown.length);
+  }
+
+  /** 新的一路画面的 canvas（放进画面里，还没交给 Worker） */
+  private newCanvas(): HTMLCanvasElement {
+    const c = document.createElement("canvas");
+    c.className = "remote-canvas";
+    c.width = 16;
+    c.height = 9;
+    this.screen.appendChild(c);
+    this.canvases.push(c);
+    return c;
+  }
+
+  /** 要看 n 路画面：还没有 canvas 的那几路建好、交给 Worker（在对方发这一路之前） */
+  private ensureCanvases(n: number) {
+    while (this.canvases.length < Math.min(n, MAX_STREAMS)) {
+      const c = this.newCanvas();
+      this.view.addCanvas(this.canvases.length - 1, c);
+    }
+  }
+
+  /** 指针（屏幕坐标）在第几路画面上的哪里：落在缝里、外面时是最近的那一路的边上 */
+  private locate(x: number, y: number): { x: number; y: number; stream: number } {
+    const rects = this.canvases.slice(0, this.streamCount).map((c) => c.getBoundingClientRect());
+    const hit = hitTest(rects, x, y);
+    return hit ? { x: hit.x, y: hit.y, stream: hit.index } : { x: 0, y: 0, stream: 0 };
+  }
+
+  /** 想看的显示器（第 i 项是第 i 路）：只看一个时是选的那个；都看时它在第 0 路（切换时这一路不用重建），接着是别的 */
+  private wanted(): number[] {
+    const n = this.displays.length;
+    if (!n) return [];
+    let first = this.displays.findIndex((d) => d.name === this.wantName);
+    if (first < 0) first = this.currentDisplay < n ? this.currentDisplay : 0;
+    if (!this.allDisplays || this.maxStreams < 2) return [first];
+    const rest = this.displays.map((_, i) => i).filter((i) => i !== first);
+    return [first, ...rest].slice(0, Math.min(this.maxStreams, MAX_STREAMS));
+  }
+
   /**
-   * 按显示区域重新算向被控端请求的短边上限（见 fit.ts）。原始大小显示时不限。
-   *
-   * 一段时间没变过就马上发；连续变化时（拖动窗口边框、窗口动画）等停下来再发，免得对方一直重建编码器。
+   * 想看的显示器，带着每一路按它在显示区域里的大小要的短边上限（见 fit.ts；不用缩小、原始大小显示、
+   * 还不知道显示区域时是 0：不限）。对方和画质设置里的上限取较严的
    */
-  private updateViewLimit() {
-    const d = this.displays[this.currentDisplay];
-    let want: number;
-    if (this.nativeScale) want = 0;
-    else if (d && this.viewport) want = viewMaxShort(d.width, d.height, this.viewport.w, this.viewport.h);
-    else return;
-    clearTimeout(this.viewLimitTimer);
-    this.viewLimitTimer = undefined;
-    if (want === this.viewLimit) return;
+  private wantedView(): StreamView[] {
+    const ds = this.wanted();
+    const infos = ds.map((i) => this.displays[i]);
+    const vp = this.viewport;
+    let limits = ds.map(() => 0);
+    if (vp && !this.nativeScale && infos.length === 1) {
+      limits = [viewMaxShort(infos[0].width, infos[0].height, vp.w, vp.h)];
+    } else if (vp && !this.nativeScale && infos.length > 1) {
+      const { tiles } = layoutTiles(placeDisplays(infos), vp);
+      limits = infos.map((d, i) => viewMaxShort(d.width, d.height, tiles[i].w, tiles[i].h));
+    }
+    return ds.map((display, i) => ({ display, maxShort: limits[i] }));
+  }
+
+  /**
+   * 告诉对方看哪几个显示器、每一路要多大的画面（变了才发）。换了显示器马上发；只是显示区域变了时，
+   * 一段时间没变过就马上发，连续变化时（拖动窗口边框、窗口动画）等停下来再发，免得对方一直重建编码器。
+   * `now`：不等（用户刚切换了、刚连上）
+   */
+  private updateView(now = false) {
+    if (this.sid === null || this.disposed) return;
+    const want = this.wantedView();
+    if (!want.length) return;
+    clearTimeout(this.viewTimer);
+    this.viewTimer = undefined;
+    const sent = this.sentView;
+    if (sent && sameView(sent, want)) return;
     const apply = () => {
-      this.viewLimitTimer = undefined;
-      this.viewLimit = want;
-      this.pushSettings();
+      this.viewTimer = undefined;
+      if (this.sid === null) return;
+      // 对方开始发这几路之前，Worker 里就要有画它们的 canvas
+      this.ensureCanvases(want.length);
+      this.sentView = want;
+      this.command({ cmd: "view", sid: this.sid, streams: want });
     };
-    const now = performance.now();
-    const quiet = now - this.viewLimitAt >= VIEW_LIMIT_DELAY_MS;
-    this.viewLimitAt = now;
-    if (quiet) apply();
-    else this.viewLimitTimer = window.setTimeout(apply, VIEW_LIMIT_DELAY_MS);
+    const moved = !sent || sent.length !== want.length || sent.some((s, i) => s.display !== want[i].display);
+    const t = performance.now();
+    const quiet = t - this.viewAt >= VIEW_LIMIT_DELAY_MS;
+    this.viewAt = t;
+    if (now || moved || quiet) apply();
+    else this.viewTimer = window.setTimeout(apply, VIEW_LIMIT_DELAY_MS);
   }
 
   // ───────────────────────── 可见性 / 设置 ─────────────────────────
@@ -924,9 +1078,12 @@ export class RemoteSession {
     this.updateSettings({ ...this.settings, codec: bestCodec(decoders, this.hostCodecs) });
   }
 
-  /** 实际发给被控端的画质：分辨率不超过画面的显示区域，不可见时降帧率 */
+  /**
+   * 实际发给被控端的画质：不可见时降帧率。分辨率不超过画面的显示区域另外按每一路说（view 命令，见 updateView），
+   * 对方和这里的短边上限取较严的
+   */
   private effectiveSettings(): QualitySettings {
-    const s = { ...this.settings, maxShort: stricter(this.settings.maxShort, this.viewLimit) };
+    const s = { ...this.settings };
     if (!this.visible) s.fps = Math.min(s.fps, BACKGROUND_FPS);
     return s;
   }
@@ -936,10 +1093,29 @@ export class RemoteSession {
     this.command({ cmd: "settings", sid: this.sid, settings: this.effectiveSettings() });
   }
 
+  /** 只看对方的第 index 个显示器 */
   selectDisplay(index: number) {
-    if (this.sid === null || index === this.currentDisplay) return;
+    const d = this.displays[index];
+    if (!d || (!this.allDisplays && this.wantName === d.name && this.currentDisplay === index)) return;
     this.releaseAll();
-    this.command({ cmd: "display", sid: this.sid, index });
+    this.allDisplays = false;
+    this.wantName = d.name;
+    this.updateView(true);
+    this.emit();
+  }
+
+  /** 能同时看对方所有的显示器：对方有不止一个显示器，也能同时发好几路画面 */
+  get canShowAll(): boolean {
+    return this.displays.length > 1 && this.maxStreams > 1;
+  }
+
+  /** 同时看对方所有的显示器（每个显示器一路画面，按它们在对方桌面上的位置拼在一起）/ 只看一个 */
+  setAllDisplays(on: boolean) {
+    if (this.allDisplays === on) return;
+    this.releaseAll();
+    this.allDisplays = on;
+    this.updateView(true);
+    this.emit();
   }
 
   setClipboardSync(v: boolean) {
@@ -1010,6 +1186,10 @@ interface CursorImage {
   /** 按 scale 缩放、生成好的 CSS cursor */
   css?: string;
   scale?: number;
+}
+
+function sameView(a: StreamView[], b: StreamView[]): boolean {
+  return a.length === b.length && a.every((v, i) => v.display === b[i].display && v.maxShort === b[i].maxShort);
 }
 
 function sameQuality(a: QualitySettings, b: QualitySettings): boolean {

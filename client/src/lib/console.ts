@@ -16,8 +16,8 @@ import ConsoleWorker from "./console-worker?worker";
 
 /** 会话的画面在 Worker 里，它告诉主线程的 */
 export interface ViewOutput {
-  /** 画面的大小（像素）变了 */
-  size(w: number, h: number): void;
+  /** 第 stream 路画面的大小（像素）变了 */
+  size(stream: number, w: number, h: number): void;
   /** 光标包（见 media.ts） */
   cursor(pkt: Uint8Array): void;
   /** 本机实际解不了这种格式 */
@@ -39,10 +39,12 @@ export interface MediaView {
   setMic(port: MessagePort | null): void;
   /** 声音时钟（见 avsync.ts）：`localMs` 是主线程 performance.now() 的时基 */
   audioClock(hostUs: number, localMs: number, appliedMs: number): void;
-  /** 请被控端编一个关键帧（例如刚切回这个会话）。和解码出错时 Worker 自己要的一起限流 */
+  /** 请被控端给每一路画面编一个关键帧（例如刚切回这个会话）。和解码出错时 Worker 自己要的一起限流 */
   requestKeyframe(): void;
-  /** 画面怎么显示：显示区域（设备像素；null = 1:1 显示）、画面增强的强度（见 enhance.ts） */
-  setLayout(area: Area | null, enhance: EnhanceLevel): void;
+  /** 第 stream 路画面（多屏）画在 canvas 上：要看这一路之前交过去（之后主线程不能再画它） */
+  addCanvas(stream: number, canvas: HTMLCanvasElement): void;
+  /** 第 stream 路画面怎么显示：显示区域（设备像素；null = 1:1 显示）、画面增强的强度（见 enhance.ts） */
+  setLayout(stream: number, area: Area | null, enhance: EnhanceLevel): void;
   /** 会话关掉了 */
   dispose(): void;
 }
@@ -207,7 +209,7 @@ export class ConsoleLink {
         this.views.get(m.id)?.cursor(m.pkt);
         return;
       case "size":
-        this.views.get(m.id)?.size(m.w, m.h);
+        this.views.get(m.id)?.size(m.stream, m.w, m.h);
         return;
       case "undecodable":
         this.views.get(m.id)?.undecodable(m.codec);
@@ -305,7 +307,11 @@ export class ConsoleLink {
       audioClock: (hostUs, localMs, appliedMs) =>
         this.post({ t: "clock", id, hostUs, at: performance.timeOrigin + localMs, appliedMs }),
       requestKeyframe: () => this.post({ t: "keyframe", id }),
-      setLayout: (area, enhance) => this.post({ t: "layout", id, area, enhance }),
+      addCanvas: (stream, canvas) => {
+        const offscreen = canvas.transferControlToOffscreen();
+        this.post({ t: "canvas", id, stream, canvas: offscreen }, [offscreen]);
+      },
+      setLayout: (stream, area, enhance) => this.post({ t: "layout", id, stream, area, enhance }),
       dispose: () => {
         this.views.delete(id);
         this.post({ t: "drop", id });

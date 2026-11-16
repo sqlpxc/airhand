@@ -85,7 +85,14 @@ mod tests {
 
         let before = cursor();
         let mut inj = Injector::new();
-        inj.handle(&[InputEvent::MouseMove { x: 0.5, y: 0.5 }], &d);
+        inj.handle(
+            &[InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                stream: 0,
+            }],
+            &d,
+        );
         std::thread::sleep(std::time::Duration::from_millis(100));
         let after = cursor();
         crate::host::dpi_aware(|| unsafe { SetCursorPos(before.0, before.1).unwrap() });
@@ -240,7 +247,14 @@ mod x11_tests {
         let mut inj = Injector::new();
 
         // 鼠标
-        inj.handle(&[InputEvent::MouseMove { x: 0.5, y: 0.25 }], &d);
+        inj.handle(
+            &[InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.25,
+                stream: 0,
+            }],
+            &d,
+        );
         inj.handle(
             &[InputEvent::MouseButton {
                 button: MouseButton::Right,

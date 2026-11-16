@@ -281,7 +281,7 @@ mod tests {
             .collect();
         let code = reserved[0].code().to_string();
         let me = Identity::generate();
-        let intro = controller_intro("unverified", "test", Default::default(), false);
+        let intro = controller_intro("unverified", "test", Default::default(), false, Vec::new());
         let (a, b) = tokio::io::duplex(65536);
         let (mut ar, mut aw) = tokio::io::split(a);
         let (br, mut bw) = tokio::io::split(b);

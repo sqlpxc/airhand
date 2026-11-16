@@ -54,14 +54,19 @@ test("连接：先把 ch 绑到画面上再发 connect，回复之后告诉 Work
   const out: any[] = [];
   const canvas = { transferControlToOffscreen: () => ({ offscreen: true }) };
   const view = h.link.view(canvas, {
-    size: (w: number, hh: number) => out.push(["size", w, hh]),
+    size: (stream: number, w: number, hh: number) => out.push(["size", stream, w, hh]),
     cursor: () => {}, undecodable: () => {}, recovered: () => {}, stats: () => {},
   });
   assert.deepEqual(plain(h.posted.at(-1)), { t: "view", id: view.id, canvas: { offscreen: true } });
-  h.fromWorker({ t: "size", id: view.id, w: 1920, h: 1080 });
-  assert.deepEqual(out, [["size", 1920, 1080]]);
-  view.setLayout({ w: 1600, h: 900 }, "low");
-  assert.deepEqual(plain(h.posted.at(-1)), { t: "layout", id: view.id, area: { w: 1600, h: 900 }, enhance: "low" });
+  h.fromWorker({ t: "size", id: view.id, stream: 0, w: 1920, h: 1080 });
+  assert.deepEqual(out, [["size", 0, 1920, 1080]]);
+  view.setLayout(0, { w: 1600, h: 900 }, "low");
+  assert.deepEqual(plain(h.posted.at(-1)), { t: "layout", id: view.id, stream: 0, area: { w: 1600, h: 900 }, enhance: "low" });
+  // 多屏：另一路画面的 canvas 也交给 Worker
+  view.addCanvas(1, { transferControlToOffscreen: () => ({ second: true }) });
+  assert.deepEqual(plain(h.posted.at(-1)), { t: "canvas", id: view.id, stream: 1, canvas: { second: true } });
+  view.setLayout(1, null, "off");
+  assert.deepEqual(plain(h.posted.at(-1)), { t: "layout", id: view.id, stream: 1, area: null, enhance: "off" });
 
   const events: any[] = [];
   const connected = h.link.connect("123456", opts, view, (ev: any) => events.push(ev), true);
@@ -299,14 +304,61 @@ test("Worker：显示方式交给画面；报给主线程的是画面的大小�
   const w = workerHarness();
   w.toWorker({ t: "view", id: 1, canvas: { width: 16, height: 9, getContext: () => ({}) } });
   const player = w.players[0];
-  w.toWorker({ t: "layout", id: 1, area: { w: 1920, h: 1080 }, enhance: "medium" });
+  w.toWorker({ t: "layout", id: 1, stream: 0, area: { w: 1920, h: 1080 }, enhance: "medium" });
   assert.deepEqual(plain(player.layouts), [[{ w: 1920, h: 1080 }, "medium"]]);
   player.options.resized(1280, 720);
-  assert.deepEqual(plain(w.posted.at(-1)!.m), { t: "size", id: 1, w: 1280, h: 720 });
+  assert.deepEqual(plain(w.posted.at(-1)!.m), { t: "size", id: 1, stream: 0, w: 1280, h: 720 });
+  // 还没有 canvas 的那一路：不管
+  w.toWorker({ t: "layout", id: 1, stream: 2, area: null, enhance: "off" });
   w.toWorker({ t: "drop", id: 1 });
   assert.equal(player.disposed, 1);
-  w.toWorker({ t: "layout", id: 1, area: null, enhance: "off" });
+  w.toWorker({ t: "layout", id: 1, stream: 0, area: null, enhance: "off" });
   assert.equal(player.layouts.length, 1, "画面已经不在了");
+});
+
+test("Worker：多屏时每一路画面一个解码器，按包头里的第几路交给它，各路分别确认、分别要关键帧", async () => {
+  const w = workerHarness();
+  w.toWorker({ t: "open", url: "ws://x" });
+  const ws = w.sockets[0];
+  ws.readyState = 1;
+  const canvas = () => ({ width: 16, height: 9, getContext: () => ({}) });
+  w.toWorker({ t: "view", id: 1, canvas: canvas() });
+  w.toWorker({ t: "bind", ch: 3, id: 1 });
+  w.toWorker({ t: "canvas", id: 1, stream: 1, canvas: canvas() });
+  const [first, second] = w.players;
+  const on = (stream: number, seq: number) => {
+    const p = packet(3, media.VIDEO, seq);
+    new Uint8Array(p)[4 + 12] = stream;
+    return p;
+  };
+  ws.onmessage({ data: on(1, 7) });
+  ws.onmessage({ data: on(0, 3) });
+  // 还没有 canvas 的一路（不应该发生）：照样确认，画面丢掉
+  ws.onmessage({ data: on(2, 5) });
+  assert.deepEqual(first.pushed, [3]);
+  assert.deepEqual(second.pushed, [7]);
+  w.toWorker({ t: "sid", ch: 3, sid: 5 });
+  const sorted = acks(ws).map((a: number[]) => a.join(",")).sort();
+  assert.deepEqual(sorted, [ackMessage(5, 3, 0), ackMessage(5, 7, 1), ackMessage(5, 5, 2)].map((b) => [...new Uint8Array(b)].join(",")).sort());
+  // 各路的大小分别报
+  second.options.resized(1280, 1024);
+  assert.deepEqual(plain(w.posted.at(-1)!.m), { t: "size", id: 1, stream: 1, w: 1280, h: 1024 });
+  // 关键帧：各路分别限流；主线程要的是每一路（收到过画面的）
+  const sent = () => ws.sent.filter((d: unknown) => typeof d === "string").map((d: string) => JSON.parse(d));
+  second.options.requestKeyframe();
+  first.options.requestKeyframe();
+  assert.deepEqual(sent(), [{ cmd: "keyframe", sid: 5, stream: 1 }, { cmd: "keyframe", sid: 5 }]);
+  second.options.requestKeyframe();
+  assert.equal(sent().length, 2);
+  await new Promise((r) => setTimeout(r, 520));
+  w.toWorker({ t: "keyframe", id: 1 });
+  assert.deepEqual(sent().slice(2), [{ cmd: "keyframe", sid: 5 }, { cmd: "keyframe", sid: 5, stream: 1 }]);
+  // 新的连接：每一路都从头开始
+  w.toWorker({ t: "bind", ch: 4, id: 1 });
+  assert.ok(first.resets >= 2 && second.resets >= 1);
+  // 画面不要了：每一路都放掉
+  w.toWorker({ t: "drop", id: 1 });
+  assert.equal(first.disposed + second.disposed, 2);
 });
 
 test("Worker：本机麦克风编好的声音包按会话的 sid 发给控制端服务（还不知道 sid 时丢掉），端口交给编码器", () => {

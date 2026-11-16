@@ -93,7 +93,7 @@ impl X11Injector {
         while c.x.conn.poll_for_event()?.is_some() {}
         for ev in events {
             match ev {
-                InputEvent::MouseMove { x, y } => {
+                InputEvent::MouseMove { x, y, .. } => {
                     let (px, py) = to_root(d, *x, *y);
                     c.fake(xproto::MOTION_NOTIFY_EVENT, 0, px, py)?;
                 }

@@ -27,9 +27,10 @@ const MIN_LOSS: f64 = 0.005;
 const MAX_LOSS: f64 = 0.5;
 
 /// 把一帧的密封单元（`密文 | 标签 | 计数`，不带长度前缀）切开、配上 `r` 块冗余，变成数据报（见 `airhand_proto::fec`）。
-/// `prev_fec`：前一帧也是这样发的。冗余多于 [`max_repair`] 的按上限算
+/// `stream`：第几路画面；`prev_fec`：前一帧也是这样发的。冗余多于 [`max_repair`] 的按上限算
 pub(crate) fn fragments(
     session_id: u64,
+    stream: u8,
     sealed: &[u8],
     prev_fec: bool,
     r: usize,
@@ -66,6 +67,7 @@ pub(crate) fn fragments(
                 k: k as u16,
                 r: r as u16,
                 flags: if prev_fec { PREV_FEC } else { 0 },
+                stream,
                 shard,
             };
             Bytes::from(f.encode(session_id))
@@ -158,11 +160,15 @@ mod tests {
     fn frames_become_fragments() {
         let (mut sealer, _) = crate::secure::test_lane(false);
         let sealed = sealer.seal(&vec![9u8; 2000]).unwrap();
-        let d = fragments(7, &sealed, true, 2).unwrap();
+        let d = fragments(7, 1, &sealed, true, 2).unwrap();
         let (size, k) = shard_size(sealed.len());
         assert_eq!(d.len(), k + 2);
         let parsed: Vec<_> = d.iter().map(|d| Fragment::parse(d).unwrap()).collect();
-        assert!(parsed.iter().all(|f| f.shard.len() == size && f.prev_fec()));
+        assert!(
+            parsed
+                .iter()
+                .all(|f| f.shard.len() == size && f.prev_fec() && f.stream == 1)
+        );
         assert_eq!(parsed[0].counter, counter_of(&sealed).unwrap());
         let joined: Vec<u8> = parsed[..k].iter().flat_map(|f| f.shard).copied().collect();
         assert_eq!(&joined[..sealed.len()], &sealed[..]);
@@ -170,7 +176,7 @@ mod tests {
         assert!(d.iter().all(|d| d.len() <= airhand_proto::datagram::MAX));
         // 太大的帧不行
         let huge = sealer.seal(&vec![0u8; MAX_FRAME]).unwrap();
-        assert!(fragments(7, &huge, false, 1).is_err());
+        assert!(fragments(7, 0, &huge, false, 1).is_err());
         // 一个数据报装得下将近 1 KB
         assert!(parsed.iter().all(|f| f.shard.len() <= MAX_SHARD));
     }

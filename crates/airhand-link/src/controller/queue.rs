@@ -345,7 +345,10 @@ mod tests {
         })
     }
 
-    const KEYFRAME: ControllerMsg = ControllerMsg::RequestKeyframe { after: 0 };
+    const KEYFRAME: ControllerMsg = ControllerMsg::RequestKeyframe {
+        after: 0,
+        stream: 0,
+    };
 
     #[test]
     fn large_text_batches_keep_order_and_fit_the_control_lane() {
@@ -401,12 +404,20 @@ mod tests {
     fn movement_coalesces_without_crossing_key_release() {
         let (tx, _rx) = channel();
         for _ in 0..1000 {
-            tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
-                .unwrap();
+            tx.send(input(vec![InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                stream: 0,
+            }]))
+            .unwrap();
         }
         tx.send(input(vec![InputEvent::ReleaseAll])).unwrap();
-        tx.send(input(vec![InputEvent::MouseMove { x: 1.0, y: 1.0 }]))
-            .unwrap();
+        tx.send(input(vec![InputEvent::MouseMove {
+            x: 1.0,
+            y: 1.0,
+            stream: 0,
+        }]))
+        .unwrap();
         assert_eq!(queued(&tx).len(), 3);
     }
 
@@ -415,8 +426,12 @@ mod tests {
     fn settings_do_not_break_movement_coalescing() {
         let (tx, _rx) = channel();
         for fps in 0..50 {
-            tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
-                .unwrap();
+            tx.send(input(vec![InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                stream: 0,
+            }]))
+            .unwrap();
             tx.send(settings(fps)).unwrap();
             tx.send(input(vec![InputEvent::MouseDelta { dx: 1, dy: 0 }]))
                 .unwrap();
@@ -425,8 +440,12 @@ mod tests {
         assert_eq!(queued(&tx).len(), 100);
         let (tx, _rx) = channel();
         for fps in 0..50 {
-            tx.send(input(vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }]))
-                .unwrap();
+            tx.send(input(vec![InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                stream: 0,
+            }]))
+            .unwrap();
             tx.send(settings(fps)).unwrap();
         }
         assert_eq!(queued(&tx).len(), 1);
@@ -487,8 +506,12 @@ mod tests {
         assert_eq!(events(&q[1]), [up]);
         assert_eq!(events(&q[2]), [InputEvent::MouseDelta { dx: 5, dy: 5 }]);
         // 绝对移动和相对移动不互相合并
-        tx.send(input(vec![InputEvent::MouseMove { x: 0.1, y: 0.1 }]))
-            .unwrap();
+        tx.send(input(vec![InputEvent::MouseMove {
+            x: 0.1,
+            y: 0.1,
+            stream: 0,
+        }]))
+        .unwrap();
         tx.send(input(vec![InputEvent::MouseDelta { dx: 1, dy: 1 }]))
             .unwrap();
         assert_eq!(queued(&tx).len(), 5);

@@ -3,6 +3,7 @@
 pub(crate) mod audio;
 pub mod capture;
 pub(crate) mod clock;
+mod cursor;
 #[cfg(windows)]
 pub(crate) mod desktop;
 pub mod encoder;

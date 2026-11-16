@@ -255,6 +255,8 @@ pub struct CaptureUpdate {
     pub frame: Option<Arc<Frame>>,
     /// 光标可见性（变没变都可以给，没变不算变化）
     pub cursor_visibility: Option<CursorVisibility>,
+    /// 光标在不在这块显示器上（见 [`CursorSnapshot::here`]；不给就是没变）
+    pub cursor_here: Option<bool>,
     /// 光标形状变化
     pub cursor_shape: Option<CursorShape>,
 }
@@ -267,6 +269,9 @@ pub struct CursorSnapshot {
     /// 形状变化时递增
     pub shape_seq: u64,
     pub visibility: CursorVisibility,
+    /// 光标在这块显示器上（或者看不出来在哪里：隐藏了、这个平台只有一个全局的光标状态）。在别的显示器上时
+    /// 这块显示器报的可见性、形状不算数：同时看好几个显示器时只听光标所在的那一块（见 `super::cursor`）
+    pub here: bool,
     pub shape: Option<Arc<CursorShape>>,
 }
 
@@ -294,6 +299,7 @@ impl FrameSlot {
                     seq: 0,
                     shape_seq: 0,
                     visibility: CursorVisibility::Hidden,
+                    here: true,
                     shape: None,
                 },
             }),
@@ -313,6 +319,12 @@ impl FrameSlot {
             && v != st.cursor.visibility
         {
             st.cursor.visibility = v;
+            cursor_changed = true;
+        }
+        if let Some(here) = u.cursor_here
+            && here != st.cursor.here
+        {
+            st.cursor.here = here;
             cursor_changed = true;
         }
         if let Some(shape) = u.cursor_shape
@@ -560,7 +572,11 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 if let Some(f) = &u.frame {
                     pacer.done(f.captured);
                 }
-                if u.frame.is_some() || u.cursor_visibility.is_some() || u.cursor_shape.is_some() {
+                if u.frame.is_some()
+                    || u.cursor_visibility.is_some()
+                    || u.cursor_here.is_some()
+                    || u.cursor_shape.is_some()
+                {
                     shared.slot.publish(u);
                 }
             }

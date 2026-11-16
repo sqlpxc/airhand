@@ -395,6 +395,14 @@ impl FlowState {
         (self.srtt_ms, self.min_rtt.get().unwrap_or(0.0))
     }
 
+    /// 这一路画面停了（不再看这个显示器，见 `airhand_proto::session` 的"多屏"）：在途的帧不用再等确认了，
+    /// 晚到的确认也不算。码率估计留着：再看这个显示器时接着用（新的编码管线从关键帧开始）
+    pub fn stopped(&mut self) {
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.acked = self.sent;
+    }
+
     /// 画面换了一条路（见模块说明的"换路"）。`lost`：旧路断了，在途的帧不会确认了
     pub fn path_changed(&mut self, lost: bool) {
         self.min_rtt = WindowMin::default();
@@ -634,6 +642,12 @@ impl Flow {
     pub fn ack_stalled(&self) -> bool {
         self.state.lock().unwrap().ack_stalled()
     }
+    /// 见 [`FlowState::stopped`]
+    pub fn stopped(&self) {
+        self.state.lock().unwrap().stopped();
+        self.cv.notify_all();
+    }
+
     /// 见 [`FlowState::path_changed`]
     pub fn path_changed(&self, lost: bool) {
         self.state.lock().unwrap().path_changed(lost);
@@ -648,11 +662,34 @@ impl Flow {
     pub fn bitrate_kbps(&self) -> u32 {
         self.state.lock().unwrap().bitrate_kbps()
     }
+
+    /// 在途的帧有几个（测试用）
+    #[cfg(test)]
+    pub(crate) fn inflight_for_test(&self) -> u32 {
+        self.state.lock().unwrap().inflight()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一路画面停了（多屏时不再看这个显示器）：在途的帧不再算，晚到的确认也不算；之后发的照常算
+    #[test]
+    fn a_stopped_stream_forgets_its_frames_in_flight() {
+        let mut f = FlowState::default();
+        f.on_sent(1, 100);
+        f.on_sent(2, 100);
+        f.stopped();
+        assert_eq!(f.inflight(), 0);
+        assert!(!f.ack_stalled());
+        f.on_ack(2, None);
+        assert_eq!(f.inflight(), 0);
+        f.on_sent(3, 100);
+        assert_eq!(f.inflight(), 1);
+        f.on_ack(3, None);
+        assert_eq!(f.inflight(), 0);
+    }
 
     #[test]
     fn rejects_future_and_stale_ack_and_counts_only_sent_frames() {

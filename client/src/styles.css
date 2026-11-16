@@ -1102,6 +1102,14 @@ kbd {
   opacity: 0.45;
   cursor: default;
 }
+.dd-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--edge);
+}
+.display-menu {
+  width: 340px;
+}
 .dd-main {
   min-width: 0;
   display: flex;
@@ -1755,14 +1763,19 @@ kbd {
   align-items: safe center;
   justify-content: safe center;
 }
-.remote-canvas {
-  display: block;
+/* 一个会话的画面：每一路画面一个 canvas（同时看对方的好几个显示器时按它们在对方桌面上的位置拼在一起，见 session.ts 的 layout）。
+   键盘焦点、鼠标事件、锁定指针都在它上面 */
+.remote-screen {
   /* 1:1 显示时用 left/top 把画面对齐到设备像素（见 session.ts 的 layout） */
   position: relative;
-  outline: none;
   flex-shrink: 0;
-  image-rendering: auto;
+  outline: none;
   touch-action: none;
+}
+.remote-canvas {
+  display: block;
+  position: absolute;
+  image-rendering: auto;
 }
 .stage-overlay {
   position: absolute;

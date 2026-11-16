@@ -4,7 +4,9 @@ import { ACK_INTERVAL_MS, AckCoalescer, ackMessage } from "../src/lib/ack.ts";
 import { micMessage } from "../src/lib/media.ts";
 
 test("二进制确认与 crates/airhand-link/src/console.rs 的 parse_ack 一致", () => {
-  assert.deepEqual([...new Uint8Array(ackMessage(3, 298))], [1, 3, 0, 0, 0, 0x2a, 1, 0, 0]);
+  assert.deepEqual([...new Uint8Array(ackMessage(3, 298))], [1, 3, 0, 0, 0, 0x2a, 1, 0, 0, 0]);
+  // 多屏：最后一个字节是第几路画面
+  assert.deepEqual([...new Uint8Array(ackMessage(3, 298, 2))], [1, 3, 0, 0, 0, 0x2a, 1, 0, 0, 2]);
 });
 
 test("麦克风的声音包与 crates/airhand-link/src/console.rs 的 parse_mic 一致", () => {

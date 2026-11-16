@@ -29,7 +29,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use airhand_proto::session::{ByeReason, HostMsg, InputEvent, QualitySettings};
+use airhand_proto::session::{ByeReason, HostMsg, InputEvent, QualitySettings, StreamView};
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -39,24 +39,69 @@ use tracing::{info, warn};
 use super::queue::Outbox;
 use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 
-/// 画面确认交给谁（[`Platform::acks`]）：桌面版是会话的 [`crate::flow::Flow`]，Android 是画面分发。
-/// 在读任务里调用：要快，不能等什么
+/// 画面确认交给谁（[`Platform::acks`]）：桌面版是每一路画面的 [`crate::flow::Flow`]（[`Flows`]），Android 是画面分发。
+/// 在读任务里调用：要快，不能等什么。`stream` 是第几路画面（见 `airhand_proto::session` 的"多屏"），
+/// 控制端给的，没检查过（不小于 `airhand_proto::MAX_STREAMS` 的已经去掉了）
 pub trait Acks: Send + Sync + 'static {
-    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 `ControllerDatagram::Ack`
-    fn ack(&self, seq: u32, arrived: u64);
+    /// 控制端收到了第 `stream` 路的第 `seq` 帧（累积确认）；`arrived` 见 `ControllerDatagram::Ack`
+    fn ack(&self, stream: u8, seq: u32, arrived: u64);
 
-    /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量。
-    /// `lost`：旧路（直连）断了，在途的帧不会确认了，不要再等它们（会话随即要一个关键帧）
+    /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量（每一路都是）。
+    /// `lost`：旧路（直连）断了，在途的帧不会确认了，不要再等它们（会话随即要关键帧）
     fn path_changed(&self, lost: bool) {
         let _ = lost;
     }
 
-    /// 控制端等不到帧了（`ControllerDatagram::Lost`，见 `airhand_proto::session` 的"帧流"）：它交给解码器的最后一帧是
-    /// `decoded`。返回 `true`：这之后在途的帧作废了（下一帧从控制端有的帧恢复），它们的帧流放弃掉；
-    /// `false`：什么也不做（恢复帧已经在路上了；默认：这个平台不恢复，控制端等久了会要关键帧）
-    fn lost(&self, decoded: u32) -> bool {
-        let _ = decoded;
+    /// 控制端等不到第 `stream` 路的帧了（`ControllerDatagram::Lost`，见 `airhand_proto::session` 的"帧流"）：
+    /// 它交给解码器的最后一帧是 `decoded`。返回 `true`：这一路这之后在途的帧作废了（下一帧从控制端有的帧恢复），
+    /// 它们的帧流放弃掉；`false`：什么也不做（恢复帧已经在路上了；默认：这个平台不恢复，控制端等久了会要关键帧）
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        let _ = (stream, decoded);
         false
+    }
+}
+
+/// 每一路画面一个在途控制和码率（[`crate::flow::Flow`]，桌面版的 [`Acks`]）：一共 `airhand_proto::MAX_STREAMS` 个，
+/// 会话一开始就建好（确认在读任务里就交给它们）。一路换了显示器（重建编码管线）时接着用它的码率估计
+pub struct Flows(Vec<Arc<crate::flow::Flow>>);
+
+impl Default for Flows {
+    fn default() -> Self {
+        Self(
+            (0..airhand_proto::MAX_STREAMS)
+                .map(|_| Arc::default())
+                .collect(),
+        )
+    }
+}
+
+impl Flows {
+    /// 第 `stream` 路的（不小于 `MAX_STREAMS` 的没有）
+    pub fn get(&self, stream: u8) -> Option<&Arc<crate::flow::Flow>> {
+        self.0.get(stream as usize)
+    }
+
+    /// 每一路的
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<crate::flow::Flow>> {
+        self.0.iter()
+    }
+}
+
+impl Acks for Flows {
+    fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+        if let Some(f) = self.get(stream) {
+            f.ack(seq, Some(arrived));
+        }
+    }
+
+    fn path_changed(&self, lost: bool) {
+        for f in self.iter() {
+            f.path_changed(lost);
+        }
+    }
+
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        self.get(stream).is_some_and(|f| f.lost(decoded))
     }
 }
 
@@ -67,19 +112,6 @@ pub trait MicSink: Send + Sync + 'static {
     fn packet(&self, packet: Vec<u8>);
 }
 
-impl Acks for crate::flow::Flow {
-    fn ack(&self, seq: u32, arrived: u64) {
-        crate::flow::Flow::ack(self, seq, Some(arrived));
-    }
-
-    fn path_changed(&self, lost: bool) {
-        crate::flow::Flow::path_changed(self, lost);
-    }
-
-    fn lost(&self, decoded: u32) -> bool {
-        crate::flow::Flow::lost(self, decoded)
-    }
-}
 use super::{Admission, Gate, Incoming};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
@@ -122,11 +154,13 @@ pub enum Request {
     Input(Vec<InputEvent>),
     /// 画质设置变了（做过范围校验）
     Settings(QualitySettings),
-    /// 要一个关键帧：控制端要的（例如解码器重置了）带着它收到的最后一帧的序号，在那之后发过关键帧就不用再编了
-    /// （见 `airhand_proto::session` 的"关键帧"）；`None`：被控端自己要的（直连断了，断在上面的帧接收端等不到了），一定要编
-    Keyframe(Option<u32>),
-    /// 改看另一个显示器（序号没检查过）
-    SelectDisplay(u8),
+    /// 要关键帧。控制端要的（例如解码器重置了）是 `Some((第几路, 它收到的这一路的最后一帧的序号))`：在那之后
+    /// 发过关键帧就不用再编了（见 `airhand_proto::session` 的"关键帧"；第几路没检查过）；`None`：被控端自己要的
+    /// （直连断了，断在上面的帧接收端等不到了），每一路都要编
+    Keyframe(Option<(u8, u32)>),
+    /// 看哪几个显示器：第 `i` 项是第 `i` 路画面（见 `airhand_proto::session` 的"多屏"）。显示器的序号、有几项都没检查过
+    /// （[`resolve_view`]）。只看一个显示器（`ControllerMsg::SelectDisplay`）也是它
+    View(Vec<StreamView>),
     /// 控制端复制了文本（不会超过 [`airhand_proto::session::MAX_CLIPBOARD_TEXT`]）
     Clipboard(String),
     /// 打开 / 关闭声音
@@ -135,20 +169,41 @@ pub enum Request {
     Mic(bool),
 }
 
-/// 会话怎么开始：握手里的画质和要不要声音，同意之前又收到的设置也算进来
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// 控制端要看的显示器（[`Request::View`]）落到这台被控端上（`displays` 个显示器，最多同时发 `max` 路）：
+/// 去掉不存在的、重复的，多出来的不要；一个都不剩时看主显示器（第 0 个）。没有显示器时是空的
+pub fn resolve_view(view: &[StreamView], displays: usize, max: u8) -> Vec<StreamView> {
+    let mut out: Vec<StreamView> = Vec::with_capacity(view.len());
+    let max = max.clamp(1, airhand_proto::MAX_STREAMS) as usize;
+    for v in view {
+        if out.len() == max {
+            break;
+        }
+        if (v.display as usize) < displays && !out.iter().any(|o| o.display == v.display) {
+            out.push(*v);
+        }
+    }
+    if out.is_empty() && displays > 0 {
+        out.push(StreamView::display(0));
+    }
+    out
+}
+
+/// 会话怎么开始：握手里的画质、要不要声音、看哪几个显示器，同意之前又收到的也算进来
+#[derive(Debug, Clone, PartialEq)]
 pub struct Start {
     /// 做过范围校验
     pub settings: QualitySettings,
     pub audio: bool,
+    /// 看哪几个显示器（和 [`Request::View`] 一样没检查过；空的是只看主显示器）
+    pub view: Vec<StreamView>,
 }
 
 /// 交给平台的发送端（[`serve`] 的 `platform` 拿到它们）
 pub struct Senders {
     /// 控制消息：Hello、提示、显示器列表、光标、剪贴板……（按消息挑通道，见 [`super::queue`]）
     pub out: Outbox,
-    /// 画面包
-    pub video: mpsc::Sender<Bytes>,
+    /// 画面包：第 `i` 项是第 `i` 路（一共 `airhand_proto::MAX_STREAMS` 路，见 `airhand_proto::session` 的"多屏"）
+    pub video: Vec<mpsc::Sender<Bytes>>,
     /// 声音包
     pub audio: mpsc::Sender<Bytes>,
 }
@@ -332,12 +387,13 @@ async fn drive<P: Platform>(
     let mut start = Start {
         settings: admitted.settings,
         audio: admitted.audio,
+        view: admitted.view.clone(),
     };
     // 不用同意的：不等确认就开始（见模块说明）
     let mut phase = if admitted.admission == Admission::NeedsApproval {
         Phase::Confirming
     } else {
-        platform.start(start).await?;
+        platform.start(start.clone()).await?;
         info!(session_id, "session started");
         started();
         Phase::Open
@@ -393,9 +449,10 @@ async fn drive<P: Platform>(
                 let Some(req) = req else { return Ok(()) };
                 match req {
                     req if open => platform.request(req).await?,
-                    // 同意之前：记下画质和声音设置，同意之后一起生效；别的（输入、剪贴板……）都不执行
+                    // 同意之前：记下画质、声音和看哪几个显示器，同意之后一起生效；别的（输入、剪贴板……）都不执行
                     Request::Settings(s) => start.settings = s,
                     Request::Audio(a) => start.audio = a,
+                    Request::View(v) => start.view = v,
                     _ => {}
                 }
             }
@@ -407,7 +464,7 @@ async fn drive<P: Platform>(
                     Answer::Allowed => {
                         info!(session_id, "the local user allowed the connection");
                         phase = Phase::Open;
-                        platform.start(start).await?;
+                        platform.start(start.clone()).await?;
                         info!(session_id, "session started");
                         started();
                         continue;
@@ -493,7 +550,8 @@ mod tests {
     }
 
     impl Acks for Log {
-        fn ack(&self, seq: u32, arrived: u64) {
+        fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+            assert_eq!(stream, 0);
             self.push(Call::Ack(seq, arrived));
         }
     }
@@ -564,6 +622,7 @@ mod tests {
             },
             settings: QualitySettings::default(),
             audio: true,
+            view: Vec::new(),
         }
     }
 
@@ -720,7 +779,11 @@ mod tests {
         })
         .await;
         h.send(ControllerMsg::Settings(fast())).await;
-        h.datagram(ControllerDatagram::Ack { seq: 3, arrived: 9 });
+        h.datagram(ControllerDatagram::Ack {
+            seq: 3,
+            arrived: 9,
+            stream: 0,
+        });
         h.send(ControllerMsg::Clipboard {
             text: "x".repeat(MAX_CLIPBOARD_TEXT + 1),
         })
@@ -739,7 +802,8 @@ mod tests {
             [
                 Call::Start(Start {
                     settings: QualitySettings::default(),
-                    audio: true
+                    audio: true,
+                    view: Vec::new(),
                 }),
                 Call::Request(Request::Input(click())),
                 Call::Request(Request::Settings(fast().sanitized())),
@@ -800,6 +864,7 @@ mod tests {
         .await;
         h.send(ControllerMsg::Settings(fast())).await;
         h.send(ControllerMsg::Audio { enabled: false }).await;
+        h.send(ControllerMsg::SelectDisplay { index: 1 }).await;
         h.send(ControllerMsg::Clipboard { text: "hi".into() }).await;
         h.datagram(ControllerDatagram::Ping { t: 1 });
         h.events.send(1).await.unwrap();
@@ -824,7 +889,8 @@ mod tests {
                 Call::Answered(true),
                 Call::Start(Start {
                     settings: fast().sanitized(),
-                    audio: false
+                    audio: false,
+                    view: vec![StreamView::display(1)],
                 }),
             ]
         );
@@ -942,5 +1008,45 @@ mod tests {
         let h = session(Admission::Open);
         let err = h.task.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("stopped responding"), "{err}");
+    }
+
+    /// 控制端要看的显示器：不存在的、重复的去掉，最多能发几路就几路；一个都不剩（或者没说）就看主显示器
+    #[test]
+    fn views_resolve_against_the_displays() {
+        let v = |ds: &[u8]| {
+            ds.iter()
+                .copied()
+                .map(StreamView::display)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(resolve_view(&v(&[2, 0]), 3, 4), v(&[2, 0]));
+        assert_eq!(resolve_view(&v(&[2, 7, 2, 1]), 3, 4), v(&[2, 1]));
+        assert_eq!(resolve_view(&v(&[0, 1, 2]), 3, 2), v(&[0, 1]));
+        // 只能发一路（0 也当作 1）
+        assert_eq!(resolve_view(&v(&[1, 0]), 3, 0), v(&[1]));
+        assert_eq!(resolve_view(&[], 3, 4), v(&[0]));
+        assert_eq!(resolve_view(&v(&[9]), 3, 4), v(&[0]));
+        assert_eq!(resolve_view(&v(&[0]), 0, 4), v(&[]));
+        // 每一路的大小跟着它走
+        let sized = [StreamView {
+            display: 1,
+            max_short: 720,
+        }];
+        assert_eq!(resolve_view(&sized, 2, 4), sized);
+    }
+
+    /// 桌面版的确认按路交给那一路的码率控制；没有的路不管
+    #[test]
+    fn flows_route_acks_by_stream() {
+        let flows = Flows::default();
+        let seq = flows.get(1).unwrap().sent(1000);
+        assert_eq!(flows.get(1).unwrap().inflight_for_test(), 1);
+        flows.ack(0, seq, 5);
+        assert_eq!(flows.get(1).unwrap().inflight_for_test(), 1);
+        flows.ack(1, seq, 5);
+        assert_eq!(flows.get(1).unwrap().inflight_for_test(), 0);
+        flows.ack(airhand_proto::MAX_STREAMS, seq, 5);
+        assert!(flows.get(airhand_proto::MAX_STREAMS).is_none());
+        assert!(!flows.lost(airhand_proto::MAX_STREAMS, 0));
     }
 }

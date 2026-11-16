@@ -316,7 +316,7 @@ mod tests {
         let t0 = Instant::now();
         for (n, lose) in [(500, vec![]), (5000, vec![0, 3]), (20_000, vec![1, 2, 5])] {
             let sealed = frame(&mut s, n);
-            let d = fragments(1, &sealed, false, 3).unwrap();
+            let d = fragments(1, 0, &sealed, false, 3).unwrap();
             let mut out = None;
             // 倒着来、丢掉几块
             for (i, d) in d.iter().enumerate().rev() {
@@ -343,9 +343,9 @@ mod tests {
         let (mut s, _) = test_lane(false);
         let mut r = Reassembler::default();
         let t0 = Instant::now();
-        let f1 = fragments(1, &frame(&mut s, 3000), false, 1).unwrap();
-        let f2 = fragments(1, &frame(&mut s, 3000), true, 1).unwrap();
-        let f3 = fragments(1, &frame(&mut s, 3000), true, 1).unwrap();
+        let f1 = fragments(1, 0, &frame(&mut s, 3000), false, 1).unwrap();
+        let f2 = fragments(1, 0, &frame(&mut s, 3000), true, 1).unwrap();
+        let f3 = fragments(1, 0, &frame(&mut s, 3000), true, 1).unwrap();
         let (c1, c2) = (0u64, 1u64);
         // 第一帧只到了一块
         assert!(r.fragment(f1[0].clone(), Via::Relay, t0).is_none());
@@ -381,8 +381,8 @@ mod tests {
         let (mut s, _) = test_lane(false);
         let mut r = Reassembler::default();
         let t0 = Instant::now();
-        let f1 = fragments(1, &frame(&mut s, 3000), false, 1).unwrap();
-        let f2 = fragments(1, &frame(&mut s, 300), true, 1).unwrap();
+        let f1 = fragments(1, 0, &frame(&mut s, 3000), false, 1).unwrap();
+        let f2 = fragments(1, 0, &frame(&mut s, 300), true, 1).unwrap();
         r.fragment(f1[0].clone(), Via::Relay, t0);
         // 后一帧从直连来，先到了
         assert!(r.fragment(f2[0].clone(), Via::Direct, t0).is_some());
@@ -399,7 +399,7 @@ mod tests {
         let mut r = Reassembler::default();
         let t0 = Instant::now();
         let sealed = frame(&mut s, 1500);
-        let d = fragments(1, &sealed, false, 1).unwrap();
+        let d = fragments(1, 0, &sealed, false, 1).unwrap();
         assert_eq!(d.len(), 3);
         // 第二块的最后一个字节（密封单元末尾的计数，两块正好没有补 0）改掉
         let mut bad = d[1].to_vec();

@@ -325,6 +325,7 @@ impl Host {
                     sh.broadcast(&HostMsg::Displays {
                         displays,
                         current: 0,
+                        shown: vec![0],
                     });
                 }
             }

@@ -20,7 +20,7 @@ use airhand_proto::handshake::{
     HostVerdict, MAX_MSG, NONCE_LEN, PAKE_CONTROLLER, PAKE_HOST, Pattern, PublicKey, Refusal,
     SEAL_OVERHEAD, TAG_LEN,
 };
-use airhand_proto::session::QualitySettings;
+use airhand_proto::session::{QualitySettings, StreamView};
 use airhand_proto::{Features, Role, SESSION_MIN, SESSION_VERSION, SessionLane, datagram};
 use anyhow::{Context, Result, anyhow, bail};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -272,7 +272,8 @@ pub struct Secured {
     pub peer: PublicKey,
     /// 安全码（两端一样，见 `airhand_proto::handshake::safety_code`）
     pub safety: String,
-    pub video: LaneKeys,
+    /// 画面的每一路（第 `i` 项是第 `i` 路，一共 [`airhand_proto::MAX_STREAMS`] 路，见 `airhand_proto::session` 的"多屏"）
+    pub video: Vec<LaneKeys>,
     pub bulk: LaneKeys,
     /// 声音数据报。乱序可以、重放不行
     pub audio: LaneKeys,
@@ -301,12 +302,13 @@ impl Drop for KeyMaterial {
     }
 }
 
-/// 每条通道、每种数据报的密钥用不同的标签派生：从别的通道搬过来的帧解不开
-fn label(lane: SessionLane) -> &'static [u8] {
+/// 每条通道、每种数据报的密钥用不同的标签派生：从别的通道（画面的别的路）搬过来的帧解不开
+fn label(lane: SessionLane) -> Vec<u8> {
     match lane {
-        SessionLane::Control => b"airhand control",
-        SessionLane::Video => b"airhand video",
-        SessionLane::Bulk => b"airhand bulk",
+        SessionLane::Control => b"airhand control".to_vec(),
+        SessionLane::Video(0) => b"airhand video".to_vec(),
+        SessionLane::Video(stream) => format!("airhand video {stream}").into_bytes(),
+        SessionLane::Bulk => b"airhand bulk".to_vec(),
     }
 }
 
@@ -341,12 +343,14 @@ impl KeyMaterial {
             Secured {
                 peer: self.peer,
                 safety: self.safety.clone(),
-                video: self.keys(label(SessionLane::Video), window()),
-                bulk: self.keys(label(SessionLane::Bulk), Order::Next(0)),
+                video: (0..airhand_proto::MAX_STREAMS)
+                    .map(|s| self.keys(&label(SessionLane::Video(s)), window()))
+                    .collect(),
+                bulk: self.keys(&label(SessionLane::Bulk), Order::Next(0)),
                 audio: self.keys(b"airhand audio", window()),
                 datagrams: self.keys(b"airhand control datagram", window()),
             },
-            self.keys(label(SessionLane::Control), Order::Next(0)),
+            self.keys(&label(SessionLane::Control), Order::Next(0)),
         )
     }
 
@@ -934,12 +938,13 @@ async fn fail<W: AsyncWrite + Unpin>(send: &mut W, e: HandshakeError) {
     .await;
 }
 
-/// 本端的介绍（控制端）：名称、系统，开始时的画质和要不要声音
+/// 本端的介绍（控制端）：名称、系统，开始时的画质、要不要声音、看哪几个显示器
 pub fn controller_intro(
     name: &str,
     os: &str,
     settings: QualitySettings,
     audio: bool,
+    view: Vec<StreamView>,
 ) -> ControllerIntro {
     ControllerIntro {
         min: SESSION_MIN,
@@ -949,6 +954,7 @@ pub fn controller_intro(
         os: os.to_string(),
         settings: settings.sanitized(),
         audio,
+        view,
     }
 }
 
@@ -1088,7 +1094,7 @@ mod tests {
             fps: 60,
             ..QualitySettings::default()
         };
-        controller_intro("ctl", "test", settings, true)
+        controller_intro("ctl", "test", settings, true, vec![StreamView::display(1)])
     }
 
     #[tokio::test]
@@ -1102,8 +1108,9 @@ mod tests {
         assert_eq!(c.secured.safety, h.secured.safety);
         assert_eq!(h.admission, Admission::Open);
         assert_eq!(h.intro.name, "ctl");
-        // 开始时的画质和声音在介绍里
+        // 开始时的画质、声音和看哪个显示器在介绍里
         assert_eq!((h.intro.settings.fps, h.intro.audio), (60, true));
+        assert_eq!(h.intro.view, [StreamView::display(1)]);
         // 两边协商出来的一样
         assert_eq!(c.negotiated, h.negotiated);
         assert_eq!(c.negotiated.version, SESSION_VERSION);
@@ -1120,13 +1127,20 @@ mod tests {
         assert_eq!(frame.capacity(), cap, "sealing reallocated");
         let mut payload = frame[4..].to_vec();
         h_recv.open(&mut payload).unwrap();
-        let mut h_send = h.secured.video.sealer;
-        let mut c_recv = c.secured.video.opener;
+        // 画面的每一路一把密钥：别的路上的帧解不开
+        let (mut h_video, mut c_video) = (h.secured.video, c.secured.video);
+        assert_eq!(h_video.len(), airhand_proto::MAX_STREAMS as usize);
         let mut frame = airhand_proto::media::frame(&[7; 24], &[b"hello"]);
-        h_send.seal_frame(&mut frame).unwrap();
+        h_video[1].sealer.seal_frame(&mut frame).unwrap();
         let mut payload = frame[4..].to_vec();
-        c_recv.open(&mut payload).unwrap();
+        assert!(c_video[0].opener.open(&mut payload.clone()).is_err());
+        c_video[1].opener.open(&mut payload).unwrap();
         assert_eq!(&payload[24..], b"hello");
+        let mut frame = airhand_proto::media::frame(&[7; 24], &[b"first"]);
+        h_video[0].sealer.seal_frame(&mut frame).unwrap();
+        let mut payload = frame[4..].to_vec();
+        c_video[0].opener.open(&mut payload).unwrap();
+        assert_eq!(&payload[24..], b"first");
         // 控制通道：被控端的发送端接着决定往下数，控制端的发送端接着确认往下数
         let (mut h_send, mut c_recv) = (h.sealer, c.opener);
         let mut f = framing::encode(&airhand_proto::session::HostMsg::AwaitingApproval);
@@ -1134,8 +1148,10 @@ mod tests {
         let mut p = f[4..].to_vec();
         c_recv.open(&mut p).unwrap();
         let (mut c_send, mut h_recv) = (c.sealer, h.opener);
-        let mut f =
-            framing::encode(&airhand_proto::session::ControllerMsg::RequestKeyframe { after: 1 });
+        let mut f = framing::encode(&airhand_proto::session::ControllerMsg::RequestKeyframe {
+            after: 1,
+            stream: 0,
+        });
         c_send.seal_frame(&mut f).unwrap();
         let mut p = f[4..].to_vec();
         h_recv.open(&mut p).unwrap();
@@ -1343,13 +1359,16 @@ mod tests {
     #[test]
     fn frames_fail_when_dropped_reordered_or_moved() {
         let (ctl, host) = materials();
-        let control = |m: &KeyMaterial| m.keys(label(SessionLane::Control), Order::Next(0));
+        let control = |m: &KeyMaterial| m.keys(&label(SessionLane::Control), Order::Next(0));
         let frames: Vec<Vec<u8>> = {
             let mut s = control(&ctl).sealer;
             (0..3u8)
                 .map(|k| {
                     let mut f = framing::encode_with_spare(
-                        &airhand_proto::session::ControllerMsg::RequestKeyframe { after: k as u32 },
+                        &airhand_proto::session::ControllerMsg::RequestKeyframe {
+                            after: k as u32,
+                            stream: 0,
+                        },
                         SEAL_OVERHEAD,
                     );
                     let cap = f.capacity();
@@ -1378,7 +1397,7 @@ mod tests {
         assert!(o.open(&mut forged).is_err());
         o.open(&mut frames[1].clone()).unwrap();
         // 换到别的通道
-        let mut o = host.keys(label(SessionLane::Bulk), Order::Next(0)).opener;
+        let mut o = host.keys(&label(SessionLane::Bulk), Order::Next(0)).opener;
         assert!(o.open(&mut frames[0].clone()).is_err());
         // 方向反了（被控端自己发的不能当成收到的）
         let back = control(&host).sealer.seal(b"x").unwrap();

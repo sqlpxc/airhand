@@ -76,7 +76,8 @@ fn incoming(
 /// 控制端握手的第一条消息（第一次连这个控制码，不配对）
 fn initiate(code: u32) -> (Initiator, Vec<u8>) {
     let me = Identity::generate();
-    let intro = secure::controller_intro("ctl", "test", QualitySettings::default(), false);
+    let intro =
+        secure::controller_intro("ctl", "test", QualitySettings::default(), false, Vec::new());
     secure::initiate(InitiatorParams {
         code,
         me: &me,
@@ -323,7 +324,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     let mut host_control = open_lane(&host.conn, sid, SessionLane::Control)
         .await
         .unwrap();
-    let mut video_tx = open_lane(&host.conn, sid, SessionLane::Video)
+    let mut video_tx = open_lane(&host.conn, sid, SessionLane::Video(0))
         .await
         .unwrap();
     // 控制端从来不读画面通道
@@ -546,7 +547,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
     /// 确认在读任务里就交给平台（Ping 也在那里回了）
     struct AckTx(mpsc::UnboundedSender<(u32, u64)>);
     impl Acks for AckTx {
-        fn ack(&self, seq: u32, arrived: u64) {
+        fn ack(&self, _stream: u8, seq: u32, arrived: u64) {
             let _ = self.0.send((seq, arrived));
         }
     }
@@ -572,6 +573,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
         for seq in [1, 2] {
             let mut header = VideoHeader {
                 seq,
+                stream: 0,
                 key: true,
                 codec: Codec::H264,
                 width: 8,
@@ -583,7 +585,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
             if seq == 1 {
                 header[2] = 99;
             }
-            io.video
+            io.video[0]
                 .send(media::frame(&header, &[&[1]]).into())
                 .await
                 .unwrap();
@@ -643,8 +645,115 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
                 Codec::H264
             }
         );
-        svc.ack(session.sid, seq).unwrap();
+        svc.ack(session.sid, 0, seq).unwrap();
     }
+    host_task.await.unwrap();
+}
+
+/// 多屏：两路画面各走自己的通道经过真的中转（1 号和 3 号通道，服务器不用认识它们），控制端服务各自合并、
+/// 原样交给界面；界面按路确认，被控端收到的确认带着是第几路
+#[tokio::test]
+async fn two_video_streams_travel_through_the_relay() {
+    use airhand_link::host::Acks;
+    use airhand_proto::media::{self, VideoHeader};
+    use airhand_proto::session::Codec;
+    struct Ui(mpsc::UnboundedSender<Vec<u8>>);
+    struct AckTx(mpsc::UnboundedSender<(u8, u32)>);
+    impl Acks for AckTx {
+        fn ack(&self, stream: u8, seq: u32, _arrived: u64) {
+            let _ = self.0.send((stream, seq));
+        }
+    }
+    impl SessionUi for Ui {
+        fn packet(&self, p: Vec<u8>) -> Result<(), UiClosed> {
+            self.0.send(p).map_err(|_| UiClosed)
+        }
+        fn event(&self, _: SessionEvent) -> Result<(), UiClosed> {
+            Ok(())
+        }
+    }
+    let (_broker, cfg) = start().await;
+    let (mut host, id) = register(&cfg, None).await;
+    let host_task = tokio::spawn(async move {
+        let (router, _router) = Router::start(&host.conn);
+        let msg = next(&mut host).await;
+        let (inc, _kick) = incoming(&host, &router, id.code, msg);
+        let session_id = inc.session_id;
+        let gate = OpenGate(Identity::generate());
+        let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        let (ack_tx, mut acks) = mpsc::unbounded_channel();
+        io.incoming.set_acks(Arc::new(AckTx(ack_tx)));
+        for seq in 1..=3u32 {
+            for stream in [1u8, 0] {
+                let header = VideoHeader {
+                    seq,
+                    stream,
+                    key: seq == 1,
+                    codec: Codec::H264,
+                    width: 8 << stream,
+                    height: 8,
+                    capture_us: 0,
+                    reference: (seq > 1).then(|| seq - 1),
+                }
+                .encode();
+                io.video[stream as usize]
+                    .send(media::frame(&header, &[&[stream; 100]]).into())
+                    .await
+                    .unwrap();
+            }
+        }
+        // 每一路都确认到了第 3 帧
+        let mut last = [0u32; 2];
+        while last != [3, 3] {
+            let (stream, seq) = timeout(Duration::from_secs(5), acks.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            last[stream as usize] = last[stream as usize].max(seq);
+        }
+        io.close(session_id, Ok(())).await.unwrap();
+    });
+    let (packets, mut received) = mpsc::unbounded_channel();
+    let svc = ControllerService::start(
+        Arc::new(cfg),
+        tokio::runtime::Handle::current(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        Identity::generate(),
+    );
+    let ui = Arc::new(Ui(packets));
+    let session = timeout(Duration::from_secs(5), async {
+        loop {
+            match svc
+                .connect(
+                    &id.code.to_string(),
+                    ConnectOptions::default(),
+                    ui.clone(),
+                    Frontend::Browser,
+                )
+                .await
+            {
+                Err(Problem::NotConnected) => tokio::time::sleep(Duration::from_millis(10)).await,
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // 每一路各自按顺序到，头里的第几路和负载对得上
+    let mut got: [Vec<u32>; 2] = Default::default();
+    while got[0].len() + got[1].len() < 6 {
+        let packet = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let h = VideoHeader::decode(&packet).unwrap();
+        assert_eq!(h.width, 8 << h.stream);
+        assert_eq!(media::payload(&packet).unwrap()[0], h.stream);
+        got[h.stream as usize].push(h.seq);
+        svc.ack(session.sid, h.stream, h.seq).unwrap();
+    }
+    assert_eq!(got, [vec![1, 2, 3], vec![1, 2, 3]]);
     host_task.await.unwrap();
 }
 
@@ -749,7 +858,10 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         assert!(matches!(req, Request::Clipboard(ref t) if *t == text));
         if wrong_lane {
             // 已知消息发到错误通道，即使密文认证成功也应拒绝。
-            let keyframe = ControllerMsg::RequestKeyframe { after: 1 };
+            let keyframe = ControllerMsg::RequestKeyframe {
+                after: 1,
+                stream: 0,
+            };
             assert_eq!(keyframe.lane(), SessionLane::Control);
             let mut frame = framing::encode(&keyframe);
             link.bulk.1.seal_frame(&mut frame).unwrap();
@@ -1201,11 +1313,11 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf, b"future lane");
-    let hc = lane(&host.conn, SessionLane::Control as u8).await;
-    let mut cc = lane(&ctrl.conn, SessionLane::Control as u8).await;
+    let hc = lane(&host.conn, SessionLane::Control.number()).await;
+    let mut cc = lane(&ctrl.conn, SessionLane::Control.number()).await;
     cc.write_all(b"ping").await.unwrap();
     let (h, mut hcr) = accept(&host.conn).await;
-    assert_eq!(h.lane, SessionLane::Control as u8);
+    assert_eq!(h.lane, SessionLane::Control.number());
     let mut b4 = [0u8; 4];
     timeout(Duration::from_secs(2), hcr.read_exact(&mut b4))
         .await
@@ -1268,10 +1380,10 @@ async fn frame_streams_are_relayed_one_frame_each() {
     };
     // 两条画面的帧流：另一端各收到一条，会话头一样（带着帧流的标志）
     for body in [&b"first"[..], b"second"] {
-        let mut s = frame(SessionLane::Video, body).await;
+        let mut s = frame(SessionLane::Video(0), body).await;
         s.finish().unwrap();
         let (h, mut r) = accept().await;
-        assert_eq!(h, SessionHeader::frame(sid, SessionLane::Video));
+        assert_eq!(h, SessionHeader::frame(sid, SessionLane::Video(0)));
         let got = timeout(Duration::from_secs(2), r.read_to_end(64))
             .await
             .unwrap()
@@ -1279,7 +1391,7 @@ async fn frame_streams_are_relayed_one_frame_each() {
         assert_eq!(got, body);
     }
     // 放弃了的帧流：另一端读到一半就断了
-    let mut abandoned = frame(SessionLane::Video, b"stale").await;
+    let mut abandoned = frame(SessionLane::Video(0), b"stale").await;
     let (_, mut r) = accept().await;
     let mut b = [0u8; 5];
     timeout(Duration::from_secs(2), r.read_exact(&mut b))
@@ -1308,13 +1420,13 @@ async fn frame_streams_are_relayed_one_frame_each() {
     .await;
     let mut open = Vec::new();
     for _ in 0..MAX_FRAME_STREAMS {
-        open.push(frame(SessionLane::Video, b"x").await);
+        open.push(frame(SessionLane::Video(0), b"x").await);
     }
     wait_until("all frame streams are relayed", || {
         broker.host_frame_streams(sid) == MAX_FRAME_STREAMS
     })
     .await;
-    let over = frame(SessionLane::Video, b"x").await;
+    let over = frame(SessionLane::Video(0), b"x").await;
     assert!(
         timeout(Duration::from_secs(2), over.stopped())
             .await
@@ -1666,7 +1778,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
         changed: AtomicU32,
     }
     impl Acks for Paths {
-        fn ack(&self, _: u32, _: u64) {}
+        fn ack(&self, _: u8, _: u32, _: u64) {}
         fn path_changed(&self, lost: bool) {
             self.changed.fetch_add(1, Ordering::Relaxed);
             if lost {
@@ -1758,6 +1870,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                         seq += 1;
                         let header = VideoHeader {
                             seq,
+                            stream: 0,
                             key: std::mem::take(&mut key),
                             codec: Codec::H264,
                             width: 8,
@@ -1766,7 +1879,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                             reference: None,
                         }
                         .encode();
-                        io.video
+                        io.video[0]
                             .send(media::frame(&header, &[&[0; 600]]).into())
                             .await
                             .unwrap();
@@ -1803,7 +1916,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                 );
                 last = h.seq;
                 frames.fetch_add(1, Ordering::Relaxed);
-                let _ = svc.ack(sid, h.seq);
+                let _ = svc.ack(sid, 0, h.seq);
             }
         })
     };

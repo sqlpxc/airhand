@@ -40,7 +40,8 @@
 //! | 通道 | 方向 | 内容 | 编码 |
 //! |------|------|------|------|
 //! | 控制 | 双向 | 小而急的 [`session::HostMsg`] / [`session::ControllerMsg`]：输入、设置、提示…… | CBOR（[`framing`]） |
-//! | 画面 | 被控端 → 控制端 | 画面包（双方都支持 [`features::session::FRAMES`] 时每帧一条帧流） | 媒体包（[`media`]） |
+//! | 画面 | 被控端 → 控制端 | 画面包（双方都支持 [`features::session::FRAMES`] 时每帧一条帧流）。多屏同时显示时每个显示器一路，
+//! 各是一条通道（[`SessionLane::Video`]，见 [`session`] 的"多屏"） | 媒体包（[`media`]） |
 //! | 大块 | 双向 | 大的消息：剪贴板、光标图像（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
@@ -125,8 +126,12 @@ pub const SESSION_MAGIC: [u8; 4] = *b"AHS9";
 pub const MAX_LANES: u8 = 8;
 
 /// 一个会话每端最多同时开着这么多条帧流（[`SessionHeader::FRAME`]，服务器的资源上限）。
-/// 被控端在途的画面最多几十帧（见 `airhand_link::flow`），放弃了的帧流随即关掉，远远用不到这么多
-pub const MAX_FRAME_STREAMS: u16 = 128;
+/// 被控端每一路画面在途的最多几十帧（见 `airhand_link::flow`），最多 [`MAX_STREAMS`] 路；放弃了的帧流随即关掉，
+/// 用不到这么多
+pub const MAX_FRAME_STREAMS: u16 = 256;
+
+/// 一个会话最多同时有这么多路画面（多屏同时显示时每个显示器一路，见 [`session`] 的"多屏"）
+pub const MAX_STREAMS: u8 = 4;
 
 /// 会话头里的优先级最高这么多（控制通道的）：更大的值解码时压到它。服务器在端到端握手之前就转发通道，
 /// 不压的话任何知道控制码的一端都能把自己的流标得比别的会话的控制通道还高
@@ -142,26 +147,54 @@ open_enum! {
     }
 }
 
-/// 会话里已知的通道（见模块说明）。服务器不认识它们：线上只是一个编号（[`SessionHeader::lane`]），取值不能改
+/// 会话里已知的通道（见模块说明）。服务器不认识它们：线上只是一个编号（[`SessionHeader::lane`]，[`SessionLane::number`]），
+/// 编号不能改
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
 pub enum SessionLane {
-    Control = 0,
-    Video = 1,
-    /// 大的消息（剪贴板、光标图像）：不挡控制通道上的输入、确认（见 [`session`] 的"走哪条通道"）
-    Bulk = 2,
+    /// 0 号
+    Control,
+    /// 画面的第几路（小于 [`MAX_STREAMS`]；只看一个显示器时只有第 0 路，见 [`session`] 的"多屏"）。
+    /// 第 0 路是 1 号通道，之后的从 3 号起（第 1 路是 3 号）。每一路的密钥、计数各是各的
+    Video(u8),
+    /// 2 号：大的消息（剪贴板、光标图像）：不挡控制通道上的输入、确认（见 [`session`] 的"走哪条通道"）
+    Bulk,
 }
 
+const _: () = assert!(
+    SessionLane::COUNT <= MAX_LANES as usize,
+    "the video streams don't fit in the lanes the server forwards"
+);
+
 impl SessionLane {
-    pub const ALL: [Self; 3] = [Self::Control, Self::Video, Self::Bulk];
+    /// 认识的通道有几条（编号是 `0..COUNT`）
+    pub const COUNT: usize = 2 + MAX_STREAMS as usize;
+
+    /// 线上的编号（`stream` 不小于 [`MAX_STREAMS`] 的画面没有编号：调用的一方不能这样用）
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Video(0) => 1,
+            Self::Bulk => 2,
+            Self::Video(stream) => {
+                assert!(stream < MAX_STREAMS, "no such video stream");
+                2 + stream
+            }
+        }
+    }
 
     pub const fn from_u8(lane: u8) -> Option<Self> {
         match lane {
             0 => Some(Self::Control),
-            1 => Some(Self::Video),
+            1 => Some(Self::Video(0)),
             2 => Some(Self::Bulk),
+            n if n < 2 + MAX_STREAMS => Some(Self::Video(n - 2)),
             _ => None,
         }
+    }
+
+    /// 认识的所有通道（按编号）
+    pub fn all() -> impl Iterator<Item = Self> {
+        (0..Self::COUNT as u8).filter_map(Self::from_u8)
     }
 
     /// 一帧负载的资源上限（含加密开销，不含长度前缀），发送和接收共用
@@ -169,7 +202,7 @@ impl SessionLane {
         match self {
             Self::Control => MAX_CONTROL_MSG,
             Self::Bulk => MAX_BULK_MSG,
-            Self::Video => media::MAX_VIDEO_PACKET + handshake::SEAL_OVERHEAD,
+            Self::Video(_) => media::MAX_VIDEO_PACKET + handshake::SEAL_OVERHEAD,
         }
     }
 
@@ -178,7 +211,7 @@ impl SessionLane {
     pub const fn priority(self) -> u8 {
         match self {
             Self::Control => 10,
-            Self::Video | Self::Bulk => 0,
+            Self::Video(_) | Self::Bulk => 0,
         }
     }
 }
@@ -210,7 +243,7 @@ impl SessionHeader {
     pub fn new(session_id: u64, lane: SessionLane) -> Self {
         Self {
             session_id,
-            lane: lane as u8,
+            lane: lane.number(),
             priority: lane.priority(),
             flags: 0,
         }
@@ -263,6 +296,7 @@ impl SessionHeader {
 ///   量两条路往返时延的探测和回声），CBOR，和控制通道上的消息一样不认识的跳过；
 /// * [`VIDEO`]：画面的一帧切出来的一块，或者它的冗余（见 [`fec`]）。和别的不一样，种类后面不是一个密封单元：
 ///   被控端先把整帧加密成一个密封单元（和帧流上的一样），再切开、算冗余，收的一方拼回密封单元再解密。
+///   明文的头里有它是第几路画面（[`fec::Fragment::stream`]，多屏同时显示时）。
 ///
 /// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。服务器不管种类，以后加种类不用升级服务器。
 pub mod datagram {
@@ -417,7 +451,7 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = SessionHeader::new(0xdead_beef_1234, SessionLane::Video);
+        let h = SessionHeader::new(0xdead_beef_1234, SessionLane::Video(0));
         assert_eq!(h.priority, 0);
         assert_eq!(SessionHeader::decode(&h.encode()), Some(h));
         let mut bad = h.encode();
@@ -441,7 +475,7 @@ mod tests {
         let b = SessionHeader::new(1, SessionLane::Bulk);
         assert_eq!(b.encode()[12..], [2, 0, 0, 0]);
         // 帧流：标志在第 14 个字节；不认识的标志原样留着（服务器照样转发）
-        let f = SessionHeader::frame(1, SessionLane::Video);
+        let f = SessionHeader::frame(1, SessionLane::Video(0));
         assert!(f.is_frame() && !b.is_frame());
         assert_eq!(f.encode()[12..], [1, 0, 1, 0]);
         assert_eq!(SessionHeader::decode(&f.encode()), Some(f));
@@ -452,11 +486,24 @@ mod tests {
         assert_eq!(n.encode(), newer);
         // v9 写的头（第 14 个字节是 0）不是帧流
         assert!(!SessionHeader::decode(&h.encode()).unwrap().is_frame());
-        for lane in SessionLane::ALL {
-            assert!((lane as u8) < MAX_LANES);
-            assert_eq!(SessionLane::from_u8(lane as u8), Some(lane));
+        for lane in SessionLane::all() {
+            assert!(lane.number() < MAX_LANES);
+            assert_eq!(SessionLane::from_u8(lane.number()), Some(lane));
         }
+        assert_eq!(SessionLane::all().count(), SessionLane::COUNT);
         assert_eq!(SessionLane::from_u8(7), None);
+        // 画面的第 0 路还是 1 号通道，之后的从 3 号起
+        assert_eq!(SessionLane::Video(0).number(), 1);
+        assert_eq!(SessionLane::Video(1).number(), 3);
+        assert_eq!(
+            SessionLane::from_u8(2 + MAX_STREAMS - 1),
+            Some(SessionLane::Video(MAX_STREAMS - 1))
+        );
+        assert_eq!(SessionLane::from_u8(2 + MAX_STREAMS), None);
+        assert_eq!(
+            SessionHeader::new(1, SessionLane::Video(2)).encode()[12..],
+            [4, 0, 0, 0]
+        );
     }
 
     #[test]

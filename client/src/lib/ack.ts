@@ -9,15 +9,16 @@
 export const ACK_INTERVAL_MS = 8;
 
 /**
- * 发给控制端服务的二进制确认：`1 | sid u32 LE | seq u32 LE`（crates/airhand-link/src/console.rs 的 parse_ack），
- * 每帧都有的消息不走 JSON
+ * 发给控制端服务的二进制确认：`1 | sid u32 LE | seq u32 LE | 第几路 u8`（crates/airhand-link/src/console.rs 的 parse_ack），
+ * 每帧都有的消息不走 JSON。画面的每一路（多屏）各自确认
  */
-export function ackMessage(sid: number, seq: number): ArrayBuffer {
-  const buf = new ArrayBuffer(9);
+export function ackMessage(sid: number, seq: number, stream = 0): ArrayBuffer {
+  const buf = new ArrayBuffer(10);
   const dv = new DataView(buf);
   dv.setUint8(0, 1);
   dv.setUint32(1, sid, true);
   dv.setUint32(5, seq, true);
+  dv.setUint8(9, stream);
   return buf;
 }
 

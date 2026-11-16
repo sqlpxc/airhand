@@ -66,7 +66,12 @@ impl Phone {
             id,
             key,
             out: senders.out,
-            video: senders.video,
+            // 手机只有一块屏幕：只有第 0 路画面
+            video: senders
+                .video
+                .into_iter()
+                .next()
+                .expect("at least one video stream"),
             audio: senders.audio,
             broadcasts: None,
             publish: None,
@@ -91,9 +96,12 @@ struct VideoAcks {
     id: u64,
 }
 
+/// 手机只有一块屏幕，只发第 0 路画面：别的路的不管
 impl Acks for VideoAcks {
-    fn ack(&self, seq: u32, arrived: u64) {
-        self.shared.video.ack(self.id, seq, Some(arrived));
+    fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+        if stream == 0 {
+            self.shared.video.ack(self.id, seq, Some(arrived));
+        }
     }
 
     /// 画面换了路（中转 ⇄ 直连）：这个会话的码率控制从头量时延；直连断了的话从关键帧重新加入
@@ -102,8 +110,8 @@ impl Acks for VideoAcks {
     }
 
     /// 控制端等不到帧了（帧流）：MediaCodec 不能控制长期参考帧，这个会话从关键帧重新加入
-    fn lost(&self, decoded: u32) -> bool {
-        self.shared.video.lost(self.id, decoded)
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        stream == 0 && self.shared.video.lost(self.id, decoded)
     }
 }
 
@@ -162,6 +170,9 @@ impl Platform for Phone {
                 platform: airhand_proto::session::Platform::Android,
                 touch: info.touch,
                 actions: info.actions.clone(),
+                // 只有一块屏幕：一路画面
+                shown: vec![0],
+                streams: 1,
             }))?;
             if !info.input {
                 self.out
@@ -194,9 +205,10 @@ impl Platform for Phone {
             // 晚到太久的输入已经换成了"释放所有按键"
             Request::Input(events) => sh.event(json!({ "type": "input", "events": events })),
             Request::Settings(s) => sh.video.set_settings(self.id, s),
-            Request::Keyframe(after) => sh.video.request_keyframe(self.id, after),
-            // 手机只有一块屏幕
-            Request::SelectDisplay(_) => {}
+            Request::Keyframe(Some((0, after))) => sh.video.request_keyframe(self.id, Some(after)),
+            Request::Keyframe(None) => sh.video.request_keyframe(self.id, None),
+            // 手机只有一块屏幕、一路画面
+            Request::Keyframe(Some(_)) | Request::View(_) => {}
             Request::Clipboard(text) => sh.event(json!({ "type": "clipboard", "text": text })),
             Request::Audio(true) => {
                 sh.audio
@@ -275,7 +287,7 @@ mod tests {
                 [0; 32],
                 Senders {
                     out,
-                    video: video_tx,
+                    video: vec![video_tx],
                     audio: audio_tx,
                 },
             );
@@ -291,12 +303,14 @@ mod tests {
                 },
                 settings: Default::default(),
                 audio: true,
+                view: Vec::new(),
             };
             answer_tx.send(phone.ask(&admitted)).unwrap();
             phone
                 .start(Start {
                     settings: Default::default(),
                     audio: true,
+                    view: Vec::new(),
                 })
                 .await
                 .unwrap();

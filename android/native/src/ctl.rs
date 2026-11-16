@@ -166,8 +166,9 @@ impl Ctl {
         q.pop(timeout)
     }
 
+    /// 界面收到了这一帧。Android 只看一个显示器：都是第 0 路画面
     pub fn ack(&self, sid: u32, seq: u32) {
-        let _ = self.svc.ack(sid, seq);
+        let _ = self.svc.ack(sid, 0, seq);
     }
 
     /// 执行命令，返回 JSON：`{"ok": ...}` 或 `{"err": Problem}`

@@ -46,7 +46,7 @@ pub(super) struct Session {
     label: String,
 }
 
-const CONTROL: u8 = 1 << SessionLane::Control as u8;
+const CONTROL: u8 = 1 << SessionLane::Control.number();
 
 impl Session {
     pub(super) fn new(
@@ -239,7 +239,7 @@ impl Broker {
         };
         let session_id = h.session_id;
         let frame = h.is_frame();
-        if frame && h.lane == SessionLane::Control as u8 {
+        if frame && h.lane == SessionLane::Control.number() {
             reject(recv);
             bail!("a frame stream on the control lane");
         }
@@ -299,7 +299,7 @@ impl Broker {
         };
         if frame {
             self.frame_done(session_id, side);
-        } else if h.lane == SessionLane::Control as u8 {
+        } else if h.lane == SessionLane::Control.number() {
             self.end_session(session_id);
         }
         piped

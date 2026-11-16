@@ -118,7 +118,7 @@ impl WinInjector {
         self.batch.clear();
         for ev in events {
             match ev {
-                InputEvent::MouseMove { x, y } => {
+                InputEvent::MouseMove { x, y, .. } => {
                     let (nx, ny) = to_absolute(display, *x, *y);
                     self.batch.push(mouse(
                         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,

@@ -23,6 +23,9 @@
 // * 所以锁定时长按 Esc（ESC_HOLD_MS）由这里自己解除：短按照常马上发给对方，按住期间不发自动重复；
 // * Ctrl+Alt+Shift+M：正在发相对移动（手动或自动锁定）就解除，否则手动锁定。
 // 这两种解除和浏览器的 Esc 一样：手动锁定结束，自动锁定到下一次点击之前不再来。
+//
+// 同时看对方的好几个显示器（多屏）时，画面是几个 canvas 拼在一起的：事件挂在包着它们的元素上，绝对坐标是指针所在
+// （落在缝里时是最近）的那一路画面上的位置，带着第几路（见 screens.ts 的 hitTest）。
 import type { InputEvent, MouseButton } from "./api";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
@@ -47,8 +50,13 @@ export function isLockShortcut(e: KeyboardEvent): boolean {
 
 type Lockable = HTMLElement & { requestPointerLock(options?: { unadjustedMovement?: boolean }): Promise<void> | void };
 
+/** 指针（屏幕坐标）在第几路画面上、在它上面的归一化坐标（0..1） */
+export type Locate = (clientX: number, clientY: number) => { x: number; y: number; stream: number };
+
 export class RemoteInput {
-  private canvas: HTMLCanvasElement;
+  /** 画面（几路画面拼在一起时是包着它们的元素）：事件挂在它上面，锁定指针也是它 */
+  private canvas: HTMLElement;
+  private locate: Locate | null;
   private send: (events: InputEvent[]) => void;
   private connected: () => boolean;
   private _interactive = false;
@@ -93,8 +101,10 @@ export class RemoteInput {
   /** 鼠标的方式变了（相对移动 / 锁定），界面据此刷新指针和工具栏 */
   onModeChange: (() => void) | null = null;
 
-  constructor(canvas: HTMLCanvasElement, connected: () => boolean, send: (events: InputEvent[]) => void) {
+  /** `locate`：指针在第几路画面上（多屏）；不给就是整个元素都是第 0 路画面 */
+  constructor(canvas: HTMLElement, connected: () => boolean, send: (events: InputEvent[]) => void, locate?: Locate) {
     this.canvas = canvas; this.connected = connected; this.send = send;
+    this.locate = locate ?? null;
     this.bind();
   }
 
@@ -307,7 +317,12 @@ export class RemoteInput {
 
   // ───────────────────────── 事件 ─────────────────────────
 
-  private pos(e: MouseEvent) {
+  /** 绝对坐标：在第几路画面上的哪里（第 0 路不写 stream） */
+  private pos(e: MouseEvent): { x: number; y: number; stream?: number } {
+    if (this.locate) {
+      const { x, y, stream } = this.locate(e.clientX, e.clientY);
+      return stream ? { x, y, stream } : { x, y };
+    }
     const r = this.canvas.getBoundingClientRect();
     return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / Math.max(1, r.width))),
       y: Math.min(1, Math.max(0, (e.clientY - r.top) / Math.max(1, r.height))) };

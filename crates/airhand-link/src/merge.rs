@@ -923,6 +923,7 @@ mod tests {
     fn frame(s: &mut Sealer, seq: u32, key: bool, reference: Option<u32>) -> Vec<u8> {
         let h = VideoHeader {
             seq,
+            stream: 0,
             key,
             codec: Codec::H264,
             width: 8,
@@ -1262,7 +1263,7 @@ mod tests {
         let (client, server) = crate::tests::quic_pair().await;
         let (mut s, o) = test_lane(false);
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut m = Merge::new(SessionLane::Video, Policy::Video, o, rx);
+        let mut m = Merge::new(SessionLane::Video(0), Policy::Video, o, rx);
         let accept = async || server.accept_uni().await.unwrap();
         for seq in 0..3u32 {
             let mut send = client.open_uni().await.unwrap();
@@ -1319,7 +1320,7 @@ mod tests {
         let (client, server) = crate::tests::quic_pair().await;
         let (mut s, o) = test_lane(false);
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut m = Merge::new(SessionLane::Video, Policy::Video, o, rx);
+        let mut m = Merge::new(SessionLane::Video(0), Policy::Video, o, rx);
         m.set_rtt(100.0);
         let wire = |f: Vec<u8>| [&(f.len() as u32).to_le_bytes()[..], &f].concat();
         let accept = async |tx: &mpsc::UnboundedSender<LaneStream>| {
@@ -1335,6 +1336,7 @@ mod tests {
         let big = async |s: &mut Sealer, seq: u32, key: bool, reference: Option<u32>| {
             let h = VideoHeader {
                 seq,
+                stream: 0,
                 key,
                 codec: Codec::H264,
                 width: 8,

@@ -36,6 +36,20 @@
       "sid": 3
     },
     {
+      "cmd": "view",
+      "sid": 3,
+      "streams": [
+        {
+          "display": 1,
+          "maxShort": 720
+        },
+        {
+          "display": 0,
+          "maxShort": 0
+        }
+      ]
+    },
+    {
       "cmd": "audio",
       "enabled": true,
       "sid": 3
@@ -175,6 +189,19 @@
       "name": "delta frame with a reference",
       "payload": "0203",
       "seq": 11,
+      "width": 1280
+    },
+    {
+      "captureUs": 123456794012,
+      "codec": "h264",
+      "height": 1024,
+      "hex": "010100180100000000050004010000009c2d99be1c00000004",
+      "key": true,
+      "kind": 1,
+      "name": "keyframe of the second stream",
+      "payload": "04",
+      "seq": 1,
+      "stream": 1,
       "width": 1280
     },
     {

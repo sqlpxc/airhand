@@ -54,7 +54,7 @@ pub async fn establish(
     let mut control = open_lane(conn, session_id, SessionLane::Control).await?;
     let done = initiator.finish(&mut control_in, &mut control).await?;
     let bulk = open_lane(conn, session_id, SessionLane::Bulk).await?;
-    let secured = done.secured;
+    let mut secured = done.secured;
     let paths = Paths::new(conn.clone());
     let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
     let mut control_merge = Merge::new(
@@ -64,6 +64,22 @@ pub async fn establish(
         inbox.control,
     );
     control_merge.add(control_in, Via::Relay)?;
+    // 画面的每一路（见 airhand_proto::session 的"多屏"）：各自的通道、密钥、纠错数据报
+    let video = std::mem::take(&mut secured.video)
+        .into_iter()
+        .zip(inbox.video.drain(..))
+        .zip(inbox.fec.drain(..))
+        .enumerate()
+        .map(|(stream, ((keys, streams), fec))| {
+            Merge::new(
+                SessionLane::Video(stream as u8),
+                Policy::Video,
+                keys.opener,
+                streams,
+            )
+            .with_datagrams(fec)
+        })
+        .collect();
     let receiver = HostReceiver::new(
         control_merge,
         Merge::new(
@@ -72,13 +88,7 @@ pub async fn establish(
             secured.bulk.opener,
             inbox.bulk,
         ),
-        Merge::new(
-            SessionLane::Video,
-            Policy::Video,
-            secured.video.opener,
-            inbox.video,
-        )
-        .with_datagrams(inbox.fec),
+        video,
         (inbox.audio, secured.audio.opener),
         (inbox.datagrams, secured.datagrams.opener),
         datagrams.clone(),
