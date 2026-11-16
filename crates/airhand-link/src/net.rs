@@ -209,6 +209,9 @@ pub struct Signal {
     pub punch: Punch,
 }
 
+/// 数据报的发送缓冲（见 [`transport_config`]），直连也一样
+pub(crate) const DATAGRAM_SEND_BUFFER: usize = 16 * 1024;
+
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
     // 服务器不开双向流（信令流是客户端开的）；会话的通道是服务器转过来的单向流，每个会话每端几条，
@@ -221,9 +224,10 @@ pub fn transport_config() -> TransportConfig {
     t.stream_receive_window(VarInt::from_u32(16 * 1024 * 1024));
     t.receive_window(VarInt::from_u32(64 * 1024 * 1024));
     t.send_window(64 * 1024 * 1024);
-    // 声音数据报（带着之前两包的副本，约 40 KB/s）：网络跟不上时宁可丢掉旧的，也不要在发送缓冲里越积越晚
-    // （缓冲满了 quinn 丢最旧的）
-    t.datagram_send_buffer_size(64 * 1024);
+    // 数据报的发送缓冲：数据报在 QUIC 包里排在所有流的前面，彼此先来先发。画面用纠错时缓冲里排着画面的块，
+    // 声音、Pong 排在它们后面：缓冲小一点，它们最多等这么多字节（10 Mbps 时约 13 ms）。缓冲满了的时候本端的
+    // 数据报都等空位（见 crate::paths::send_datagram），不挤掉排着的；声音等不到就丢，不在缓冲里越积越晚
+    t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t
 }

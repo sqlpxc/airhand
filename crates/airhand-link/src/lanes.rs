@@ -6,7 +6,7 @@
 //! 直连上由 [`accept_direct`] 做（一条直连只属于一个会话）。数据报也一样按会话 ID 和种类分发。
 //!
 //! 一个会话在收的一端是一个 [`Inbox`]：每条通道一个信箱（中转、直连上来的流都放进来，交给 [`crate::merge::Merge`]
-//! 合并），声音、控制数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
+//! 合并），声音、控制、画面（纠错）数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
 //!
 //! 画面还可以是**帧流**（[`open_frame`]，会话头带 `SessionHeader::FRAME`，见 `airhand_proto::session` 的"帧流"）：
 //! 每帧一条流，同一条通道上来很多条。它们和普通的流放进同一个信箱，带着 [`LaneStream::frame`]。
@@ -48,6 +48,8 @@ pub type LaneStreams = mpsc::UnboundedReceiver<LaneStream>;
 const AUDIO_QUEUE: usize = 16;
 /// 控制数据报（确认每秒可能有上百个，直连通着时每个来两份，还有两条路上的探测和回声）
 const CONTROL_QUEUE: usize = 64;
+/// 画面的纠错数据报（见 `crate::fec`）：一帧就有几十上百个，一下子来一串
+const VIDEO_QUEUE: usize = 1024;
 /// 读会话头最多等这么久
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// 会话还没登记就先到了的流（中转转过来的时候，本端还没处理完服务器的回答）：最多留这么多条、这么久
@@ -60,6 +62,7 @@ pub struct Feed {
     lanes: [mpsc::UnboundedSender<LaneStream>; SessionLane::ALL.len()],
     audio: mpsc::Sender<Bytes>,
     control: mpsc::Sender<(Via, Bytes)>,
+    video: mpsc::Sender<(Via, Bytes)>,
 }
 
 /// 一个会话收的一端（见模块说明）
@@ -72,6 +75,8 @@ pub struct Inbox {
     /// 控制数据报（同上）和它从哪条路来（探测要从同一条路弹回去）。直连通着时 Ping、Pong、确认两条路各来一份，
     /// 后到的那份解密时被当成重放丢掉
     pub datagrams: mpsc::Receiver<(Via, Bytes)>,
+    /// 画面的纠错数据报（整个数据报）和它从哪条路来：交给画面的合并（见 `crate::fec`）
+    pub fec: mpsc::Receiver<(Via, Bytes)>,
     /// 直连上来的流、数据报也放进来
     pub feed: Feed,
 }
@@ -83,16 +88,19 @@ impl Inbox {
         let (bulk_tx, bulk) = mpsc::unbounded_channel();
         let (audio_tx, audio) = mpsc::channel(AUDIO_QUEUE);
         let (datagrams_tx, datagrams) = mpsc::channel(CONTROL_QUEUE);
+        let (fec_tx, fec) = mpsc::channel(VIDEO_QUEUE);
         Self {
             control,
             video,
             bulk,
             audio,
             datagrams,
+            fec,
             feed: Feed {
                 lanes: [control_tx, video_tx, bulk_tx],
                 audio: audio_tx,
                 control: datagrams_tx,
+                video: fec_tx,
             },
         }
     }
@@ -131,6 +139,9 @@ impl Feed {
             }
             Some(datagram::CONTROL) => {
                 let _ = self.control.try_send((via, d));
+            }
+            Some(datagram::VIDEO) => {
+                let _ = self.video.try_send((via, d));
             }
             _ => {}
         }

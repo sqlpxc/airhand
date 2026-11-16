@@ -523,6 +523,7 @@ mod tests {
                 adaptive: true,
                 codec: Codec::AV1,
                 priority: Default::default(),
+                transport: Default::default(),
             }
         );
         assert!(opts.audio);

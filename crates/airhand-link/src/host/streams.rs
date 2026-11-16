@@ -22,7 +22,7 @@ use airhand_proto::framing;
 use airhand_proto::handshake::{Confirm, Negotiated, PublicKey};
 use airhand_proto::session::{
     ControllerDatagram, ControllerMsg, DirectOffer, HostDatagram, InputEvent, MAX_CLIPBOARD_TEXT,
-    QualitySettings,
+    QualitySettings, VideoTransport,
 };
 use airhand_proto::{SessionLane, features};
 use anyhow::{Context, Result, anyhow};
@@ -37,6 +37,7 @@ use super::session::{Acks, MicSink, Request};
 use super::write::{FrameStreams, Video, Writers, write_all};
 use crate::audio::Unbundler;
 use crate::direct;
+use crate::fec::Chooser;
 use crate::lanes::{Via, first_stream, open_lane};
 use crate::merge::{Merge, Policy};
 use crate::paths::{DatagramSender, Paths};
@@ -137,6 +138,7 @@ impl ControllerReceiver {
 /// * Ping：马上回 Pong。同意之前也回：控制端不会把等待当成失联；
 /// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
 /// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
+/// * 画面收得怎么样的报告（`ControllerDatagram::Report`）：交给画面的 [`Chooser`]（用不用纠错、配多少冗余）；
 /// * 控制端麦克风的声音包：马上交给平台的 [`MicSink`]；
 /// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
 #[derive(Clone)]
@@ -148,6 +150,8 @@ pub(crate) struct Express {
     heard: Arc<Mutex<tokio::time::Instant>>,
     /// 在途的帧流（画面用帧流时）
     frames: Option<Arc<FrameStreams>>,
+    /// 画面走帧流还是纠错（双方都支持纠错时）
+    fec: Option<Arc<Chooser>>,
 }
 
 impl Express {
@@ -159,6 +163,7 @@ impl Express {
             mic: Arc::default(),
             heard: Arc::new(Mutex::new(tokio::time::Instant::now())),
             frames: None,
+            fec: None,
         }
     }
 
@@ -166,6 +171,19 @@ impl Express {
     fn with_frames(mut self, frames: Arc<FrameStreams>) -> Self {
         self.frames = Some(frames);
         self
+    }
+
+    /// 画面可能走纠错：控制端的报告、确认、画质设置交给 `fec`
+    fn with_fec(mut self, fec: Arc<Chooser>) -> Self {
+        self.fec = Some(fec);
+        self
+    }
+
+    /// 控制端的画质设置里画面怎么传（见 `airhand_proto::session` 的"前向纠错"）
+    pub(crate) fn transport(&self, t: VideoTransport) {
+        if let Some(c) = &self.fec {
+            c.set_mode(t);
+        }
     }
 
     /// 控制端麦克风的一个声音包（还没有人收时丢掉）
@@ -191,6 +209,14 @@ impl Express {
                 }
                 if let Some(f) = &self.frames {
                     f.acked(seq);
+                }
+                if let Some(c) = &self.fec {
+                    c.acked(seq, tokio::time::Instant::now());
+                }
+            }
+            ControllerDatagram::Report(r) => {
+                if let Some(c) = &self.fec {
+                    c.report(r, tokio::time::Instant::now());
                 }
             }
             // 平台要恢复：之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）
@@ -318,11 +344,22 @@ impl HostStreams {
         // 双方都支持、中转也支持：画面每帧一条帧流（见 airhand_proto::session 的"帧流"）
         let frames = (admitted.negotiated.features.has(features::session::FRAMES) && inc.frames)
             .then(|| Arc::new(FrameStreams::default()));
+        // 用着帧流、双方又都支持纠错：增量帧可能走纠错的数据报（见 airhand_proto::session 的"前向纠错"）
+        let fec = (frames.is_some() && admitted.negotiated.features.has(features::session::FEC))
+            .then(|| Arc::new(Chooser::new(admitted.settings.transport)));
         let video_send = match &frames {
-            Some(f) => Video::Frames(f.clone()),
+            Some(f) => Video::Frames {
+                streams: f.clone(),
+                fec: fec.clone(),
+            },
             None => Video::Stream(open_lane(conn, session_id, SessionLane::Video).await?),
         };
-        info!(session_id, frames = frames.is_some(), "video lanes");
+        info!(
+            session_id,
+            frames = frames.is_some(),
+            fec = fec.is_some(),
+            "video lanes"
+        );
         let (out, ctl_rx, bulk_rx) = queue::channel();
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
@@ -362,6 +399,9 @@ impl HostStreams {
         let mut express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }));
         if let Some(f) = frames {
             express = express.with_frames(f);
+        }
+        if let Some(c) = fec {
+            express = express.with_fec(c);
         }
         let incoming = ControllerReceiver::new(control_rx, bulk_rx, confirm_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
@@ -511,7 +551,9 @@ async fn read_all(r: Readers) -> Result<()> {
                 ControllerDatagram::Echo { t } => {
                     let _ = echoes.try_send((via, t));
                 }
-                ControllerDatagram::Ack { .. } | ControllerDatagram::Lost { .. } => {}
+                ControllerDatagram::Ack { .. }
+                | ControllerDatagram::Lost { .. }
+                | ControllerDatagram::Report(_) => {}
             }
             express.datagram(m);
         }
@@ -567,6 +609,11 @@ async fn read_all(r: Readers) -> Result<()> {
                 ControllerMsg::Direct(offer) => {
                     let _ = answers.try_send(offer);
                     continue;
+                }
+                // 画面怎么传是链路的事，在这里就交给它；别的设置交给平台
+                ControllerMsg::Settings(s) => {
+                    express.transport(s.transport);
+                    ControllerMsg::Settings(s)
                 }
                 ControllerMsg::Input { t, events } => {
                     let stale = clock.lock().unwrap().stale(t, Instant::now());
@@ -720,6 +767,27 @@ mod tests {
         tokio::time::advance(Duration::from_secs(10)).await;
         express.heard();
         assert_eq!(incoming.silent_for(), Duration::ZERO);
+    }
+
+    /// 画面收得怎么样的报告、画质设置里的传输方式交给画面的 Chooser（自动时卡住的帧多了改用纠错）
+    #[tokio::test(start_paused = true)]
+    async fn reports_and_settings_reach_the_chooser() {
+        use airhand_proto::session::VideoReport;
+        let c = Arc::new(Chooser::new(VideoTransport::Auto));
+        let express = Express::new(|_| {}).with_fec(c.clone());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        express.datagram(ControllerDatagram::Report(VideoReport {
+            frames: 60,
+            stalled: 10,
+            ..Default::default()
+        }));
+        assert!(c.using());
+        express.transport(VideoTransport::Streams);
+        assert!(!c.using());
+        // 没有 Chooser（对方不支持纠错）：什么也不做
+        let plain = Express::new(|_| {});
+        plain.transport(VideoTransport::Fec);
+        plain.datagram(ControllerDatagram::Report(VideoReport::default()));
     }
 
     /// 控制端等不到帧了：读任务马上交给平台；平台要恢复的话，之后的帧流放弃，确认了的帧流忘掉

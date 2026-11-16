@@ -81,10 +81,10 @@ pub fn frame_bytes(kbps: u32, fps: u8) -> usize {
 /// 最近 [`MIN_RTT_WINDOW`] 里的最小值：样本按时间排列、值严格递增，队头就是窗口里的最小值。
 /// 窗口里只有一个样本时即使过了期也留着（画面静止时不发帧，没有新样本）
 #[derive(Debug, Default)]
-struct WindowMin(VecDeque<(f64, Instant)>);
+pub(crate) struct WindowMin(VecDeque<(f64, Instant)>);
 
 impl WindowMin {
-    fn push(&mut self, v: f64, now: Instant) {
+    pub(crate) fn push(&mut self, v: f64, now: Instant) {
         while self.0.back().is_some_and(|&(x, _)| x >= v) {
             self.0.pop_back();
         }
@@ -99,7 +99,7 @@ impl WindowMin {
         }
     }
 
-    fn get(&self) -> Option<f64> {
+    pub(crate) fn get(&self) -> Option<f64> {
         self.0.front().map(|&(v, _)| v)
     }
 }

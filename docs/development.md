@@ -10,8 +10,9 @@ cargo test
 # the server only uses airhand-link's wire module (default client feature off); the cargo test above always builds it with client, so check this separately
 cargo test -p airhand-link --no-default-features
 
-# crates/airhand-proto/fuzz/: what the server parses before any authentication (version handshake, signaling messages, session headers); needs nightly and cargo-fuzz
-cargo +nightly fuzz run signal    # also hello, session_header
+# crates/airhand-proto/fuzz/: what the server parses before any authentication (version handshake, signaling messages, session headers),
+# and the video FEC datagrams the controller parses before decrypting; needs nightly and cargo-fuzz
+cargo +nightly fuzz run signal    # also hello, session_header, fec_fragment
 
 # web/: web console (WebSocket protocol, password, HTTPS certificate)
 cargo test
@@ -55,7 +56,7 @@ cargo build -p airhand-server
 AIRHAND_CERT=target/e2e/cert.pem AIRHAND_KEY=target/e2e/key.pem ./target/debug/airhand-server &
 
 # client/src-tauri/
-cargo test --lib e2e_roundtrip -- --ignored --nocapture   # video / codec switching / clipboard / audio / ping / disconnect
+cargo test --lib e2e_roundtrip -- --ignored --nocapture   # video (delta frames over forward error correction) / codec switching / clipboard / audio / ping / disconnect
 cargo test --lib e2e_reconnect -- --ignored --nocapture   # getting the code back after a server restart, changing the code
 cargo test --lib e2e_mic -- --ignored --nocapture         # Windows: the controller's microphone through the relay into Steam Streaming Microphone
 ```
@@ -123,7 +124,7 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 There are two version numbers (`crates/airhand-proto/src/lib.rs`); the rules are in [How it works → Protocol evolution](architecture.md#protocol-evolution):
 
-- `SIGNAL_VERSION` / `SIGNAL_MIN`: client ⇄ server (signaling, the session header, the datagram's session ID). The server accepts clients within its range; without a common version it replies `Incompatible` (with its own range) and the client tells the user whether to update Airhand or the server, then retries once a minute. Currently 9..=10: v10 added frame streams (`SessionHeader::FRAME`, a lane can be opened many times), which the host only uses once it has agreed on v10 with the server (`SIGNAL_FRAMES`; see [How it works → Frame streams and reference invalidation](architecture.md#frame-streams-and-reference-invalidation))
+- `SIGNAL_VERSION` / `SIGNAL_MIN`: client ⇄ server (signaling, the session header, the datagram's session ID). The server accepts clients within its range; without a common version it replies `Incompatible` (with its own range) and the client tells the user whether to update Airhand or the server, then retries once a minute. Currently 9..=10: v10 added frame streams (`SessionHeader::FRAME`, a lane can be opened many times), which the host only uses once it has agreed on v10 with the server (`SIGNAL_FRAMES`; see [How it works → Frame streams and reference invalidation](architecture.md#frame-streams-and-reference-invalidation)). Forward error correction for video needed no signaling change: the server doesn't care about datagram kinds, and the session capability bit `FEC` is enough
 - `SESSION_VERSION` / `SESSION_MIN`: host ⇄ controller, negotiated in the end-to-end handshake; the server never looks at it. Without a common version the controller shows `peerIncompatible`
 
 Before changing the protocol, look for a compatible way; if there is one, don't bump a version:
@@ -138,7 +139,7 @@ The version range in the version handshake (keys 0 and 1 of the `ClientHello` / 
 
 ### One protocol, three implementations
 
-`crates/airhand-proto/tests/v9.rs` holds the v9 CBOR bytes. Once v9 is released they are fixed and must not be regenerated from the implementation: existing message numbers and field positions stay compatible, and new messages get separate fixtures. The wire formats added in v10 (the frame stream session header, the video header's reference extension, `ControllerDatagram::Lost`) are in `tests/v10.rs`. Cursor receiver tests cover ordering across both lanes, and a server test uses real QUIC and the controller session to verify that unknown video formats are acknowledged and subsequent frames still arrive.
+`crates/airhand-proto/tests/v9.rs` holds the v9 CBOR bytes. Once v9 is released they are fixed and must not be regenerated from the implementation: existing message numbers and field positions stay compatible, and new messages get separate fixtures. The wire formats added in v10 (the frame stream session header, the video header's reference extension, `ControllerDatagram::Lost`, forward error correction datagrams, `ControllerDatagram::Report`, the transport in the quality settings) are in `tests/v10.rs`. Cursor receiver tests cover ordering across both lanes, and a server test uses real QUIC and the controller session to verify that unknown video formats are acknowledged and subsequent frames still arrive.
 
 The Rust side, the console (TypeScript) and Android (Kotlin) all speak the same formats: media packets (`crates/airhand-proto/src/media.rs`), input events, UI commands and connect options (`airhand_link::controller::Command`, `ConnectOptions`). All the JSON between the UIs and Rust is camelCase: field names, enum values (`"h264"`, `"android"`, `"quickSettings"`), and a field naming the variant of tagged unions (`cmd` for commands, `type` for events and input, `kind` for problems and notices). `crates/airhand-link/tests/protocol.json` holds samples of each, generated by a Rust test; `npm test` (`tests/protocol.test.ts`) and `./gradlew testDebugUnitTest` (`ProtocolTest`) check their parsers and builders against the same file. After changing a format, regenerate it with `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol`, then make the other two pass.
 

@@ -38,6 +38,11 @@ class CodeTest {
         assertEquals(VideoPriority.CLARITY, sharp.priority)
         assertEquals(Preset.HD, Preset.match(sharp))
         assertEquals(VideoPriority.LATENCY, Preset.HD.quality(Codec.AV1).priority)
+        // 丢包恢复也一样：换预设时保留，不影响认是哪个预设
+        val fec = Preset.HD.quality(Codec.AV1, transport = VideoTransport.FEC)
+        assertEquals(VideoTransport.FEC, fec.transport)
+        assertEquals(Preset.HD, Preset.match(fec))
+        assertEquals(VideoTransport.AUTO, Preset.HD.quality(Codec.AV1).transport)
         assertEquals(1080, Preset.SMOOTH.maxShort)
     }
 

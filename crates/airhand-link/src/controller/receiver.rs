@@ -1,5 +1,5 @@
-//! 控制端收被控端的东西：控制、大块、画面三条通道，声音数据报和控制数据报，解密之后交出来（[`HostReceiver`]）。
-//! 被控端的探测（`HostDatagram::Probe`）在这里就从原来的那条路弹回去，不交出来。
+//! 控制端收被控端的东西：控制、大块、画面三条通道（画面还有纠错的数据报，见 `crate::fec`），声音数据报和控制数据报，
+//! 解密之后交出来（[`HostReceiver`]）。被控端的探测（`HostDatagram::Probe`）在这里就从原来的那条路弹回去，不交出来。
 
 use std::collections::VecDeque;
 
@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::audio::Unbundler;
 use crate::lanes::Via;
-use crate::merge::{Merge, Video};
+use crate::merge::{Merge, Video, VideoStats};
 use crate::paths::DatagramSender;
 use crate::secure::Opener;
 use crate::transport::{next_msg, open_datagram};
@@ -27,11 +27,12 @@ pub enum FromHost {
     Pong(u64),
     /// 画面包（`airhand_proto::media` 格式：头 + 码流），解得了，原样交给界面。`arrived`：开始从网络上到达的时刻
     /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerDatagram::Ack`）。
-    /// `direct`：从直连来的
+    /// `direct`：从直连来的；`fec`：纠错的数据报拼回来的
     Video {
         packet: Vec<u8>,
         arrived: u64,
         direct: bool,
+        fec: bool,
     },
     /// 画面通道上别的事：解不了的帧、等不到的帧、要关键帧（见 [`crate::merge::Video`]）
     VideoEvent(Video),
@@ -95,6 +96,11 @@ impl HostReceiver {
         self.video.set_rtt(rtt_ms);
     }
 
+    /// 画面收得怎么样：定时取走、报告给被控端（`ControllerDatagram::Report`，见 [`crate::merge`] 的"报告"）
+    pub fn video_stats(&self) -> VideoStats {
+        self.video.stats()
+    }
+
     /// 下一样东西。控制消息优先；控制通道结束了就是会话结束了（其它通道先结束不算）。可以放在 `select!` 里
     pub async fn recv(&mut self) -> Result<FromHost> {
         loop {
@@ -131,6 +137,7 @@ impl HostReceiver {
                             packet: f.data,
                             arrived: f.arrived,
                             direct: f.direct,
+                            fec: f.fec,
                         });
                     }
                     Some(other) => return Ok(FromHost::VideoEvent(other)),

@@ -35,7 +35,7 @@ pub(crate) fn transport() -> TransportConfig {
     t.stream_receive_window(VarInt::from_u32(16 * 1024 * 1024));
     t.receive_window(VarInt::from_u32(64 * 1024 * 1024));
     t.send_window(64 * 1024 * 1024);
-    t.datagram_send_buffer_size(64 * 1024);
+    t.datagram_send_buffer_size(crate::net::DATAGRAM_SEND_BUFFER);
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t
 }

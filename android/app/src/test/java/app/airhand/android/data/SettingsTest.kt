@@ -16,4 +16,13 @@ class SettingsTest {
         assertFalse(Settings.parse(off.toJson()).localCursor)
         assertEquals(off, Settings.parse(off.toJson()))
     }
+
+    /** 丢包恢复：默认自动（之前保存的设置里没有这一项也是），改了之后记得住 */
+    @Test
+    fun lossRecoveryIsAutoByDefaultAndRemembered() {
+        assertEquals("auto", Settings().transport)
+        assertEquals("auto", Settings.parse(JSONObject().put("navKeys", false)).transport)
+        val fec = Settings(transport = "fec")
+        assertEquals(fec, Settings.parse(fec.toJson()))
+    }
 }

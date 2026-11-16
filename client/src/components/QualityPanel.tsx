@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import type { Codec, QualitySettings, VideoPriority } from "../lib/api";
+import type { Codec, QualitySettings, VideoPriority, VideoTransport } from "../lib/api";
 import { useT } from "../lib/i18n";
 import { CODEC_PRIORITY, codecUsable } from "../lib/codec";
 import { ENHANCE_LEVELS } from "../lib/enhance";
@@ -21,6 +21,9 @@ const RES: { v: number; label?: string }[] = [
 
 /** 缩放画面时优先什么：低延迟（显卡缩放，默认）/ 清楚（CPU 缩放） */
 const PRIORITIES: VideoPriority[] = ["latency", "clarity"];
+
+/** 丢包时怎么办：自动（默认，被控端看网络情况选）/ 重传 / 前向纠错 */
+const TRANSPORTS: VideoTransport[] = ["auto", "streams", "fec"];
 
 // 码率滑块使用对数刻度：0.5 ~ 50 Mbps
 const MIN_KBPS = 500;
@@ -63,6 +66,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const cur = s.settings;
   const preset = matchPreset(cur);
   const priority = cur.priority ?? "latency";
+  const transport = cur.transport ?? "auto";
 
   useEffect(() => setDraftKbps(cur.bitrateKbps), [cur.bitrateKbps]);
 
@@ -71,6 +75,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   // 高亮对方实际在用的格式（与工具栏一致）：请求的格式对方建不起来时会回退到 H.264
   const activeCodec = s.encoder?.codec ?? cur.codec;
   const priorityHint = PRIORITIES.map((p) => `${t(`quality.priority.${p}`)} · ${t(`quality.priority.${p}.hint`)}`).join("\n\n");
+  const transportHint = TRANSPORTS.map((m) => `${t(`quality.transport.${m}`)} · ${t(`quality.transport.${m}.hint`)}`).join("\n\n");
   const encoderLine =
     s.encoder &&
     t("quality.encoder", {
@@ -90,7 +95,9 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
               key={p.id}
               className={preset === p.id ? "active" : ""}
               title={presetDesc(p.id)}
-              onClick={() => s.updateSettings({ ...presetSettings(p.id, cur.codec), priority: cur.priority })}
+              onClick={() =>
+                s.updateSettings({ ...presetSettings(p.id, cur.codec), priority: cur.priority, transport: cur.transport })
+              }
             >
               {presetName(p.id)}
             </button>
@@ -176,6 +183,20 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
                 onClick={() => apply({ priority: p })}
               >
                 {t(`quality.priority.${p}`)}
+              </button>
+            ))}
+          </div>
+
+          <Label text={t("quality.transport")} hint={transportHint} />
+          <div className="segmented">
+            {TRANSPORTS.map((m) => (
+              <button
+                key={m}
+                className={transport === m ? "active" : ""}
+                title={t(`quality.transport.${m}.hint`)}
+                onClick={() => apply({ transport: m })}
+              >
+                {t(`quality.transport.${m}`)}
               </button>
             ))}
           </div>

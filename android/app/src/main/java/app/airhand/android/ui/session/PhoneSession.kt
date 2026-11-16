@@ -105,6 +105,7 @@ import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
 import app.airhand.android.core.SystemAction
 import app.airhand.android.core.VideoPriority
+import app.airhand.android.core.VideoTransport
 import app.airhand.android.data.TouchMode
 import app.airhand.android.ui.ConfirmDialog
 import app.airhand.android.ui.Messages
@@ -113,6 +114,8 @@ import app.airhand.android.ui.phone.presetDesc
 import app.airhand.android.ui.phone.presetName
 import app.airhand.android.ui.phone.priorityDesc
 import app.airhand.android.ui.phone.priorityName
+import app.airhand.android.ui.phone.transportDesc
+import app.airhand.android.ui.phone.transportName
 import app.airhand.android.ui.theme.Brand
 import kotlin.math.roundToInt
 
@@ -451,6 +454,8 @@ private fun MainMenu(
                 stats?.let { if (it.kbps >= 1000) "%.1f Mbps".format(it.kbps / 1000) else "${it.kbps.roundToInt()} kbps" },
                 // 画面走的路：收到画面之后才知道
                 stats?.takeIf { it.width > 0 }?.let { stringResource(if (it.direct) R.string.path_direct else R.string.path_relayed) },
+                // 画面正在用前向纠错（丢包恢复）
+                stats?.takeIf { it.width > 0 && it.fec }?.let { stringResource(R.string.path_fec) },
             )
             Text(
                 parts.joinToString(" · ").ifEmpty { Code.format(session.code) },
@@ -699,7 +704,7 @@ private fun Quality(session: RemoteSession) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .clickable { session.setQuality(p.quality(q.codec, q.priority)) }
+                .clickable { session.setQuality(p.quality(q.codec, q.priority, q.transport)) }
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -731,6 +736,24 @@ private fun Quality(session: RemoteSession) {
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
         )
     }
+    // 丢包恢复：自动 / 重传 / 纠错（对方是手机也一样有）
+    HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
+    Text(stringResource(R.string.loss_recovery), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
+    FlowRow(Modifier.padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        VideoTransport.entries.forEach { t ->
+            FilterChip(
+                selected = q.transport == t,
+                onClick = { session.setTransport(t) },
+                label = { Text(transportName(t)) },
+            )
+        }
+    }
+    Text(
+        transportDesc(q.transport),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+    )
     HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
     Text(stringResource(R.string.codec), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
     val hostCodecs = hello?.codecs ?: listOf(Codec.H264)

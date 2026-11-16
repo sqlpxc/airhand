@@ -1,5 +1,5 @@
 //! 控制端的单个会话：把画面、声音原样转交给界面（界面自己解码），转发输入与设置，
-//! 把界面打好的麦克风声音包发成声音数据报。
+//! 把界面打好的麦克风声音包发成声音数据报，定时告诉被控端画面收得怎么样（[`Feedback::report`]）。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use crate::transport::write_lane;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostMsg,
-    MicState, Notice, Platform, SystemAction,
+    MicState, Notice, Platform, REPORT_EVERY, SystemAction, VideoReport,
 };
 use airhand_proto::{datagram, features};
 use anyhow::Result;
@@ -69,6 +69,11 @@ impl Feedback {
     /// 等不到一帧了（见 `crate::merge`）：请被控端从 `decoded` 恢复
     fn lost(&self, decoded: u32) {
         self.out.send(&ControllerDatagram::Lost { decoded });
+    }
+
+    /// 画面最近收得怎么样（见 `airhand_proto::session` 的"前向纠错"）：被控端据此决定用不用纠错、配多少冗余
+    fn report(&self, r: VideoReport) {
+        self.out.send(&ControllerDatagram::Report(r));
     }
 
     /// 每秒一次：Ping（也是保活），再带一次最近的确认
@@ -203,6 +208,8 @@ pub enum SessionEvent {
         frames: u64,
         /// 画面是从直连来的（不经过中转，见 [`crate::direct`]）
         direct: bool,
+        /// 这一秒里有画面是纠错的数据报拼回来的（见 `airhand_proto::session` 的"前向纠错"）
+        fec: bool,
     },
     /// 被控端发来的提示，由控制台按自己的界面语言显示
     Notice { notice: NoticeView },
@@ -272,6 +279,8 @@ struct Stats {
     last_msg: Instant,
     /// 最近一帧画面是从直连来的
     direct: bool,
+    /// 这一秒里纠错的数据报拼回来的帧
+    fec_frames: u32,
 }
 
 impl Default for Stats {
@@ -285,6 +294,7 @@ impl Default for Stats {
             rtt: None,
             last_msg: Instant::now(),
             direct: false,
+            fec_frames: 0,
         }
     }
 }
@@ -420,6 +430,10 @@ pub(super) async fn run(
     let acker = feedback.clone();
     let on_direct = video_direct.clone();
     let frames = negotiated.features.has(features::session::FRAMES);
+    // 画面收得怎么样：定时报告给被控端（只有懂的被控端才报，见 reporter）
+    let video_stats = recv.video_stats();
+    let report_fec = negotiated.features.has(features::session::FEC);
+    let reporter_feedback = feedback.clone();
     let reader = async move {
         let mut cursor = super::cursor::CursorReceiver::default();
         loop {
@@ -430,6 +444,7 @@ pub(super) async fn run(
                     packet: p,
                     arrived,
                     direct,
+                    fec,
                 } => {
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
@@ -443,6 +458,7 @@ pub(super) async fn run(
                         s.w = h.width;
                         s.h = h.height;
                         s.direct = direct;
+                        s.fec_frames += u32::from(fec);
                     }
                     on_direct.store(direct, Ordering::Relaxed);
                     arrivals.lock().unwrap().record(h.seq, arrived);
@@ -603,9 +619,11 @@ pub(super) async fn run(
                     height: s.h,
                     frames: s.total,
                     direct: s.direct,
+                    fec: s.fec_frames > 0,
                 };
                 s.frames = 0;
                 s.bytes = 0;
+                s.fec_frames = 0;
                 e
             };
             out.event(event).map_err(|_| ui_closed())?;
@@ -614,6 +632,21 @@ pub(super) async fn run(
         }
         #[allow(unreachable_code)]
         anyhow::Ok(())
+    };
+    // 画面收得怎么样（见 crate::merge 的"报告"）：每 REPORT_EVERY 告诉被控端一次，这段时间什么画面都没收到就不报
+    let reporter = async move {
+        if !report_fec {
+            return std::future::pending().await;
+        }
+        let mut tick = tokio::time::interval(REPORT_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let r = video_stats.take();
+            if !r.is_empty() {
+                reporter_feedback.report(r);
+            }
+        }
     };
     // 丢了的确认（见 Feedback）
     let repeater = async move {
@@ -679,6 +712,7 @@ pub(super) async fn run(
         r = reader => r,
         r = ticker => r,
         _ = repeater => Ok(()),
+        () = reporter => Ok(()),
         () = clipper => Ok(()),
         () = direct => Ok(()),
         () = mic => Ok(()),
@@ -852,9 +886,11 @@ mod tests {
             height: 1,
             frames: 2,
             direct: true,
+            fec: true,
         };
         assert_eq!(serde_json::to_value(&s).unwrap()["rttMs"], json!(null));
         assert_eq!(serde_json::to_value(&s).unwrap()["direct"], json!(true));
+        assert_eq!(serde_json::to_value(&s).unwrap()["fec"], json!(true));
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::Declined),
             retry: false,

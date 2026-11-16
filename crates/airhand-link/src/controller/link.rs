@@ -77,7 +77,8 @@ pub async fn establish(
             Policy::Video,
             secured.video.opener,
             inbox.video,
-        ),
+        )
+        .with_datagrams(inbox.fec),
         (inbox.audio, secured.audio.opener),
         (inbox.datagrams, secured.datagrams.opener),
         datagrams.clone(),

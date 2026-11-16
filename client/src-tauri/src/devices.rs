@@ -7,7 +7,7 @@
 //! alias = "设计部"
 //! os = "Windows 11 Pro"
 //! last_used = 2026-11-08T10:20:30Z
-//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264", priority = "clarity" }
+//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264", priority = "clarity", transport = "fec" }
 //! resume = "q83vEjRWeJCrze8SNFZ4kA=="
 //! host_key = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 //! ```
@@ -22,7 +22,7 @@
 //!
 //! 手动添加时 `code` 写 6 位数字在所有平台上都可以。
 
-use airhand_proto::session::{Codec, QualitySettings, VideoPriority};
+use airhand_proto::session::{Codec, QualitySettings, VideoPriority, VideoTransport};
 use airhand_proto::signal::ResumeToken;
 use anyhow::Result;
 use base64::Engine;
@@ -175,6 +175,12 @@ fn quality_from(item: &Item) -> Option<QualitySettings> {
             .and_then(Item::as_str)
             .and_then(VideoPriority::from_name)
             .unwrap_or_default(),
+        // 同上：之前的版本没有；自动（默认）也不写
+        transport: t
+            .get("transport")
+            .and_then(Item::as_str)
+            .and_then(VideoTransport::from_name)
+            .unwrap_or_default(),
     })
 }
 
@@ -248,6 +254,11 @@ pub fn to_table(d: &Device) -> Option<Table> {
             && q.priority != VideoPriority::Latency
         {
             it.insert("priority", p.into());
+        }
+        if let Some(p) = q.transport.or_auto().name()
+            && q.transport.or_auto() != VideoTransport::Auto
+        {
+            it.insert("transport", p.into());
         }
         t["quality"] = toml_edit::value(it);
     }
@@ -343,6 +354,7 @@ mod tests {
                 adaptive: true,
                 codec: Codec::H265,
                 priority: VideoPriority::Clarity,
+                transport: VideoTransport::Fec,
             }),
             host_key: Some("ab".repeat(32)),
         }
@@ -381,15 +393,18 @@ mod tests {
             ..d.clone()
         };
         assert_eq!(from_table(&to_table(&bare).unwrap()), Some(bare));
-        // 低延迟优先（默认）不写进文件
+        assert!(t.to_string().contains("transport = \"fec\""));
+        // 低延迟优先、自动的传输方式（默认）不写进文件
         let mut q = d.quality.unwrap();
         q.priority = VideoPriority::Latency;
+        q.transport = VideoTransport::Auto;
         let latency = Device {
             quality: Some(q),
             ..d
         };
         let t = to_table(&latency).unwrap();
         assert!(!t.to_string().contains("priority"));
+        assert!(!t.to_string().contains("transport"));
         assert_eq!(from_table(&t), Some(latency));
     }
 
@@ -421,10 +436,10 @@ name = "no code"
         assert!(list[1].last_used > 0);
         // 帧率超出范围：画质整个不要，用控制台的默认
         assert_eq!(list[1].quality, None);
-        // 之前的版本写的编码格式是 "H265" 这样的：照样认；没有优先项：低延迟
+        // 之前的版本写的编码格式是 "H265" 这样的：照样认；没有优先项、传输方式：低延迟、自动
         assert_eq!(
-            list[2].quality.map(|q| (q.codec, q.priority)),
-            Some((Codec::H265, VideoPriority::Latency))
+            list[2].quality.map(|q| (q.codec, q.priority, q.transport)),
+            Some((Codec::H265, VideoPriority::Latency, VideoTransport::Auto))
         );
         assert!(list.into_iter().all(|d| open(d).is_some()));
     }

@@ -24,6 +24,12 @@ export type Codec = "h264" | "h265" | "av1";
  */
 export type VideoPriority = "latency" | "clarity";
 
+/**
+ * 画面怎么传（airhand_proto::session::VideoTransport）：auto 由被控端看网络情况选（默认）；streams 丢了的包重传；
+ * fec 增量帧走数据报、每帧多发几块冗余，丢了几块也拼得回来，不等重传。对方的版本旧时总是重传
+ */
+export type VideoTransport = "auto" | "streams" | "fec";
+
 /** 与 airhand_proto::session::QualitySettings 对应 */
 export interface QualitySettings {
   fps: number;
@@ -34,6 +40,8 @@ export interface QualitySettings {
   codec: Codec;
   /** 不带（之前保存的画质、Android）就是 latency */
   priority?: VideoPriority;
+  /** 不带（之前保存的画质）就是 auto */
+  transport?: VideoTransport;
 }
 
 export interface DisplayInfo {
@@ -233,6 +241,8 @@ export type SessionEvent =
       frames: number;
       /** 画面是从直连来的（两台设备之间打通的路，不经过服务器） */
       direct: boolean;
+      /** 这一秒里有画面是纠错的数据报拼回来的（前向纠错正在用） */
+      fec: boolean;
     }
   | { type: "encoder"; codec: Codec; name: string; hardware: boolean; width: number; height: number }
   | { type: "notice"; notice: RemoteNotice }

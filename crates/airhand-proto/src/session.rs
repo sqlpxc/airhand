@@ -84,6 +84,22 @@
 //!
 //! 帧流和单条画面流都用同一把画面密钥、同一串计数，控制端两种都收（中转不支持帧流时被控端还是用一条流）。
 //!
+//! # 前向纠错
+//!
+//! 帧流上一帧丢了包要等 QUIC 重传（一段路的往返），后面的帧参考它，整段画面跟着晚。往返时延长、又常丢包的网络上
+//! （跨境、Wi-Fi）画面就一顿一顿的。双方都支持（会话能力位 [`crate::features::session::FEC`]）、画面用着帧流时，
+//! 被控端可以把增量帧改成**数据报 + 前向纠错**：一帧的密封单元切成几个数据报（[`crate::fec`]），再多发几个冗余数据报
+//! （Reed-Solomon），收到的够了（任意几个，个数和原来的一样）就拼得回这一帧，不等重传：
+//!
+//! * 关键帧、恢复帧（参考的不是前一帧）照旧走帧流：它们最大、最要紧，丢了包也要送到；
+//! * 冗余按丢包率配：控制端每 [`REPORT_EVERY`] 报告一次收到的情况（[`ControllerDatagram::Report`]），
+//!   被控端按最近的丢包率配，一帧补不回来的机会不到千分之五；
+//! * 补不回来的（丢得太多了）：数据报不重传，后面的帧到了它还缺着，控制端马上就知道，报告等不到
+//!   （[`ControllerDatagram::Lost`]），和帧流一样从控制端已经有的帧恢复；
+//! * 用不用由控制端的画质设置决定（[`QualitySettings::transport`]）：自动（默认）由被控端看情况，控制端报告里
+//!   等重传卡住的帧多了就改用纠错，纠错时丢包少了、或者往返时延很短（重传很快）就换回帧流；也可以固定用其中一种。
+//!   对方不支持时照旧是帧流。
+//!
 //! # 麦克风
 //!
 //! 控制端可以把本机麦克风的声音交给被控端，被控端把它放进一个虚拟麦克风，那台电脑上的程序（会议、语音输入）
@@ -479,6 +495,36 @@ impl VideoPriority {
     }
 }
 
+open_enum! {
+    /// 画面怎么传（[`QualitySettings::transport`]，见模块说明的"前向纠错"）。只管增量帧：关键帧、恢复帧总是走帧流
+    #[derive(Default)]
+    pub enum VideoTransport {
+        /// 被控端看网络情况选（默认）：等重传卡住的帧多了就改用纠错，丢包少了、往返时延很短时换回重传
+        #[default]
+        Auto = 0 => "auto",
+        /// 一直用帧流：丢了的包由 QUIC 重传，不多发冗余。适合局域网、很少丢包的网络
+        Streams = 1 => "streams",
+        /// 一直用数据报 + 前向纠错：每帧多发几个冗余数据报，丢了几个也拼得回来，不等重传。
+        /// 适合丢包多、往返时延长的网络；对方不支持时照旧是帧流
+        Fec = 2 => "fec",
+    }
+}
+
+impl VideoTransport {
+    fn is_auto(&self) -> bool {
+        *self == VideoTransport::Auto
+    }
+
+    /// 不认识的值（对方版本新增的）按自动处理
+    pub fn or_auto(self) -> Self {
+        if self.is_known() {
+            self
+        } else {
+            VideoTransport::Auto
+        }
+    }
+}
+
 /// 控制端 → 被控端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ControllerMsg {
@@ -586,6 +632,41 @@ pub enum ControllerDatagram {
         #[n(0)]
         decoded: u32,
     },
+    /// 最近这段时间（[`REPORT_EVERY`]）画面收得怎么样（见模块说明的"前向纠错"），被控端据此决定用不用纠错、
+    /// 配多少冗余。只发给协商了 [`crate::features::session::FEC`] 的被控端；这段时间什么画面都没收到就不发。
+    /// 丢了就丢了（下一个报告是新的一段）
+    #[n(4)]
+    Report(#[n(0)] VideoReport),
+}
+
+/// 控制端多久报告一次画面收得怎么样（[`ControllerDatagram::Report`]）
+pub const REPORT_EVERY: Duration = Duration::from_millis(500);
+
+/// 一段时间里画面收得怎么样（[`ControllerDatagram::Report`]）。都是这段时间里的个数，不是累计的
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoReport {
+    /// 从帧流上收完的帧
+    #[n(0)]
+    pub frames: u32,
+    /// 其中等重传卡住过的：读到一半停住了一阵（丢了包，QUIC 只按顺序交出数据），后面的帧却先到了
+    #[n(1)]
+    pub stalled: u32,
+    /// 纠错的帧（数据报）一共该到多少个数据报（原来的加冗余的）
+    #[n(2)]
+    pub fragments: u32,
+    /// 其中没到的
+    #[n(3)]
+    pub missing: u32,
+    /// 纠错也补不回来的帧
+    #[n(4)]
+    pub unrecovered: u32,
+}
+
+impl VideoReport {
+    /// 什么都没收到
+    pub fn is_empty(&self) -> bool {
+        self.frames == 0 && self.fragments == 0 && self.unrecovered == 0
+    }
 }
 
 /// 被控端 → 控制端的控制数据报（见模块说明的"走哪条通道"）。变体的编号不能改、不能复用
@@ -637,6 +718,11 @@ pub struct QualitySettings {
     #[cbor(n(5), skip_if = "VideoPriority::is_latency")]
     #[serde(default)]
     pub priority: VideoPriority,
+    /// 画面怎么传：重传还是前向纠错（见模块说明的"前向纠错"）。自动（默认）不写进线上的数组；
+    /// 之前的版本不发这一项，也就是自动
+    #[cbor(n(6), skip_if = "VideoTransport::is_auto")]
+    #[serde(default)]
+    pub transport: VideoTransport,
 }
 
 impl Default for QualitySettings {
@@ -648,17 +734,19 @@ impl Default for QualitySettings {
             adaptive: true,
             codec: Codec::H264,
             priority: VideoPriority::Latency,
+            transport: VideoTransport::Auto,
         }
     }
 }
 
 impl QualitySettings {
-    /// 范围校验；不认识的编码格式（对方版本新增的）换成 H.264，不认识的优先项按低延迟
+    /// 范围校验；不认识的编码格式（对方版本新增的）换成 H.264，不认识的优先项按低延迟、传输方式按自动
     pub fn sanitized(mut self) -> Self {
         self.fps = self.fps.clamp(1, 120);
         self.bitrate_kbps = self.bitrate_kbps.clamp(100, 100_000);
         self.codec = self.codec.or_h264();
         self.priority = self.priority.or_latency();
+        self.transport = self.transport.or_auto();
         self
     }
 }
@@ -877,14 +965,15 @@ mod tests {
         // 新版本带了优先项（还有再新的版本加的字段）：认识的照用，不认识的优先项按低延迟
         let newer = |priority: u8| {
             let mut e = minicbor::Encoder::new(Vec::new());
-            e.array(7).unwrap();
+            e.array(8).unwrap();
             e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
             e.bool(true).unwrap().u8(1).unwrap().u8(priority).unwrap();
-            e.str("later").unwrap();
+            e.u8(2).unwrap().str("later").unwrap();
             e.into_writer()
         };
         let q: QualitySettings = minicbor::decode(&newer(1)).unwrap();
         assert_eq!((q.codec, q.priority), (Codec::H265, VideoPriority::Clarity));
+        assert_eq!(q.transport, VideoTransport::Fec);
         let q: QualitySettings = minicbor::decode(&newer(5)).unwrap();
         assert_eq!(q.priority, VideoPriority::Unknown(5));
         assert_eq!(q.sanitized().priority, VideoPriority::Latency);
@@ -902,6 +991,53 @@ mod tests {
         };
         let old: Before = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
         assert_eq!((old.fps, old.codec), (q.fps, q.codec));
+
+        // 传输方式：自动不写（字节和之前一样）；写了的跟着优先项那一位。低延迟优先不写时中间空着的一位也解得出
+        let auto = QualitySettings::default();
+        // 5 项的数组，和之前的版本一样
+        assert_eq!(minicbor::to_vec(auto).unwrap()[0], 0x85);
+        for (priority, transport) in [
+            (VideoPriority::Latency, VideoTransport::Fec),
+            (VideoPriority::Clarity, VideoTransport::Streams),
+            (VideoPriority::Clarity, VideoTransport::Auto),
+        ] {
+            let q = QualitySettings {
+                priority,
+                transport,
+                ..Default::default()
+            };
+            let back: QualitySettings = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
+            assert_eq!(back, q);
+            let old: Before = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
+            assert_eq!((old.fps, old.codec), (q.fps, q.codec));
+        }
+        // 新版本加的传输方式：按自动
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(7).unwrap();
+        e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
+        e.bool(true)
+            .unwrap()
+            .u8(1)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .u8(9)
+            .unwrap();
+        let q: QualitySettings = minicbor::decode(&e.into_writer()).unwrap();
+        assert_eq!(q.transport, VideoTransport::Unknown(9));
+        assert_eq!(q.sanitized().transport, VideoTransport::Auto);
+
+        // 画面的报告：之前的被控端不认识这个控制数据报，跳过就是了（见 framing 的兼容规则）
+        let r = ControllerDatagram::Report(VideoReport {
+            frames: 60,
+            stalled: 2,
+            fragments: 300,
+            missing: 4,
+            unrecovered: 1,
+        });
+        let back: ControllerDatagram = minicbor::decode(&minicbor::to_vec(r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        assert!(VideoReport::default().is_empty());
 
         // Bye(77)：[9, [77]]
         let mut e = minicbor::Encoder::new(Vec::new());
@@ -970,17 +1106,23 @@ mod tests {
             adaptive: true,
             codec: Codec::AV1,
             priority: VideoPriority::Clarity,
+            transport: VideoTransport::Fec,
         };
         assert_eq!(
             serde_json::to_value(q).unwrap(),
-            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity" })
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity", "transport": "fec" })
         );
-        // 之前的界面不带优先项：低延迟
+        // 之前的界面不带优先项、传输方式：低延迟、自动
         let old: QualitySettings = serde_json::from_value(
             json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }),
         )
         .unwrap();
         assert_eq!(old.priority, VideoPriority::Latency);
+        assert_eq!(old.transport, VideoTransport::Auto);
+        assert_eq!(
+            serde_json::to_value(VideoTransport::KNOWN).unwrap(),
+            json!(["auto", "streams", "fec"])
+        );
         let events = vec![
             InputEvent::MouseMove { x: 0.5, y: 0.25 },
             InputEvent::MouseButton {

@@ -45,7 +45,8 @@
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
 //! "之后的每一帧"）。声音包，以及 Ping / Pong、画面确认、探测这些只看最新值的控制消息走 QUIC 数据报（[`datagram`]）：
-//! 丢了就丢了，不重传，也不用排在丢了的包、流里别的消息后面等。
+//! 丢了就丢了，不重传，也不用排在丢了的包、流里别的消息后面等。画面的增量帧也可以走数据报，带着前向纠错的冗余
+//! （[`fec`]，见 [`session`] 的"前向纠错"）。
 //!
 //! # 直连
 //!
@@ -68,6 +69,7 @@
 //! （IPv6 一般没有 NAT，IPv4 的对称 NAT、运营商级 NAT 打不通时它往往通）。
 
 pub mod cbor;
+pub mod fec;
 pub mod framing;
 
 /// 消息的编码（带编号的 CBOR，见 [`framing`]）
@@ -258,9 +260,11 @@ impl SessionHeader {
 /// * [`AUDIO`]：声音：最新的一包和之前一两包的副本（见 [`media`] 的"声音数据报"）。被控端发的是它的系统声音，
 ///   控制端发的是它的麦克风（双方都支持 [`features::session::MIC`]、控制端打开了麦克风时，见 [`session`] 的"麦克风"）；
 /// * [`CONTROL`]：控制数据报（[`session::ControllerDatagram`] / [`session::HostDatagram`]：Ping、Pong、画面确认、
-///   量两条路往返时延的探测和回声），CBOR，和控制通道上的消息一样不认识的跳过。
+///   量两条路往返时延的探测和回声），CBOR，和控制通道上的消息一样不认识的跳过；
+/// * [`VIDEO`]：画面的一帧切出来的一块，或者它的冗余（见 [`fec`]）。和别的不一样，种类后面不是一个密封单元：
+///   被控端先把整帧加密成一个密封单元（和帧流上的一样），再切开、算冗余，收的一方拼回密封单元再解密。
 ///
-/// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。
+/// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。服务器不管种类，以后加种类不用升级服务器。
 pub mod datagram {
     /// 开头的会话 ID 和种类
     pub const HEADER: usize = 9;
@@ -268,6 +272,8 @@ pub mod datagram {
     pub const AUDIO: u8 = 0;
     /// 控制数据报
     pub const CONTROL: u8 = 1;
+    /// 画面：纠错的一块（见 [`crate::fec`]）
+    pub const VIDEO: u8 = 2;
     /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
     /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
     pub const MAX: usize = 1000;
@@ -277,7 +283,7 @@ pub mod datagram {
         Some(u64::from_le_bytes(d.get(..8)?.try_into().ok()?))
     }
 
-    /// 数据报的种类（[`AUDIO`]、[`CONTROL`]）；不到一个头长时为 `None`
+    /// 数据报的种类（[`AUDIO`]、[`CONTROL`]、[`VIDEO`]）；不到一个头长时为 `None`
     pub fn kind(d: &[u8]) -> Option<u8> {
         d.get(8).copied()
     }
@@ -363,8 +369,14 @@ pub mod features {
         /// （[`crate::SIGNAL_FRAMES`]）
         pub const FRAMES: Features = Features::from_bits(1 << 1);
 
+        /// 2 号位：画面的前向纠错（见 [`crate::session`] 的"前向纠错"）。控制端收得了画面的纠错数据报
+        /// （[`crate::datagram::VIDEO`]、[`crate::fec`]），会发 [`crate::session::ControllerDatagram::Report`]；
+        /// 被控端看得懂 `Report`、[`crate::session::QualitySettings::transport`]。被控端只在画面用着帧流时用它
+        /// （恢复要靠 [`FRAMES`] 的那一套）
+        pub const FEC: Features = Features::from_bits(1 << 2);
+
         /// 本端支持的
-        pub const SUPPORTED: Features = MIC.with(FRAMES);
+        pub const SUPPORTED: Features = MIC.with(FRAMES).with(FEC);
     }
 }
 

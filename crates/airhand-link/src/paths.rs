@@ -7,15 +7,20 @@
 //! * 探测和回声只发在要量的那条路上（[`DatagramSender::send_on`]）。
 //!
 //! 直连任务在直连通了、断了的时候改它（[`Paths::attach`] / [`Paths::detach`]），写任务每一帧、每个数据报看一眼。
+//!
+//! 数据报都经 [`send_datagram`] / [`DatagramSender`] 发：QUIC 的数据报发送缓冲（`net::transport_config`）排满了时
+//! 等一会儿空位，而不是让 quinn 挤掉排在最前面的那个。画面用纠错时缓冲里排的多半是画面的块，挤掉一块就白白多丢一块
+//! （见 `airhand_proto::session` 的"前向纠错"）。
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use airhand_proto::datagram;
 use airhand_proto::framing;
 use airhand_proto::minicbor::Encode;
 use bytes::Bytes;
-use quinn::{Connection, SendStream};
+use quinn::{Connection, SendDatagramError, SendStream};
 use tokio::sync::{mpsc, watch};
 use tracing::debug;
 
@@ -24,6 +29,44 @@ use crate::secure::Sealer;
 
 /// 直连上的控制通道最多排着这么多帧没写出去，再多就不写了（中转上还有一份）
 const MIRROR_QUEUE: usize = 64;
+/// 控制数据报：发送缓冲排满了时最多等这么久空位
+const CONTROL_WAIT: Duration = Duration::from_millis(100);
+
+/// 发一个数据报（见模块说明）：发送缓冲放得下就马上放进去；放不下就等空位，最多等 `wait`，等不到就算丢了（`Ok`）。
+/// 连接断了是错误
+pub(crate) async fn send_datagram(
+    conn: &Connection,
+    d: Bytes,
+    wait: Duration,
+) -> Result<(), SendDatagramError> {
+    if conn.datagram_send_buffer_space() >= d.len() {
+        return conn.send_datagram(d);
+    }
+    match tokio::time::timeout(wait, conn.send_datagram_wait(d)).await {
+        Ok(r) => r,
+        Err(_) => {
+            debug!("the datagram send buffer stayed full, dropped a datagram");
+            Ok(())
+        }
+    }
+}
+
+/// 同 [`send_datagram`]，但不在这里等（控制数据报是同步发的）：放不下就交给一个小任务去等 [`CONTROL_WAIT`]
+fn send_datagram_soon(conn: &Connection, d: Bytes) -> Result<(), SendDatagramError> {
+    if conn.datagram_send_buffer_space() >= d.len() {
+        return conn.send_datagram(d);
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            let conn = conn.clone();
+            rt.spawn(async move {
+                let _ = send_datagram(&conn, d, CONTROL_WAIT).await;
+            });
+            Ok(())
+        }
+        Err(_) => conn.send_datagram(d),
+    }
+}
 
 /// 一个会话的两条路（见模块说明）。复制出来的是同一个
 #[derive(Clone)]
@@ -170,9 +213,9 @@ impl DatagramSender {
     pub fn send<T: Encode<()>>(&self, msg: &T) {
         let Some(d) = self.seal(msg) else { return };
         if let Some(direct) = self.0.paths.direct() {
-            let _ = direct.send_datagram(d.clone());
+            let _ = send_datagram_soon(&direct, d.clone());
         }
-        if let Err(e) = self.0.paths.relay().send_datagram(d) {
+        if let Err(e) = send_datagram_soon(self.0.paths.relay(), d) {
             debug!("dropped a control datagram: {e}");
         }
     }
@@ -184,7 +227,7 @@ impl DatagramSender {
             Via::Direct => self.0.paths.direct(),
         };
         if let (Some(conn), Some(d)) = (conn, self.seal(msg)) {
-            let _ = conn.send_datagram(d);
+            let _ = send_datagram_soon(&conn, d);
         }
     }
 

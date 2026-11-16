@@ -185,6 +185,13 @@
     <string name="priority_latency_desc">在对方电脑的显卡上缩放：延迟和对方的 CPU 占用更低</string>
     <string name="priority_clarity">文字清晰</string>
     <string name="priority_clarity_desc">在对方电脑的 CPU 上用更锐利的算法缩放：高分屏缩小时文字更清楚，延迟和 CPU 占用更高。不缩放时与低延迟相同</string>
+    <string name="loss_recovery">丢包恢复</string>
+    <string name="transport_auto">自动</string>
+    <string name="transport_auto_desc">看网络情况切换：画面常因为丢包等重传而卡一下时改用纠错，网络好了换回重传</string>
+    <string name="transport_streams">重传</string>
+    <string name="transport_streams_desc">丢了的数据重新发一遍，不多占带宽。适合局域网、很少丢包的网络；路远又常丢包时画面会一顿一顿的</string>
+    <string name="transport_fec">纠错</string>
+    <string name="transport_fec_desc">每帧多发几块冗余（多占百分之几到二十几的带宽），丢了几块也能马上拼回来，不用等重传。适合跨境、Wi-Fi 这类路远又常丢包的网络。对方的版本旧时照旧重传</string>
 
     <!-- 远程画面 -->
     <string name="session_connecting">正在连接 %1$s…</string>
@@ -204,6 +211,7 @@
     <!-- 画面走的路：直连不经过服务器，中转经过服务器 -->
     <string name="path_direct">直连</string>
     <string name="path_relayed">中转</string>
+    <string name="path_fec">纠错</string>
     <string name="clipboard_received">已复制对方的剪贴板内容</string>
     <string name="audio_playback_failed">无法播放声音：%1$s</string>
     <string name="menu_keyboard">键盘</string>

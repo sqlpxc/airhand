@@ -4,6 +4,7 @@ import app.airhand.android.core.Codec
 import app.airhand.android.core.Quality
 import app.airhand.android.core.SystemAction
 import app.airhand.android.core.VideoPriority
+import app.airhand.android.core.VideoTransport
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -115,6 +116,15 @@ class ProtocolTest {
         assertEquals(VideoPriority.LATENCY, VideoPriority.fromWire(null))
         assertEquals(VideoPriority.LATENCY, VideoPriority.fromWire("later"))
         assertEquals(VideoPriority.CLARITY, VideoPriority.fromWire("clarity"))
+        // 丢包恢复：自动是默认，不写；重传、纠错才写 transport（和 Rust 的名字一样）
+        for ((t, wire) in listOf(VideoTransport.STREAMS to "streams", VideoTransport.FEC to "fec")) {
+            val s = Commands.settings(3, Quality(60, 8000, 1080, true, Codec.H265, transport = t))
+            assertEquals(wire, s.getJSONObject("settings").getString("transport"))
+            assertSame(want["settings"], JSONObject(s.toString()).apply { getJSONObject("settings").remove("transport") })
+        }
+        assertEquals(VideoTransport.AUTO, VideoTransport.fromWire(null))
+        assertEquals(VideoTransport.AUTO, VideoTransport.fromWire("later"))
+        assertEquals(VideoTransport.FEC, VideoTransport.fromWire("fec"))
         assertSame(want["keyframe"], Commands.keyframe(3))
         assertSame(want["display"], Commands.display(3, 1))
         assertSame(want["audio"], Commands.audio(3, true))
