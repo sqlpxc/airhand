@@ -106,15 +106,38 @@ fn resize_striped(
     })
 }
 
+#[derive(Default)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub key: bool,
+    /// 编码器报告的长期参考帧（只有 [`VideoEncoder::ltr_slots`] 不为 0 的编码器才有）
+    pub ltr: Option<LtrReport>,
 }
+
+/// 下一帧的长期参考帧控制（见 `airhand_link::refs`）。只对 [`VideoEncoder::ltr_slots`] 不为 0 的编码器有意义，
+/// 编完那一帧就失效
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LtrControl {
+    /// 把这一帧标成长期参考帧，放进这个槽位（替换掉槽位里原来的）
+    pub mark: Option<u8>,
+    /// 这一帧只参考这个槽位里的长期参考帧；之后的帧也不再参考这一帧之前的短期参考帧、别的槽位
+    /// （参考帧失效：它们控制端可能没有）
+    pub recover: Option<u8>,
+}
+
+/// 编码器报告的这一帧的长期参考帧（编码器在关键帧之后可能自己标几帧）
+pub use airhand_link::refs::LtrReport;
 
 pub trait VideoEncoder {
     fn info(&self) -> &EncoderInfo;
     /// 运行时调整码率（不重建编码器、不产生关键帧）。
     fn set_bitrate(&mut self, kbps: u32);
+    /// 能控制几个长期参考帧的槽位（0：不能，丢了帧只能编关键帧，见 `airhand_link::refs`）
+    fn ltr_slots(&self) -> u8 {
+        0
+    }
+    /// 下一帧的长期参考帧控制（[`Self::ltr_slots`] 为 0 时不用调用）
+    fn set_ltr(&mut self, _ctl: LtrControl) {}
     /// 编码一帧 BGRA（尺寸已经等于输出尺寸，stride = width * 4）。
     fn encode(&mut self, bgra: &[u8], force_key: bool) -> Result<Option<EncodedFrame>>;
     /// 这个编码器直接编码 GPU 上的画面（[`Self::encode_gpu`]）。是的话只会收到同一路采集的画面
@@ -320,6 +343,16 @@ impl Encoder {
 
     pub fn set_bitrate(&mut self, kbps: u32) {
         self.inner.set_bitrate(kbps);
+    }
+
+    /// 见 [`VideoEncoder::ltr_slots`]
+    pub fn ltr_slots(&self) -> u8 {
+        self.inner.ltr_slots()
+    }
+
+    /// 见 [`VideoEncoder::set_ltr`]
+    pub fn set_ltr(&mut self, ctl: LtrControl) {
+        self.inner.set_ltr(ctl);
     }
 
     pub fn encode(&mut self, frame: &Frame, force_key: bool) -> Result<Option<EncodedFrame>> {

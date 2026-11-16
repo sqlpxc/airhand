@@ -23,11 +23,12 @@ use sha2::{Digest, Sha256};
 pub(crate) const SERVER_NAME: &str = "airhand";
 
 /// 直连的传输参数：和连中转的差不多（BBR、大窗口、2 秒内发现掉线），另外打洞时第一个包常常被对方的 NAT 丢掉
-/// （对方还没往这边发过包）：起始 RTT 按 100 ms 算，重发得快一点。每条通道是一条单向流，没有双向流
+/// （对方还没往这边发过包）：起始 RTT 按 100 ms 算，重发得快一点。每条通道是一条单向流，没有双向流；
+/// 画面用帧流时每帧一条（见 `airhand_proto::session` 的"帧流"），同时开着的不超过在途的帧数
 pub(crate) fn transport() -> TransportConfig {
     let mut t = TransportConfig::default();
     t.max_concurrent_bidi_streams(VarInt::from_u32(0));
-    t.max_concurrent_uni_streams(VarInt::from_u32(16));
+    t.max_concurrent_uni_streams(VarInt::from_u32(256));
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(1)));
     t.initial_rtt(Duration::from_millis(100));

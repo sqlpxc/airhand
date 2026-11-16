@@ -47,7 +47,7 @@ impl Frames for mpsc::Receiver<Bytes> {
 }
 
 /// 十秒钟写不进去一帧算对方失联
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 往中转上的一条流写一帧密文：写不进去是错误（会话结束）
 pub(crate) async fn write_sealed(send: &mut SendStream, sealed: Bytes) -> Result<()> {

@@ -23,7 +23,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface, PWSTR};
 use yuvutils_rs::{YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix};
 
-use super::{EncodedFrame, VideoEncoder, annexb_nal_types};
+use super::{EncodedFrame, LtrControl, LtrReport, VideoEncoder, annexb_nal_types};
 use crate::host::capture::{D3dSource, GpuFrame};
 
 fn subtype(c: Codec) -> GUID {
@@ -116,6 +116,22 @@ fn friendly_name(a: &IMFActivate) -> String {
         }
     }
     "Media Foundation encoder".into()
+}
+
+/// 这个编码器的长期参考帧信得过吗。恢复帧在报告里说只参考了长期参考帧、实际上却还参考了被放弃的短期参考帧的话，
+/// 控制端解出来是花屏，而且看不出来（只看报告的冒烟测试也看不出来）。所以只用在：
+///
+/// * H.264：微软的文档只规定了 H.264 编码器怎么做，实测 NVIDIA、Intel 的编码器都照做；
+/// * NVIDIA 的 AV1：实测照做。
+///
+/// HEVC 不用：NVIDIA 的编码器恢复之后还在参考被放弃的帧（解出来和不丢帧时不一样），Intel 的不支持。
+/// 别的编码器用 `ltr_recovery_decodes_without_the_lost_frames` 测过之后再加
+fn ltr_trusted(codec: Codec, name: &str) -> bool {
+    match codec {
+        Codec::H264 => true,
+        Codec::AV1 => name.contains("NVIDIA"),
+        Codec::H265 | Codec::Unknown(_) => false,
+    }
 }
 
 fn pack(hi: u32, lo: u32) -> u64 {
@@ -376,6 +392,9 @@ fn nv12_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D
 
 // ───────────────────────────── 编码器 ─────────────────────────────
 
+/// 长期参考帧要几个槽位（见 `airhand_link::refs`）：一个是控制端确认收到了的，另一个轮流标最近的帧
+const LTR_SLOTS: u8 = 2;
+
 pub struct MfEncoder {
     activate: IMFActivate,
     transform: IMFTransform,
@@ -392,6 +411,11 @@ pub struct MfEncoder {
     epoch: Instant,
     /// GPU 零拷贝（编码器关掉之后才释放，见 Drop）
     gpu: Option<GpuInput>,
+    /// 长期参考帧的槽位数：编码器认了 `CODECAPI_AVEncVideoLTRBufferControl`、输出的样本上又带着
+    /// `MFSampleExtension_LongTermReferenceFrameInfo`（说明它真的在控制）才不是 0
+    ltr_slots: u8,
+    /// 下一帧的长期参考帧控制
+    next_ltr: LtrControl,
 }
 
 impl MfEncoder {
@@ -491,6 +515,7 @@ impl MfEncoder {
 
             let codec_api: Option<ICodecAPI> = transform.cast().ok();
             let bps = kbps.saturating_mul(1000);
+            let mut ltr_slots = 0;
             if let Some(api) = &codec_api {
                 let set = |k: &GUID, v: VARIANT| api.SetValue(k, &v).is_ok();
                 set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
@@ -513,6 +538,19 @@ impl MfEncoder {
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps as u32 * 600));
                 // 偏向速度（0=速度 100=质量）
                 set(&CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(60u32));
+                // 长期参考帧（丢了帧时从控制端确认收到的那一帧接着编，不用编关键帧，见 airhand_link::refs）：
+                // 静态属性，要在设置媒体类型之前。低 16 位是槽位数，高 16 位是信任模式（1：一直可用，直到用
+                // CODECAPI_AVEncVideoUseLTRFrame 说明只用哪些）。编码器真的支持与否看输出（见下面的冒烟测试）。
+                // 只用在信得过的地方（见 ltr_trusted）
+                ltr_slots = if ltr_trusted(codec, name)
+                    && set(
+                        &CODECAPI_AVEncVideoLTRBufferControl,
+                        VARIANT::from(LTR_SLOTS as u32 | 1 << 16),
+                    ) {
+                    LTR_SLOTS
+                } else {
+                    0
+                };
                 // H.264 High 档次用 CABAC（比 CAVLC 省约一成码率）：大多数硬件编码器默认就开，但不保证，显式打开。
                 // 不支持这个属性的编码器忽略即可
                 if codec == Codec::H264 {
@@ -591,13 +629,58 @@ impl MfEncoder {
                 fps,
                 epoch: Instant::now(),
                 gpu,
+                ltr_slots,
+                next_ltr: LtrControl::default(),
             };
             // 冒烟测试：编码一帧（GPU 零拷贝时就用第一帧画面，整条路都走一遍），确保这个编码器在当前参数下真的能工作
-            match first.filter(|_| enc.gpu.is_some()) {
-                Some(g) => enc.encode_gpu(g, true),
-                None => enc.encode(&vec![0u8; (w * h * 4) as usize], true),
+            let gpu_first = first.filter(|_| enc.gpu.is_some());
+            let black = vec![
+                0u8;
+                if gpu_first.is_some() {
+                    0
+                } else {
+                    (w * h * 4) as usize
+                }
+            ];
+            let test = |enc: &mut Self, key: bool| match gpu_first {
+                Some(g) => enc.encode_gpu(g, key),
+                None => enc.encode(&black, key),
+            };
+            test(&mut enc, true).context("test encode failed")?;
+            // 长期参考帧：标一帧、再只参考它编一帧，编码器报告的要和要求的一样才用（有的编码器认了属性却不照做，
+            // 例如 Intel 的 AV1 编码器每一帧都说自己标进了 0 号槽位）。之后的第一帧总是关键帧，这几帧不会发出去
+            if enc.ltr_slots > 0 {
+                let slot = enc.ltr_slots - 1;
+                let probe = |enc: &mut Self, ctl| {
+                    enc.set_ltr(ctl);
+                    test(enc, false).map(|f| f.and_then(|f| f.ltr))
+                };
+                let marked = probe(
+                    &mut enc,
+                    LtrControl {
+                        mark: Some(slot),
+                        recover: None,
+                    },
+                );
+                let used = probe(
+                    &mut enc,
+                    LtrControl {
+                        mark: None,
+                        recover: Some(slot),
+                    },
+                );
+                let ok = matches!(marked, Ok(Some(r)) if r.marked == Some(slot))
+                    && matches!(used, Ok(Some(r)) if r.used == 1 << slot);
+                if !ok {
+                    tracing::info!(
+                        encoder = name,
+                        ?marked,
+                        ?used,
+                        "the encoder doesn't follow long-term reference frame controls, not using them"
+                    );
+                    enc.ltr_slots = 0;
+                }
             }
-            .context("test encode failed")?;
             Ok(enc)
         }
     }
@@ -711,9 +794,25 @@ impl MfEncoder {
 
     /// 交给编码器一帧，等它编完
     fn submit(&mut self, sample: IMFSample, force_key: bool) -> Result<Option<EncodedFrame>> {
-        if force_key && let Some(api) = &self.codec_api {
+        let ltr = std::mem::take(&mut self.next_ltr);
+        if let Some(api) = &self.codec_api {
             unsafe {
-                let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
+                if force_key {
+                    let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
+                } else if self.ltr_slots > 0 {
+                    // 低 16 位是可以参考的槽位，高 16 位 1：之后的帧也不再参考这之前的短期参考帧、别的槽位
+                    if let Some(i) = ltr.recover {
+                        api.SetValue(
+                            &CODECAPI_AVEncVideoUseLTRFrame,
+                            &VARIANT::from(1u32 << i | 1 << 16),
+                        )
+                        .context("CODECAPI_AVEncVideoUseLTRFrame")?;
+                    }
+                    if let Some(i) = ltr.mark {
+                        api.SetValue(&CODECAPI_AVEncVideoMarkLTRFrame, &VARIANT::from(i as u32))
+                            .context("CODECAPI_AVEncVideoMarkLTRFrame")?;
+                    }
+                }
             }
         }
         if self.events.is_none() {
@@ -795,6 +894,14 @@ impl MfEncoder {
             let mut data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
             buf.Unlock()?;
             let clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+            // 低 16 位：这一帧标进了哪个槽位（0xFFFF：没有标）；高 16 位：参考了哪些槽位
+            let ltr = sample
+                .GetUINT32(&MFSampleExtension_LongTermReferenceFrameInfo)
+                .ok()
+                .map(|v| LtrReport {
+                    marked: (v & 0xffff != 0xffff).then_some((v & 0xffff) as u8),
+                    used: (v >> 16) as u16,
+                });
             let key = match self.info.codec {
                 Codec::H264 => clean || annexb_nal_types(&data, false).any(|t| t == 5),
                 Codec::H265 => {
@@ -817,7 +924,7 @@ impl MfEncoder {
                     data = v;
                 }
             }
-            Ok(EncodedFrame { data, key })
+            Ok(EncodedFrame { data, key, ltr })
         }
     }
 }
@@ -825,6 +932,14 @@ impl MfEncoder {
 impl VideoEncoder for MfEncoder {
     fn info(&self) -> &EncoderInfo {
         &self.info
+    }
+
+    fn ltr_slots(&self) -> u8 {
+        self.ltr_slots
+    }
+
+    fn set_ltr(&mut self, ctl: LtrControl) {
+        self.next_ltr = ctl;
     }
 
     fn set_bitrate(&mut self, kbps: u32) {
@@ -1032,6 +1147,199 @@ mod tests {
                 assert!(close(blue, BLUE), "{name} {rotation:?}: blue is {blue:?}");
             }
         }
+    }
+
+    /// 每个硬件编码器的长期参考帧：打印它报告了什么（调查用）
+    #[test]
+    #[ignore]
+    fn ltr_probe() {
+        ensure_init().unwrap();
+        let (w, h) = (640u32, 360u32);
+        let frame = |i: u32| {
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            for (j, p) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let (x, y) = (j as u32 % w, j as u32 / w);
+                *p = [
+                    ((x + i * 7) % 256) as u8,
+                    ((y + i * 3) % 256) as u8,
+                    (x ^ y) as u8,
+                    255,
+                ];
+            }
+            px
+        };
+        for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+            for activate in enum_hardware(codec) {
+                let name = friendly_name(&activate);
+                let mut e = match unsafe {
+                    MfEncoder::open(activate.clone(), &name, codec, w, h, 30, 2000, None, None)
+                } {
+                    Ok(e) => e,
+                    Err(err) => {
+                        println!("{name} {codec:?}: {err:#}");
+                        continue;
+                    }
+                };
+                println!("{name} {codec:?}: ltr_slots {}", e.ltr_slots);
+                e.ltr_slots = LTR_SLOTS;
+                for i in 0..16u32 {
+                    let ctl = match i {
+                        5 => LtrControl {
+                            mark: Some(1),
+                            recover: None,
+                        },
+                        8 => LtrControl {
+                            mark: Some(0),
+                            recover: None,
+                        },
+                        12 => LtrControl {
+                            mark: None,
+                            recover: Some(1),
+                        },
+                        _ => LtrControl::default(),
+                    };
+                    e.set_ltr(ctl);
+                    match e.encode(&frame(i), i == 0) {
+                        Ok(Some(f)) => println!(
+                            "  {i}: key {} {} bytes {:?} ctl {ctl:?}",
+                            f.key,
+                            f.data.len(),
+                            f.ltr
+                        ),
+                        Ok(None) => println!("  {i}: none"),
+                        Err(err) => println!("  {i}: {err:#}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// ffmpeg 严格模式（`-err_detect explode`：码流有一点问题就报错）解出来的每一帧的 MD5。没装 ffmpeg 时为 `None`
+    fn ffmpeg_md5(codec: Codec, stream: &[u8], tag: &str) -> Option<Vec<String>> {
+        let path = std::env::temp_dir().join(format!("airhand-{}-{tag}.bin", std::process::id()));
+        std::fs::write(&path, stream).unwrap();
+        let format = match codec {
+            Codec::H265 => "hevc",
+            Codec::AV1 => "obu",
+            _ => "h264",
+        };
+        // HEVC 的参考帧集里可以列着不再用来预测、只是留着的帧（RefPicSetStFoll），恢复帧就列着被放弃的帧：标准允许它们不在，
+        // ffmpeg 的严格模式却当它是错。HEVC 只看解出来的对不对
+        let strict: &[&str] = if codec == Codec::H265 {
+            &[]
+        } else {
+            &["-err_detect", "explode"]
+        };
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error"])
+            .args(strict)
+            .args(["-f", format, "-i"])
+            .arg(&path)
+            .args(["-f", "framemd5", "-"])
+            .output();
+        let _ = std::fs::remove_file(&path);
+        let out = out.ok()?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "ffmpeg ({tag}): {stderr}");
+        if !stderr.is_empty() {
+            println!("  ffmpeg ({codec:?} {tag}): {}", stderr.trim());
+        }
+        assert!(
+            strict.is_empty() || stderr.is_empty(),
+            "ffmpeg ({tag}): {stderr}"
+        );
+        let text = String::from_utf8(out.stdout).unwrap();
+        Some(
+            text.lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.rsplit(',').next().map(|m| m.trim().to_string()))
+                .collect(),
+        )
+    }
+
+    /// 长期参考帧恢复（参考帧失效）：丢掉中间几帧，从长期参考帧恢复的那一帧和之后的帧照样解得出来，
+    /// 而且和一帧不丢时解出来的一模一样（它们只参考了那个长期参考帧）。每个支持长期参考帧的硬件编码器都检查它报告的；
+    /// 装了 ffmpeg 的话再用它解一遍（浏览器的软件 H.264 解码也是它）。OpenH264 的解码器不支持这样用长期参考帧
+    /// （一帧不丢也报参考帧丢了），不能拿来对照
+    #[test]
+    fn ltr_recovery_decodes_without_the_lost_frames() {
+        ensure_init().unwrap();
+        let (w, h) = (640u32, 360u32);
+        let picture = |i: u32| {
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            for (j, p) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let (x, y) = (j as u32 % w, j as u32 / w);
+                *p = [
+                    ((x + i * 9) % 256) as u8,
+                    ((y + i * 5) % 256) as u8,
+                    ((x ^ y) + i) as u8,
+                    255,
+                ];
+            }
+            px
+        };
+        let mut tested = 0;
+        let encoders = [Codec::H264, Codec::H265, Codec::AV1]
+            .into_iter()
+            .flat_map(|c| enum_hardware(c).into_iter().map(move |a| (c, a)));
+        for (codec, activate) in encoders {
+            let name = format!("{} ({codec:?})", friendly_name(&activate));
+            let Ok(mut e) = (unsafe {
+                MfEncoder::open(activate.clone(), &name, codec, w, h, 30, 3000, None, None)
+            }) else {
+                continue;
+            };
+            if e.ltr_slots() == 0 {
+                println!("{name}: no long-term reference frames");
+                continue;
+            }
+            // 第 6 帧标进 1 号槽位；第 7、8、9 帧"丢了"；第 10 帧只参考 1 号槽位（第 6 帧）
+            let mut frames = Vec::new();
+            for i in 0..15u32 {
+                let ctl = match i {
+                    6 => LtrControl {
+                        mark: Some(1),
+                        recover: None,
+                    },
+                    10 => LtrControl {
+                        mark: None,
+                        recover: Some(1),
+                    },
+                    _ => LtrControl::default(),
+                };
+                e.set_ltr(ctl);
+                let f = e.encode(&picture(i), i == 0).unwrap().expect("no output");
+                assert_eq!(f.key, i == 0, "{name}: frame {i}");
+                if i == 6 {
+                    assert_eq!(f.ltr.unwrap().marked, Some(1), "{name}");
+                }
+                if i == 10 {
+                    assert_eq!(f.ltr.unwrap().used, 0b10, "{name}");
+                }
+                frames.push(f.data);
+            }
+            let stream = |skip: &[usize]| -> Vec<u8> {
+                let kept = frames.iter().enumerate().filter(|(i, _)| !skip.contains(i));
+                kept.flat_map(|(_, f)| f.clone()).collect()
+            };
+            let (Some(all), Some(lossy)) = (
+                ffmpeg_md5(codec, &stream(&[]), "full"),
+                ffmpeg_md5(codec, &stream(&[7, 8, 9]), "lossy"),
+            ) else {
+                println!("{name}: ffmpeg isn't installed, not decoding");
+                continue;
+            };
+            assert_eq!((all.len(), lossy.len()), (15, 12), "{name}");
+            assert_eq!(all[..7], lossy[..7], "{name}");
+            assert_eq!(
+                all[10..],
+                lossy[7..],
+                "{name}: the frames after the recovery decode differently without frames 7-9"
+            );
+            println!("{name}: recovered from a long-term reference frame");
+            tested += 1;
+        }
+        println!("{tested} encoders decoded");
     }
 
     /// 每块显卡上：同一块显卡的硬件编码器直接编码 GPU 上的画面；只要有硬件 H.264 编码器，至少一块显卡上要成功

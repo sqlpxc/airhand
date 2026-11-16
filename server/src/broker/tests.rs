@@ -68,6 +68,7 @@ fn incoming(
         kick,
         approvals: Default::default(),
         direct: None,
+        frames: host.version >= airhand_proto::SIGNAL_FRAMES,
     };
     (inc, kick_tx)
 }
@@ -576,6 +577,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
                 width: 8,
                 height: 8,
                 capture_us: 0,
+                reference: None,
             }
             .encode();
             if seq == 1 {
@@ -1173,6 +1175,7 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
             session_id: sid,
             lane,
             priority: 3,
+            flags: 0,
         };
         send.write_all(&h.encode()).await.unwrap();
         send
@@ -1232,6 +1235,101 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
             .is_err()
     );
     drop(cc);
+}
+
+/// 帧流（信令 v10）：同一条通道可以开很多条，各自转给另一端（带着同样的会话头）；一端放弃了一条（reset），
+/// 转过去的那条也放弃。同时开着的有上限，结束了的不算；控制通道不能是帧流
+#[tokio::test]
+async fn frame_streams_are_relayed_one_frame_each() {
+    use airhand_proto::{MAX_FRAME_STREAMS, SessionHeader};
+    let (broker, cfg) = start().await;
+    let (mut host, id) = register(&cfg, None).await;
+    assert_eq!(host.version, airhand_proto::SIGNAL_VERSION);
+    assert!(host.version >= airhand_proto::SIGNAL_FRAMES);
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+    assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    let frame = async |lane: SessionLane, body: &[u8]| {
+        let mut send = host.conn.open_uni().await.unwrap();
+        send.write_all(&SessionHeader::frame(sid, lane).encode())
+            .await
+            .unwrap();
+        send.write_all(body).await.unwrap();
+        send
+    };
+    let accept = async || {
+        let mut recv = timeout(Duration::from_secs(2), ctrl.conn.accept_uni())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut hdr = [0u8; SessionHeader::LEN];
+        recv.read_exact(&mut hdr).await.unwrap();
+        (SessionHeader::decode(&hdr).unwrap(), recv)
+    };
+    // 两条画面的帧流：另一端各收到一条，会话头一样（带着帧流的标志）
+    for body in [&b"first"[..], b"second"] {
+        let mut s = frame(SessionLane::Video, body).await;
+        s.finish().unwrap();
+        let (h, mut r) = accept().await;
+        assert_eq!(h, SessionHeader::frame(sid, SessionLane::Video));
+        let got = timeout(Duration::from_secs(2), r.read_to_end(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, body);
+    }
+    // 放弃了的帧流：另一端读到一半就断了
+    let mut abandoned = frame(SessionLane::Video, b"stale").await;
+    let (_, mut r) = accept().await;
+    let mut b = [0u8; 5];
+    timeout(Duration::from_secs(2), r.read_exact(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    abandoned.reset(VarInt::from_u32(0)).unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), r.read_to_end(64))
+            .await
+            .unwrap(),
+        Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))
+    ));
+    // 控制通道不能是帧流
+    let control = frame(SessionLane::Control, b"x").await;
+    assert!(
+        timeout(Duration::from_secs(2), control.stopped())
+            .await
+            .unwrap()
+            .is_ok()
+    );
+    // 同时开着的帧流有上限
+    wait_until("the finished frame streams are gone", || {
+        broker.host_frame_streams(sid) == 0
+    })
+    .await;
+    let mut open = Vec::new();
+    for _ in 0..MAX_FRAME_STREAMS {
+        open.push(frame(SessionLane::Video, b"x").await);
+    }
+    wait_until("all frame streams are relayed", || {
+        broker.host_frame_streams(sid) == MAX_FRAME_STREAMS
+    })
+    .await;
+    let over = frame(SessionLane::Video, b"x").await;
+    assert!(
+        timeout(Duration::from_secs(2), over.stopped())
+            .await
+            .unwrap()
+            .is_ok()
+    );
+    // 结束了一条：又能开了
+    let mut done = open.pop().unwrap();
+    done.finish().unwrap();
+    wait_until("a frame stream finished", || {
+        broker.host_frame_streams(sid) < MAX_FRAME_STREAMS
+    })
+    .await;
+    assert!(broker.sessions.lock().contains_key(&sid));
+    drop(open);
 }
 
 /// 数据报按开头的会话 ID 在会话的两端之间转发（服务器批准了就转，不用等通道）；不是这个会话的连接发的、
@@ -1665,6 +1763,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                             width: 8,
                             height: 8,
                             capture_us: 0,
+                            reference: None,
                         }
                         .encode();
                         io.video

@@ -378,10 +378,13 @@ mod tests {
             minicbor::decode::<Versions>(&wire).unwrap(),
             Versions { min: 9, max: 11 }
         );
+        // 服务器回答的是自己的区间和双方都能说的最高版本（值随版本变，位置不变）
         let answer = ServerHello::answer(hello.versions(), Features::NONE);
         let wire = minicbor::to_vec(&answer).unwrap();
-        assert_eq!(wire[..5], [0xa4, 0x00, 0x09, 0x01, 0x09]);
-        assert_eq!(answer.version, Some(9));
+        let (min, max) = (crate::SIGNAL_MIN as u8, crate::SIGNAL_VERSION as u8);
+        assert!(min < 24 && max < 24, "one-byte CBOR integers");
+        assert_eq!(wire[..5], [0xa4, 0x00, min, 0x01, max]);
+        assert_eq!(answer.version, Some(crate::SIGNAL_VERSION.min(11)));
         assert_eq!(crate::ALPN, b"airhand/1");
     }
 

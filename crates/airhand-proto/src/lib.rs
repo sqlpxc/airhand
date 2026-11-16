@@ -30,6 +30,9 @@
 //! * 会话的每条"通道"（[`SessionLane`]）是**单向流**：每端只为自己要发的通道开流，开头写 [`SessionHeader`]。
 //!   服务器收到之后向另一端开一条单向流、写同样的头，然后**零拷贝透传**；它不配对、不管会话有几条通道、各是什么
 //!   （只限制数量 [`MAX_LANES`]），以后加通道不用改服务器。任何一端的控制通道结束，整个会话结束。
+//! * 信令 v10 起还有**帧流**（会话头带 [`SessionHeader::FRAME`]）：一条短的单向流只装一个单元（一帧画面），
+//!   同一条通道可以开很多条，服务器只限制同时开着的条数（[`MAX_FRAME_STREAMS`]）。一帧丢了包只卡住它自己那一条流，
+//!   后面的帧照样到；等不到的帧发送方可以整条放弃（`RESET_STREAM`），不再重传过时的数据（见 [`session`] 的"帧流"）。
 //! * 端到端握手在控制通道上做完（[`handshake`]，Noise），之后每条通道上的每一帧、每个数据报都是加密的：
 //!   服务器看不到、也没法篡改或插入。
 //! * 每条流各自有序，跨流没有顺序保证（音画用采集时间同步），一条流堵住不影响其它的：
@@ -37,7 +40,7 @@
 //! | 通道 | 方向 | 内容 | 编码 |
 //! |------|------|------|------|
 //! | 控制 | 双向 | 小而急的 [`session::HostMsg`] / [`session::ControllerMsg`]：输入、设置、提示…… | CBOR（[`framing`]） |
-//! | 画面 | 被控端 → 控制端 | 画面包 | 媒体包（[`media`]） |
+//! | 画面 | 被控端 → 控制端 | 画面包（双方都支持 [`features::session::FRAMES`] 时每帧一条帧流） | 媒体包（[`media`]） |
 //! | 大块 | 双向 | 大的消息：剪贴板、光标图像（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
@@ -76,10 +79,17 @@ pub mod signal;
 
 use cbor::open_enum;
 
-/// 信令协议版本（客户端 ⇄ 服务器，包括 [`SessionHeader`] 和数据报的会话 ID）。只在没法兼容的改动时加 1
-pub const SIGNAL_VERSION: u16 = 9;
+/// 信令协议版本（客户端 ⇄ 服务器，包括 [`SessionHeader`] 和数据报的会话 ID）。只在没法兼容的改动时加 1。
+///
+/// * 9：会话的每条通道每端开一次；
+/// * 10：另有帧流（[`SessionHeader::FRAME`]）：同一条通道可以开很多条，每条装一帧。服务器说 10 的时候才转发帧流，
+///   所以被控端只在和服务器商定了 10 的时候才用（9 的服务器会把同一条通道的第二条流拒掉）。
+///   9 的客户端照样连得上 10 的服务器，什么都不用变
+pub const SIGNAL_VERSION: u16 = 10;
 /// 本端还能说的最老的信令版本
 pub const SIGNAL_MIN: u16 = 9;
+/// 从这个信令版本起服务器转发帧流（[`SessionHeader::FRAME`]）
+pub const SIGNAL_FRAMES: u16 = 10;
 
 /// 会话协议版本（被控端 ⇄ 控制端，服务器不看）。两端在端到端握手里取双方都支持的最高版本
 pub const SESSION_VERSION: u16 = 1;
@@ -111,6 +121,10 @@ pub const SESSION_MAGIC: [u8; 4] = *b"AHS9";
 
 /// 一个会话每端最多这么多条通道（服务器的资源上限，与通道是什么无关）
 pub const MAX_LANES: u8 = 8;
+
+/// 一个会话每端最多同时开着这么多条帧流（[`SessionHeader::FRAME`]，服务器的资源上限）。
+/// 被控端在途的画面最多几十帧（见 `airhand_link::flow`），放弃了的帧流随即关掉，远远用不到这么多
+pub const MAX_FRAME_STREAMS: u16 = 128;
 
 /// 会话头里的优先级最高这么多（控制通道的）：更大的值解码时压到它。服务器在端到端握手之前就转发通道，
 /// 不压的话任何知道控制码的一端都能把自己的流标得比别的会话的控制通道还高
@@ -167,10 +181,13 @@ impl SessionLane {
     }
 }
 
-/// 通道流的开头（固定 16 字节）：`magic[4] | session_id u64 LE | lane u8 | priority u8 | 0 | 0`。
+/// 通道流的开头（固定 16 字节）：`magic[4] | session_id u64 LE | lane u8 | priority u8 | flags u8 | 0`。
 ///
 /// 服务器按会话 ID 找到会话的另一端，向它开一条单向流、写同样的头，然后转发；往那一端写数据时用这里给的优先级
-/// （不超过 [`MAX_PRIORITY`]）。直连上的通道流开头也是它（会话 ID 必须是这条直连的会话）
+/// （不超过 [`MAX_PRIORITY`]）。直连上的通道流开头也是它（会话 ID 必须是这条直连的会话）。
+///
+/// `flags`（信令 v10 起，v9 写 0、不看）：[`SessionHeader::FRAME`] 表示这是一条帧流。别的位以后再分配，
+/// 不认识的原样转发
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {
     pub session_id: u64,
@@ -178,17 +195,36 @@ pub struct SessionHeader {
     pub lane: u8,
     /// 不超过 [`MAX_PRIORITY`]
     pub priority: u8,
+    pub flags: u8,
 }
 
 impl SessionHeader {
     pub const LEN: usize = 16;
+
+    /// 帧流：这条流只装一个单元（一帧画面），同一条通道可以开很多条（信令 v10，见 crate 说明）。
+    /// 它结束了不代表通道结束了；控制通道不能是帧流
+    pub const FRAME: u8 = 1;
 
     pub fn new(session_id: u64, lane: SessionLane) -> Self {
         Self {
             session_id,
             lane: lane as u8,
             priority: lane.priority(),
+            flags: 0,
         }
+    }
+
+    /// 一条帧流的头（见 [`SessionHeader::FRAME`]）
+    pub fn frame(session_id: u64, lane: SessionLane) -> Self {
+        Self {
+            flags: Self::FRAME,
+            ..Self::new(session_id, lane)
+        }
+    }
+
+    /// 是一条帧流
+    pub fn is_frame(&self) -> bool {
+        self.flags & Self::FRAME != 0
     }
 
     pub fn encode(&self) -> [u8; Self::LEN] {
@@ -197,6 +233,7 @@ impl SessionHeader {
         b[4..12].copy_from_slice(&self.session_id.to_le_bytes());
         b[12] = self.lane;
         b[13] = self.priority;
+        b[14] = self.flags;
         b
     }
 
@@ -208,6 +245,7 @@ impl SessionHeader {
             session_id: u64::from_le_bytes(b[4..12].try_into().ok()?),
             lane: b[12],
             priority: b[13].min(MAX_PRIORITY),
+            flags: b[14],
         })
     }
 }
@@ -319,8 +357,14 @@ pub mod features {
         /// 是 `HostMsg::Mic` 里的状态，不是能力位
         pub const MIC: Features = Features::from_bits(1 << 0);
 
+        /// 1 号位：画面的帧流（见 [`crate::session`] 的"帧流"）。控制端收得了一帧一条的帧流、看得懂画面包头里的
+        /// 参考帧（[`crate::media`] 的"参考帧"），会发 [`crate::session::ControllerDatagram::Lost`]；
+        /// 被控端收到 `Lost` 会放弃在途的帧、从控制端有的帧恢复。被控端在中转上用帧流还要服务器说信令 v10
+        /// （[`crate::SIGNAL_FRAMES`]）
+        pub const FRAMES: Features = Features::from_bits(1 << 1);
+
         /// 本端支持的
-        pub const SUPPORTED: Features = MIC;
+        pub const SUPPORTED: Features = MIC.with(FRAMES);
     }
 }
 
@@ -384,6 +428,18 @@ mod tests {
         );
         let b = SessionHeader::new(1, SessionLane::Bulk);
         assert_eq!(b.encode()[12..], [2, 0, 0, 0]);
+        // 帧流：标志在第 14 个字节；不认识的标志原样留着（服务器照样转发）
+        let f = SessionHeader::frame(1, SessionLane::Video);
+        assert!(f.is_frame() && !b.is_frame());
+        assert_eq!(f.encode()[12..], [1, 0, 1, 0]);
+        assert_eq!(SessionHeader::decode(&f.encode()), Some(f));
+        let mut newer = f.encode();
+        newer[14] = 0x81;
+        let n = SessionHeader::decode(&newer).unwrap();
+        assert!(n.is_frame());
+        assert_eq!(n.encode(), newer);
+        // v9 写的头（第 14 个字节是 0）不是帧流
+        assert!(!SessionHeader::decode(&h.encode()).unwrap().is_frame());
         for lane in SessionLane::ALL {
             assert!((lane as u8) < MAX_LANES);
             assert_eq!(SessionLane::from_u8(lane as u8), Some(lane));

@@ -241,6 +241,7 @@ mod tests {
             width: 2,
             height: 2,
             capture_us: 0,
+            reference: None,
         }
         .encode();
         let plain =

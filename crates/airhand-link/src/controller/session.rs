@@ -8,15 +8,16 @@ use std::time::{Duration, Instant};
 
 use super::receiver::{FromHost, HostReceiver};
 use crate::audio::Bundler;
+use crate::merge::Video;
 use crate::paths::{DatagramSender, Paths};
 use crate::secure::{Negotiated, Sealer};
 use crate::transport::write_lane;
-use airhand_proto::datagram;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostMsg,
     MicState, Notice, Platform, SystemAction,
 };
+use airhand_proto::{datagram, features};
 use anyhow::Result;
 use bytes::Bytes;
 use quinn::SendStream;
@@ -63,6 +64,11 @@ impl Feedback {
         if let Some(m) = m {
             self.out.send(&m);
         }
+    }
+
+    /// 等不到一帧了（见 `crate::merge`）：请被控端从 `decoded` 恢复
+    fn lost(&self, decoded: u32) {
+        self.out.send(&ControllerDatagram::Lost { decoded });
     }
 
     /// 每秒一次：Ping（也是保活），再带一次最近的确认
@@ -137,21 +143,6 @@ impl AckState {
     /// 最近的确认（随 Ping 再发一次）
     fn last(&self) -> Option<ControllerDatagram> {
         self.last.map(|l| l.msg())
-    }
-}
-
-/// 画面断过（前面有帧断在直连上等不到了，[`FromHost::Video`] 的 `gap`）：之后的增量帧缺了参考帧，硬件解码器多半
-/// 不报错、而是解出花屏。所以从断的地方到下一个关键帧之间的帧不交给界面（三种界面都不用知道有过缺口）
-#[derive(Default)]
-struct Keyframes {
-    waiting: bool,
-}
-
-impl Keyframes {
-    /// 这一帧交不交给界面
-    fn admit(&mut self, gap: bool, key: bool) -> bool {
-        self.waiting = (self.waiting || gap) && !key;
-        !self.waiting
     }
 }
 
@@ -428,25 +419,21 @@ pub(super) async fn run(
     let keyframe_tx = tx.clone();
     let acker = feedback.clone();
     let on_direct = video_direct.clone();
+    let frames = negotiated.features.has(features::session::FRAMES);
     let reader = async move {
         let mut cursor = super::cursor::CursorReceiver::default();
-        let mut keyframes = Keyframes::default();
         loop {
             let msg = match recv.recv().await? {
-                // 画面、声音：只看一眼头做统计，原样交给界面
+                // 画面、声音：只看一眼头做统计，原样交给界面。交出来的画面都解得了（缺了参考帧的在
+                // crate::merge 里就挑出来了：硬件解码器多半不报错、而是解出花屏，三种界面都不用知道有过缺口）
                 FromHost::Video {
                     packet: p,
                     arrived,
                     direct,
-                    gap,
                 } => {
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
-                    // 前面有帧断在了直连上：解码器要从关键帧重新开始（被控端在这一帧之后发过关键帧就不用了）
-                    if gap {
-                        keyframe_tx.send(ControllerMsg::RequestKeyframe { after: h.seq })?;
-                    }
                     {
                         let mut s = st.lock().unwrap();
                         s.last_msg = Instant::now();
@@ -458,13 +445,26 @@ pub(super) async fn run(
                         s.direct = direct;
                     }
                     on_direct.store(direct, Ordering::Relaxed);
-                    if !keyframes.admit(gap, h.key) {
-                        // 解不了的增量帧不交给界面，这里替它确认：不然被控端的在途窗口停住，关键帧也发不过来
-                        acker.ack(h.seq, arrived);
-                        continue;
-                    }
                     arrivals.lock().unwrap().record(h.seq, arrived);
                     out.packet(p).map_err(|_| ui_closed())?;
+                    continue;
+                }
+                FromHost::VideoEvent(v) => {
+                    match v {
+                        // 解不了的增量帧不交给界面，这里替它确认：不然被控端的在途窗口停住，恢复的帧也发不过来
+                        Video::Skipped { seq, arrived } => {
+                            st.lock().unwrap().last_msg = Instant::now();
+                            acker.ack(seq, arrived);
+                        }
+                        // 等不到一帧了：请被控端恢复（只有协商了帧流的被控端懂）
+                        Video::Lost { decoded } if frames => acker.lost(decoded),
+                        Video::Lost { .. } => {}
+                        // 被控端在这一帧之后发过关键帧就不用再编了
+                        Video::Keyframe { after } => {
+                            keyframe_tx.send(ControllerMsg::RequestKeyframe { after })?;
+                        }
+                        Video::Frame(_) => unreachable!("delivered as FromHost::Video"),
+                    }
                     continue;
                 }
                 FromHost::Audio(p) => {
@@ -478,12 +478,18 @@ pub(super) async fn run(
                 }
                 FromHost::Pong(t) => {
                     let sample = now_us().saturating_sub(t) as f32 / 1000.0;
-                    let mut s = st.lock().unwrap();
-                    s.last_msg = Instant::now();
-                    s.rtt = Some(match s.rtt {
-                        Some(r) => r * 0.7 + sample * 0.3,
-                        None => sample,
-                    });
+                    let rtt = {
+                        let mut s = st.lock().unwrap();
+                        s.last_msg = Instant::now();
+                        let rtt = match s.rtt {
+                            Some(r) => r * 0.7 + sample * 0.3,
+                            None => sample,
+                        };
+                        s.rtt = Some(rtt);
+                        rtt
+                    };
+                    // 缺着的画面等多久按它算（见 crate::merge）
+                    recv.set_rtt(rtt as f64);
                     continue;
                 }
                 FromHost::Control(m) => m,
@@ -737,21 +743,6 @@ mod tests {
         let mut a = AckState::default();
         assert_eq!(a.ack(u32::MAX, 0, t0), ack(u32::MAX));
         assert_eq!(a.ack(0, 0, t0), ack(0));
-    }
-
-    /// 断过之后等关键帧：中间的增量帧不交给界面
-    #[test]
-    fn frames_after_a_gap_wait_for_a_keyframe() {
-        let mut k = Keyframes::default();
-        assert!(k.admit(false, true));
-        assert!(k.admit(false, false));
-        assert!(!k.admit(true, false));
-        assert!(!k.admit(false, false));
-        assert!(k.admit(false, true));
-        assert!(k.admit(false, false));
-        // 断在关键帧前面：关键帧不用等前面的帧
-        assert!(k.admit(true, true));
-        assert!(k.admit(false, false));
     }
 
     /// 控制台（client/src/lib/api.ts 的 SessionEvent / Notice 类型）依赖这个 JSON 形状

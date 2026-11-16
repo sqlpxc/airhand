@@ -1,8 +1,19 @@
 //! 被控端一个会话的写任务：控制、大块通道（两端共用的 [`write_lane`]），画面（[`write_video`]）和声音（[`write_audio`]）。
 //! 画面、声音走哪条路由直连任务决定（[`Paths::media`]，见 `crate::direct`），这里每一帧、每一包看一眼。
+//!
+//! 画面有两种写法（见 `airhand_proto::session` 的"帧流"）：
+//!
+//! * 一条画面流（[`Video::Stream`]）：每条路上一条，帧一个接一个写进去；
+//! * 帧流（[`Video::Frames`]，双方都支持、中转也支持时）：每帧开一条流，写完就结束。写好的流记在 [`FrameStreams`] 里，
+//!   控制端确认了就不用管了；控制端等不到了（`ControllerDatagram::Lost`），之后的帧整条流放弃（reset），
+//!   不再重传过时的数据。
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use airhand_proto::SessionLane;
 use airhand_proto::datagram;
+use airhand_proto::media::VideoHeader;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use quinn::{Connection, SendDatagramError, SendStream};
@@ -12,10 +23,10 @@ use tracing::debug;
 
 use super::queue::LaneReceiver;
 use crate::audio::Bundler;
-use crate::lanes::open_lane;
+use crate::lanes::{open_frame, open_lane};
 use crate::paths::Paths;
 use crate::secure::Sealer;
-use crate::transport::{seal, write_lane, write_sealed};
+use crate::transport::{WRITE_TIMEOUT, seal, write_lane, write_sealed};
 
 /// 本端各条通道的写任务要的东西
 pub(super) struct Writers {
@@ -23,8 +34,16 @@ pub(super) struct Writers {
     pub paths: Paths,
     pub control: (SendStream, LaneReceiver, Sealer),
     pub bulk: (SendStream, LaneReceiver, Sealer),
-    pub video: (SendStream, mpsc::Receiver<Bytes>, Sealer),
+    pub video: (Video, mpsc::Receiver<Bytes>, Sealer),
     pub audio: (mpsc::Receiver<Bytes>, Sealer),
+}
+
+/// 画面怎么写（见模块说明）
+pub(super) enum Video {
+    /// 中转上的那条画面流
+    Stream(SendStream),
+    /// 每帧一条帧流
+    Frames(std::sync::Arc<FrameStreams>),
 }
 
 /// 所有的写任务，一个出错就都结束
@@ -37,10 +56,21 @@ pub(super) async fn write_all(w: Writers) -> Result<((), (), (), ())> {
         video: (video, video_rx, video_sealer),
         audio: (audio_rx, audio_sealer),
     } = w;
+    let video_paths = paths.clone();
+    let video = async move {
+        match video {
+            Video::Stream(relay) => {
+                write_video(relay, video_rx, video_sealer, session_id, video_paths).await
+            }
+            Video::Frames(streams) => {
+                write_frames(&streams, video_rx, video_sealer, session_id, video_paths).await
+            }
+        }
+    };
     tokio::try_join!(
         write_lane(control, ctl_rx, ctl_sealer, Some(paths.clone())),
         write_lane(bulk, bulk_rx, bulk_sealer, None),
-        write_video(video, video_rx, video_sealer, session_id, paths.clone()),
+        video,
         write_audio(paths, session_id, audio_rx, audio_sealer)
     )
 }
@@ -105,6 +135,114 @@ async fn write_direct(
     Ok(())
 }
 
+/// 最多记着这么多条还没确认的帧流（在途的帧不超过 `flow::MAX_WINDOW`，多出来的是确认丢了的，忘掉就是了：
+/// 忘掉一条流不会放弃它，QUIC 照样送完）
+const MAX_FRAME_STREAMS: usize = 4 * crate::flow::MAX_WINDOW as usize;
+
+/// 在途的帧流（见模块说明）：按发出的先后，带着帧序号
+#[derive(Default)]
+pub(crate) struct FrameStreams(Mutex<VecDeque<(u32, SendStream)>>);
+
+impl FrameStreams {
+    fn add(&self, seq: u32, s: SendStream) {
+        let mut q = self.0.lock().unwrap();
+        if q.len() == MAX_FRAME_STREAMS {
+            q.pop_front();
+        }
+        q.push_back((seq, s));
+    }
+
+    /// 控制端确认到了第 `seq` 帧（累积）：它和它之前的帧流不用管了
+    pub(crate) fn acked(&self, seq: u32) {
+        let mut q = self.0.lock().unwrap();
+        while q
+            .front()
+            .is_some_and(|(s, _)| s.wrapping_sub(seq) as i32 <= 0)
+        {
+            q.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_for_test(&self, seq: u32, s: SendStream) {
+        self.add(seq, s);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    /// 控制端等不到了：第 `after` 帧之后的帧流都放弃（reset，不再重传）。返回放弃了几条
+    pub(crate) fn abandon(&self, after: u32) -> usize {
+        let mut q = self.0.lock().unwrap();
+        let before = q.len();
+        q.retain_mut(|(seq, s)| {
+            let keep = seq.wrapping_sub(after) as i32 <= 0;
+            if !keep {
+                let _ = s.reset(0u32.into());
+            }
+            keep
+        });
+        before - q.len()
+    }
+}
+
+/// 帧流（见模块说明）：每一帧加密后开一条帧流写进去、结束这条流，记进 `streams`。
+/// 直连上写不进去：这一帧改从中转发，告诉直连任务（和 [`write_video`] 一样）。
+/// 中转上开不了流（连接断了、对方一直不给开新流）是错误，会话结束；开了流却写不进去（对方叫停了这条流）只是丢了这一帧，
+/// 控制端会报告等不到它
+async fn write_frames(
+    streams: &FrameStreams,
+    mut rx: mpsc::Receiver<Bytes>,
+    mut sealer: Sealer,
+    session_id: u64,
+    paths: Paths,
+) -> Result<()> {
+    while let Some(frame) = rx.recv().await {
+        let seq = frame
+            .get(4..)
+            .and_then(VideoHeader::decode_any)
+            .map(|h| h.seq)
+            .context("not a video packet")?;
+        let sealed = seal(frame, &mut sealer)?;
+        if let Some(conn) = paths.media() {
+            let written = async {
+                let mut s = open_frame(&conn, session_id, SessionLane::Video).await?;
+                tokio::time::timeout(DIRECT_WRITE_TIMEOUT, s.write_chunk(sealed.clone()))
+                    .await
+                    .context("the direct path stalled")??;
+                s.finish()?;
+                anyhow::Ok(s)
+            };
+            match written.await {
+                Ok(s) => {
+                    streams.add(seq, s);
+                    continue;
+                }
+                Err(e) => {
+                    debug!("writing video to the direct path failed: {e:#}");
+                    paths.report_broken(&conn);
+                }
+            }
+        }
+        let mut s = open_frame(paths.relay(), session_id, SessionLane::Video).await?;
+        let written = async {
+            tokio::time::timeout(WRITE_TIMEOUT, s.write_chunk(sealed))
+                .await
+                .context("session writer stalled")??;
+            s.finish()?;
+            anyhow::Ok(())
+        };
+        match written.await {
+            Ok(()) => streams.add(seq, s),
+            Err(e) if paths.relay().close_reason().is_some() => return Err(e),
+            Err(e) => debug!(seq, "a video frame couldn't be written: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
 /// 声音：`rx` 里排好队的声音包（`media::frame` 编好的，带长度前缀）连同之前几包的副本（[`Bundler`]）
 /// 加密后发成数据报，发在画面走的那条路上（[`Paths::media`]）。单独一包都放不进一个数据报的
 /// （`media::MAX_AUDIO_PACKET`）丢掉
@@ -132,4 +270,33 @@ async fn write_audio(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 确认了的帧流不用管了（序号会绕回）；放弃的是控制端解到的那一帧之后的
+    #[tokio::test]
+    async fn frame_streams_are_forgotten_when_acked_and_reset_when_abandoned() {
+        let (client, _server) = crate::tests::quic_pair().await;
+        let streams = FrameStreams::default();
+        for seq in [u32::MAX, 0, 1, 2] {
+            let mut s = client.open_uni().await.unwrap();
+            s.write_all(&seq.to_le_bytes()).await.unwrap();
+            streams.add(seq, s);
+        }
+        streams.acked(0);
+        let left = |s: &FrameStreams| {
+            s.0.lock()
+                .unwrap()
+                .iter()
+                .map(|(q, _)| *q)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(left(&streams), [1, 2]);
+        assert_eq!(streams.abandon(1), 1);
+        assert_eq!(left(&streams), [1]);
+        assert_eq!(streams.abandon(1), 0);
+    }
 }

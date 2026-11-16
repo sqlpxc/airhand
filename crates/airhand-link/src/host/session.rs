@@ -50,6 +50,14 @@ pub trait Acks: Send + Sync + 'static {
     fn path_changed(&self, lost: bool) {
         let _ = lost;
     }
+
+    /// 控制端等不到帧了（`ControllerDatagram::Lost`，见 `airhand_proto::session` 的"帧流"）：它交给解码器的最后一帧是
+    /// `decoded`。返回 `true`：这之后在途的帧作废了（下一帧从控制端有的帧恢复），它们的帧流放弃掉；
+    /// `false`：什么也不做（恢复帧已经在路上了；默认：这个平台不恢复，控制端等久了会要关键帧）
+    fn lost(&self, decoded: u32) -> bool {
+        let _ = decoded;
+        false
+    }
 }
 
 /// 控制端麦克风的声音交给谁（[`Platform::mic`]，见 `airhand_proto::session` 的"麦克风"）。在读任务里调用：要快，不能等什么
@@ -66,6 +74,10 @@ impl Acks for crate::flow::Flow {
 
     fn path_changed(&self, lost: bool) {
         crate::flow::Flow::path_changed(self, lost);
+    }
+
+    fn lost(&self, decoded: u32) -> bool {
+        crate::flow::Flow::lost(self, decoded)
     }
 }
 use super::{Admission, Gate, Incoming};

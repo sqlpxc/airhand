@@ -64,9 +64,10 @@ fn env_path(key: &str, default: PathBuf) -> PathBuf {
 /// 这里的值兜底那些不发保活的连接。
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
-    // 双向流只有信令流；会话的通道是单向流，每个会话每端几条（服务器限制每端最多 MAX_LANES 条）
+    // 双向流只有信令流；会话的通道是单向流，每个会话每端几条（服务器限制每端最多 MAX_LANES 条），
+    // 画面用帧流时还有每帧一条（每个会话每端同时开着的不超过 MAX_FRAME_STREAMS 条）
     t.max_concurrent_bidi_streams(VarInt::from_u32(1));
-    t.max_concurrent_uni_streams(VarInt::from_u32(256));
+    t.max_concurrent_uni_streams(VarInt::from_u32(1024));
     t.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(4)));
     // 服务器只转发：收到就转出去，窗口只要盖住一段链路的带宽时延积（100 Mbps × 300 ms ≈ 3.75 MB）。

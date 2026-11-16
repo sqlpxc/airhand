@@ -166,6 +166,18 @@
       "width": 1280
     },
     {
+      "captureUs": 123456822345,
+      "codec": "h265",
+      "height": 720,
+      "hex": "0100011e0b0000000005d00200000000499c99be1c00000001040a0000000203",
+      "key": false,
+      "kind": 1,
+      "name": "delta frame with a reference",
+      "payload": "0203",
+      "seq": 11,
+      "width": 1280
+    },
+    {
       "captureUs": 123456809012,
       "hex": "03010018030000000000000000000000346899be1c000000fcfffe",
       "kind": 3,

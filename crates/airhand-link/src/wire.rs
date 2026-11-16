@@ -120,10 +120,25 @@ pub async fn read_packet_timed<R, T>(
 where
     R: AsyncRead + Unpin,
 {
+    read_packet_watched(r, max, clock, |_| {}).await
+}
+
+/// 同 [`read_packet_timed`]，另外每读到一段就调用一次 `progress(done)`（`done`：这一帧读完了）：调用的一方据此知道
+/// 读到一半的帧是还在传（大），还是卡住了（丢了包、等重传：QUIC 只按顺序交出数据）
+pub async fn read_packet_watched<R, T>(
+    r: &mut R,
+    max: usize,
+    clock: impl FnOnce() -> T,
+    mut progress: impl FnMut(bool),
+) -> Result<Option<(Vec<u8>, T)>, WireError>
+where
+    R: AsyncRead + Unpin,
+{
     let Some(len) = read_len(r, max).await? else {
         return Ok(None);
     };
     let at = clock();
+    progress(len == 0);
     let mut buf = Vec::with_capacity(len);
     while buf.len() < len {
         // take 限制住这一帧剩下的长度，不会读进下一帧；buf 的容量正好够，不会再分配
@@ -131,6 +146,7 @@ where
         if (&mut *r).take(left).read_buf(&mut buf).await? == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
+        progress(buf.len() == len);
     }
     debug_assert_eq!(buf.capacity(), len);
     Ok(Some((buf, at)))

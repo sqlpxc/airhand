@@ -486,7 +486,11 @@ fn to_annexb(sb: &CMSampleBuffer, codec: Codec) -> Result<EncodedFrame, String> 
         }
     }
     data.extend_from_slice(&body);
-    Ok(EncodedFrame { data, key })
+    Ok(EncodedFrame {
+        data,
+        key,
+        ltr: None,
+    })
 }
 
 /// 格式描述里的参数集，以及 NAL 长度字段的字节数。

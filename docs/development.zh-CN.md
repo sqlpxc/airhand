@@ -20,7 +20,10 @@ cargo test
 npm test
 
 # client/src-tauri/：客户端 Rust 部分（编码器含硬件探测、Opus 打包、格式转换等）
+# 装了 ffmpeg 的话，ltr_recovery_decodes_without_the_lost_frames 还会用它检查长期参考帧恢复解出来的画面和不丢帧时逐位相同
 cargo test --lib
+# 每个硬件编码器的长期参考帧报告了什么（调查新显卡用）
+cargo test --lib ltr_probe -- --ignored --nocapture
 # 声音环回采集（需要声音输出设备，会以 -60 dBFS 播放 1.5 秒测试音，几乎听不见）
 cargo test --lib loopback_captures_tone -- --ignored --nocapture
 # Windows：控制端的麦克风写进 Steam Streaming Microphone（这台电脑上要有它），从它的录音端录回 1 kHz 的声音
@@ -119,7 +122,7 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 有两个版本号（`crates/airhand-proto/src/lib.rs`），规则见[工作原理 → 协议的演进](architecture.zh-CN.md#协议的演进)：
 
-- `SIGNAL_VERSION` / `SIGNAL_MIN`：客户端 ⇄ 服务器（信令、会话头、数据报的会话 ID）。服务器接受这个区间里的客户端；没有交集时回复 `Incompatible`（带着服务器的区间），客户端提示用户该更新 Airhand 还是服务器，之后每分钟重试一次
+- `SIGNAL_VERSION` / `SIGNAL_MIN`：客户端 ⇄ 服务器（信令、会话头、数据报的会话 ID）。服务器接受这个区间里的客户端；没有交集时回复 `Incompatible`（带着服务器的区间），客户端提示用户该更新 Airhand 还是服务器，之后每分钟重试一次。现在是 9..=10：v10 加了帧流（`SessionHeader::FRAME`，同一条通道可以开很多次），被控端和服务器商定了 v10（`SIGNAL_FRAMES`）才用（见[工作原理 → 帧流与参考帧失效](architecture.zh-CN.md#帧流与参考帧失效)）
 - `SESSION_VERSION` / `SESSION_MIN`：被控端 ⇄ 控制端，在端到端握手里协商，服务器不看。不兼容时控制端显示 `peerIncompatible`
 
 改协议时先想能不能兼容地改，能就不加版本号：
@@ -134,7 +137,7 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 ### 一份协议，三份实现
 
-`crates/airhand-proto/tests/v9.rs` 保存 v9 的 CBOR 字节样例。v9 发布之后它们就固定了，不能随着实现重新生成：现有消息的编号和字段位置必须保持兼容，新增消息另加样例。光标接收测试覆盖两个通道的乱序；服务器测试经过真实 QUIC 和控制端会话检查未知视频格式仍能确认、后续帧继续接收。
+`crates/airhand-proto/tests/v9.rs` 保存 v9 的 CBOR 字节样例。v9 发布之后它们就固定了，不能随着实现重新生成：现有消息的编号和字段位置必须保持兼容，新增消息另加样例。v10 新增的线上格式（帧流的会话头、画面包头的参考帧扩展、`ControllerDatagram::Lost`）在 `tests/v10.rs`。光标接收测试覆盖两个通道的乱序；服务器测试经过真实 QUIC 和控制端会话检查未知视频格式仍能确认、后续帧继续接收。
 
 Rust、控制台（TypeScript）和 Android（Kotlin）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令、连接选项（`airhand_link::controller::Command`、`ConnectOptions`）。界面和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`），带字段的联合类型用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）和 `./gradlew testDebugUnitTest`（`ProtocolTest`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边的测试通过。
 

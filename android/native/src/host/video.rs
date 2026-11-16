@@ -5,15 +5,18 @@
 //!   跟不上的会话跳过帧，恢复后从关键帧重新加入；所有会话都堵住时才等待；
 //! * **码率**：每个会话各自按网络上的排队和带宽估计（与桌面版相同），共享的编码器用还在接收的会话里最高的那个：
 //!   慢的观看者跳帧，不拉低别人的画质；
-//! * 新加入的会话从关键帧开始收（[`Out::need_key`]）。
+//! * 新加入的会话从关键帧开始收（[`Out::need_key`]）；
+//! * 增量帧的头里写着它参考的帧（编码器编出的前一帧，见 `airhand_proto::media` 的"参考帧"）；控制端等不到帧时
+//!   （[`VideoHub::lost`]）MediaCodec 不能从长期参考帧恢复，那个会话从关键帧重新加入。
 //!
 //! Kotlin 的渲染线程每一轮调用 [`VideoHub::tick`]：设置变了（帧率、分辨率上限、编码格式、码率）
 //! 或者需要关键帧时返回一个 JSON，见 [`Tick`]。
 
 use airhand_link::flow::{FlowState as Flow, frame_bytes};
+use airhand_link::refs::recover_wait;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{Codec, QualitySettings};
@@ -57,6 +60,8 @@ struct Out {
     need_key: bool,
     /// 最近发给它的关键帧的序号（0：还没有）：它要的关键帧已经在路上了就不再编（见 [`VideoHub::request_keyframe`]）
     last_key: u32,
+    /// 那个关键帧是什么时候发的：控制端等不到帧时，太久以前发的关键帧不算还在路上（见 [`VideoHub::lost`]）
+    last_key_at: Option<Instant>,
 }
 
 /// [`VideoHub::tick`] 的结果
@@ -109,6 +114,7 @@ impl VideoHub {
                 settings: settings.sanitized(),
                 need_key: true,
                 last_key: 0,
+                last_key_at: None,
             },
         );
         st.merge_settings();
@@ -200,6 +206,30 @@ impl VideoHub {
         st.force_key = true;
     }
 
+    /// 会话 `id` 的控制端等不到帧了（帧流，见 `airhand_proto::session` 的"帧流"）：它解到了第 `decoded` 帧。
+    /// 之后在途的帧作废，它从关键帧重新加入（MediaCodec 不能从长期参考帧恢复），返回 `true`（放弃它们的帧流）。
+    /// 刚发给它的关键帧还在路上（比 `decoded` 新、发出去不久）：重复的请求，什么也不做
+    pub fn lost(&self, id: u64, decoded: u32) -> bool {
+        let mut st = self.st.lock().unwrap();
+        let Some(o) = st.sessions.get_mut(&id) else {
+            return false;
+        };
+        let srtt = Some(o.flow.rtt().0).filter(|r| *r > 0.0).unwrap_or(100.0);
+        let in_flight = o.last_key != 0
+            && o.last_key.wrapping_sub(decoded) as i32 > 0
+            && o.last_key_at
+                .is_some_and(|t| t.elapsed() < recover_wait(srtt));
+        if in_flight {
+            return false;
+        }
+        o.flow.abandon(decoded);
+        o.need_key = true;
+        st.force_key = true;
+        drop(st);
+        self.cv.notify_all();
+        true
+    }
+
     /// 渲染线程每一轮调用：需要 Kotlin 做点什么（设置变了、码率变了、要关键帧）时返回 [`Tick`]
     pub fn tick(&self) -> Option<Tick> {
         let mut st = self.st.lock().unwrap();
@@ -268,6 +298,8 @@ impl VideoHub {
         if st.sessions.is_empty() {
             return;
         }
+        // 增量帧参考编码器编出的前一帧：没收到它的会话（跳过了）本来就等着关键帧
+        let previous = st.seq;
         st.seq = st.seq.wrapping_add(1);
         let seq = st.seq;
         let header = VideoHeader {
@@ -277,6 +309,7 @@ impl VideoHub {
             width,
             height,
             capture_us,
+            reference: (!key && previous != 0).then_some(previous),
         };
         // 关键帧前面拼上参数集：和画面一起一次拷进包里
         let config: &[u8] = if key && codec != Codec::AV1 && !starts_with_parameter_set(data, codec)
@@ -303,6 +336,7 @@ impl VideoHub {
                     o.need_key = false;
                     if key {
                         o.last_key = seq;
+                        o.last_key_at = Some(Instant::now());
                     }
                     o.flow.on_sent(seq, bytes.len() - 4);
                 }
@@ -540,6 +574,41 @@ mod tests {
         assert!(hub.tick().unwrap().key);
         hub.request_keyframe(1, None);
         assert!(hub.tick().unwrap().key);
+    }
+
+    /// 控制端等不到帧了：之后在途的帧不再占着窗口，从关键帧重新加入；关键帧还在路上时重复的请求不再编。
+    /// 增量帧的头里写着前一帧
+    #[test]
+    fn a_lost_frame_restarts_the_viewer_from_a_keyframe() {
+        let (hub, _) = hub();
+        let (tx, mut rx) = mpsc::channel(QUEUE);
+        hub.add(1, tx);
+        let _ = hub.tick();
+        hub.push(&[1], true, false, 0, Codec::AV1, 8, 8);
+        hub.push(&[2], false, false, 0, Codec::AV1, 8, 8);
+        hub.push(&[3], false, false, 0, Codec::AV1, 8, 8);
+        let frames: Vec<VideoHeader> = (0..3)
+            .map(|_| VideoHeader::decode(&rx.try_recv().unwrap()[4..]).unwrap())
+            .collect();
+        assert_eq!(frames[0].reference, None);
+        assert_eq!(frames[1].reference, Some(frames[0].seq));
+        assert_eq!(frames[2].reference, Some(frames[1].seq));
+        let inflight = || hub.st.lock().unwrap().sessions[&1].flow.inflight();
+        assert_eq!(inflight(), 3);
+        // 解到了第一帧（关键帧），之后的等不到了：关键帧就是它自己，不算在路上
+        assert!(hub.lost(1, frames[0].seq));
+        assert_eq!(inflight(), 1);
+        assert!(hub.tick().unwrap().key);
+        hub.push(&[4], false, false, 0, Codec::AV1, 8, 8);
+        assert!(rx.try_recv().is_err(), "delta frames before the keyframe");
+        hub.push(&[5], true, false, 0, Codec::AV1, 8, 8);
+        assert!(decode(&rx.try_recv().unwrap()).key);
+        // 等关键帧时那个增量帧又要过一次（见 push），先清掉
+        let _ = hub.tick();
+        // 关键帧还在路上：重复的请求不再编
+        assert!(!hub.lost(1, frames[0].seq));
+        assert!(hub.tick().is_none());
+        assert!(!hub.lost(2, 0), "unknown session");
     }
 
     #[test]

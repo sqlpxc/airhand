@@ -36,12 +36,17 @@
 //! 最小单向时延从头量（不然换到慢一点的路会被当成排队、白白降码率），换路之前发出的帧确认回来时不算样本
 //! （它们走的是旧路）；码率的估计接着用。
 //! 直连断了换回中转时，断在直连上的帧永远不会确认了：不再算在途，编码器马上能发下一帧（关键帧）。
+//!
+//! **等不到的帧**（帧流，控制端发了 `ControllerDatagram::Lost`，见 [`FlowState::lost`]）：控制端解到的最后一帧之后、
+//! 在途的帧都作废，不再算在途（确认不会来了，它们的流也被放弃了）；下一帧怎么编见 [`crate::refs`]。
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_proto::session::QualitySettings;
+
+use crate::refs::{LtrReport, Plan, Refs};
 
 /// 在途帧数的上限（Android 的画面队列、控制端记到达时刻的环形缓冲都按它定大小）
 pub const MAX_WINDOW: u32 = 32;
@@ -143,6 +148,8 @@ pub struct FlowState {
     blocked: bool,
     /// 换了路（[`FlowState::path_changed`]）：这一帧和之前发的走的是旧路，确认时不算时延样本
     old_path: Option<u32>,
+    /// 每一帧参考哪一帧、等不到帧时怎么恢复（见 [`crate::refs`]）
+    refs: Refs,
 }
 
 impl Default for FlowState {
@@ -162,6 +169,7 @@ impl Default for FlowState {
             adaptive: true,
             blocked: false,
             old_path: None,
+            refs: Refs::default(),
         }
     }
 }
@@ -198,6 +206,7 @@ impl FlowState {
             return;
         }
         self.acked = seq;
+        self.refs.acked(seq);
         let mut acked = None;
         while let Some(&f) = self.pending.front() {
             if f.seq.wrapping_sub(seq) as i32 > 0 {
@@ -354,6 +363,31 @@ impl FlowState {
         self.pending.is_empty()
             || (self.pending.len() < MAX_WINDOW as usize
                 && self.pending_bytes + bytes <= self.window_bytes())
+    }
+
+    /// 在途的、第 `after` 帧之后的帧都作废（控制端等不到它们了，见模块说明的"等不到的帧"）：不再算在途
+    pub fn abandon(&mut self, after: u32) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|f| f.seq.wrapping_sub(after) as i32 <= 0);
+        if self.pending.len() != before {
+            self.pending_bytes = self.pending.iter().map(|f| f.bytes).sum();
+        }
+    }
+
+    /// 控制端交给解码器的最后一帧是 `decoded`，之后的等不到了（`ControllerDatagram::Lost`）。返回 `true`：
+    /// 在途的、`decoded` 之后的帧作废了，它们的流也该放弃；`false`：恢复帧已经在路上了，重复的请求（见 [`crate::refs`]）
+    pub fn lost(&mut self, decoded: u32, now: Instant) -> bool {
+        let srtt = if self.srtt_ms > 0.0 {
+            self.srtt_ms
+        } else {
+            DEFAULT_RTT_MS
+        };
+        if !self.refs.lost(decoded, srtt, now) {
+            return false;
+        }
+        self.abandon(decoded);
+        true
     }
 
     /// (平滑的 RTT, 基础 RTT)，毫秒；还没有样本时是 0
@@ -520,6 +554,39 @@ impl Flow {
         state.on_sent(seq, bytes);
         seq
     }
+    /// 下一帧怎么编（见 [`crate::refs`]）：`slots` 是编码器能控制的长期参考帧槽位数
+    pub fn plan(&self, slots: u8) -> Plan {
+        self.state.lock().unwrap().refs.plan(slots, Instant::now())
+    }
+
+    /// 控制端等不到帧了，还没编出恢复帧：画面静止时也要编一帧
+    pub fn recovering(&self) -> bool {
+        self.state.lock().unwrap().refs.recovering()
+    }
+
+    /// 编码器按 `plan` 编出了一帧（[`Flow::sent`]，另外记下它参考哪一帧）。返回 (序号, 参考帧)
+    pub fn sent_frame(
+        &self,
+        bytes: usize,
+        key: bool,
+        plan: Plan,
+        report: Option<LtrReport>,
+    ) -> (u32, Option<u32>) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let seq = state.sent.wrapping_add(1);
+        state.on_sent_at(seq, bytes, now);
+        let reference = state.refs.encoded(seq, key, plan, report, now);
+        (seq, reference)
+    }
+
+    /// 见 [`FlowState::lost`]
+    pub fn lost(&self, decoded: u32) -> bool {
+        let abandoned = self.state.lock().unwrap().lost(decoded, Instant::now());
+        self.cv.notify_all();
+        abandoned
+    }
+
     /// A frame assigned a sequence but cancelled before enqueueing needs no ACK.
     pub fn discard(&self, seq: u32) {
         let mut state = self.state.lock().unwrap();
@@ -656,6 +723,40 @@ mod tests {
         let s = f.state.lock().unwrap();
         assert!(s.min_owd.get().is_some() && s.min_rtt.get().is_some());
         assert_eq!(s.queue_delay(), Some(0.0));
+    }
+
+    /// 控制端等不到帧了：它解到的那一帧之后在途的帧不再占着窗口；之后的确认照常，作废了的帧的确认不算
+    #[test]
+    fn lost_frames_free_the_window() {
+        let f = Flow::default();
+        let stop = AtomicBool::new(false);
+        let window = f.state.lock().unwrap().window_bytes();
+        let mut seqs = Vec::new();
+        for _ in 0..4 {
+            let plan = f.plan(0);
+            seqs.push(f.sent_frame(window / 4, false, plan, None).0);
+        }
+        assert!(!f.wait_room(window / 4, &stop, Duration::ZERO));
+        f.ack(seqs[0], Some(1));
+        // 控制端解到了第 2 帧（它的确认还在路上），第 3、4 帧作废
+        assert!(f.lost(seqs[1]));
+        assert_eq!(f.state.lock().unwrap().inflight(), 1);
+        assert_eq!(f.state.lock().unwrap().pending_bytes, window / 4);
+        // 恢复：编码器不能控制长期参考帧，编关键帧；关键帧在路上时重复的请求不算
+        assert!(f.recovering());
+        assert!(f.plan(0).key);
+        let (key, reference) = f.sent_frame(100, true, f.plan(0), None);
+        assert_eq!(reference, None);
+        assert!(!f.recovering());
+        assert!(!f.lost(seqs[1]));
+        assert_eq!(f.state.lock().unwrap().inflight(), 2);
+        // 作废了的帧的确认（控制端跳过它们时替界面确认的）：确认了第 2 帧，不动关键帧
+        f.ack(seqs[3], Some(2));
+        assert_eq!(f.state.lock().unwrap().inflight(), 1);
+        f.ack(key, Some(3));
+        assert_eq!(f.state.lock().unwrap().inflight(), 0);
+        // 之后的增量帧参考关键帧
+        assert_eq!(f.sent_frame(100, false, f.plan(0), None).1, Some(key));
     }
 
     #[test]

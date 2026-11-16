@@ -161,6 +161,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 capture_us: 0,
+                reference: None,
             }
             .encode()
             .to_vec();

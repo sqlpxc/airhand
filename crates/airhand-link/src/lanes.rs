@@ -7,6 +7,9 @@
 //!
 //! 一个会话在收的一端是一个 [`Inbox`]：每条通道一个信箱（中转、直连上来的流都放进来，交给 [`crate::merge::Merge`]
 //! 合并），声音、控制数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
+//!
+//! 画面还可以是**帧流**（[`open_frame`]，会话头带 `SessionHeader::FRAME`，见 `airhand_proto::session` 的"帧流"）：
+//! 每帧一条流，同一条通道上来很多条。它们和普通的流放进同一个信箱，带着 [`LaneStream::frame`]。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -30,8 +33,16 @@ pub enum Via {
     Direct = 1,
 }
 
-/// 一条通道的流：中转上的一条，直连上的（每次直连通了一条）
-pub type LaneStreams = mpsc::UnboundedReceiver<(RecvStream, Via)>;
+/// 对方开过来的一条流
+pub struct LaneStream {
+    pub recv: RecvStream,
+    pub via: Via,
+    /// 帧流（每帧一条，见模块说明）：它结束了不代表这条通道结束了
+    pub frame: bool,
+}
+
+/// 一条通道的流：中转上的一条，直连上的（每次直连通了一条），还有帧流
+pub type LaneStreams = mpsc::UnboundedReceiver<LaneStream>;
 
 /// 每个会话最多排着这么多个还没交出去的声音数据报。再多就丢：本来就可能丢
 const AUDIO_QUEUE: usize = 16;
@@ -46,7 +57,7 @@ const EARLY_TTL: Duration = Duration::from_secs(10);
 /// 往一个会话放东西（见模块说明）
 #[derive(Clone)]
 pub struct Feed {
-    lanes: [mpsc::UnboundedSender<(RecvStream, Via)>; SessionLane::ALL.len()],
+    lanes: [mpsc::UnboundedSender<LaneStream>; SessionLane::ALL.len()],
     audio: mpsc::Sender<Bytes>,
     control: mpsc::Sender<(Via, Bytes)>,
 }
@@ -94,15 +105,21 @@ impl Default for Inbox {
 }
 
 impl Feed {
-    /// 一条通道的流到了。会话不认识的通道（对方版本新增的）、不再收的通道：叫对方别发了
-    pub fn stream(&self, lane: u8, recv: RecvStream, via: Via) {
-        let Some(lane) = SessionLane::from_u8(lane) else {
-            debug!(lane, "ignoring a lane this version doesn't know");
+    /// 一条通道的流到了（`h` 是它的会话头）。会话不认识的通道（对方版本新增的）、不再收的通道、
+    /// 控制通道的帧流（控制通道只有一条）：叫对方别发了
+    pub fn stream(&self, h: &SessionHeader, recv: RecvStream, via: Via) {
+        let Some(lane) = SessionLane::from_u8(h.lane) else {
+            debug!(lane = h.lane, "ignoring a lane this version doesn't know");
             return stop(recv);
         };
-        if let Err(mpsc::error::SendError((recv, _))) = self.lanes[lane as usize].send((recv, via))
-        {
-            stop(recv);
+        let frame = h.is_frame();
+        if frame && lane == SessionLane::Control {
+            debug!("ignoring a frame stream on the control lane");
+            return stop(recv);
+        }
+        let s = LaneStream { recv, via, frame };
+        if let Err(mpsc::error::SendError(s)) = self.lanes[lane as usize].send(s) {
+            stop(s.recv);
         }
     }
 
@@ -139,13 +156,30 @@ pub async fn open_lane(
     Ok(send)
 }
 
+/// 开一条帧流（见模块说明），写好会话头（带 `SessionHeader::FRAME`）。调用的一方接着写一帧、结束这条流
+pub async fn open_frame(
+    conn: &Connection,
+    session_id: u64,
+    lane: SessionLane,
+) -> Result<SendStream> {
+    let mut send = tokio::time::timeout(HEADER_TIMEOUT, conn.open_uni())
+        .await
+        .context("timed out opening a frame stream")??;
+    send.set_priority(lane.priority() as i32)?;
+    send.write_chunk(Bytes::copy_from_slice(
+        &SessionHeader::frame(session_id, lane).encode(),
+    ))
+    .await?;
+    Ok(send)
+}
+
 /// 对方在这条通道上开的第一条流（中转上的那条）。握手用：那时还没有直连
 pub async fn first_stream(lane: &mut LaneStreams, wait: Duration) -> Result<RecvStream> {
-    let (recv, _) = tokio::time::timeout(wait, lane.recv())
+    let s = tokio::time::timeout(wait, lane.recv())
         .await
         .context("the peer didn't open its lane")?
         .context("the session ended")?;
-    Ok(recv)
+    Ok(s.recv)
 }
 
 /// 读一条流开头的会话头；读不出来（超时、不是会话头）就叫对方别发了
@@ -213,7 +247,7 @@ impl Router {
         let early = std::mem::take(&mut st.early);
         for (at, h, recv) in early {
             if h.session_id == session_id {
-                inbox.feed.stream(h.lane, recv, Via::Relay);
+                inbox.feed.stream(&h, recv, Via::Relay);
             } else {
                 st.early.push_back((at, h, recv));
             }
@@ -229,7 +263,7 @@ impl Router {
     fn stream(&self, h: SessionHeader, recv: RecvStream) {
         let mut st = self.state.lock().unwrap();
         if let Some(feed) = st.sessions.get(&h.session_id) {
-            return feed.stream(h.lane, recv, Via::Relay);
+            return feed.stream(&h, recv, Via::Relay);
         }
         let now = Instant::now();
         while st
@@ -315,7 +349,7 @@ pub async fn accept_direct(
             // 只匹配 `Some(_)`（见 Router::run）
             Some(r) = headers.join_next() => match r {
                 Ok(Some((h, recv))) if h.session_id == session_id => {
-                    feed.stream(h.lane, recv, Via::Direct);
+                    feed.stream(&h, recv, Via::Direct);
                 }
                 Ok(Some((_, recv))) => stop(recv),
                 _ => {}
@@ -347,7 +381,14 @@ mod tests {
         lane.write_all(&header[8..]).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), inbox.control.recv()).await;
         assert!(
-            matches!(got, Ok(Some((_, Via::Relay)))),
+            matches!(
+                got,
+                Ok(Some(LaneStream {
+                    via: Via::Relay,
+                    frame: false,
+                    ..
+                }))
+            ),
             "the lane was held up"
         );
     }

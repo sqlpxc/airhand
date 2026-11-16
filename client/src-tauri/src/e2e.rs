@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use airhand_link::controller::{Established, FromHost, establish};
 use airhand_link::host::Router;
+use airhand_link::merge::Video;
 use airhand_link::net::Signal;
 use airhand_link::secure::{self, Identity, InitiatorParams, Sealer};
 use airhand_link::wire::{read_msg, write_msg};
@@ -268,6 +269,8 @@ async fn e2e_roundtrip() {
     let age_ms = |capture_us: u64| {
         (crate::host::clock::us(Instant::now()) as f64 - capture_us as f64) / 1000.0
     };
+    // 只用来确认关键帧解得出来：OpenH264 的解码器不支持硬件编码器那样用长期参考帧（见 airhand_link::refs），
+    // 之后参考了长期参考帧的增量帧它解不出来（编码器层面的恢复由 mf.rs 的测试用 ffmpeg 检查）
     let mut decoder = openh264::decoder::Decoder::new().unwrap();
     let mut switched = false;
     // 剪贴板：控制端 → 被控端（写入本机剪贴板），然后本机修改 → 被控端应回传
@@ -339,6 +342,22 @@ async fn e2e_roundtrip() {
                     seq: v.seq,
                     arrived,
                 });
+                continue;
+            }
+            // 画面通道上别的事（和控制端服务一样处理）：解不了的替界面确认、等不到了报告、等太久了要关键帧
+            FromHost::VideoEvent(ev) => {
+                match ev {
+                    Video::Skipped { seq, arrived } => {
+                        datagrams.send(&ControllerDatagram::Ack { seq, arrived })
+                    }
+                    Video::Lost { decoded } => {
+                        datagrams.send(&ControllerDatagram::Lost { decoded })
+                    }
+                    Video::Keyframe { after } => {
+                        ctl.send(&ControllerMsg::RequestKeyframe { after }).await
+                    }
+                    Video::Frame(_) => {}
+                }
                 continue;
             }
             FromHost::Audio(p) => {
@@ -509,7 +528,7 @@ async fn e2e_roundtrip() {
         assert!(rep.keyframes >= 1);
         assert!(!rep.encoders.is_empty());
         assert!(rep.encoders.len() >= 2, "切换编码格式后应重建编码器");
-        assert!(rep.decoded >= 1, "H.264 码流无法解码");
+        assert!(rep.decoded >= 1, "H.264 的关键帧无法解码");
         // 画面静止时会重新编码上一帧（时间戳不变），所以只检查不离谱
         assert!(
             rep.video_age_ms < 10_000.0,

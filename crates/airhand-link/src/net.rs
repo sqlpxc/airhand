@@ -211,9 +211,10 @@ pub struct Signal {
 
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
-    // 服务器不开双向流（信令流是客户端开的）；会话的通道是服务器转过来的单向流，每个会话每端几条
+    // 服务器不开双向流（信令流是客户端开的）；会话的通道是服务器转过来的单向流，每个会话每端几条，
+    // 画面用帧流时还有每帧一条（见 airhand_proto::session 的"帧流"），控制台同时开着好几个会话
     t.max_concurrent_bidi_streams(VarInt::from_u32(0));
-    t.max_concurrent_uni_streams(VarInt::from_u32(256));
+    t.max_concurrent_uni_streams(VarInt::from_u32(1024));
     // 短保活间隔：既能防止 NAT 映射过期，也能让掉线在 10 秒内被发现并重连
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(2)));

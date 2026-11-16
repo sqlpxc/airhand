@@ -4,7 +4,9 @@
 //! * 永远只编码**最新**的一帧，旧帧直接丢弃，不排队；
 //! * 帧率按画面的时间戳节流（见 [`super::pace`]），处理花的时间不会累积成延迟；
 //! * 在途（已发送未确认）字节受限，网络变慢时编码器等待而不是把数据堆进缓冲区；
-//! * 码率按网络上的排队和带宽估计每帧调整（见 [`airhand_link::flow`]）。
+//! * 码率按网络上的排队和带宽估计每帧调整（见 [`airhand_link::flow`]）；
+//! * 每一帧参考哪一帧写进画面包头；控制端等不到帧时，编码器支持长期参考帧就从控制端有的那一帧恢复（参考帧失效），
+//!   不支持就编关键帧（见 [`airhand_link::refs`]）。
 //!
 //! 画面停下来之后补画质：画面大面积变化（切换窗口、滚动）时，码率控制只能给这一帧分到大约一帧的码率，
 //! 文字是糊的；采集只在画面变化时才有新帧，不补的话控制端就一直停在这一帧上。把最后一帧再编几次，
@@ -17,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use airhand_link::flow::Flow;
 use airhand_link::host::{CursorCache, Outbox, SendError};
+use airhand_link::refs::Plan;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{HostMsg, Notice, QualitySettings};
 use bytes::Bytes;
@@ -24,7 +27,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::capture::{self, Frame};
-use super::encoder::Encoder;
+use super::encoder::{Encoder, LtrControl};
 use super::pace::Pacer;
 
 /// 画面停下来之后，同一帧最多再编这么多次
@@ -261,9 +264,10 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 }
                 reported_error = Some(err);
             }
-            // 画面静止但控制端需要关键帧（例如解码器重置），或者该补画质了：重新编码上一帧
+            // 画面静止但控制端需要关键帧（例如解码器重置）、等不到帧了要恢复，或者该补画质了：重新编码上一帧
             let refine = refine_left > 0 && Instant::now() >= refine_due;
-            if !((force || refine) && last_frame.is_some()) {
+            let recover = ctrl.flow.recovering();
+            if !((force || refine || recover) && last_frame.is_some()) {
                 continue;
             }
         } else if reported_error.take().is_some() {
@@ -332,6 +336,23 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         let e = enc.as_mut().unwrap();
         // 不自适应时就是画质设置里的码率；编码器自己会跳过没变的
         e.set_bitrate(ctrl.flow.bitrate_kbps());
+        // 参考帧：控制端等不到帧时从它有的长期参考帧恢复（做不到就编关键帧），平时隔一阵标一个长期参考帧
+        let plan = ctrl.flow.plan(e.ltr_slots());
+        force |= plan.key;
+        let plan = if force {
+            Plan {
+                key: true,
+                ..Plan::default()
+            }
+        } else {
+            if plan.mark.is_some() || plan.recover.is_some() {
+                e.set_ltr(LtrControl {
+                    mark: plan.mark,
+                    recover: plan.recover,
+                });
+            }
+            plan
+        };
 
         // 新画面、关键帧之后从头开始补；补的帧本身只减次数
         if fresh || force {
@@ -360,7 +381,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                         return;
                     }
                 }
-                let seq = ctrl.flow.sent(size);
+                let (seq, reference) = ctrl.flow.sent_frame(size, ef.key, plan, ef.ltr);
                 if ef.key {
                     ctrl.last_key.store(seq, Ordering::Release);
                 }
@@ -378,6 +399,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     // 重新编码的上一帧就是现在的画面（画面一直没变），采集时间记为现在：
                     // 控制端按采集时间做音画同步，用旧的时间会以为这一帧严重滞后，让声音跟着多等
                     capture_us: super::clock::us(if fresh { frame.captured } else { started }),
+                    reference,
                 };
                 let packet = Bytes::from(media::frame(&header.encode(), &[&ef.data]));
                 if !send_cancellable(&video, &ctrl.stop, packet) {

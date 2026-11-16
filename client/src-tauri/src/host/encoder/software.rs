@@ -168,6 +168,7 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(Some(EncodedFrame {
             data,
             key: matches!(ft, FrameType::IDR | FrameType::I),
+            ltr: None,
         }))
     }
 }

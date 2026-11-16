@@ -17,7 +17,6 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use airhand_proto::SessionLane;
 use airhand_proto::datagram;
 use airhand_proto::framing;
 use airhand_proto::handshake::{Confirm, Negotiated, PublicKey};
@@ -25,16 +24,17 @@ use airhand_proto::session::{
     ControllerDatagram, ControllerMsg, DirectOffer, HostDatagram, InputEvent, MAX_CLIPBOARD_TEXT,
     QualitySettings,
 };
+use airhand_proto::{SessionLane, features};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::Incoming;
 use super::clock::InputClock;
 use super::queue::{self, Outbox};
 use super::session::{Acks, MicSink, Request};
-use super::write::{Writers, write_all};
+use super::write::{FrameStreams, Video, Writers, write_all};
 use crate::audio::Unbundler;
 use crate::direct;
 use crate::lanes::{Via, first_stream, open_lane};
@@ -135,7 +135,8 @@ impl ControllerReceiver {
 /// 读任务自己处理的事（见模块说明）：
 ///
 /// * Ping：马上回 Pong。同意之前也回：控制端不会把等待当成失联；
-/// * 画面确认：马上交给平台的 [`Acks`]；
+/// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
+/// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
 /// * 控制端麦克风的声音包：马上交给平台的 [`MicSink`]；
 /// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
 #[derive(Clone)]
@@ -145,6 +146,8 @@ pub(crate) struct Express {
     mic: Arc<OnceLock<Arc<dyn MicSink>>>,
     /// 上次收到控制端消息的时刻（tokio 的时钟：测试里可以拨）
     heard: Arc<Mutex<tokio::time::Instant>>,
+    /// 在途的帧流（画面用帧流时）
+    frames: Option<Arc<FrameStreams>>,
 }
 
 impl Express {
@@ -155,7 +158,14 @@ impl Express {
             acks: Arc::default(),
             mic: Arc::default(),
             heard: Arc::new(Mutex::new(tokio::time::Instant::now())),
+            frames: None,
         }
+    }
+
+    /// 画面用帧流：确认了的帧流不用管了，等不到的帧放弃
+    fn with_frames(mut self, frames: Arc<FrameStreams>) -> Self {
+        self.frames = Some(frames);
+        self
     }
 
     /// 控制端麦克风的一个声音包（还没有人收时丢掉）
@@ -178,6 +188,21 @@ impl Express {
             ControllerDatagram::Ack { seq, arrived } => {
                 if let Some(acks) = self.acks.get() {
                     acks.ack(seq, arrived);
+                }
+                if let Some(f) = &self.frames {
+                    f.acked(seq);
+                }
+            }
+            // 平台要恢复：之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）
+            ControllerDatagram::Lost { decoded } => {
+                let recover = self.acks.get().is_some_and(|a| a.lost(decoded));
+                if recover && let Some(f) = &self.frames {
+                    let n = f.abandon(decoded);
+                    debug!(
+                        decoded,
+                        abandoned = n,
+                        "the controller lost a frame, recovering"
+                    );
                 }
             }
             // 直连任务的事（读任务转给它）
@@ -290,7 +315,14 @@ impl HostStreams {
         );
         let secured = r.secured;
         let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
-        let video_send = open_lane(conn, session_id, SessionLane::Video).await?;
+        // 双方都支持、中转也支持：画面每帧一条帧流（见 airhand_proto::session 的"帧流"）
+        let frames = (admitted.negotiated.features.has(features::session::FRAMES) && inc.frames)
+            .then(|| Arc::new(FrameStreams::default()));
+        let video_send = match &frames {
+            Some(f) => Video::Frames(f.clone()),
+            None => Video::Stream(open_lane(conn, session_id, SessionLane::Video).await?),
+        };
+        info!(session_id, frames = frames.is_some(), "video lanes");
         let (out, ctl_rx, bulk_rx) = queue::channel();
         let (video_tx, video_rx) = mpsc::channel(video_queue);
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
@@ -327,7 +359,10 @@ impl HostStreams {
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
         let pong = datagrams.clone();
-        let express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }));
+        let mut express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }));
+        if let Some(f) = frames {
+            express = express.with_frames(f);
+        }
         let incoming = ControllerReceiver::new(control_rx, bulk_rx, confirm_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
         let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
@@ -476,7 +511,7 @@ async fn read_all(r: Readers) -> Result<()> {
                 ControllerDatagram::Echo { t } => {
                     let _ = echoes.try_send((via, t));
                 }
-                ControllerDatagram::Ack { .. } => {}
+                ControllerDatagram::Ack { .. } | ControllerDatagram::Lost { .. } => {}
             }
             express.datagram(m);
         }
@@ -687,6 +722,43 @@ mod tests {
         assert_eq!(incoming.silent_for(), Duration::ZERO);
     }
 
+    /// 控制端等不到帧了：读任务马上交给平台；平台要恢复的话，之后的帧流放弃，确认了的帧流忘掉
+    #[tokio::test]
+    async fn lost_frames_abandon_their_streams_when_the_platform_recovers() {
+        struct Recover(Mutex<Vec<u32>>, bool);
+        impl Acks for Recover {
+            fn ack(&self, _: u32, _: u64) {}
+            fn lost(&self, decoded: u32) -> bool {
+                self.0.lock().unwrap().push(decoded);
+                self.1
+            }
+        }
+        let (client, _server) = crate::tests::quic_pair().await;
+        for recover in [false, true] {
+            let frames = Arc::new(FrameStreams::default());
+            for seq in 1..=4 {
+                frames.add_for_test(seq, client.open_uni().await.unwrap());
+            }
+            let express = Express::new(|_| {}).with_frames(frames.clone());
+            // 平台还没接上：什么也不做
+            express.datagram(ControllerDatagram::Lost { decoded: 1 });
+            assert_eq!(frames.len_for_test(), 4);
+            let platform = Arc::new(Recover(Mutex::default(), recover));
+            let incoming = ControllerReceiver::new(
+                mpsc::channel(1).1,
+                mpsc::channel(1).1,
+                oneshot::channel().1,
+                express.clone(),
+            );
+            incoming.set_acks(platform.clone());
+            express.datagram(ControllerDatagram::Ack { seq: 1, arrived: 0 });
+            assert_eq!(frames.len_for_test(), 3);
+            express.datagram(ControllerDatagram::Lost { decoded: 2 });
+            assert_eq!(*platform.0.lock().unwrap(), [2]);
+            assert_eq!(frames.len_for_test(), if recover { 1 } else { 3 });
+        }
+    }
+
     /// 控制端麦克风的声音数据报：读任务解开、去掉副本，一包一包按先后交给平台；丢了的从下一个数据报里补上。
     /// 解不开的、重放的丢掉；平台还没设好接收时收到的也丢掉
     #[tokio::test]
@@ -808,7 +880,11 @@ mod tests {
             send.write_all(&next).await.unwrap();
             // 对方写了东西，这边才接得到这条流
             frames_tx
-                .send((server.accept_uni().await.unwrap(), Via::Relay))
+                .send(crate::lanes::LaneStream {
+                    recv: server.accept_uni().await.unwrap(),
+                    via: Via::Relay,
+                    frame: false,
+                })
                 .ok();
 
             let (control_tx, mut control_rx) = mpsc::channel(4);

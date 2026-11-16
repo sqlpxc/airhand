@@ -21,7 +21,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// 交给界面的包（线上的包去掉长度前缀）
-fn packet(header: &[u8; media::HEADER_LEN], payload: &[u8]) -> Vec<u8> {
+fn packet(header: &[u8], payload: &[u8]) -> Vec<u8> {
     media::frame(header, &[payload])[4..].to_vec()
 }
 
@@ -159,6 +159,7 @@ fn fixture() -> Value {
         width: 1920,
         height: 1080,
         capture_us,
+        reference: None,
     };
     let audio = AudioHeader {
         seq: 3,
@@ -172,6 +173,14 @@ fn fixture() -> Value {
         width: 1280,
         height: 720,
         capture_us: capture_us + 16_667,
+        reference: None,
+    };
+    // 带参考帧扩展的增量帧（协议 v10，头的长度是 30）：界面不用管它，照样按头的长度找负载
+    let referenced = VideoHeader {
+        seq: 11,
+        reference: Some(10),
+        capture_us: capture_us + 33_333,
+        ..delta
     };
     let shape = CursorShape {
         width: 2,
@@ -233,6 +242,11 @@ fn fixture() -> Value {
                 "name": "delta frame", "hex": hex(&packet(&delta.encode(), &[1])),
                 "kind": 1, "seq": 10, "key": false, "codec": "h265", "width": 1280, "height": 720,
                 "captureUs": capture_us + 16_667, "payload": "01"
+            },
+            {
+                "name": "delta frame with a reference", "hex": hex(&packet(&referenced.encode(), &[2, 3])),
+                "kind": 1, "seq": 11, "key": false, "codec": "h265", "width": 1280, "height": 720,
+                "captureUs": capture_us + 33_333, "payload": "0203"
             },
             {
                 "name": "audio", "hex": hex(&packet(&audio.encode(), &[0xfc, 0xff, 0xfe])),
@@ -358,7 +372,9 @@ fn media_packets_decode() {
         (9, true, Codec::AV1, 1920)
     );
     assert_eq!(media::payload(&v), Some(&[7, 8, 9][..]));
-    let a = unhex(f["media"][2]["hex"].as_str().unwrap());
+    let r = unhex(f["media"][2]["hex"].as_str().unwrap());
+    assert_eq!(VideoHeader::decode(&r).unwrap().reference, Some(10));
+    let a = unhex(f["media"][3]["hex"].as_str().unwrap());
     assert!(AudioHeader::decode(&a).unwrap().start);
     for m in f["media"].as_array().unwrap() {
         let p = unhex(m["hex"].as_str().unwrap());

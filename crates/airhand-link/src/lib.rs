@@ -12,7 +12,8 @@
 //!   画面和事件交给 [`controller::SessionUi`]；
 //! * [`console`]（feature `console`）：控制台和控制端服务之间的 WebSocket 协议，桌面版和网页版共用；
 //! * [`host`]：被控端与服务器的连接和会话（协议层的事在这里，采集、编码、注入输入由各平台实现 [`host::Platform`]）；
-//! * [`flow`]：被控端的在途控制（按字节）和码率控制（按排队时延和带宽估计）；
+//! * [`flow`]：被控端的在途控制（按字节）和码率控制（按排队时延和带宽估计）；[`refs`]：每一帧参考哪一帧、
+//!   控制端等不到帧时从哪一帧恢复（长期参考帧、参考帧失效）；
 //! * [`Problem`]：显示给用户的问题，以类型而不是文字的形式传给界面。
 //!
 //! 两端的消息通道用同一种发送队列（`queue`：只留最新值的槽位 + 有界的队列），时钟在 `clock`。
@@ -49,6 +50,8 @@ pub mod paths;
 mod problem;
 #[cfg(feature = "client")]
 mod queue;
+#[cfg(feature = "client")]
+pub mod refs;
 #[cfg(feature = "client")]
 pub mod secure;
 #[cfg(feature = "client")]

@@ -36,7 +36,13 @@
 //! 把头变长，负载照样从"头的长度"处开始，旧的界面不认识新字段、跳过它们就行。
 //!
 //! 24 字节之后是一串扩展，每个是 `类型 u8 | 长度 u8 | 值`（TLV）：每个扩展自己说明有多长，
-//! 新的扩展不依赖别的扩展在不在、排在第几，读的一方只取认识的类型。现在还没有扩展。所以读的一方必须：
+//! 新的扩展不依赖别的扩展在不在、排在第几，读的一方只取认识的类型。现在有的扩展：
+//!
+//! | 类型 | 长度 | 用在 | 值 |
+//! |-----:|-----:|------|----|
+//! | 1    | 4    | 画面 | 参考帧：`u32 LE` 的帧序号（见下面的"参考帧"） |
+//!
+//! 所以读的一方必须：
 //!
 //! * 从第 3 个字节读头的长度、从那里开始取负载，**不能**写死 24；
 //! * 忽略不认识的标志位、为 0 的保留字节（以后可能有值）、24 字节之后不认识的部分；
@@ -45,6 +51,19 @@
 //! 现在的三种实现（这里、`client/src/lib/media.ts`、Android 的 `Media`）都按这个规则读。
 //!
 //! 采集时间是被控端的时钟，画面和声音是同一个时钟，控制端据此做音画同步。
+//!
+//! # 参考帧
+//!
+//! 增量帧要在它参考的帧解出来之后才解得了。哪些帧解得了，控制端交给解码器之前就要知道：交给解码器的增量帧缺了参考帧，
+//! 硬件解码器多半不报错，而是解出花屏。所以画面包可以带一个**参考帧**扩展（[`VideoHeader::reference`]）：
+//!
+//! * 这一帧只从第 `reference` 帧预测，以及那一帧自己依赖的帧（它的参考帧，一直往前到关键帧）。那一帧交给过解码器，
+//!   这一帧就解得了，中间的帧丢没丢都不要紧（例如被控端放弃了它们之后，从控制端解到了的长期参考帧接着编，
+//!   见 [`crate::session`] 的"帧流"）；
+//! * 关键帧不带它（什么都不依赖）；
+//! * 不带它的增量帧（旧版本的被控端）依赖这条通道上的前一帧（加密的计数紧挨着的那一帧，见 [`crate::handshake`]）。
+//!
+//! 控制端只按这个判断，不解析码流；界面不用管它（头的长度照常跳过扩展）。
 //!
 //! 光标的形状按槽位缓存（[`CURSOR_SLOTS`](crate::session::CURSOR_SLOTS)）：带新形状（bit1）的包后面是 RGBA，
 //! 界面把它存进字节 2 给出的槽位并换成它；带旧形状（bit2）的包没有数据，换成这个槽位里已有的形状；
@@ -76,8 +95,13 @@
 
 use crate::session::{Codec, CursorShape, CursorVisibility};
 
-/// 本版本写的媒体包头的长度，也是头最短的长度（读的时候按第 3 个字节，见 [`header_len`]）
+/// 媒体包头定长部分的长度，也是头最短的长度（读的时候按第 3 个字节，见 [`header_len`]）。
+/// 声音包、光标包的头就是这么长；画面包带扩展时更长（[`VideoHeader::encode`]）
 pub const HEADER_LEN: usize = 24;
+/// 本版本写的头最长多长（定长部分加上本版本会写的扩展）
+pub const MAX_HEADER_LEN: usize = 32;
+/// 扩展：参考帧（见模块说明的"参考帧"）
+const EXT_REFERENCE: u8 = 1;
 /// 画面包上限（一个 4K 关键帧也远小于这个值）
 pub const MAX_VIDEO_PACKET: usize = 32 * 1024 * 1024;
 /// 声音数据报的明文（[`audio_datagram`]）上限：加密之后正好放得进一个数据报（[`crate::datagram::MAX`]）
@@ -156,6 +180,45 @@ fn u64_at(b: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
 }
 
+/// 编好的头：定长部分加上扩展（[`VideoHeader::encode`]），当作 `&[u8]` 用
+#[derive(Clone, Copy)]
+pub struct Header {
+    buf: [u8; MAX_HEADER_LEN],
+    len: u8,
+}
+
+impl std::ops::Deref for Header {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+}
+
+impl std::ops::DerefMut for Header {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.len as usize]
+    }
+}
+
+impl std::fmt::Debug for Header {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// 头的扩展（见模块说明的"以后加字段"）：`(类型, 值)`。格式不对的地方（长度超出了头）之后的都不要
+fn extensions(packet: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut ext = header_len(packet).map_or(&[][..], |n| &packet[HEADER_LEN..n]);
+    std::iter::from_fn(move || {
+        let [t, l, rest @ ..] = ext else {
+            return None;
+        };
+        let value = rest.get(..*l as usize)?;
+        ext = &rest[*l as usize..];
+        Some((*t, value))
+    })
+}
+
 /// 画面包的头
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoHeader {
@@ -166,19 +229,33 @@ pub struct VideoHeader {
     pub width: u16,
     pub height: u16,
     pub capture_us: u64,
+    /// 参考帧（扩展，见模块说明的"参考帧"）：这一帧只依赖这一帧（和它依赖的）。关键帧、旧版本的被控端没有
+    pub reference: Option<u32>,
 }
 
 impl VideoHeader {
-    pub fn encode(&self) -> [u8; HEADER_LEN] {
+    pub fn encode(&self) -> Header {
         debug_assert!(self.codec.is_known(), "encoding with an unknown codec");
-        let mut h = new_header(Kind::Video);
+        let mut buf = [0u8; MAX_HEADER_LEN];
+        let h = &mut buf[..HEADER_LEN];
+        h.copy_from_slice(&new_header(Kind::Video));
         h[1] = if self.key { FLAG_KEY } else { 0 };
         h[2] = self.codec.code() as u8;
         h[4..8].copy_from_slice(&self.seq.to_le_bytes());
         h[8..10].copy_from_slice(&self.width.to_le_bytes());
         h[10..12].copy_from_slice(&self.height.to_le_bytes());
         h[16..24].copy_from_slice(&self.capture_us.to_le_bytes());
-        h
+        let mut len = HEADER_LEN;
+        if let Some(r) = self.reference.filter(|_| !self.key) {
+            buf[len..len + 2].copy_from_slice(&[EXT_REFERENCE, 4]);
+            buf[len + 2..len + 6].copy_from_slice(&r.to_le_bytes());
+            len += 6;
+        }
+        buf[3] = len as u8;
+        Header {
+            buf,
+            len: len as u8,
+        }
     }
 
     /// 解析画面包的头；不是画面包或者编码格式不认识时为 `None`
@@ -193,13 +270,19 @@ impl VideoHeader {
             return None;
         }
         let codec = Codec::from_code(packet[2] as u32);
+        let key = packet[1] & FLAG_KEY != 0;
+        let reference = extensions(packet)
+            .find(|(t, v)| *t == EXT_REFERENCE && v.len() == 4)
+            .map(|(_, v)| u32::from_le_bytes(v.try_into().unwrap()))
+            .filter(|_| !key);
         Some(Self {
             seq: u32_at(packet, 4),
-            key: packet[1] & FLAG_KEY != 0,
+            key,
             codec,
             width: u16_at(packet, 8),
             height: u16_at(packet, 10),
             capture_us: u64_at(packet, 16),
+            reference,
         })
     }
 }
@@ -323,11 +406,13 @@ pub fn cursor_packet(c: &CursorState) -> Vec<u8> {
     buf
 }
 
-/// 线上的一个媒体包（加密之前）：长度前缀 + 头 + 负载。负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
+/// 线上的一个媒体包（加密之前）：长度前缀 + 头（定长部分和扩展，见 [`VideoHeader::encode`]）+ 负载。
+/// 负载可以分几段给出（例如参数集 + 关键帧），一次拷贝拼好。
 /// 多留了加密开销（标签和计数）的容量：原地加密时不用重新分配（画面包可能有几 MiB）。
 /// 声音包也用它（发成数据报时和之前几包的副本拼在一起，见 [`audio_datagram`]），发送队列里画面、声音是同一种东西
-pub fn frame(header: &[u8; HEADER_LEN], payload: &[&[u8]]) -> Vec<u8> {
-    let len = HEADER_LEN + payload.iter().map(|p| p.len()).sum::<usize>();
+pub fn frame(header: &[u8], payload: &[&[u8]]) -> Vec<u8> {
+    debug_assert!(header.len() >= HEADER_LEN);
+    let len = header.len() + payload.iter().map(|p| p.len()).sum::<usize>();
     let mut buf = Vec::with_capacity(4 + len + crate::handshake::SEAL_OVERHEAD);
     buf.extend_from_slice(&(len as u32).to_le_bytes());
     buf.extend_from_slice(header);
@@ -350,6 +435,7 @@ mod tests {
             width: 1920,
             height: 1080,
             capture_us: 100,
+            reference: None,
         }
         .encode()
         .to_vec();
@@ -363,6 +449,41 @@ mod tests {
         assert!(VideoHeader::decode_any(&packet).is_none());
     }
 
+    /// 参考帧扩展：增量帧带着它（头变长，负载照样从头的长度处开始）；关键帧不带；
+    /// 不认识的扩展、格式不对的扩展不影响读出认识的字段
+    #[test]
+    fn the_reference_extension() {
+        let delta = VideoHeader {
+            seq: 10,
+            key: false,
+            codec: Codec::H265,
+            width: 1280,
+            height: 720,
+            capture_us: 5,
+            reference: Some(7),
+        };
+        let wire = frame(&delta.encode(), &[&[1, 2]]);
+        let p = &wire[4..];
+        assert_eq!(header_len(p), Some(30));
+        assert_eq!(&p[24..30], &[1, 4, 7, 0, 0, 0]);
+        assert_eq!(VideoHeader::decode(p), Some(delta));
+        assert_eq!(payload(p), Some(&[1, 2][..]));
+        // 关键帧什么都不依赖：不写
+        let key = VideoHeader { key: true, ..delta };
+        assert_eq!(key.encode().len(), HEADER_LEN);
+        assert_eq!(VideoHeader::decode(&key.encode()).unwrap().reference, None);
+        // 以后的扩展排在前面、后面跟着格式不对的：认识的照样读出来，不认识的跳过
+        let mut p = delta.encode()[..HEADER_LEN].to_vec();
+        p.extend_from_slice(&[9, 2, 0xaa, 0xbb, 1, 4, 3, 0, 0, 0, 7, 200]);
+        p[3] = p.len() as u8;
+        assert_eq!(VideoHeader::decode(&p).unwrap().reference, Some(3));
+        // 长度不对的参考帧不算
+        let mut bad = delta.encode()[..HEADER_LEN].to_vec();
+        bad.extend_from_slice(&[1, 2, 3, 0]);
+        bad[3] = bad.len() as u8;
+        assert_eq!(VideoHeader::decode(&bad).unwrap().reference, None);
+    }
+
     #[test]
     fn video_header_roundtrip() {
         let h = VideoHeader {
@@ -372,6 +493,7 @@ mod tests {
             width: 1920,
             height: 1080,
             capture_us: 0x0102_0304_0506_0708,
+            reference: None,
         };
         let wire = frame(&h.encode(), &[&[7; 3], &[8; 2]]);
         assert_eq!(u32::from_le_bytes(wire[..4].try_into().unwrap()), 29);

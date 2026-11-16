@@ -111,6 +111,9 @@ pub struct Incoming {
     pub approvals: ApprovalSlots,
     /// 直连（见 [`crate::direct`]）：这条服务器连接上的 [`DirectHub`] 和服务器看到的本机地址；`None`：不建直连
     pub direct: Option<HostLink>,
+    /// 服务器转发帧流（和它商定的信令版本不低于 `airhand_proto::SIGNAL_FRAMES`）：控制端也支持的话，
+    /// 画面每帧一条流（见 `airhand_proto::session` 的"帧流"）
+    pub frames: bool,
 }
 
 /// 被控端服务：一直连着服务器，直到 future 被丢掉（丢掉时依次释放会话、QUIC 连接）。
@@ -260,6 +263,7 @@ where
                             hub: hub.clone(),
                             observed,
                         }),
+                        frames: sig.version >= airhand_proto::SIGNAL_FRAMES,
                     });
                     sessions.spawn(async move {
                         run.await;

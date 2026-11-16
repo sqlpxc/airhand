@@ -100,6 +100,11 @@ impl Acks for VideoAcks {
     fn path_changed(&self, lost: bool) {
         self.shared.video.path_changed(self.id, lost);
     }
+
+    /// 控制端等不到帧了（帧流）：MediaCodec 不能控制长期参考帧，这个会话从关键帧重新加入
+    fn lost(&self, decoded: u32) -> bool {
+        self.shared.video.lost(self.id, decoded)
+    }
 }
 
 impl Platform for Phone {

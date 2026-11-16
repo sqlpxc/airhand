@@ -3,6 +3,9 @@
 //! * 两端开过来的通道（单向流，开头是会话头）转给另一端：服务器向另一端开一条单向流、写同样的会话头，
 //!   然后以 `Bytes` 块为单位零拷贝透传（[`pipe`]）。不用配对，也不管通道是什么：每端每条通道只能开一次，最多
 //!   [`airhand_proto::MAX_LANES`] 条；
+//! * 帧流（会话头带 `SessionHeader::FRAME`，信令 v10，见 `airhand_proto` 的 crate 说明）：同一条通道可以开很多条，
+//!   每端同时开着的不超过 [`MAX_FRAME_STREAMS`]，转发的办法一样。一端放弃了一条帧流（reset），转给另一端的那条也 reset；
+//!   另一端叫停了（stop），这一端的也叫停。控制通道不能是帧流；
 //! * 会话的数据报按开头的会话 ID 在两端之间原样转发（[`Broker::relay_datagrams`]）。
 //!
 //! 任何一端的控制通道（0 号）结束，整个会话结束：其它通道随之断开、不再转发数据报、归还会话槽位。
@@ -11,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use airhand_proto::{Role, SessionHeader, SessionLane, datagram};
+use airhand_proto::{MAX_FRAME_STREAMS, Role, SessionHeader, SessionLane, datagram};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::{RecvStream, SendStream, VarInt};
 use rand::Rng;
@@ -34,6 +37,8 @@ pub(super) struct Session {
     created: Instant,
     /// 每一端开过哪些通道（第 i 位是 i 号通道），`[被控端, 控制端]`
     opened: [u8; 2],
+    /// 每一端同时开着几条帧流（见模块说明），`[被控端, 控制端]`
+    frames: [u16; 2],
     /// 会话结束时告诉所有转发任务
     ended: watch::Sender<bool>,
     /// 被控端的一个会话槽位，会话结束时归还
@@ -55,6 +60,7 @@ impl Session {
             ctrl,
             created: Instant::now(),
             opened: [0; 2],
+            frames: [0; 2],
             ended: watch::Sender::new(false),
             _slot: slot,
             label,
@@ -199,7 +205,24 @@ impl Broker {
         }
     }
 
-    /// 一条通道：读会话头，向会话的另一端开一条单向流、写同样的会话头，转发到结束。控制通道结束时整个会话结束
+    /// 会话 `session_id` 的被控端现在开着几条帧流（测试用）
+    #[cfg(test)]
+    pub(super) fn host_frame_streams(&self, session_id: u64) -> u16 {
+        self.sessions
+            .lock()
+            .get(&session_id)
+            .map_or(0, |s| s.frames[0])
+    }
+
+    /// 一条帧流转发完了（或者没转成）：会话 `session_id` 第 `side` 端开着的帧流少了一条
+    fn frame_done(&self, session_id: u64, side: usize) {
+        if let Some(s) = self.sessions.lock().get_mut(&session_id) {
+            s.frames[side] = s.frames[side].saturating_sub(1);
+        }
+    }
+
+    /// 一条通道（或者一条帧流）：读会话头，向会话的另一端开一条单向流、写同样的会话头，转发到结束。
+    /// 控制通道结束时整个会话结束
     async fn forward(
         self: Arc<Self>,
         conn_id: u64,
@@ -215,6 +238,11 @@ impl Broker {
             bail!("invalid session header");
         };
         let session_id = h.session_id;
+        let frame = h.is_frame();
+        if frame && h.lane == SessionLane::Control as u8 {
+            reject(recv);
+            bail!("a frame stream on the control lane");
+        }
         let found = {
             let mut sessions = self.sessions.lock();
             sessions.get_mut(&session_id).and_then(|s| {
@@ -223,20 +251,28 @@ impl Broker {
                     Role::Controller if s.ctrl.0 == conn_id => 1,
                     _ => return None,
                 };
-                let bit = 1 << h.lane;
-                if s.opened[side] & bit != 0 {
-                    return Some(Err(h.lane));
+                if frame {
+                    // 帧流：同一条通道可以开很多条，只限制同时开着的条数
+                    if s.frames[side] >= MAX_FRAME_STREAMS {
+                        return Some(Err("too many frame streams are open"));
+                    }
+                    s.frames[side] += 1;
+                } else {
+                    let bit = 1 << h.lane;
+                    if s.opened[side] & bit != 0 {
+                        return Some(Err("the lane was opened twice"));
+                    }
+                    s.opened[side] |= bit;
                 }
-                s.opened[side] |= bit;
                 let peer = s.peer_of(conn_id).expect("one of the two ends").clone();
-                Some(Ok((peer, s.ended.subscribe())))
+                Some(Ok((peer, s.ended.subscribe(), side)))
             })
         };
-        let (peer, ended) = match found {
+        let (peer, ended, side) = match found {
             Some(Ok(found)) => found,
-            Some(Err(lane)) => {
+            Some(Err(why)) => {
                 reject(recv);
-                bail!("session lane {lane} was opened twice");
+                bail!("session lane {} rejected: {why}", h.lane);
             }
             None => {
                 reject(recv);
@@ -251,19 +287,21 @@ impl Broker {
             send.write_all(&h.encode()).await?;
             anyhow::Ok(send)
         };
-        match timeout(HANDSHAKE_TIMEOUT, open).await {
-            Ok(Ok(send)) => pipe(recv, send, ended).await,
+        let piped = match timeout(HANDSHAKE_TIMEOUT, open).await {
+            Ok(Ok(send)) => {
+                pipe(recv, send, ended).await;
+                Ok(())
+            }
             r => {
                 reject(recv);
-                if h.lane == SessionLane::Control as u8 {
-                    self.end_session(session_id);
-                }
-                bail!("can't open the lane to the other end: {r:?}");
+                Err(anyhow!("can't open the lane to the other end: {r:?}"))
             }
-        }
-        if h.lane == SessionLane::Control as u8 {
+        };
+        if frame {
+            self.frame_done(session_id, side);
+        } else if h.lane == SessionLane::Control as u8 {
             self.end_session(session_id);
         }
-        Ok(())
+        piped
     }
 }

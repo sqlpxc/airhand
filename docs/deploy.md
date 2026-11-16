@@ -6,6 +6,8 @@
 
 The server listens on **UDP 4433**. On first start it generates a self-signed certificate in the `data/` directory next to `docker-compose.yml`. **Keep that directory**: clients recognise the server by the certificate's fingerprint, and it holds the SQLite database with the hosts' fixed control codes (`airhand.db`, plus its `-wal` / `-shm` files while the server runs). Every host that keeps its code (the desktop client with its `config.toml`, Android) gets the same code back from it, however long it has been offline.
 
+**Upgrading**: the server speaks signaling v9 and v10, so old and new clients can be mixed. Only a v10 server relays video frame streams (one stream per frame, so a lost packet doesn't hold up the frames behind it, see [How it works → Frame streams and reference invalidation](architecture.md#frame-streams-and-reference-invalidation)); a v9 server still works, but the video stays a single stream. Upgrade the server along with the clients.
+
 Environment variables (see `docker-compose.yml`):
 
 | Variable | Default | Description |

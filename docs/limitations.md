@@ -7,11 +7,13 @@
 - The clipboard syncs text only, not files
 - Audio is captured after the host's volume control, so a muted host sends silence
 - The controller's microphone only reaches Windows hosts that have Steam Streaming Microphone (Steam installed and Steam Remote Play used once): Airhand has no virtual sound card driver of its own. macOS, Linux and Android hosts can't take it yet, and the Android controller can't send it yet
-- Sessions are end-to-end encrypted, so the relay can't see their content, but it still knows who connected to whom, when, and how much traffic flowed (see [Security](security.md#end-to-end-encryption))
+- Sessions are end-to-end encrypted, so the relay can't see their content, but it still knows who connected to whom, when, and how much traffic flowed, and with one stream per video frame also how large each frame is (see [Security](security.md#end-to-end-encryption))
 - The web console is where end-to-end encryption ends: the machine running it can see the picture
 - On the first connection to a computer its identity is whatever was seen then (like SSH): only the pairing code (or comparing the safety code) proves nobody is impersonating it
 - The direct path relies on hole punching only: when both ends are behind symmetric NATs (common with some carriers' carrier-grade NAT and on corporate networks) and don't both have public IPv6, or a firewall blocks UDP, it doesn't work and the session stays on the relay; there's no UPnP / NAT-PMP port mapping. When an established direct path suddenly breaks (for example the host switches networks), the video stalls for about a second (until the host notices, moves back to the relay and encodes a keyframe) before the direct path is tried again
 - While the direct path is up, the control lane is sent on both paths (the relay always has a complete copy) and the bulk lane (clipboard, cursor images) only over the relay: the relay carries much less traffic without video and audio, but not none
+- Recovering a lost frame from a long-term reference frame (instead of a keyframe) currently only works with Windows hardware encoders: H.264 (NVIDIA, Intel) and NVIDIA AV1. HEVC, macOS (VideoToolbox), Linux and software encoding (OpenH264) and Android (MediaCodec) send a keyframe (see [How it works → Frame streams and reference invalidation](architecture.md#frame-streams-and-reference-invalidation))
+- One stream per video frame also needs a v10 relay server: older servers still work, but video stays a single stream, so one lost packet holds up the frames behind it
 
 ## Windows
 

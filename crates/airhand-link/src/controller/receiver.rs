@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::audio::Unbundler;
 use crate::lanes::Via;
-use crate::merge::Merge;
+use crate::merge::{Merge, Video};
 use crate::paths::DatagramSender;
 use crate::secure::Opener;
 use crate::transport::{next_msg, open_datagram};
@@ -25,15 +25,16 @@ pub enum FromHost {
     Control(HostMsg),
     /// 回应 Ping（`HostDatagram::Pong`）：`t` 是 Ping 里的时刻
     Pong(u64),
-    /// 画面包（`airhand_proto::media` 格式：头 + 码流），原样交给界面。`arrived`：开始从网络上到达的时刻
+    /// 画面包（`airhand_proto::media` 格式：头 + 码流），解得了，原样交给界面。`arrived`：开始从网络上到达的时刻
     /// （控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerDatagram::Ack`）。
-    /// `direct`：从直连来的；`gap`：前面有帧没等到（断在了直连上），要一个关键帧（见 [`crate::merge`]）
+    /// `direct`：从直连来的
     Video {
         packet: Vec<u8>,
         arrived: u64,
         direct: bool,
-        gap: bool,
     },
+    /// 画面通道上别的事：解不了的帧、等不到的帧、要关键帧（见 [`crate::merge::Video`]）
+    VideoEvent(Video),
     /// 声音包（`airhand_proto::media` 格式：头 + Opus 包），原样交给界面。一个数据报里带着之前几包的副本，
     /// 拆开之后只交出没收过的（丢了的包这样补回来，见 `crate::audio`），一个一个、按采集先后
     Audio(Vec<u8>),
@@ -89,6 +90,11 @@ impl HostReceiver {
         }
     }
 
+    /// 往返时延（毫秒，Ping / Pong 量的）：画面据此决定缺着的帧等多久（见 [`crate::merge`]）
+    pub fn set_rtt(&mut self, rtt_ms: f64) {
+        self.video.set_rtt(rtt_ms);
+    }
+
     /// 下一样东西。控制消息优先；控制通道结束了就是会话结束了（其它通道先结束不算）。可以放在 `select!` 里
     pub async fn recv(&mut self) -> Result<FromHost> {
         loop {
@@ -119,15 +125,15 @@ impl HostReceiver {
                     Some(d) => self.open_audio(&d),
                     None => self.audio_open = false,
                 },
-                f = self.video.next(), if self.video_open => match f? {
-                    Some(f) => {
+                f = self.video.next_video(), if self.video_open => match f? {
+                    Some(Video::Frame(f)) => {
                         return Ok(FromHost::Video {
                             packet: f.data,
                             arrived: f.arrived,
                             direct: f.direct,
-                            gap: f.gap,
                         });
                     }
+                    Some(other) => return Ok(FromHost::VideoEvent(other)),
                     None => self.video_open = false,
                 },
             }
