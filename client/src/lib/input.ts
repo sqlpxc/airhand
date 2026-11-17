@@ -1,13 +1,21 @@
 // 输入：把本机的鼠标、键盘变成发给被控端的输入事件，合并后成批发送。
 // 断开 / 换了会话之后，还没发出去的输入全部丢掉：延迟的定时器绝不能把旧输入发给新的会话。
 //
-// 鼠标有两种方式（见 airhand_proto::session 的模块说明）：
-// * 绝对坐标（平时）：本机指针在画面的哪里，被控端的光标就在哪里；
-// * 相对移动（被控端的光标隐藏了，例如游戏里按住右键转视角、第一人称游戏；或者用户手动锁定了鼠标）：
-//   发移动了多少（mouseDelta）。这时尽量锁定本机指针（Pointer Lock）：指针不会碰到屏幕边就停下，
-//   移动量也是鼠标的原始计数（unadjustedMovement）。锁定不了（浏览器不支持、被拒绝）也照样发相对移动。
+// 鼠标有两种发法（见 airhand_proto::session 的"鼠标"）：
+// * 绝对坐标：本机指针在画面的哪里，被控端的光标就在哪里；
+// * 相对移动：发移动了多少（mouseDelta）。这时锁定本机指针（Pointer Lock）：指针不会碰到屏幕边就停下，
+//   移动量也是鼠标的原始计数（unadjustedMovement）。
 //
-// 什么时候锁定：
+// 三种鼠标模式（MouseMode，用户在工具栏的鼠标菜单里选，按设备记住）：
+// * 自动（默认）：平时发绝对坐标；被控端的光标隐藏了（游戏里按住右键转视角、第一人称游戏）时自动锁定、
+//   改发相对移动，光标重新出现时解除。锁定不了（浏览器不支持、被拒绝）也照样发相对移动；
+// * 桌面：一直发绝对坐标，从不锁定（看视频、画图这些会隐藏光标、却不该锁定的软件）。对方隐藏光标时本机显示普通的指针；
+// * 游戏：一直锁定、发相对移动，被控端把光标画进画面里（QualitySettings.drawCursor，session.ts 加上），
+//   本机指针不显示：看到的就是对方真实的光标，不用管它隐藏没有。没锁定的时候（还没点过画面、按 Esc 放开了、
+//   切到别的窗口回来）鼠标什么也不发：点一下画面重新锁定，这一下不发给对方（游戏里点一下可能就是开枪）；
+//   键盘照常发。
+//
+// 自动模式什么时候锁定：
 // * 被控端光标隐藏时按下鼠标键，或者按着键时光标隐藏了（游戏按住右键转视角）：马上锁定；
 // * 被控端光标隐藏时只是移动（第一人称游戏）：持续移动一小会儿光标还是隐藏的才锁定。
 //   Windows 打字时会暂时隐藏光标，鼠标一动就重新出现，这种情况不锁定；
@@ -17,20 +25,21 @@
 //   视角乱跳。实际游戏里还没见过这样跳：以前魔兽世界里按住右键转视角时反复锁定、解除，是锁定后把按着的键当成了松开、
 //   给对方发了松开，游戏真的退出了转视角、光标真的出现了（见 buttonsAfter）。代价：游戏在按着键时真的把光标显示出来
 //   （例如转视角时弹出菜单），要等松开才改回绝对坐标，这期间看不到光标；
-// * 锁定期间按键的状态只跟着按下 / 松开走，不看单纯移动的 buttons（Windows 上锁定时它是 0，见 buttonsAfter）；
-// * 用户按 Esc 解除了锁定：到下一次点击之前不再自动锁定，指针照常显示；
-// * 手动锁定（Ctrl+Alt+Shift+M 或工具栏）：不管被控端光标，直到再切换一次或者按 Esc。
+// * 用户按 Esc 解除了锁定：到下一次点击之前不再自动锁定，指针照常显示。
 //
-// 怎么解除：
+// 不管哪种模式，锁定期间按键的状态只跟着按下 / 松开走，不看单纯移动的 buttons（Windows 上锁定时它是 0，见 buttonsAfter）。
+//
+// 怎么放开鼠标（解除锁定）：
 // * 浏览器自己的 Esc：只在 Esc 没被键盘锁定时有用。全屏时键盘整个被锁定（见 actions.ts），
 //   Esc 交给网页、发给对方（游戏要用），浏览器不再用它解除锁定，而这时指针也碰不到顶端、叫不出工具栏；
-// * 所以锁定时长按 Esc（ESC_HOLD_MS）由这里自己解除：短按照常马上发给对方，按住期间不发自动重复；
-// * Ctrl+Alt+Shift+M：正在发相对移动（手动或自动锁定）就解除，否则手动锁定。
-// 这两种解除和浏览器的 Esc 一样：手动锁定结束，自动锁定到下一次点击之前不再来。
+// * 所以锁定时长按 Esc（ESC_HOLD_MS）由这里自己解除：短按照常马上发给对方，按住期间不发自动重复。
+// 放开之后：自动模式到下一次点击之前不再自动锁定，游戏模式点一下画面重新锁定。
+//
+// Ctrl+Alt+Shift+M：进入 / 退出游戏模式（退出时回到之前的自动或桌面模式）。
 //
 // 同时看对方的好几个显示器（多屏）时，画面是几个 canvas 拼在一起的：事件挂在包着它们的元素上，绝对坐标是指针所在
 // （落在缝里时是最近）的那一路画面上的位置，带着第几路（见 screens.ts 的 hitTest）。
-import type { InputEvent, MouseButton } from "./api";
+import type { InputEvent, MouseButton, MouseMode } from "./api";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
 const META_KEYS = new Set(["MetaLeft", "MetaRight"]);
@@ -46,8 +55,13 @@ const AUTO_LOCK_AFTER_MS = 300;
 const MOVE_INTERVAL_MS = 8;
 /** 锁定时按住 Esc 这么久就解除锁定（见文件开头） */
 const ESC_HOLD_MS = 1000;
+/**
+ * 锁定被拒绝之后，自动锁定（光标隐藏着一直在移动时）这么久之内不再试：被拒绝时每次移动都请求的话，一秒钟能失败几十次
+ * （例如刚解除就又要锁定，浏览器还不让）
+ */
+const LOCK_RETRY_MS = 500;
 
-/** 锁定 / 解除鼠标的快捷键：Ctrl+Alt+Shift+M */
+/** 进入 / 退出游戏模式的快捷键：Ctrl+Alt+Shift+M */
 export function isLockShortcut(e: KeyboardEvent): boolean {
   return e.code === "KeyM" && e.ctrlKey && e.altKey && e.shiftKey && !e.metaKey;
 }
@@ -83,10 +97,16 @@ export class RemoteInput {
   private remoteHidden = false;
   /** 被控端最新说的：光标隐藏着。按着键时 remoteHidden 可能还是 true，松开所有键时再跟上它 */
   private remoteHiddenNow = false;
-  /** 用户手动锁定了鼠标 */
-  private manual = false;
+  /** 鼠标模式（见文件开头） */
+  private _mode: MouseMode = "auto";
+  /** 进入游戏模式之前的模式：Ctrl+Alt+Shift+M 退出游戏模式时回到它 */
+  private lastMode: Exclude<MouseMode, "game"> = "auto";
+  /** 游戏模式下点画面重新锁定的那一下：按下到松开都不发给对方 */
+  private swallowing = false;
   /** 请求了锁定，还没有结果 */
   private lockPending = false;
+  /** 锁定被拒绝了：自动锁定到这个时刻之前不再试（见 LOCK_RETRY_MS） */
+  private lockRetryAt = 0;
   /** 是我们自己解除的锁定（不是用户按了 Esc） */
   private unlocking = false;
   /** 用户按 Esc 解除了锁定：到下一次点击之前不自动锁定 */
@@ -102,8 +122,10 @@ export class RemoteInput {
   /** 按住 Esc 够久就解除锁定的定时器 */
   private escTimer: ReturnType<typeof setTimeout> | undefined;
 
-  /** 鼠标的方式变了（相对移动 / 锁定），界面据此刷新指针和工具栏 */
+  /** 鼠标的方式变了（相对移动 / 锁定 / 鼠标模式），界面据此刷新指针和工具栏 */
   onModeChange: (() => void) | null = null;
+  /** 鼠标模式变了（工具栏、快捷键）：会话据此让对方画不画光标、记进我的设备 */
+  onMouseMode: ((mode: MouseMode) => void) | null = null;
 
   /** `locate`：指针在第几路画面上（多屏）；不给就是整个元素都是第 0 路画面 */
   constructor(canvas: HTMLElement, connected: () => boolean, send: (events: InputEvent[]) => void, locate?: Locate) {
@@ -116,10 +138,42 @@ export class RemoteInput {
   set interactive(v: boolean) {
     this._interactive = v;
     if (!v) {
-      this.manual = false;
       this.cancelEscHold();
       this.unlock();
+      this.swallowing = false;
     }
+  }
+
+  /** 鼠标模式（见文件开头） */
+  get mode(): MouseMode {
+    return this._mode;
+  }
+
+  /**
+   * 换鼠标模式。要在用户操作里调用（点菜单、按快捷键）：游戏模式马上锁定指针，没有用户操作时浏览器不让锁定
+   * （那就等用户点一下画面）。会话刚建好时用记着的模式不算换，不通知（`notify` 为 false）
+   */
+  setMode(mode: MouseMode, notify = true) {
+    if (mode !== "game") this.lastMode = mode;
+    if (mode === this._mode) {
+      // 游戏模式里再选一次游戏模式：重新锁定（例如放开了鼠标之后）
+      if (mode === "game") this.lock();
+      return;
+    }
+    this._mode = mode;
+    this.userUnlocked = false;
+    this.hiddenMoveSince = null;
+    this.frac = { x: 0, y: 0 };
+    if (mode === "game") this.lock();
+    // 自动模式下对方的光标还隐藏着（例如从游戏模式回来时游戏还在转视角）：接着锁定
+    else if (mode === "desktop" || !this.remoteHidden) this.unlock();
+    this.onModeChange?.();
+    if (notify) this.onMouseMode?.(mode);
+  }
+
+  /** Ctrl+Alt+Shift+M：进入 / 退出游戏模式（退出时回到之前的模式）。要在用户操作里调用 */
+  toggleGame() {
+    this.setMode(this._mode === "game" ? this.lastMode : "game");
   }
 
   /** 本机指针锁定在画面上了 */
@@ -129,12 +183,22 @@ export class RemoteInput {
 
   /** 鼠标现在发相对移动 */
   get relative(): boolean {
-    return this.locked || this.manual || (this.remoteHidden && !this.userUnlocked);
+    switch (this._mode) {
+      // 浏览器不能锁定指针时游戏模式也照样发相对移动（指针会停在屏幕边上）
+      case "game": return this.locked || !this.canLock;
+      case "desktop": return false;
+      default: return this.locked || (this.remoteHidden && !this.userUnlocked);
+    }
   }
 
-  /** 用户手动锁定了鼠标（工具栏显示为按下） */
-  get manualLock(): boolean {
-    return this.manual;
+  /** 游戏模式下指针没有锁定（还没点过画面、放开了鼠标、切走过）：鼠标不发给对方，点一下画面重新锁定 */
+  get gamePaused(): boolean {
+    return this._mode === "game" && !this.relative;
+  }
+
+  /** 这个浏览器能锁定指针 */
+  private get canLock(): boolean {
+    return typeof (this.canvas as unknown as Partial<Lockable>).requestPointerLock === "function";
   }
 
   reset() {
@@ -151,10 +215,11 @@ export class RemoteInput {
     this.remoteHiddenNow = false;
     this.hiddenMoveSince = null;
     this.userUnlocked = false;
+    this.swallowing = false;
     this.cancelEscHold();
     this.unlock();
   }
-  dispose() { this.manual = false; this.reset(); this.abort.abort(); }
+  dispose() { this.reset(); this.abort.abort(); }
   releaseAll() {
     this.pressed.clear();
     this.buttons = 0;
@@ -216,33 +281,23 @@ export class RemoteInput {
     if (this.remoteHidden === hidden) return;
     this.remoteHidden = hidden;
     this.hiddenMoveSince = null;
-    if (hidden) {
-      // 按着键时光标隐藏了（游戏按住右键转视角）：马上锁定，按下鼠标键的那一下还算用户操作
-      if (this._interactive && this.buttons !== 0 && !this.userUnlocked) this.lock();
-    } else {
-      this.userUnlocked = false;
-      if (!this.manual) this.unlock();
-    }
-    this.frac = { x: 0, y: 0 };
-    this.onModeChange?.();
-  }
-
-  /** 手动锁定 / 解锁鼠标（需要在用户操作里调用：点击、按键） */
-  toggleLock() {
-    this.manual = !this.manual;
-    if (this.manual) {
-      this.userUnlocked = false;
-      this.lock();
-    } else if (!this.remoteHidden) {
-      this.unlock();
+    // 只有自动模式跟着对方的光标锁定、解除；别的模式只是记下来（换回自动模式时用）
+    if (this._mode === "auto") {
+      if (hidden) {
+        // 按着键时光标隐藏了（游戏按住右键转视角）：马上锁定，按下鼠标键的那一下还算用户操作
+        if (this._interactive && this.buttons !== 0 && !this.userUnlocked) this.lock();
+      } else {
+        this.userUnlocked = false;
+        this.unlock();
+      }
+      this.frac = { x: 0, y: 0 };
     }
     this.onModeChange?.();
   }
 
-  /** 用户解除锁定（长按 Esc、快捷键）：和浏览器的 Esc 一样，手动锁定结束，自动锁定到下一次点击之前不再来 */
+  /** 用户放开鼠标（长按 Esc）：和浏览器的 Esc 一样，自动模式到下一次点击之前不再自动锁定，游戏模式点一下画面再锁定 */
   release() {
-    this.manual = false;
-    if (this.remoteHidden) this.userUnlocked = true;
+    if (this._mode === "auto" && this.remoteHidden) this.userUnlocked = true;
     this.hiddenMoveSince = null;
     this.frac = { x: 0, y: 0 };
     this.unlock();
@@ -282,7 +337,8 @@ export class RemoteInput {
     };
     attempt(true)
       .catch((e: unknown) => ((e as { name?: string })?.name === "NotSupportedError" ? attempt(false) : Promise.reject(e)))
-      // 锁定不了（例如没有用户操作、浏览器不允许）：照样发相对移动，只是指针会停在屏幕边上
+      // 锁定不了（例如没有用户操作、浏览器不允许）：自动模式照样发相对移动，只是指针会停在屏幕边上；
+      // 游戏模式等用户点画面
       .catch(() => {})
       .finally(() => { this.lockPending = false; });
   }
@@ -297,11 +353,8 @@ export class RemoteInput {
     this.lockPending = false;
     this.frac = { x: 0, y: 0 };
     if (!this.locked) {
-      if (!this.unlocking) {
-        // 用户按了 Esc（或者浏览器收回了锁定）：手动锁定就此结束；自动锁定到下一次点击之前不再来
-        if (this.manual) this.manual = false;
-        else if (this.remoteHidden) this.userUnlocked = true;
-      }
+      // 用户按了 Esc（或者浏览器收回了锁定）：自动锁定到下一次点击之前不再来；游戏模式等用户点画面
+      if (!this.unlocking && this._mode === "auto" && this.remoteHidden) this.userUnlocked = true;
       this.unlocking = false;
     }
     this.onModeChange?.();
@@ -361,14 +414,16 @@ export class RemoteInput {
 
   /** 一个指针事件：位置（绝对坐标时）+ 按键变化。`move`：是 pointermove */
   private pointer(e: PointerEvent, urgent: boolean, move = false) {
+    // 游戏模式没锁定：什么也不发（不发绝对坐标，对方的光标留在原处）；点画面重新锁定的那一下也不发
+    if (this.gamePaused || this.swallowing) return;
     const buttons = this.buttonEvents(this.buttonsAfter(e, move));
     if (this.relative) {
       this.moveBy(e);
-      if (!this.locked && this.remoteHidden && !this.userUnlocked && e.type === "pointermove") {
-        // 光标隐藏着一直在移动（第一人称游戏）：锁定，指针才不会碰到屏幕边就停下
+      if (this._mode === "auto" && !this.locked && this.remoteHidden && !this.userUnlocked && move) {
+        // 光标隐藏着一直在移动（第一人称游戏）：锁定，指针才不会碰到屏幕边就停下。刚被拒绝过就等一会儿再试
         const now = performance.now();
         if (this.hiddenMoveSince === null) this.hiddenMoveSince = now;
-        else if (now - this.hiddenMoveSince >= AUTO_LOCK_AFTER_MS) this.lock();
+        else if (now - this.hiddenMoveSince >= AUTO_LOCK_AFTER_MS && now >= this.lockRetryAt) this.lock();
       }
       if (buttons.length) this.enqueue(buttons, true);
     } else {
@@ -388,23 +443,35 @@ export class RemoteInput {
       document.addEventListener("pointerlockchange", () => this.onLockChange(), { signal });
       document.addEventListener("pointerlockerror", () => {
         this.lockPending = false;
-        if (this.manual) { this.manual = false; this.onModeChange?.(); }
+        this.lockRetryAt = performance.now() + LOCK_RETRY_MS;
+        this.onModeChange?.();
       }, { signal });
     }
     on("pointermove", e => { if (this._interactive) this.pointer(e, false, true); });
     on("pointerdown", e => {
       if (!this._interactive) return;
       e.preventDefault(); this.focus();
+      // 游戏模式没锁定：这一下只是锁定，从按下到松开都不发给对方（游戏里点一下可能就是开枪、选中东西）
+      if (this.gamePaused) {
+        this.swallowing = true;
+        this.lock();
+        return;
+      }
       // 锁定时不能再捕获指针（会抛异常），也用不着
       if (!this.locked) try { c.setPointerCapture(e.pointerId); } catch { /* 已经锁定 */ }
       // 点一下：Esc 之后暂停的自动锁定恢复；被控端光标隐藏着就锁定（这次按下就是用户操作）
       if (this.userUnlocked) { this.userUnlocked = false; this.onModeChange?.(); }
-      if (this.remoteHidden || this.manual) this.lock();
+      if (this._mode === "auto" && this.remoteHidden) this.lock();
       this.pointer(e, true);
     });
     on("pointerup", e => {
       if (!this._interactive) return;
       e.preventDefault();
+      // 重新锁定的那一下松开了（按下时一起按着的键都松开）：之后的照常发
+      if (this.swallowing) {
+        if (e.buttons === 0) this.swallowing = false;
+        return;
+      }
       this.pointer(e, true);
     });
     on("pointercancel", () => this.releaseAll());
@@ -413,6 +480,7 @@ export class RemoteInput {
     on("wheel", e => {
       if (!this._interactive) return;
       e.preventDefault();
+      if (this.gamePaused) return;
       const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 360 : 1.2;
       this.wheel.x += e.deltaX * unit; this.wheel.y -= e.deltaY * unit;
       const dx = Math.trunc(this.wheel.x), dy = Math.trunc(this.wheel.y);
@@ -426,10 +494,7 @@ export class RemoteInput {
       e.preventDefault(); e.stopPropagation();
       if (!e.code || e.code === "Unidentified") return;
       if (isLockShortcut(e)) {
-        if (!e.repeat) {
-          if (this.relative) this.release();
-          else this.toggleLock();
-        }
+        if (!e.repeat) this.toggleGame();
         this.swallowed.add(e.code);
         return;
       }

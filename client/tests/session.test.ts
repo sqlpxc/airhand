@@ -256,6 +256,56 @@ test("开始时的画质和要不要声音在连接选项里（对方在握手�
   assert.equal(opts2.audio, false);
 });
 
+test("游戏模式：连接选项里就让对方把光标画进画面；换了模式马上发新的画质；保存的画质里不带它", async () => {
+  let opts: any;
+  const h = sessionHarness(async (_code, _resume, o) => {
+    opts = o;
+    return granted;
+  });
+  const s = h.session;
+  // 保存的画质里就算带着（之前存的、Rust 那边读回来的）也不算数：只看鼠标模式
+  const settings = { fps: 60, bitrateKbps: 8000, maxShort: 1080, adaptive: true, codec: "h265", drawCursor: false };
+  const input: any = { mode: "game", relative: true, reset() {} };
+  Object.assign(s, { settings, input });
+  await s.start();
+  assert.equal(opts.settings.drawCursor, true);
+  assert.equal(s.settings.drawCursor, false, "the saved quality isn't touched");
+  assert.deepEqual(h.calls.filter((c) => Array.isArray(c) && c[0] === "settings"), []);
+
+  // 换成自动模式：发不带 drawCursor 的画质
+  input.mode = "auto";
+  s.pushSettings();
+  const sent = h.calls.filter((c) => Array.isArray(c) && c[0] === "settings");
+  assert.equal(sent.length, 1);
+  assert.equal("drawCursor" in sent[0][2], false);
+
+  // 本机指针：游戏模式锁定着不显示，放开了（没锁定）显示普通的指针，好去点画面
+  const style: any = {};
+  Object.assign(s, { screen: { style } });
+  input.mode = "game";
+  s.refreshCursor();
+  assert.equal(style.cursor, "none");
+  input.relative = false;
+  s.refreshCursor();
+  assert.equal(style.cursor, "default");
+});
+
+test("对方是手机：没有鼠标模式，记着的游戏模式也改回自动（不让对方画光标）", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  const modes: any[] = [];
+  const input: any = { mode: "game", reset() {}, setMode(m: string, notify: boolean) { modes.push([m, notify]); this.mode = m; } };
+  Object.assign(s, { sid: 7, settings: { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: "h264" }, input });
+  h.session.onEvent({
+    type: "hello", hostname: "phone", os: "Android 15", platform: "android", actions: [], version: "0.3.0",
+    displays: [], current: 0, shown: [], codecs: ["h264"],
+  });
+  assert.deepEqual(modes, [["auto", false]]);
+  const sent = h.calls.filter((c) => Array.isArray(c) && c[0] === "settings");
+  assert.equal(sent.length, 1);
+  assert.equal("drawCursor" in sent[0][2], false);
+});
+
 test("端到端：记下对方的公钥、之后只认它；要配对码时不自动重连，输入之后带着它连一次", async () => {
   const tried: any[] = [];
   let answer: () => Promise<any> = async () => { throw { kind: "pairingRequired" }; };

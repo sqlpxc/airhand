@@ -178,7 +178,9 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
     // 要哪种画面取决于画质设置（macOS 让系统直接缩放，见 capture::output_for），设置变了可能要换一路采集
     let mut output = capture::output_for(screen, &settings);
-    let mut sub = capture::subscribe(screen, settings.fps, output);
+    // 控制端的游戏模式要光标画进画面：读带光标的那一路（见 capture 的"带光标的画面"）
+    let mut draw = settings.draw_cursor;
+    let mut sub = capture::subscribe(screen, settings.fps, output, draw);
     let mut enc: Option<Encoder> = None;
     // 硬件编码器连续失败时改用软件编码；GPU 零拷贝连续失败时硬件编码器改用内存里的画面
     let mut hw_failures = 0u32;
@@ -207,15 +209,24 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
             ver = v;
             settings = *ctrl.settings.lock().unwrap();
             let want = capture::output_for(screen, &settings);
-            if want != output {
-                // 换一路采集：旧的画面不再用，等新的一路的第一帧（采集一开始就会给）；光标状态重新发
-                info!(?output, ?want, "switching the capture");
+            if want != output || settings.draw_cursor != draw {
+                // 换一路采集：旧的画面不再用，等新的一路的第一帧（采集一开始就会给）；光标状态重新发。
+                // 只是要不要光标变了：画面只差一个光标，接着编增量帧，不用关键帧
+                info!(
+                    ?output,
+                    ?want,
+                    draw = settings.draw_cursor,
+                    "switching the capture"
+                );
+                if want != output {
+                    ctrl.force_key.store(true, Ordering::Release);
+                }
                 output = want;
-                sub = capture::subscribe(screen, settings.fps, output);
+                draw = settings.draw_cursor;
+                sub = capture::subscribe(screen, settings.fps, output, draw);
                 (frame_seq, cursor_seq, shape_seq) = (0, 0, 0);
                 last_frame = None;
                 refine_left = 0;
-                ctrl.force_key.store(true, Ordering::Release);
             }
             sub.set_fps(settings.fps);
             pacer.set_fps(settings.fps);
@@ -242,7 +253,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
             Duration::from_millis(40)
         };
         let slot = sub.slot();
-        let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
+        let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait, draw);
 
         // 光标变化：可见性和形状引用走控制通道（只留最新值）；控制端还没有的形状（动画光标第一次转到的帧）
         // 先把图像排进大块通道，和剪贴板共用：队列满了不等，下一轮再发最新形状（见 CursorCache）。
@@ -321,7 +332,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
             }
         }
         // 取等待期间到达的最新一帧；没有的话重新编码上一帧（关键帧、补画质）
-        let (frame, fresh) = match slot.try_newer(frame_seq) {
+        let (frame, fresh) = match slot.try_newer(frame_seq, draw) {
             Some((s, f)) => {
                 frame_seq = s;
                 (f, true)

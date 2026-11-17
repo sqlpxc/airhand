@@ -3,7 +3,8 @@
 // 性能要点：
 // * 画面是被控端打好的媒体包，经 WebSocket 原样进到 Worker（桌面版和网页版一样，零 JSON），
 //   读一下头就把码流切片交给 VideoDecoder，画到 OffscreenCanvas 上：主线程忙的时候也不耽误；
-// * 被控端的光标隐藏时（游戏里转视角等）鼠标改发相对移动并锁定本机指针（见 input.ts）；
+// * 鼠标三种模式（自动 / 桌面 / 游戏，见 input.ts），按设备记住：自动模式在被控端隐藏光标时（游戏里转视角等）
+//   改发相对移动并锁定本机指针；游戏模式一直这样，并让被控端把光标画进画面里（QualitySettings.drawCursor）；
 // * 解码器 optimizeForLatency，帧解码后立即绘制到 desynchronized Canvas，不排队等 vsync；
 // * 鼠标移动按 8ms 合并，按键/点击立即发送；
 // * 不可见的会话自动降到 5fps，节省带宽与对端 CPU；
@@ -21,6 +22,7 @@ import {
   type Command,
   type DisplayInfo,
   type InputEvent,
+  type MouseMode,
   type Problem,
   type QualitySettings,
   type ResumeToken,
@@ -153,6 +155,8 @@ export class RemoteSession {
   onConnected: ((s: RemoteSession) => void) | null = null;
   /** 画质设置变了：记进我的设备，下次用同样的画质连 */
   onSettingsChange: ((s: RemoteSession) => void) | null = null;
+  /** 鼠标模式变了：记进我的设备，下次连这台还用它 */
+  onMouseModeChange: ((s: RemoteSession) => void) | null = null;
 
   /** 变化计数，供 React useSyncExternalStore 使用 */
   version = 0;
@@ -241,7 +245,7 @@ export class RemoteSession {
   constructor(
     code: string,
     settings: QualitySettings,
-    saved?: { resume: ResumeToken | null; name: string; os: string; hostKey?: string | null },
+    saved?: { resume: ResumeToken | null; name: string; os: string; hostKey?: string | null; mouse?: MouseMode | null },
     pairing?: string | null,
   ) {
     this.code = code;
@@ -285,6 +289,13 @@ export class RemoteSession {
     this.input.onModeChange = () => {
       this.applyCursor();
       this.emit();
+    };
+    // 这台电脑上次用的鼠标模式（不算换：不用告诉谁）。之后用户换了（菜单、快捷键）：告诉对方画不画光标、记下来
+    this.input.setMode(saved?.mouse ?? "auto", false);
+    this.input.onMouseMode = () => {
+      this.pushSettings();
+      this.emit();
+      this.onMouseModeChange?.(this);
     };
     this.audio.onClock = (hostUs, localMs, appliedMs) => this.view.audioClock(hostUs, localMs, appliedMs);
     this.audio.onUnsupported = () => {
@@ -524,6 +535,11 @@ export class RemoteSession {
         this.hostName = ev.hostname;
         this.hostOs = ev.os;
         this.hostPlatform = ev.platform;
+        // 手机点的是触屏，没有鼠标模式（工具栏也不显示）：一律按自动
+        if (ev.platform === "android" && this.input.mode !== "auto") {
+          this.input.setMode("auto", false);
+          this.pushSettings();
+        }
         this.hostActions = ev.actions;
         this.hostVersion = ev.version;
         this.maxStreams = Math.max(1, ev.maxStreams ?? 1);
@@ -675,8 +691,13 @@ export class RemoteSession {
 
   /** 按当前显示比例缩放远端光标，生成 CSS cursor */
   private applyCursor() {
+    // 游戏模式：光标在画面里（对方画的），本机指针锁定着不显示；没锁定时显示一个普通的指针，好去点画面、点工具栏
+    if (this.input.mode === "game") {
+      this.setCursor(this.input.relative ? "none" : "default");
+      return;
+    }
     if (!this.cursorVisible || this.input.relative) {
-      // 发相对移动时本机指针的位置没有意义，不显示；用户按 Esc 解除了锁定就显示一个普通的指针
+      // 发相对移动时本机指针的位置没有意义，不显示；用户按 Esc 解除了锁定、桌面模式下对方隐藏了光标，就显示一个普通的指针
       this.setCursor(this.input.relative ? "none" : "default");
       return;
     }
@@ -1080,6 +1101,10 @@ export class RemoteSession {
    */
   private effectiveSettings(): QualitySettings {
     const s = { ...this.settings };
+    // 游戏模式：让对方把光标画进画面里（本机指针锁定着、不显示，看到的就是对方真实的光标）。它跟着鼠标模式走，
+    // 不算画质：保存的画质里就算带着也不用
+    delete s.drawCursor;
+    if (this.input.mode === "game") s.drawCursor = true;
     if (!this.visible) s.fps = Math.min(s.fps, BACKGROUND_FPS);
     return s;
   }
@@ -1156,14 +1181,16 @@ export class RemoteSession {
     if (piece) this.enqueue([{ type: "text", text: piece }], true);
   }
 
-  /** 用户手动锁定了鼠标（发相对移动） */
-  get mouseLocked(): boolean { return this.input.manualLock; }
-  /** 本机指针锁定在画面上了（手动或自动） */
+  /** 鼠标模式（见 input.ts） */
+  get mouseMode(): MouseMode { return this.input.mode; }
+  /** 本机指针锁定在画面上了 */
   get pointerLocked(): boolean { return this.input.locked; }
+  /** 游戏模式下指针没锁定：鼠标不发给对方，点一下画面重新锁定（界面上提示一下） */
+  get gamePaused(): boolean { return this.input.gamePaused; }
 
-  /** 手动锁定 / 解锁鼠标（工具栏；快捷键 Ctrl+Alt+Shift+M 由 input.ts 处理）。要在点击里调用 */
-  toggleMouseLock() {
-    this.input.toggleLock();
+  /** 换鼠标模式（工具栏的鼠标菜单；快捷键 Ctrl+Alt+Shift+M 由 input.ts 处理）。要在点击里调用：游戏模式马上锁定 */
+  setMouseMode(mode: MouseMode) {
+    this.input.setMode(mode);
     this.focus();
   }
 
@@ -1192,5 +1219,6 @@ function sameQuality(a: QualitySettings, b: QualitySettings): boolean {
   return a.fps === b.fps && a.bitrateKbps === b.bitrateKbps && a.maxShort === b.maxShort
     && a.adaptive === b.adaptive && a.codec === b.codec
     && (a.priority ?? "latency") === (b.priority ?? "latency")
-    && (a.transport ?? "auto") === (b.transport ?? "auto");
+    && (a.transport ?? "auto") === (b.transport ?? "auto")
+    && !!a.drawCursor === !!b.drawCursor;
 }

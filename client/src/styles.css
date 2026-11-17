@@ -1118,6 +1118,24 @@ kbd {
 .audio-menu {
   width: 350px;
 }
+/* 鼠标菜单：三种模式（图标 + 名称 + 说明）、本机光标的开关、怎么放开鼠标 */
+.mouse-menu {
+  width: 360px;
+}
+.mouse-menu .dd-title {
+  padding: 6px 11px 4px;
+}
+.dd-item.mode {
+  justify-content: flex-start;
+  align-items: flex-start;
+}
+.dd-item.mode svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.dd-foot {
+  padding: 4px 11px 6px;
+}
 .session-menu {
   min-width: 300px;
   max-height: 60vh;
@@ -1850,6 +1868,24 @@ kbd {
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
   animation: rise 0.2s ease-out;
+}
+/* 游戏模式下指针没锁定：提示点画面锁定。不挡点击（点的就是它下面的画面） */
+.lock-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  padding: 7px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--text-2);
+  background: var(--pop);
+  border: 1px solid var(--edge-2);
+  box-shadow: var(--shadow);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  pointer-events: none;
+  z-index: 2;
 }
 @keyframes rise {
   from {

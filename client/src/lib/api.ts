@@ -42,7 +42,21 @@ export interface QualitySettings {
   priority?: VideoPriority;
   /** 不带（之前保存的画质）就是 auto */
   transport?: VideoTransport;
+  /**
+   * 让对方把光标画进画面里（游戏模式，见 input.ts）。不是画质的一部分：由会话按鼠标模式在发出去的时候加上
+   * （session.ts 的 effectiveSettings），保存的画质里没有它
+   */
+  drawCursor?: boolean;
 }
+
+/**
+ * 鼠标模式（见 input.ts 和 airhand_proto::session 的"鼠标"）：
+ * auto：平时跟着本机指针，对方隐藏光标时（游戏里转视角）自动锁定、发相对移动（默认）；
+ * desktop：一直跟着本机指针，从不锁定；
+ * game：锁定本机指针、一直发相对移动，对方把光标画进画面里
+ */
+export type MouseMode = "auto" | "desktop" | "game";
+export const MOUSE_MODES: MouseMode[] = ["auto", "desktop", "game"];
 
 export interface DisplayInfo {
   index: number;
@@ -157,6 +171,8 @@ export interface SavedDevice {
   lastUsed: number;
   /** 上次用的画质 */
   quality: QualitySettings | null;
+  /** 上次用的鼠标模式；没有（自动、之前的版本、网页版刚记下的）就是自动 */
+  mouse?: MouseMode | null;
   /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
   hostKey: string | null;
 }

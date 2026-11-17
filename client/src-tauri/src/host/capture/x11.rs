@@ -3,7 +3,8 @@
 //! * MIT-SHM：X 服务器把画面直接写进共享内存（memfd，不产生文件），省去经过套接字传输的几 MB 数据；
 //!   服务器不支持时退回普通 `GetImage`；
 //! * DAMAGE：只有显示器范围内的画面有变化才采集，静止的桌面不产生帧；没有 DAMAGE 时按帧率采集并比较内容；
-//! * XFIXES：光标形状变化通知 + 光标图像（与 Windows 一样，画面里不含光标，由控制端本地绘制）；
+//! * XFIXES：光标形状变化通知 + 光标图像（与 Windows 一样，画面里不含光标，由控制端本地绘制；控制端要带光标的画面时
+//!   自己画上去，指针的位置每一轮问一次，见 `super` 的"带光标的画面"）；
 //! * RandR：显示器布局或分辨率变化时报错，由采集线程重建采集器。
 
 use std::hash::{Hash, Hasher};
@@ -20,6 +21,7 @@ use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder};
 
+use super::overlay::{self, CursorBitmap};
 use super::{CaptureUpdate, Capturer, CursorVisibility, FramePool};
 use crate::host::x11::{self, Monitor, X11};
 
@@ -90,10 +92,20 @@ pub struct X11Capturer {
     last_hash: u64,
     /// 上次检查显示器布局的时间（有些布局变化不会发 RandR 通知，例如 `xrandr --setmonitor`）
     layout_checked: Instant,
+    /// 带光标的画面用的光标图像和热点；光标隐藏了（全透明）时为 `None`
+    bitmap: Option<(Arc<CursorBitmap>, (u16, u16))>,
+    /// 指针（热点）在根窗口上的位置：只在要带光标的画面时问（指针移动不产生 DAMAGE）
+    pointer: Option<(i32, i32)>,
+    /// 最新的原始画面：只有光标动了的时候，带光标的画面画在它上面
+    last: Option<Arc<super::Frame>>,
+    /// 上一帧带光标的画面是按现在的画面和光标画的
+    drawn_fresh: bool,
 }
 
 /// 定期检查显示器布局的间隔
 const LAYOUT_CHECK: Duration = Duration::from_secs(2);
+/// 要带光标的画面、画面又静止时，多久问一次指针在哪
+const POINTER_POLL: Duration = Duration::from_millis(8);
 
 impl X11Capturer {
     pub fn open(index: u8) -> Result<Self> {
@@ -164,7 +176,53 @@ impl X11Capturer {
             first: true,
             last_hash: 0,
             layout_checked: Instant::now(),
+            bitmap: None,
+            pointer: None,
+            last: None,
+            drawn_fresh: false,
         })
+    }
+
+    /// 问一下指针在哪（要带光标的画面时）：变了返回 true。没有 XFIXES 时拿不到光标图像，不用问
+    fn poll_pointer(&mut self) -> Result<bool> {
+        if !self.cursor {
+            return Ok(false);
+        }
+        let r = self.x.conn.query_pointer(self.x.root())?.reply()?;
+        let p = Some((r.root_x as i32, r.root_y as i32));
+        let moved = p != self.pointer;
+        self.pointer = p;
+        Ok(moved)
+    }
+
+    /// 带光标的画面：把光标画在 `base` 的一份拷贝上（`base` 不动）；光标隐藏了、不在这块显示器上时就是 `base`
+    fn draw_pointer(
+        &self,
+        base: &Arc<super::Frame>,
+        captured: Instant,
+        pool: &mut FramePool,
+    ) -> Result<Arc<super::Frame>> {
+        let (Some((bitmap, (hx, hy))), Some((px, py))) = (&self.bitmap, self.pointer) else {
+            return Ok(base.clone());
+        };
+        let (w, h) = (base.width, base.height);
+        let pos = (
+            px - self.mon.x as i32 - *hx as i32,
+            py - self.mon.y as i32 - *hy as i32,
+        );
+        if overlay::bounds(bitmap, pos, (w, h)).is_none() {
+            return Ok(base.clone());
+        }
+        let mut frame = pool.checkout(w, h);
+        let f = Arc::get_mut(&mut frame).expect("unique frame");
+        f.captured = captured;
+        let dst = f.pixels_mut();
+        dst.copy_from_slice(base.pixels()?);
+        overlay::draw(bitmap, pos, (w, h), dst, |x, y| {
+            Some((y as usize * w as usize + x as usize) * 4)
+        });
+        pool.keep(&frame);
+        Ok(frame)
     }
 
     /// 处理已到达的事件，不阻塞。
@@ -270,13 +328,37 @@ impl X11Capturer {
 }
 
 impl Capturer for X11Capturer {
-    fn next(&mut self, timeout: Duration, pool: &mut FramePool) -> Result<CaptureUpdate> {
+    fn next(
+        &mut self,
+        timeout: Duration,
+        pool: &mut FramePool,
+        draw: bool,
+    ) -> Result<CaptureUpdate> {
         self.drain_events()?;
-        if self.damage.is_some() && !self.dirty && !self.cursor_dirty {
-            x11::wait_readable(&self.x, timeout)?;
+        if !draw {
+            self.drawn_fresh = false;
+        }
+        let mut moved = draw && self.poll_pointer()?;
+        if self.damage.is_some()
+            && !self.dirty
+            && !self.cursor_dirty
+            && !moved
+            && (!draw || self.drawn_fresh)
+        {
+            // 要带光标的画面时不能一直等 DAMAGE：指针移动不产生它，过一小会儿再问一次指针在哪
+            let wait = if draw {
+                timeout.min(POINTER_POLL)
+            } else {
+                timeout
+            };
+            x11::wait_readable(&self.x, wait)?;
             self.drain_events()?;
+            if draw {
+                moved |= self.poll_pointer()?;
+            }
         }
         let mut update = CaptureUpdate::default();
+        let mut shape_changed = false;
         if self.cursor && self.cursor_dirty {
             self.cursor_dirty = false;
             if let Some(shape) = self.cursor_shape()? {
@@ -287,6 +369,15 @@ impl Capturer for X11Capturer {
                 } else {
                     CursorVisibility::Hidden
                 });
+                self.bitmap = shown.then(|| {
+                    let bitmap = CursorBitmap::Rgba {
+                        width: shape.width as u32,
+                        height: shape.height as u32,
+                        rgba: shape.rgba.clone(),
+                    };
+                    (Arc::new(bitmap), (shape.hot_x, shape.hot_y))
+                });
+                shape_changed = true;
                 update.cursor_shape = Some(shape);
             }
         } else if self.first {
@@ -295,6 +386,20 @@ impl Capturer for X11Capturer {
         if self.dirty || self.damage.is_none() {
             update.frame = self.grab(pool)?;
             self.first = false;
+        }
+        if let Some(f) = &update.frame {
+            self.last = Some(f.clone());
+        }
+        if draw
+            && (update.frame.is_some() || moved || shape_changed || !self.drawn_fresh)
+            && let Some(base) = self.last.clone()
+        {
+            let captured = update
+                .frame
+                .as_ref()
+                .map_or_else(Instant::now, |f| f.captured);
+            update.drawn = Some(self.draw_pointer(&base, captured, pool)?);
+            self.drawn_fresh = true;
         }
         Ok(update)
     }
@@ -403,7 +508,9 @@ mod tests {
 
         let mut cap = X11Capturer::open(0).expect("打开采集");
         let mut pool = FramePool::default();
-        let first = cap.next(Duration::from_millis(100), &mut pool).unwrap();
+        let first = cap
+            .next(Duration::from_millis(100), &mut pool, false)
+            .unwrap();
         let f = first.frame.expect("第一次应当产生一帧");
         assert_eq!(
             (f.width, f.height),
@@ -418,7 +525,9 @@ mod tests {
         if cap.damage.is_some() {
             // 先把其它程序（例如时钟）造成的变化消化掉
             for _ in 0..3 {
-                let _ = cap.next(Duration::from_millis(20), &mut pool).unwrap();
+                let _ = cap
+                    .next(Duration::from_millis(20), &mut pool, false)
+                    .unwrap();
             }
         }
 
@@ -470,7 +579,7 @@ mod tests {
                 "画面变化后没有产生新帧"
             );
             if let Some(f) = cap
-                .next(Duration::from_millis(100), &mut pool)
+                .next(Duration::from_millis(100), &mut pool, false)
                 .unwrap()
                 .frame
             {

@@ -8,9 +8,12 @@
 //! os = "Windows 11 Pro"
 //! last_used = 2026-11-08T10:20:30Z
 //! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264", priority = "clarity", transport = "fec" }
+//! mouse = "game"
 //! resume = "q83vEjRWeJCrze8SNFZ4kA=="
 //! host_key = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 //! ```
+//!
+//! `mouse` 是上次用的鼠标模式（控制台的"桌面" / "游戏"，没有就是"自动"）。
 //!
 //! `host_key` 是那台电脑的端到端加密公钥（第一次连上时记下，见 `airhand_link::controller` 的"端到端加密"）：
 //! 之后只认它，对不上就警告。是公钥，不用加密。
@@ -65,6 +68,18 @@ pub struct Device {
     /// 上次用的画质
     #[serde(default)]
     pub quality: Option<QualitySettings>,
+    /// 上次用的鼠标模式："desktop" / "game"，`None` 是自动（不认识的也当自动，见 [`mouse_mode`]）
+    #[serde(default)]
+    pub mouse: Option<String>,
+}
+
+/// 认识的鼠标模式（自动是默认，不记）
+fn mouse_mode(s: &str) -> Option<&'static str> {
+    match s.trim() {
+        "desktop" => Some("desktop"),
+        "game" => Some("game"),
+        _ => None,
+    }
 }
 
 /// 6 位数字、不以 0 开头（与 airhand_proto::parse_code 相同）
@@ -88,6 +103,7 @@ pub fn normalize(mut list: Vec<Device>) -> Vec<Device> {
         d.os = clip(&d.os);
         d.alias = d.alias.as_deref().map(clip).filter(|a| !a.is_empty());
         d.host_key = d.host_key.as_deref().and_then(host_key);
+        d.mouse = d.mouse.as_deref().and_then(mouse_mode).map(Into::into);
     }
     list
 }
@@ -152,6 +168,11 @@ fn from_table(t: &Table) -> Option<Device> {
             _ => 0,
         },
         quality: t.get("quality").and_then(quality_from),
+        mouse: t
+            .get("mouse")
+            .and_then(Item::as_str)
+            .and_then(mouse_mode)
+            .map(Into::into),
         host_key: t.get("host_key").and_then(Item::as_str).and_then(host_key),
     })
 }
@@ -181,6 +202,8 @@ fn quality_from(item: &Item) -> Option<QualitySettings> {
             .and_then(Item::as_str)
             .and_then(VideoTransport::from_name)
             .unwrap_or_default(),
+        // 画不画光标跟着鼠标模式走（上面的 `mouse`），不算画质
+        draw_cursor: false,
     })
 }
 
@@ -261,6 +284,9 @@ pub fn to_table(d: &Device) -> Option<Table> {
             it.insert("transport", p.into());
         }
         t["quality"] = toml_edit::value(it);
+    }
+    if let Some(m) = d.mouse.as_deref().and_then(mouse_mode) {
+        t["mouse"] = toml_edit::value(m);
     }
     if let Some(r) = &d.resume {
         t["resume"] = toml_edit::value(STANDARD.encode(r));
@@ -355,7 +381,9 @@ mod tests {
                 codec: Codec::H265,
                 priority: VideoPriority::Clarity,
                 transport: VideoTransport::Fec,
+                draw_cursor: false,
             }),
+            mouse: Some("game".into()),
             host_key: Some("ab".repeat(32)),
         }
     }
@@ -388,12 +416,25 @@ mod tests {
             os: String::new(),
             resume: None,
             quality: None,
+            mouse: None,
             last_used: 0,
             host_key: None,
             ..d.clone()
         };
         assert_eq!(from_table(&to_table(&bare).unwrap()), Some(bare));
         assert!(t.to_string().contains("transport = \"fec\""));
+        assert!(t.to_string().contains("mouse = \"game\""));
+        // 自动（默认）和不认识的鼠标模式不写进文件，读回来是自动
+        for m in ["auto", "warp"] {
+            let other = Device {
+                mouse: Some(m.into()),
+                ..d.clone()
+            };
+            let t = to_table(&other).unwrap();
+            assert!(!t.to_string().contains("mouse"), "{m}");
+            assert_eq!(from_table(&t).unwrap().mouse, None);
+            assert_eq!(normalize(vec![other])[0].mouse, None);
+        }
         // 低延迟优先、自动的传输方式（默认）不写进文件
         let mut q = d.quality.unwrap();
         q.priority = VideoPriority::Latency;

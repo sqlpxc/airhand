@@ -1281,6 +1281,7 @@ mod tests {
             resume: None,
             last_used: 1_762_597_230_000,
             quality: None,
+            mouse: None,
             host_key: None,
         }
     }

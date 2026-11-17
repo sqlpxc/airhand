@@ -132,6 +132,8 @@ pub struct SckCapturer {
     first: bool,
     cursor: CursorReader,
     layout_checked: Instant,
+    /// 系统把光标画进了采集到的画面里（要带光标的画面的订阅者单独一路，见 `super` 的"带光标的画面"）
+    shows_cursor: bool,
 }
 
 fn frame_interval(fps: u8) -> CMTime {
@@ -139,7 +141,8 @@ fn frame_interval(fps: u8) -> CMTime {
 }
 
 impl SckCapturer {
-    pub fn open(index: u8, fps: u8, output: Output) -> Result<Self> {
+    /// `shows_cursor`：让系统把光标画进画面里（给要带光标的画面的订阅者）
+    pub fn open(index: u8, fps: u8, output: Output, shows_cursor: bool) -> Result<Self> {
         macos::check_screen_permission()?;
         let display = macos::display(index)?;
         let target = sck::shareable_display(display.id)?;
@@ -174,7 +177,8 @@ impl SckCapturer {
                 }
             }
             c.setColorSpaceName(kCGColorSpaceSRGB);
-            c.setShowsCursor(false);
+            // 平时画面里不要光标（控制端用本地光标显示它）；控制端的游戏模式要系统画上去，光标一动也会出新的一帧
+            c.setShowsCursor(shows_cursor);
             c.setMinimumFrameInterval(frame_interval(fps));
             c
         };
@@ -224,6 +228,7 @@ impl SckCapturer {
             first: true,
             cursor: CursorReader::default(),
             layout_checked: Instant::now(),
+            shows_cursor,
         })
     }
 
@@ -288,7 +293,12 @@ impl SckCapturer {
 }
 
 impl Capturer for SckCapturer {
-    fn next(&mut self, timeout: Duration, pool: &mut FramePool) -> Result<CaptureUpdate> {
+    fn next(
+        &mut self,
+        timeout: Duration,
+        pool: &mut FramePool,
+        _draw: bool,
+    ) -> Result<CaptureUpdate> {
         if self.layout_checked.elapsed() > LAYOUT_CHECK {
             self.layout_checked = Instant::now();
             if macos::display(self.index).ok().as_ref() != Some(&self.display) {
@@ -317,7 +327,12 @@ impl Capturer for SckCapturer {
             st.sample.take()
         };
         if let Some(s) = sample {
-            update.frame = Some(self.frame(&s.0, pool).context("reading the frame")?);
+            let frame = self.frame(&s.0, pool).context("reading the frame")?;
+            // 系统画了光标：这一路的订阅者都要带光标的画面，就是它
+            if self.shows_cursor {
+                update.drawn = Some(frame.clone());
+            }
+            update.frame = Some(frame);
             self.first = false;
         }
         Ok(update)
@@ -460,13 +475,13 @@ mod tests {
         if !sck::require_permission() {
             return;
         }
-        let mut cap = SckCapturer::open(0, 30, Output::Native).expect("打开采集");
+        let mut cap = SckCapturer::open(0, 30, Output::Native, false).expect("打开采集");
         let mut pool = FramePool::default();
         let started = Instant::now();
         let frame = loop {
             assert!(started.elapsed() < Duration::from_secs(5), "没有收到画面");
             if let Some(f) = cap
-                .next(Duration::from_millis(100), &mut pool)
+                .next(Duration::from_millis(100), &mut pool, false)
                 .unwrap()
                 .frame
             {
@@ -497,13 +512,13 @@ mod tests {
             return;
         }
         let grab = |output: Output| {
-            let mut cap = SckCapturer::open(0, 30, output).expect("打开采集");
+            let mut cap = SckCapturer::open(0, 30, output, false).expect("打开采集");
             let mut pool = FramePool::default();
             let started = Instant::now();
             loop {
                 assert!(started.elapsed() < Duration::from_secs(5), "没有收到画面");
                 if let Some(f) = cap
-                    .next(Duration::from_millis(100), &mut pool)
+                    .next(Duration::from_millis(100), &mut pool, false)
                     .unwrap()
                     .frame
                 {

@@ -1,6 +1,6 @@
 import { type ReactNode, type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { closeTab, fmtCode, toggleFullscreen } from "../lib/actions";
-import { api, type Platform } from "../lib/api";
+import { api, MOUSE_MODES, type MouseMode, type Platform } from "../lib/api";
 import { type MsgKey, t, useT } from "../lib/i18n";
 import { errorText, noticeText, problemText, sessionStateText } from "../lib/messages";
 import { CODEC_LABEL } from "../lib/presets";
@@ -12,11 +12,13 @@ import {
   IconCpu,
   IconExpand,
   IconFit,
+  IconGamepad,
   IconKeyboard,
   IconMic,
   IconMicOff,
   IconMonitor,
   IconMouse,
+  IconPointer,
   IconPower,
   IconRefresh,
   IconShrink,
@@ -88,7 +90,10 @@ const combosFor = (platform: Platform | null, os: string) => {
   return os === "" || /windows/i.test(os) ? WINDOWS_COMBOS : /^macos/i.test(os) ? MAC_COMBOS : LINUX_COMBOS;
 };
 
-type Menu = null | "quality" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
+type Menu = null | "quality" | "mouse" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
+
+/** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
+const MOUSE_ICONS: Record<MouseMode, typeof IconMouse> = { auto: IconMouse, desktop: IconPointer, game: IconGamepad };
 
 /** 顶端热区的高度（和 .hot-edge 一致） */
 const HOT_EDGE = 6;
@@ -175,7 +180,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // 第一次锁定鼠标时（包括被控端隐藏光标时自动锁定、按快捷键）提示怎么解除：
+  // 第一次锁定鼠标时（自动模式里被控端隐藏光标、进入游戏模式）提示怎么放开：
   // 全屏时 Esc 发给了对方，指针也碰不到顶端叫出工具栏
   const pointerLocked = s.pointerLocked;
   const lockHinted = useRef(false);
@@ -205,6 +210,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
 
   const st = s.stats;
   const live = s.state === "live";
+  const MouseIcon = MOUSE_ICONS[s.mouseMode];
   // 同时看着好几个显示器（多屏）
   const showingAll = s.allDisplays && s.shown.length > 1;
   const rtt = st.rttMs != null ? Math.round(st.rttMs) : null;
@@ -504,18 +510,17 @@ export function SessionView({ s }: { s: RemoteSession }) {
             </div>
           )}
           {s.hostPlatform !== "android" && (
-            // 游戏：鼠标锁定在画面上、发相对移动（被控端隐藏光标时会自动这样做，这里是手动的）
-            <button
-              className={`tb-btn icon ${s.mouseLocked ? "on" : ""}`}
-              title={s.mouseLocked ? t("session.mouseUnlock") : t("session.mouseLock")}
-              onClick={() => {
-                setMenu(null);
-                s.toggleMouseLock();
-                if (s.mouseLocked) setToast(t("session.mouseLocked"));
-              }}
-            >
-              <IconMouse size={17} />
-            </button>
+            // 鼠标：自动 / 桌面 / 游戏（见 input.ts），还有画面里有光标时显不显示本机光标。手机是点触屏的，没有这些
+            <div className="menu-anchor">
+              <button
+                className={`tb-btn icon ${menu === "mouse" || s.mouseMode === "game" ? "on" : ""}`}
+                title={t("session.mouse", { mode: t(`mouse.${s.mouseMode}`) })}
+                onClick={() => toggleMenu("mouse")}
+              >
+                <MouseIcon size={17} />
+              </button>
+              {menu === "mouse" && <MouseMenu s={s} onClose={closeMenu} />}
+            </div>
           )}
           <button
             className={`tb-btn icon ${s.scaleMode === "native" ? "on" : ""}`}
@@ -613,9 +618,57 @@ export function SessionView({ s }: { s: RemoteSession }) {
             <span>{noticeText(s.notice)}</span>
           </div>
         )}
+        {live && s.gamePaused && <div className="lock-hint">{t("session.clickToLock")}</div>}
         {toast && <div className="toast">{toast}</div>}
       </div>
     </div>
+  );
+}
+
+/** 鼠标菜单：三种模式（点了马上生效，游戏模式马上锁定指针），画面里有光标时显不显示本机光标，怎么放开鼠标 */
+function MouseMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
+  const localCursor = useStore((st) => st.localCursor);
+  const game = s.mouseMode === "game";
+  return (
+    <Dropdown onClose={onClose} className="mouse-menu">
+      <div className="dd-title pop-title">{t("mouse.title")}</div>
+      {MOUSE_MODES.map((m) => {
+        const Icon = MOUSE_ICONS[m];
+        return (
+          <button
+            key={m}
+            className={`dd-item mode ${s.mouseMode === m ? "active" : ""}`}
+            onClick={() => {
+              // 在点击里换：游戏模式要马上锁定指针，浏览器只在用户操作里让锁定
+              s.setMouseMode(m);
+              onClose();
+            }}
+          >
+            <Icon size={18} />
+            <span>
+              {t(`mouse.${m}`)}
+              <span className="muted small block">{t(`mouse.${m}.hint`)}</span>
+            </span>
+          </button>
+        );
+      })}
+      <div className="dd-sep" />
+      <label className={`dd-item toggle ${game ? "disabled" : ""}`}>
+        <span>
+          {t("mouse.localCursor")}
+          <span className="muted small block">{t(game ? "mouse.localCursor.game" : "mouse.localCursor.hint")}</span>
+        </span>
+        <input
+          type="checkbox"
+          className="switch"
+          checked={localCursor}
+          disabled={game}
+          onChange={(e) => store.setLocalCursor(e.target.checked)}
+        />
+      </label>
+      <div className="dd-sep" />
+      <div className="dd-foot muted small">{t("mouse.footer")}</div>
+    </Dropdown>
   );
 }
 

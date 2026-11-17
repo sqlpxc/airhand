@@ -23,13 +23,25 @@ function base({ size = 18, ...rest }: P, children: React.ReactNode) {
 }
 
 export const IconPlus = (p: P) => base(p, <path d="M12 5v14M5 12h14" />);
-/** 鼠标（锁定鼠标） */
+/** 鼠标（鼠标菜单：自动模式） */
 export const IconMouse = (p: P) =>
   base(
     p,
     <>
       <rect x="6" y="3" width="12" height="18" rx="6" />
       <path d="M12 7v4" />
+    </>,
+  );
+/** 指针箭头（鼠标菜单：桌面模式） */
+export const IconPointer = (p: P) => base(p, <path d="M6 3.5v15l4.2-4.1 2.9 6.4 2.6-1.2-2.9-6.3h5.7z" />);
+/** 手柄（鼠标菜单：游戏模式） */
+export const IconGamepad = (p: P) =>
+  base(
+    p,
+    <>
+      <path d="M7.5 7h9a4.5 4.5 0 0 1 4.4 5.4l-.9 4.3a2.3 2.3 0 0 1-4 1L14.3 16H9.7L8 17.7a2.3 2.3 0 0 1-4-1l-.9-4.3A4.5 4.5 0 0 1 7.5 7z" />
+      <path d="M8 10v3M6.5 11.5h3" />
+      <path d="M15.5 10.5h.01M17 12.5h.01" />
     </>,
   );
 export const IconGrid = (p: P) =>

@@ -31,10 +31,22 @@
 //!
 //! # 鼠标
 //!
-//! 平时鼠标用绝对坐标（[`InputEvent::MouseMove`]）：控制端的指针在哪里，被控端的光标就在哪里。
-//! 被控端的光标隐藏了（[`CursorVisibility::Hidden`]，例如游戏里按住右键转视角、第一人称游戏）时，
-//! 控制端改发相对移动（[`InputEvent::MouseDelta`]）：游戏这时自己把光标拉回原位、只看移动了多少，
-//! 绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动了）。
+//! 鼠标有两种发法，光标也有两种显示法，原则是**谁决定光标的位置，就由谁画光标**：
+//!
+//! * **绝对坐标**（[`InputEvent::MouseMove`]）：控制端的指针在哪里，被控端的光标就在哪里。位置由控制端决定，
+//!   光标也就用控制端的本地光标显示（形状是被控端的，见 [`HostMsg::Cursor`]），移动零延迟；
+//! * **相对移动**（[`InputEvent::MouseDelta`]）：只说移动了多少，被控端像真鼠标一样注入。光标落在哪里由被控端决定
+//!   （指针速度和加速、屏幕边缘、游戏自己把光标拉回原位），控制端不知道，本地光标表示不了它：要看光标，
+//!   就让被控端把它画进画面里（[`QualitySettings::draw_cursor`]）。
+//!
+//! 控制端（控制台）据此有三种鼠标模式：
+//!
+//! * 自动（默认）：平时发绝对坐标；被控端的光标隐藏了（[`CursorVisibility::Hidden`]，例如游戏里按住右键转视角、
+//!   第一人称游戏）时改发相对移动：游戏这时自己把光标拉回原位、只看移动了多少，绝对坐标会和它打架
+//!   （视角乱跳、拖到画面边上就转不动了）。光标隐藏着，画面里也就不用有光标；
+//! * 桌面：一直发绝对坐标，不管被控端的光标隐藏没有；
+//! * 游戏：一直发相对移动，被控端把光标画进画面里（`draw_cursor`），控制端不显示本地光标。
+//!   游戏里转视角、点界面都是对方真实的光标，不用看对方的光标隐藏没有，也就不会反复切换。
 //!
 //! 光标显示着、但已经画在画面里了（[`CursorVisibility::InFrame`]，被控端改用了软件光标，例如 Windows 拖动、
 //! 缩放窗口时）：不算隐藏，控制端照常发绝对坐标。本地光标还显示不显示由控制端的用户决定：显示着跟手，
@@ -813,6 +825,16 @@ pub struct QualitySettings {
     #[cbor(n(6), skip_if = "VideoTransport::is_auto")]
     #[serde(default)]
     pub transport: VideoTransport,
+    /// 把被控端的光标画进画面里（控制端的游戏模式，见模块说明的"鼠标"）：光标显示着、在这一路的显示器上时画上去，
+    /// 光标单独移动（画面没变）也出新的一帧。隐藏了就不画；已经是画面里的软件光标（[`CursorVisibility::InFrame`]）
+    /// 也不再画一遍。不画（默认）不写进线上的数组
+    #[cbor(n(7), skip_if = "is_false")]
+    #[serde(default)]
+    pub draw_cursor: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl Default for QualitySettings {
@@ -825,6 +847,7 @@ impl Default for QualitySettings {
             codec: Codec::H264,
             priority: VideoPriority::Latency,
             transport: VideoTransport::Auto,
+            draw_cursor: false,
         }
     }
 }
@@ -1067,15 +1090,16 @@ mod tests {
         // 新版本带了优先项（还有再新的版本加的字段）：认识的照用，不认识的优先项按低延迟
         let newer = |priority: u8| {
             let mut e = minicbor::Encoder::new(Vec::new());
-            e.array(8).unwrap();
+            e.array(9).unwrap();
             e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
             e.bool(true).unwrap().u8(1).unwrap().u8(priority).unwrap();
-            e.u8(2).unwrap().str("later").unwrap();
+            e.u8(2).unwrap().bool(true).unwrap().str("later").unwrap();
             e.into_writer()
         };
         let q: QualitySettings = minicbor::decode(&newer(1)).unwrap();
         assert_eq!((q.codec, q.priority), (Codec::H265, VideoPriority::Clarity));
         assert_eq!(q.transport, VideoTransport::Fec);
+        assert!(q.draw_cursor);
         let q: QualitySettings = minicbor::decode(&newer(5)).unwrap();
         assert_eq!(q.priority, VideoPriority::Unknown(5));
         assert_eq!(q.sanitized().priority, VideoPriority::Latency);
@@ -1128,6 +1152,26 @@ mod tests {
         let q: QualitySettings = minicbor::decode(&e.into_writer()).unwrap();
         assert_eq!(q.transport, VideoTransport::Unknown(9));
         assert_eq!(q.sanitized().transport, VideoTransport::Auto);
+
+        // 光标画进画面：不画（默认）不写，字节和之前一样；画的时候前面空着的几位也解得出
+        assert!(!auto.draw_cursor);
+        for (priority, transport) in [
+            (VideoPriority::Latency, VideoTransport::Auto),
+            (VideoPriority::Clarity, VideoTransport::Fec),
+        ] {
+            let q = QualitySettings {
+                priority,
+                transport,
+                draw_cursor: true,
+                ..Default::default()
+            };
+            let wire = minicbor::to_vec(q).unwrap();
+            assert_eq!(wire[0], 0x88, "8 items");
+            let back: QualitySettings = minicbor::decode(&wire).unwrap();
+            assert_eq!(back, q);
+            let old: Before = minicbor::decode(&wire).unwrap();
+            assert_eq!((old.fps, old.codec), (q.fps, q.codec));
+        }
 
         // 画面的报告：之前的被控端不认识这个控制数据报，跳过就是了（见 framing 的兼容规则）
         let report = VideoReport {
@@ -1254,18 +1298,20 @@ mod tests {
             codec: Codec::AV1,
             priority: VideoPriority::Clarity,
             transport: VideoTransport::Fec,
+            draw_cursor: true,
         };
         assert_eq!(
             serde_json::to_value(q).unwrap(),
-            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity", "transport": "fec" })
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity", "transport": "fec", "drawCursor": true })
         );
-        // 之前的界面不带优先项、传输方式：低延迟、自动
+        // 之前的界面不带优先项、传输方式、光标：低延迟、自动、不画
         let old: QualitySettings = serde_json::from_value(
             json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }),
         )
         .unwrap();
         assert_eq!(old.priority, VideoPriority::Latency);
         assert_eq!(old.transport, VideoTransport::Auto);
+        assert!(!old.draw_cursor);
         assert_eq!(
             serde_json::to_value(VideoTransport::KNOWN).unwrap(),
             json!(["auto", "streams", "fec"])

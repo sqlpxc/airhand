@@ -70,6 +70,8 @@ fn settings() -> QualitySettings {
         priority: VideoPriority::Latency,
         // 不带传输方式时是自动（之前的界面不带；自动也不带）
         transport: VideoTransport::Auto,
+        // 不带时不把光标画进画面（Android 不带）
+        draw_cursor: false,
     }
 }
 

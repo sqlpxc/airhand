@@ -7,9 +7,10 @@ use airhand_lib::host::{capture, encoder::Encoder};
 use airhand_proto::session::{Codec, QualitySettings, VideoPriority};
 use std::time::{Duration, Instant};
 fn main() {
-    let sub = capture::subscribe(0, 60, capture::Output::Native);
-    sub.slot().wait_change(0, u64::MAX, Duration::from_secs(3));
-    let (_, f) = sub.slot().try_newer(0).expect("capture");
+    let sub = capture::subscribe(0, 60, capture::Output::Native, false);
+    sub.slot()
+        .wait_change(0, u64::MAX, Duration::from_secs(3), false);
+    let (_, f) = sub.slot().try_newer(0, false).expect("capture");
     println!(
         "screen {}x{} ({})",
         f.width,
@@ -25,8 +26,8 @@ fn main() {
     let t = Instant::now();
     while frames.len() < 30 && t.elapsed() < Duration::from_secs(3) {
         sub.slot()
-            .wait_change(seq, u64::MAX, Duration::from_millis(50));
-        if let Some((s, f)) = sub.slot().try_newer(seq) {
+            .wait_change(seq, u64::MAX, Duration::from_millis(50), false);
+        if let Some((s, f)) = sub.slot().try_newer(seq, false) {
             seq = s;
             frames.push(f);
         } else {

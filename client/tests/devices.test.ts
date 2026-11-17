@@ -7,6 +7,7 @@ import {
   deviceTitle,
   forgetDevice,
   matchDevice,
+  patchDevice,
   relativeTime,
   remember,
   renameDevice,
@@ -32,6 +33,19 @@ test("连上就记下，最近的在前面，再连一次只是更新", () => {
   // 这次没有的（凭证、画质）沿用上次的
   assert.deepEqual(list[0].resume, [1, 2, 3]);
   assert.deepEqual(list[0].quality, q);
+});
+
+test("鼠标模式按设备记住：连上时记下、换了就更新，这次没说就沿用上次的", () => {
+  let list: SavedDevice[] = remember([], seen("482913"), 1);
+  assert.equal(list[0].mouse, null, "auto by default");
+  list = remember(list, { ...seen("482913"), mouse: "game" }, 2);
+  assert.equal(list[0].mouse, "game");
+  list = remember(list, seen("482913"), 3);
+  assert.equal(list[0].mouse, "game");
+  list = patchDevice(list, "482913", { mouse: "desktop" });
+  assert.equal(list[0].mouse, "desktop");
+  // 没记下的设备不变
+  assert.equal(patchDevice(list, "111111", { mouse: "game" }), list);
 });
 
 test("自己起的名字：重连后保留；改回对方的名字或清空就是不另起名字", () => {
