@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { RemoteInput, isLockShortcut } from "../src/lib/input.ts";
+import { RemoteInput, isLockShortcut, physicalCode } from "../src/lib/input.ts";
 
 /** 记下注册的事件处理函数，测试里直接调用 */
 function fakeCanvas() {
@@ -262,6 +262,33 @@ test("按着键时失去焦点（全部松开）：按着键期间出现的光�
   fire("blur", {});
   assert.equal(input.locked, false);
   assert.equal(input.relative, false);
+  input.dispose();
+});
+
+test("右 Shift 没有 code（Windows 11 + 微软输入法下的 Chromium）：当成 ShiftRight 发，按下、松开都是", async () => {
+  const batches: any[][] = [];
+  const { canvas, fire } = fakeCanvas();
+  const input = new RemoteInput(canvas, () => true, events => batches.push(events));
+  input.interactive = true;
+  // 抓到的真实事件：key 是 Shift，code 是空的，location 是 0
+  const rshift = { key: "Shift", code: "", location: 0, repeat: false };
+  fire("keydown", rshift);
+  fire("keydown", { key: "!", code: "Digit1", location: 0, repeat: false });
+  fire("keyup", { key: "!", code: "Digit1", location: 0, repeat: false });
+  fire("keydown", { ...rshift, repeat: true });
+  fire("keyup", rshift);
+  // 别的认不出的键照样不发
+  fire("keydown", { key: "Unidentified", code: "", location: 0, repeat: false });
+  await Promise.resolve();
+  assert.deepEqual(batches.flat(), [
+    { type: "key", code: "ShiftRight", down: true },
+    { type: "key", code: "Digit1", down: true },
+    { type: "key", code: "Digit1", down: false },
+    { type: "key", code: "ShiftRight", down: true },
+    { type: "key", code: "ShiftRight", down: false },
+  ]);
+  assert.equal(physicalCode({ key: "Shift", code: "", location: 1 } as KeyboardEvent), "ShiftLeft");
+  assert.equal(physicalCode({ key: "Shift", code: "ShiftLeft", location: 1 } as KeyboardEvent), "ShiftLeft");
   input.dispose();
 });
 

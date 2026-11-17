@@ -62,6 +62,20 @@ const ESC_HOLD_MS = 1000;
  */
 const LOCK_RETRY_MS = 500;
 
+/**
+ * 这个键盘事件是哪个物理键（W3C `KeyboardEvent.code`），认不出时是空字符串。
+ *
+ * Windows 11 上用新版微软输入法（微软拼音、日文 IME 等，TSF）时，右 Shift 的按键消息带着扩展键标志（扫描码成了 E0 36，
+ * 本来是 36），Chromium（WebView2、Chrome、Edge）认不出这个扫描码：`code` 是空的，`location` 也是 0，只有 `key` 还是 "Shift"。
+ * 左 Shift 不受影响，所以没有 `code` 的 Shift 就当右 Shift。不这样的话右 Shift 整个不发给对方，按住右 Shift 打 1 出来的是 1
+ */
+export function physicalCode(e: KeyboardEvent): string {
+  if (e.code && e.code !== "Unidentified") return e.code;
+  // location 1 = DOM_KEY_LOCATION_LEFT
+  if (e.key === "Shift") return e.location === 1 ? "ShiftLeft" : "ShiftRight";
+  return "";
+}
+
 /** 进入 / 退出游戏模式的快捷键：Ctrl+Alt+Shift+M */
 export function isLockShortcut(e: KeyboardEvent): boolean {
   return e.code === "KeyM" && e.ctrlKey && e.altKey && e.shiftKey && !e.metaKey;
@@ -502,45 +516,46 @@ export class RemoteInput {
       const paste = this.onPaste !== null && !e.repeat && isPasteKey(e);
       if (!paste) e.preventDefault();
       e.stopPropagation();
-      if (!e.code || e.code === "Unidentified") return;
+      const code = physicalCode(e);
+      if (!code) return;
       if (paste) {
-        this.pressed.add(e.code);
-        const code = e.code;
+        this.pressed.add(code);
         setTimeout(() => this.enqueue([{ type: "key", code, down: true }], true), 0);
         return;
       }
       if (isLockShortcut(e)) {
         if (!e.repeat) this.toggleGame();
-        this.swallowed.add(e.code);
+        this.swallowed.add(code);
         return;
       }
       // 锁定时的 Esc（全屏时浏览器不再用它解除锁定）：照常发给对方，按住够久就解除，松开之前不发自动重复
-      if (e.code === "Escape" && (this.escHeld || this.locked)) {
+      if (code === "Escape" && (this.escHeld || this.locked)) {
         if (e.repeat) return;
         this.holdEsc();
       }
-      if (IS_MAC && e.code === "CapsLock") return this.tapCaps();
-      if (e.repeat && !this.pressed.has(e.code)) return;
-      this.pressed.add(e.code);
-      this.enqueue([{ type: "key", code: e.code, down: true }], true);
+      if (IS_MAC && code === "CapsLock") return this.tapCaps();
+      if (e.repeat && !this.pressed.has(code)) return;
+      this.pressed.add(code);
+      this.enqueue([{ type: "key", code, down: true }], true);
     });
     on("keyup", e => {
       if (!this._interactive) return;
       e.preventDefault(); e.stopPropagation();
-      if (!e.code || e.code === "Unidentified") return;
-      if (this.swallowed.delete(e.code)) return;
-      if (e.code === "Escape") this.cancelEscHold();
-      if (IS_MAC && e.code === "CapsLock") return this.tapCaps();
-      this.pressed.delete(e.code);
+      const code = physicalCode(e);
+      if (!code) return;
+      if (this.swallowed.delete(code)) return;
+      if (code === "Escape") this.cancelEscHold();
+      if (IS_MAC && code === "CapsLock") return this.tapCaps();
+      this.pressed.delete(code);
       const events: InputEvent[] = [];
-      if (IS_MAC && META_KEYS.has(e.code)) {
-        for (const code of this.pressed) {
-          if (MODIFIERS.has(code)) continue;
-          this.pressed.delete(code);
-          events.push({ type: "key", code, down: false });
+      if (IS_MAC && META_KEYS.has(code)) {
+        for (const held of this.pressed) {
+          if (MODIFIERS.has(held)) continue;
+          this.pressed.delete(held);
+          events.push({ type: "key", code: held, down: false });
         }
       }
-      events.push({ type: "key", code: e.code, down: false });
+      events.push({ type: "key", code, down: false });
       this.enqueue(events, true);
     });
     on("blur", () => { this.cancelEscHold(); this.releaseAll(); });
