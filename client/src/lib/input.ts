@@ -14,6 +14,7 @@
 // * 被控端光标重新出现：自动锁定的解除锁定，本机指针回到锁定时的位置（游戏也会把光标放回原处）。
 //   按着鼠标键时光标出现了先不算，松开所有键再解除：有的游戏按住键转视角时光标一闪一闪（隐藏 / 出现来回跳），
 //   跟着它解除、再锁定，浏览器每次都提示"按 Esc 显示光标"，中间还改发绝对坐标，视角乱跳；
+//   锁定期间按键的状态只跟着按下 / 松开走，不看单纯移动的 buttons（Windows 上锁定时它是 0，见 buttonsAfter）；
 // * 用户按 Esc 解除了锁定：到下一次点击之前不再自动锁定，指针照常显示；
 // * 手动锁定（Ctrl+Alt+Shift+M 或工具栏）：不管被控端光标，直到再切换一次或者按 Esc。
 //
@@ -339,9 +340,25 @@ export class RemoteInput {
     return out;
   }
 
-  /** 一个指针事件：位置（绝对坐标时）+ 按键变化 */
-  private pointer(e: PointerEvent, urgent: boolean) {
-    const buttons = this.buttonEvents(e.buttons);
+  /**
+   * 这个指针事件之后按着哪些键（PointerEvent.buttons 的位）。`move`：是 pointermove。
+   *
+   * 锁定时单纯的移动（button 是 -1 的 pointermove）不改按键状态：Windows 上的 Chromium / WebView2 按
+   * unadjustedMovement 锁定之后，移动改从 Raw Input（WM_INPUT）拿，而 Raw Input 只有按下 / 松开的变化、
+   * 没有"现在按着哪些键"，这些 pointermove 的 buttons 是 0（新版 Chromium 自己记了按键状态，可锁定之前就按着的键
+   * 它还是不知道）。游戏里按着右键转视角正好是先按下、光标隐藏了才锁定：把这个 0 当成松开，就会给对方发右键松开，
+   * 游戏退出转视角、光标出现、解除锁定，下一次移动又按下、又锁定……一秒钟好几次，每次都提示"按 Esc 显示光标"，
+   * 视角走走停停。按下 / 松开（pointerdown / pointerup，同时按几个键时 button 不是 -1 的 pointermove）
+   * 来自普通的鼠标消息，它们的 buttons 是对的
+   */
+  private buttonsAfter(e: PointerEvent, move: boolean): number {
+    if (move && this.locked && !(e.button >= 0)) return this.buttons;
+    return e.buttons;
+  }
+
+  /** 一个指针事件：位置（绝对坐标时）+ 按键变化。`move`：是 pointermove */
+  private pointer(e: PointerEvent, urgent: boolean, move = false) {
+    const buttons = this.buttonEvents(this.buttonsAfter(e, move));
     if (this.relative) {
       this.moveBy(e);
       if (!this.locked && this.remoteHidden && !this.userUnlocked && e.type === "pointermove") {
@@ -371,7 +388,7 @@ export class RemoteInput {
         if (this.manual) { this.manual = false; this.onModeChange?.(); }
       }, { signal });
     }
-    on("pointermove", e => { if (this._interactive) this.pointer(e, false); });
+    on("pointermove", e => { if (this._interactive) this.pointer(e, false, true); });
     on("pointerdown", e => {
       if (!this._interactive) return;
       e.preventDefault(); this.focus();

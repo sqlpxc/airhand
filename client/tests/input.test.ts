@@ -203,6 +203,53 @@ test("按着键转视角时被控端光标一闪一闪：一直锁定、发相�
   input.dispose();
 });
 
+test("锁定时单纯移动的 buttons 是 0（Windows 的 Raw Input）：不当成松开，按键状态只跟着按下 / 松开", async (t) => {
+  const batches: any[][] = [];
+  const { canvas, fire } = fakeCanvas();
+  t.after(fakeLockDocument(canvas));
+  let lockRequests = 0;
+  const request = canvas.requestPointerLock;
+  canvas.requestPointerLock = () => { lockRequests++; return request(); };
+  const input = new RemoteInput(canvas, () => true, events => batches.push(events));
+  input.interactive = true;
+
+  // 实测（WebView2 157）：按着右键拖动，游戏隐藏光标、锁定之后，每个 pointermove 都是 buttons 0、button -1
+  fire("pointerdown", { button: 2, buttons: 2, clientX: 50, clientY: 50, pointerId: 1, movementX: 0, movementY: 0 });
+  fire("pointermove", { button: -1, buttons: 2, movementX: 4, movementY: 0, clientX: 54, clientY: 50 });
+  input.setRemoteCursorHidden(true);
+  assert.equal(input.locked, true);
+  for (let i = 0; i < 5; i++) {
+    fire("pointermove", { button: -1, buttons: 0, movementX: 5, movementY: 0, clientX: 54, clientY: 50 });
+  }
+  // 被控端光标闪了一下：照样锁着
+  input.setRemoteCursorHidden(false);
+  input.setRemoteCursorHidden(true);
+  // 锁定时又按下左键（同时按两个键，只在 pointermove 里出现，button 是变化的那个键）
+  fire("pointermove", { button: 0, buttons: 3, movementX: 0, movementY: 0, clientX: 54, clientY: 50 });
+  fire("pointermove", { button: -1, buttons: 0, movementX: 1, movementY: 0, clientX: 54, clientY: 50 });
+  assert.equal(input.locked, true);
+  assert.equal(lockRequests, 1);
+
+  // 真的松开：Raw Input 先来一个 buttons 0 的移动，再是 pointerup
+  fire("pointermove", { button: -1, buttons: 0, movementX: 0, movementY: 0, clientX: 54, clientY: 50 });
+  fire("pointerup", { button: 0, buttons: 2, movementX: 0, movementY: 0, clientX: 54, clientY: 50 });
+  fire("pointerup", { button: 2, buttons: 0, movementX: 0, movementY: 0, clientX: 54, clientY: 50 });
+  input.setRemoteCursorHidden(false);
+  assert.equal(input.locked, false);
+
+  await new Promise((r) => setTimeout(r, 20));
+  const sent = batches.flat();
+  assert.deepEqual(sent.filter(e => e.type === "mouseButton"), [
+    { type: "mouseButton", button: "right", down: true },
+    { type: "mouseButton", button: "left", down: true },
+    { type: "mouseButton", button: "left", down: false },
+    { type: "mouseButton", button: "right", down: false },
+  ]);
+  // 锁定之后只发移动量
+  assert.equal(sent.filter(e => e.type === "mouseDelta").reduce((n, e) => n + e.dx, 0), 26);
+  input.dispose();
+});
+
 test("按着键时失去焦点（全部松开）：按着键期间出现的光标也就算数了", (t) => {
   const { canvas, fire } = fakeCanvas();
   t.after(fakeLockDocument(canvas));
