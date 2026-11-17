@@ -25,9 +25,9 @@ const PRIORITIES: VideoPriority[] = ["latency", "clarity"];
 /** 丢包时怎么办：自动（默认，被控端看网络情况选）/ 重传 / 前向纠错 */
 const TRANSPORTS: VideoTransport[] = ["auto", "streams", "fec"];
 
-// 码率滑块使用对数刻度：0.5 ~ 50 Mbps
+// 码率滑块使用对数刻度：0.5 ~ 100 Mbps（与协议里 QualitySettings 的上限 100_000 kbps 一致）
 const MIN_KBPS = 500;
-const MAX_KBPS = 50000;
+const MAX_KBPS = 100000;
 const toSlider = (kbps: number) => (Math.log(kbps / MIN_KBPS) / Math.log(MAX_KBPS / MIN_KBPS)) * 100;
 const fromSlider = (v: number) => {
   const k = MIN_KBPS * Math.pow(MAX_KBPS / MIN_KBPS, v / 100);
@@ -126,7 +126,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
             ))}
           </div>
 
-          <Label text={t("quality.bitrate")} hint={`0.5 ~ 50 Mbps · ${t("quality.idleHint")}`} />
+          <Label text={t("quality.bitrate")} hint={`0.5 ~ 100 Mbps · ${t("quality.idleHint")}`} />
           <div className="qp-bitrate">
             <input
               type="range"
