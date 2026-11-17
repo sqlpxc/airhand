@@ -59,16 +59,18 @@ mod queue;
 mod receiver;
 mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::direct;
+use crate::files::{Files, Provider, RemoteOffer};
 use crate::lanes::Router;
 use crate::secure::{self, Identity, InitiatorParams};
 use crate::tasks::OwnedTask;
 use crate::wire::{read_msg, write_msg};
+use airhand_proto::files::FileMsg;
 use airhand_proto::framing;
 use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media;
@@ -99,13 +101,52 @@ pub const CLIPBOARD_POLL: Duration = Duration::from_millis(300);
 const BULK_QUEUE: usize = 4;
 /// 麦克风的声音包最多排着这么多个没发出去（约 320 ms），再多就丢：本来就是数据报
 const MIC_QUEUE: usize = 16;
+/// 本机刚公告了文件时，输入最多扣住这么久等被控端放好（见 [`ControllerService::command`] 的输入）
+const HOLD_INPUT: Duration = Duration::from_secs(1);
+
+/// 发给被控端的文件消息（见 [`crate::files::Peer`]）：控制通道上的经命令队列，大块通道上的（公告、列表）经大块通道。
+/// 会话结束时（[`Files::close`]）放开它们
+struct ControllerPeer(Mutex<Option<(queue::Sender, mpsc::Sender<Bytes>)>>);
+
+impl crate::files::Peer for ControllerPeer {
+    fn send(&self, msg: FileMsg) -> bool {
+        let Some((tx, bulk)) = self.0.lock().unwrap().clone() else {
+            return false;
+        };
+        let msg = ControllerMsg::Files(Some(msg));
+        match msg.lane() {
+            airhand_proto::SessionLane::Bulk => {
+                let b = framing::encode_with_spare(&msg, SEAL_OVERHEAD);
+                b.len() <= airhand_proto::MAX_BULK_MSG && bulk.try_send(Bytes::from(b)).is_ok()
+            }
+            _ => tx.send(msg).is_ok(),
+        }
+    }
+
+    fn close(&self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+/// 本机剪贴板里有了什么（[`ClipboardSync::poll`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Clip {
+    Text(String),
+    /// 复制了文件（用户选中的那几个路径，见 [`crate::files`]）
+    Files(Vec<std::path::PathBuf>),
+}
 
 /// 本机剪贴板的双向同步（桌面版；实现见客户端的 `clipboard.rs`）。
 pub trait ClipboardSync: Send + 'static {
     /// 每隔 [`CLIPBOARD_POLL`] 调用一次，只取已完成的读取结果；不得执行或等待系统剪贴板 IO。
-    fn poll(&mut self) -> Option<String>;
+    fn poll(&mut self) -> Option<Clip>;
     /// 写入被控端复制的文本
     fn apply(&self, text: String);
+    /// 被控端复制了文件：放进本机剪贴板，本机有程序粘贴时才去取（见 [`crate::files`]）。放好了（放不了也要）调用
+    /// [`RemoteOffer::ready`]。默认：这个平台放不了
+    fn apply_files(&self, offer: RemoteOffer) {
+        offer.ready();
+    }
 }
 
 /// 控制台在哪里。
@@ -180,6 +221,11 @@ pub enum Command {
         sid: u32,
         enabled: bool,
     },
+    /// 界面这边的剪贴板换成了文字以外的东西、清空了（网页版、Android：界面自己读剪贴板）：之前公告的文件不再是最新的
+    /// （公告文件见 [`ControllerService::offer_files`]）
+    ClipboardCleared {
+        sid: u32,
+    },
     /// 界面收到了第 `stream` 路画面的第 `seq` 帧（累积确认），见 [`SessionUi::packet`]
     Ack {
         sid: u32,
@@ -206,6 +252,7 @@ impl Command {
             | Command::Mic { sid, .. }
             | Command::Clipboard { sid, .. }
             | Command::ClipboardSync { sid, .. }
+            | Command::ClipboardCleared { sid }
             | Command::Ack { sid, .. }
             | Command::Disconnect { sid } => *sid,
         }
@@ -249,6 +296,8 @@ struct Live {
     router: Arc<Router>,
     tx: mpsc::Sender<ClientMsg>,
     pending: Pending,
+    /// 一次粘贴经中转最多传多少（服务器在版本握手里说的，见 `airhand_proto::files`）
+    file_limit: Option<u64>,
 }
 
 struct SessionHandle {
@@ -264,6 +313,12 @@ struct SessionHandle {
     feedback: Arc<session::Feedback>,
     /// 麦克风的声音包；被控端不支持（没协商到 MIC）时为 `None`
     mic: Option<Mic>,
+    /// 剪贴板里的文件；被控端不支持（没协商到 FILES）时为 `None`
+    files: Option<Files>,
+    /// 本机刚公告了文件、对方还没放好时扣住的输入（见 [`ControllerService::command`] 的输入）
+    held: Arc<Mutex<Option<VecDeque<ControllerMsg>>>>,
+    /// 被控端剪贴板里最新的文件（网页版、Android 从这里取，见 [`ControllerService::remote_files`]）
+    remote: Arc<Mutex<Option<RemoteOffer>>>,
 }
 
 /// 一个会话的麦克风
@@ -428,6 +483,26 @@ impl ControllerService {
                 tx: mic_tx,
                 on: AtomicBool::new(false),
             });
+        // 剪贴板里的文件（双方都支持时）：被控端开过来的文件流交给它
+        let (file_keys, file_streams) = link.files;
+        let files = link
+            .negotiated
+            .has(airhand_proto::features::session::FILES)
+            .then(|| {
+                Files::start(
+                    grant.session_id,
+                    link.paths.clone(),
+                    file_keys,
+                    live.file_limit,
+                    ControllerPeer(Mutex::new(Some((tx.clone(), bulk_tx.clone())))),
+                    file_streams,
+                )
+            });
+        let (files, files_task) = match files {
+            Some((f, t)) => (Some(f), Some(t)),
+            None => (None, None),
+        };
+        let remote: Arc<Mutex<Option<RemoteOffer>>> = Arc::default();
         // Ping、画面确认：控制数据报，中转上发、直连通着时直连上也发
         let feedback = Arc::new(session::Feedback::new(link.datagrams));
         // 直连：等被控端发来候选地址
@@ -471,6 +546,8 @@ impl ControllerService {
                 task: Box::pin(direct),
             },
             mic: (grant.session_id, mic_rx, link.mic),
+            files: files.clone().zip(files_task),
+            remote: remote.clone(),
         };
         let registration = link.registration;
         let inner = self.inner.clone();
@@ -494,6 +571,9 @@ impl ControllerService {
                 arrivals,
                 feedback,
                 mic,
+                files,
+                held: Arc::default(),
+                remote,
             },
         );
         info!(sid, code, host = %grant.host_name, %safety, "session established");
@@ -511,7 +591,7 @@ impl ControllerService {
     /// 执行界面的命令
     pub fn command(&self, cmd: Command) -> Result<(), Problem> {
         let msg = match cmd {
-            Command::Input { sid, events } => (sid, queue::input(events)),
+            Command::Input { sid, events } => return self.input(sid, queue::input(events)),
             Command::Settings { sid, settings } => {
                 (sid, ControllerMsg::Settings(settings.sanitized()))
             }
@@ -547,6 +627,10 @@ impl ControllerService {
             Command::Clipboard { sid, text } => {
                 let sessions = self.inner.sessions.lock().unwrap();
                 let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+                // 文字取代之前公告的文件
+                if let Some(f) = &s.files {
+                    f.withdraw();
+                }
                 send_clipboard(&s.bulk, text);
                 return Ok(());
             }
@@ -556,6 +640,14 @@ impl ControllerService {
                 // 网页版、Android 没有这个开关：剪贴板由界面自己决定发不发
                 if let Some(c) = &s.clipboard {
                     c.store(enabled, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+            Command::ClipboardCleared { sid } => {
+                let sessions = self.inner.sessions.lock().unwrap();
+                let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+                if let Some(f) = &s.files {
+                    f.withdraw();
                 }
                 return Ok(());
             }
@@ -572,6 +664,74 @@ impl ControllerService {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
         s.tx.send(msg)
+    }
+
+    /// 一批输入。本机刚公告了文件、被控端还没放好时（最多 [`HOLD_INPUT`]）先扣住，之后的输入也排在后面：
+    /// 公告走大块通道、输入走控制通道，刚复制完就在远端按粘贴的话，粘贴键不能赶在公告前面
+    /// （见 `airhand_proto::files` 的"公告"）
+    fn input(&self, sid: u32, msg: ControllerMsg) -> Result<(), Problem> {
+        let sessions = self.inner.sessions.lock().unwrap();
+        let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+        let mut held = s.held.lock().unwrap();
+        if let Some(q) = held.as_mut() {
+            q.push_back(msg);
+            return Ok(());
+        }
+        let Some(files) = s.files.as_ref().filter(|f| f.awaiting_ready()) else {
+            drop(held);
+            return s.tx.send(msg);
+        };
+        *held = Some(VecDeque::from([msg]));
+        let (files, held, tx) = (files.clone(), s.held.clone(), s.tx.clone());
+        self.inner.rt.spawn(async move {
+            if !files.await_ready(HOLD_INPUT).await {
+                debug!(
+                    "the host didn't confirm the clipboard files in time, sending the input anyway"
+                );
+            }
+            // 按顺序发出去；发的时候又来了的也排在后面一起发，空了才不再扣
+            loop {
+                let next = {
+                    let mut held = held.lock().unwrap();
+                    match held.as_mut().and_then(VecDeque::pop_front) {
+                        Some(m) => m,
+                        None => {
+                            *held = None;
+                            break;
+                        }
+                    }
+                };
+                if tx.send(next).is_err() {
+                    held.lock().unwrap().take();
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// 界面这边复制了文件（网页版、Android：文件在界面那边，由 `provider` 读）：公告给被控端，它粘贴时才来取。
+    /// 被控端不支持时是错误
+    pub fn offer_files(&self, sid: u32, provider: Arc<dyn Provider>) -> Result<(), Problem> {
+        let sessions = self.inner.sessions.lock().unwrap();
+        let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+        let files = s
+            .files
+            .as_ref()
+            .ok_or_else(|| Problem::failed("the host doesn't support clipboard files"))?;
+        files.offer(provider);
+        Ok(())
+    }
+
+    /// 被控端剪贴板里最新的文件（网页版、Android：界面收到 [`SessionEvent::ClipboardFiles`] 之后从这里取）。
+    /// 编号不是 `clip` 的（已经被新的取代了）不给
+    pub fn remote_files(&self, sid: u32, clip: u32) -> Result<RemoteOffer, Problem> {
+        let sessions = self.inner.sessions.lock().unwrap();
+        let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
+        let offer = s.remote.lock().unwrap().clone();
+        offer
+            .filter(|o| o.clip() == clip)
+            .ok_or_else(|| Problem::failed("these clipboard files are no longer available"))
     }
 
     /// 界面收到了第 `stream` 路的这一帧（[`Command::Ack`]；Android 每帧走一次 JNI，不经过 JSON）。确认是累积的，
@@ -689,6 +849,7 @@ async fn connect_once(inner: &Arc<Inner>, report: &Report) -> Result<()> {
         router,
         tx,
         pending: pending.clone(),
+        file_limit: sig.file_limit,
     });
     report(ServerState::Connected);
     info!("controller connected to the server");

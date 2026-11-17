@@ -42,6 +42,7 @@ fn signal_messages_keep_their_wire_encoding() {
             max: 9,
             version: Some(9),
             features: Features::NONE,
+            file_limit: None,
         },
         "a40009010902090300",
     );
@@ -51,6 +52,7 @@ fn signal_messages_keep_their_wire_encoding() {
             max: 9,
             version: None,
             features: Features::NONE,
+            file_limit: None,
         },
         "a3000901090300",
     );

@@ -124,6 +124,13 @@ pub enum Cmd {
         #[serde(flatten)]
         opts: ConnectOptions,
     },
+    /// 被控端复制的文件（会话事件 `clipboardFiles` 的 `clip`）：回复给 Kotlin 用的 `key`（见 crate::files）
+    RemoteFiles { sid: u32, clip: u32 },
+    /// 手机上分享给 Airhand 的文件（打开着的文件描述符）：公告给被控端，它粘贴时才来取（见 crate::files）
+    OfferFiles {
+        sid: u32,
+        files: Vec<crate::files::FdFile>,
+    },
     /// 对会话的操作
     #[serde(untagged)]
     Session(Command),
@@ -179,6 +186,20 @@ impl Ctl {
         };
         let r = match cmd {
             Cmd::Connect { code, opts } => return self.connect(&code, opts),
+            Cmd::RemoteFiles { sid, clip } => {
+                return match self.svc.remote_files(sid, clip) {
+                    Ok(o) => json!({ "ok": crate::files::register(o) }).to_string(),
+                    Err(p) => err(p),
+                };
+            }
+            Cmd::OfferFiles { sid, files } => {
+                let provider = crate::files::FdFiles::new(files);
+                if provider.is_empty() {
+                    Ok(())
+                } else {
+                    self.svc.offer_files(sid, Arc::new(provider))
+                }
+            }
             Cmd::Session(c) => {
                 if let Command::Disconnect { sid } = c
                     && let Some(q) = self.sessions.lock().unwrap().remove(&sid)

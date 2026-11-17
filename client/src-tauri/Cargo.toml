@@ -46,6 +46,8 @@ fast_image_resize = "6"
 opus = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+# #[implement] 展开的代码直接引用 windows_core（剪贴板里的文件：自己实现的 IDataObject、IStream）
+windows-core = "0.62"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
@@ -67,6 +69,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Registry",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Ole",
@@ -79,6 +82,9 @@ windows = { version = "0.62", features = [
   "Win32_UI_HiDpi",
   # 声音设备的属性（控制端的麦克风：按接口名找 Steam Streaming Microphone、读它的设备格式）
   "Win32_UI_Shell_PropertiesSystem",
+  # 剪贴板里的文件：对方复制的文件以"虚拟文件"放进本机剪贴板（FILEDESCRIPTORW / FILECONTENTS，见 src/clipfiles/windows.rs）
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
   "Win32_Security",
 ] }
 
@@ -94,6 +100,9 @@ libc = "0.2"
 # 和 Tauri（gtk 0.18）用同一个版本：全屏时暂停 webview 上的信号处理函数（见 fullscreen.rs）
 glib = "0.18"
 x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr", "xtest", "xkb"] }
+# 剪贴板里的文件：对方复制的文件放在一个 FUSE 文件系统里，粘贴时才取（见 src/clipfiles/linux.rs）。
+# 不链接 libfuse：经 fusermount3 挂载
+fuser = { version = "0.15", default-features = false }
 libpulse-binding = "2"
 
 # macOS 被控端：ScreenCaptureKit 采集画面和系统声音，VideoToolbox 硬件编码，CGEvent 注入键鼠，

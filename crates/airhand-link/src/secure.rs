@@ -280,6 +280,60 @@ pub struct Secured {
     /// 控制数据报（Ping、Pong、画面确认、探测和回声，`airhand_proto::datagram::CONTROL`）。乱序可以、重放不行：
     /// 直连通着时同一个数据报两条路各发一份，后到的那份就是重放
     pub datagrams: LaneKeys,
+    /// 剪贴板里的文件：每次取用一把密钥（见 [`FileKeys`]）
+    pub files: FileKeys,
+}
+
+/// 剪贴板里的文件的密钥（见 `airhand_proto::files`）：每次取用一把，从每个方向一个的根按取用编号派生，计数从 0 开始、
+/// 必须一个接一个。取用编号由取的一方分配，一个会话里严格递增（给的一方检查）：同一把密钥不会加密两份内容
+pub struct FileKeys {
+    /// 本端发出去的（本端给的取用）
+    send: [u8; 32],
+    /// 对方发来的（本端取的）
+    recv: [u8; 32],
+}
+
+impl FileKeys {
+    fn key(root: &[u8; 32], fetch: u32) -> LessSafeKey {
+        let mut out = [0u8; 32];
+        derive(
+            root,
+            root,
+            format!("airhand file fetch {fetch}").as_bytes(),
+            &mut out,
+        );
+        aead_key(&out)
+    }
+
+    /// 本端给对方的取用 `fetch` 的加密端
+    pub fn sealer(&self, fetch: u32) -> Sealer {
+        Sealer {
+            key: Self::key(&self.send, fetch),
+            counter: 0,
+        }
+    }
+
+    /// 本端向对方取的取用 `fetch` 的解密端（必须一个接一个）
+    pub fn opener(&self, fetch: u32) -> Opener {
+        Opener {
+            key: Self::key(&self.recv, fetch),
+            order: Order::Next(0),
+        }
+    }
+
+    /// 测试用：两端的一对（`a` 给、`b` 取，或者反过来）
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, Self) {
+        let (x, y) = ([1u8; 32], [2u8; 32]);
+        (Self { send: x, recv: y }, Self { send: y, recv: x })
+    }
+}
+
+impl Drop for FileKeys {
+    fn drop(&mut self) {
+        self.send = [0; 32];
+        self.recv = [0; 32];
+    }
 }
 
 /// 仅握手内部持有的原始材料，消费后派生一次全部通道密钥。
@@ -309,6 +363,7 @@ fn label(lane: SessionLane) -> Vec<u8> {
         SessionLane::Video(0) => b"airhand video".to_vec(),
         SessionLane::Video(stream) => format!("airhand video {stream}").into_bytes(),
         SessionLane::Bulk => b"airhand bulk".to_vec(),
+        SessionLane::File => b"airhand files".to_vec(),
     }
 }
 
@@ -349,18 +404,27 @@ impl KeyMaterial {
                 bulk: self.keys(&label(SessionLane::Bulk), Order::Next(0)),
                 audio: self.keys(b"airhand audio", window()),
                 datagrams: self.keys(b"airhand control datagram", window()),
+                files: FileKeys {
+                    send: self.raw(true, &label(SessionLane::File)),
+                    recv: self.raw(false, &label(SessionLane::File)),
+                },
             },
             self.keys(&label(SessionLane::Control), Order::Next(0)),
         )
     }
 
-    fn key(&self, sending: bool, label: &[u8]) -> LessSafeKey {
+    /// 一个方向、一个标签的原始密钥
+    fn raw(&self, sending: bool, label: &[u8]) -> [u8; 32] {
         // 控制端发送 = 发起方 → 响应方
         let i2r = sending == (self.role == Role::Controller);
         let ikm = if i2r { &self.i2r } else { &self.r2i };
         let mut out = [0u8; 32];
         derive(&self.h, ikm, label, &mut out);
-        aead_key(&out)
+        out
+    }
+
+    fn key(&self, sending: bool, label: &[u8]) -> LessSafeKey {
+        aead_key(&self.raw(sending, label))
     }
 
     fn keys(&self, label: &[u8], order: Order) -> LaneKeys {

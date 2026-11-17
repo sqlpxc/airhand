@@ -9,7 +9,8 @@
 //! 服务器从不解析会话内容：会话是端到端加密的（见 `airhand_proto::handshake`），服务器只看会话头里的会话 ID、
 //! 通道编号和优先级，发起会话时控制端带来的握手消息也原样交给被控端。会话有几条通道、每条是什么，服务器都不管
 //! （只限制数量，`airhand_proto::MAX_LANES`）；任何一端的控制通道（0 号）结束了，整个会话结束。所以会话层加通道、
-//! 改格式都不用升级服务器。
+//! 改格式都不用升级服务器。唯一的例外是文件通道（剪贴板里的文件，`SessionLane::File`）：传文件对中转的带宽压力大，
+//! 服务器在版本握手里告诉客户端一次粘贴经中转最多多大（[`Config::file_limit`]），并按单条文件流兜底（见 [`relay`]）。
 //!
 //! 版本握手见 `airhand_proto::signal` 的"版本握手"：服务器接受一个区间的信令版本，不要求相等。
 //!
@@ -111,6 +112,9 @@ pub struct Config {
     /// 同一个来源（[`limiter_key`]）一分钟内最多向同一台被控端发起这么多个会话（见模块说明）。
     /// 不应该比 `max_sessions_per_host` 小：不然同一个出口 IP 后面的人坐不满一台被控端
     pub connects_per_minute: usize,
+    /// 一次粘贴（剪贴板里的一个文件公告）经中转最多传这么多字节的内容（`None`：不限；`Some(0)`：中转不传文件，
+    /// 只能走直连）。在版本握手里告诉客户端（`ServerHello::file_limit`）；服务器按单条文件流兜底（见 [`relay`]）
+    pub file_limit: Option<u64>,
 }
 
 impl Config {
@@ -119,6 +123,8 @@ impl Config {
     /// 发起之后不开流的会话占着槽位到配对超时（20 多秒）：一分钟 6 个，平均占着 2 个多，
     /// 一个来源靠它占不满默认的 4 个槽位。正常使用（输错配对码再试、断线重连）到不了这个数
     pub const DEFAULT_CONNECTS_PER_MINUTE: usize = 6;
+    /// 剪贴板里的文件经中转的上限：50 MiB（大的走直连，见 `airhand_proto::files` 的"走哪条路"）
+    pub const DEFAULT_FILE_LIMIT: u64 = 50 << 20;
 }
 
 /// Bounded signaling output. A non-reading peer is disconnected on overflow,
@@ -162,6 +168,8 @@ pub struct Broker {
     /// 每个来源（[`limiter_key`]）现在有几条连接
     conns: Ranked<HashMap<std::net::IpAddr, usize>>,
     next_conn: AtomicU64,
+    /// 启动以来文件流一共转发了多少字节（见 [`relay`]）
+    file_bytes: Arc<AtomicU64>,
 }
 
 async fn writer_loop(mut send: SendStream, mut rx: mpsc::Receiver<ServerMsg>) {
@@ -188,6 +196,7 @@ impl Broker {
             new_codes: Limiter::new(Rank::NewCodes, limits::NEW_CODE_WINDOW),
             conns: Ranked::default_with(Rank::Conns),
             next_conn: AtomicU64::new(1),
+            file_bytes: Arc::default(),
         }))
     }
 
@@ -232,6 +241,11 @@ impl Broker {
         let sessions = self.sessions.lock().len();
         let fixed = self.bindings.lock().len();
         (hosts, sessions, fixed)
+    }
+
+    /// 启动以来文件流（剪贴板里的文件）一共经中转转发了多少字节
+    pub fn relayed_file_bytes(&self) -> u64 {
+        self.file_bytes.load(Ordering::Relaxed)
     }
 
     pub async fn handle_incoming(self: Arc<Self>, incoming: quinn::Incoming) {
@@ -284,7 +298,8 @@ impl Broker {
         // 版本握手（见 airhand_proto::signal 的"版本握手"）：先只读版本区间，任何版本的客户端都能听懂回答
         let versions: Versions =
             framing::decode_known(&buf).context("the first message must be Hello")?;
-        let answer = ServerHello::answer(versions, features::signal::SUPPORTED);
+        let answer =
+            ServerHello::answer(versions, features::signal::SUPPORTED, self.cfg.file_limit);
         write_frame(&mut send, &framing::to_vec(&answer)).await?;
         let Some(version) = answer.version else {
             info!(%peer, min = versions.min, max = versions.max, "rejected client: no common signal version");

@@ -9,10 +9,10 @@ use anyhow::Result;
 use quinn::{Connection, SendStream};
 
 use super::receiver::HostReceiver;
-use crate::lanes::{Feed, Registration, Router, Via, first_stream, open_lane};
+use crate::lanes::{Feed, LaneStreams, Registration, Router, Via, first_stream, open_lane};
 use crate::merge::{Merge, Policy};
 use crate::paths::{DatagramSender, Paths};
-use crate::secure::{Initiator, STEP_TIMEOUT, Sealer};
+use crate::secure::{FileKeys, Initiator, STEP_TIMEOUT, Sealer};
 
 /// 握手做完了、本端的通道开好了的会话（见模块说明）
 pub struct Established {
@@ -37,6 +37,8 @@ pub struct Established {
     pub receiver: HostReceiver,
     /// 直连上来的流、数据报交给这个会话
     pub feed: Feed,
+    /// 剪贴板里的文件：每次取用的密钥，被控端开过来的文件流（见 [`crate::files`]）
+    pub files: (FileKeys, LaneStreams),
     /// 在中转连接上的登记：丢掉之后不再收这个会话的东西
     pub registration: Registration,
 }
@@ -105,6 +107,7 @@ pub async fn establish(
         mic: secured.audio.sealer,
         receiver,
         feed: inbox.feed,
+        files: (secured.files, inbox.files),
         registration,
     })
 }

@@ -143,6 +143,10 @@ fn commands() -> Vec<(Value, Command)> {
             },
         ),
         (
+            json!({ "cmd": "clipboardCleared", "sid": 3 }),
+            Command::ClipboardCleared { sid: 3 },
+        ),
+        (
             json!({ "cmd": "ack", "sid": 3, "seq": 99 }),
             Command::Ack {
                 sid: 3,

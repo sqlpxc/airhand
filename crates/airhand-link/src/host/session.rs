@@ -132,6 +132,9 @@ pub enum Request {
     View(Vec<StreamView>),
     /// 控制端复制了文本（不会超过 [`airhand_proto::session::MAX_CLIPBOARD_TEXT`]）
     Clipboard(String),
+    /// 控制端复制了文件（见 [`crate::files`]）：放进本机剪贴板，本机有程序粘贴时才去取内容。
+    /// 放好了（放不了也要）调用 [`crate::files::RemoteOffer::ready`]
+    ClipboardFiles(crate::files::RemoteOffer),
     /// 打开 / 关闭声音
     Audio(bool),
     /// 打开 / 关闭控制端的麦克风（见 [`MicSink`]）
@@ -175,6 +178,9 @@ pub struct Senders {
     pub video: Vec<mpsc::Sender<Bytes>>,
     /// 声音包
     pub audio: mpsc::Sender<Bytes>,
+    /// 剪贴板里的文件（双方都支持时才有，见 [`crate::files`]）：本机剪贴板里有了文件时 [`crate::files::Files::offer`]，
+    /// 换成了文字时 [`crate::files::Files::withdraw`]
+    pub files: Option<crate::files::Files>,
 }
 
 /// 一个会话里各平台不同的事。方法都在会话的任务里依次调用，不会同时进来两个。
@@ -259,6 +265,7 @@ where
             out: io.out.clone(),
             video: io.video.clone(),
             audio: io.audio.clone(),
+            files: io.files.clone(),
         },
     );
     let result = drive(

@@ -1,6 +1,7 @@
 //! v10 新增的线上格式：帧流的会话头、画面包头的参考帧扩展、`ControllerDatagram::Lost`；
 //! 前向纠错的数据报、`ControllerDatagram::Report`、画质设置里的传输方式；
-//! 多屏（每个显示器一路画面：画面的第几路在通道编号、画面包头、纠错数据报、确认和反馈里）。
+//! 多屏（每个显示器一路画面：画面的第几路在通道编号、画面包头、纠错数据报、确认和反馈里）；
+//! 剪贴板里的文件（文件通道、`FileMsg`，画面和大块通道的优先级因此从 0 提到 1）。
 //! 和 v9 的样例一样，发布之后不要随实现重新生成（见 `v9.rs`）。
 use airhand_proto::fec::{Fragment, PREV_FEC};
 use airhand_proto::media::VideoHeader;
@@ -18,10 +19,10 @@ fn hex(b: &[u8]) -> String {
 fn frame_stream_headers_keep_their_wire_encoding() {
     assert_eq!(airhand_proto::SIGNAL_FRAMES, 10);
     let h = SessionHeader::frame(0x0102_0304_0506_0708, SessionLane::Video(0));
-    assert_eq!(hex(&h.encode()), "41485339080706050403020101000100");
-    // v9 的会话头：第 14 个字节是 0
+    assert_eq!(hex(&h.encode()), "41485339080706050403020101010100");
+    // 不是帧流：第 14 个字节是 0
     let v9 = SessionHeader::new(0x0102_0304_0506_0708, SessionLane::Video(0));
-    assert_eq!(hex(&v9.encode()), "41485339080706050403020101000000");
+    assert_eq!(hex(&v9.encode()), "41485339080706050403020101010000");
 }
 
 #[test]
@@ -59,7 +60,7 @@ fn multi_display_formats_keep_their_wire_encoding() {
     assert_eq!(airhand_proto::MAX_STREAMS, 4);
     // 画面的第 1 路是 3 号通道
     let h = SessionHeader::frame(0x0102_0304_0506_0708, SessionLane::Video(1));
-    assert_eq!(hex(&h.encode()), "41485339080706050403020103000100");
+    assert_eq!(hex(&h.encode()), "41485339080706050403020103010100");
     // 画面包头的第 12 个字节
     let v = VideoHeader {
         seq: 1,
@@ -119,6 +120,49 @@ fn multi_display_formats_keep_their_wire_encoding() {
         hex(&framing::to_vec(&mv)),
         "8201820081820083fa3f000000fa3e80000001"
     );
+}
+
+#[test]
+fn file_formats_keep_their_wire_encoding() {
+    use airhand_proto::files::{FileEntry, FileError, FileKind, FileMsg, reset};
+    use airhand_proto::session::HostMsg;
+    assert_eq!(features::session::FILES.bits(), 8);
+    // 文件通道是 6 号，只用帧流，优先级 0
+    let h = SessionHeader::frame(0x0102_0304_0506_0708, SessionLane::File);
+    assert_eq!(hex(&h.encode()), "41485339080706050403020106000100");
+    assert_eq!((reset::CANCELLED, reset::RELAY_LIMIT), (0x10, 0x20));
+    let offer = HostMsg::Files(Some(FileMsg::Offer {
+        clip: 1,
+        items: vec![FileEntry {
+            path: vec!["a".into()],
+            kind: FileKind::File,
+            size: 3,
+            mtime: None,
+            target: None,
+        }],
+    }));
+    assert_eq!(
+        hex(&framing::to_vec(&offer)),
+        "820d818200820181838161610003"
+    );
+    let fetch = ControllerMsg::Files(Some(FileMsg::Fetch {
+        fetch: 2,
+        clip: 1,
+        path: vec!["a".into()],
+        offset: 0,
+        size: 3,
+        mtime: Some(4),
+        until: 5,
+    }));
+    assert_eq!(
+        hex(&framing::to_vec(&fetch)),
+        "820c818204870201816161000304 05".replace(' ', "")
+    );
+    let failed = HostMsg::Files(Some(FileMsg::Failed {
+        fetch: 2,
+        error: FileError::TooLarge,
+    }));
+    assert_eq!(hex(&framing::to_vec(&failed)), "820d818207820204");
 }
 
 #[test]

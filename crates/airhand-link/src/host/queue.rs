@@ -59,8 +59,8 @@ impl Place {
     fn of(msg: &HostMsg) -> Self {
         let lane = match msg.lane() {
             SessionLane::Bulk => BULK,
-            // 画面不是消息，不走这里
-            SessionLane::Control | SessionLane::Video(_) => CONTROL,
+            // 画面、文件的内容不是消息，不走这里
+            SessionLane::Control | SessionLane::Video(_) | SessionLane::File => CONTROL,
         };
         let queued = |before| Place::Queued { lane, before };
         match msg {
@@ -74,7 +74,8 @@ impl Place {
             | HostMsg::Bye(_)
             | HostMsg::Direct(_)
             // 麦克风的状态很少变，跟在 Hello 后面按顺序发
-            | HostMsg::Mic { .. } => queued(None),
+            | HostMsg::Mic { .. }
+            | HostMsg::Files(_) => queued(None),
         }
     }
 

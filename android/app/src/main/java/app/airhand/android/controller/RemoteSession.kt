@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import app.airhand.android.AirhandApp
+import app.airhand.android.core.ClipFiles
 import app.airhand.android.core.Codec
 import app.airhand.android.core.DisplayInfo
 import app.airhand.android.core.EncoderInfo
@@ -497,7 +498,38 @@ class RemoteSession(
                     }
                 }
             }
+            // 对方复制了文件：换一个 key，放进手机的剪贴板（别的应用读的时候才取），通知里可以保存到下载
+            "clipboardFiles" -> {
+                val h = handle
+                val s = sid
+                val items = e.optJSONArray("items") ?: return
+                if (h == 0L || s < 0) return
+                scope.launch(Dispatchers.IO) {
+                    val cmd = JSONObject().put("cmd", "remoteFiles").put("sid", s).put("clip", e.optInt("clip"))
+                    val r = runCatching { JSONObject(Native.ctlCall(h, cmd.toString())) }.getOrNull() ?: return@launch
+                    if (r.has("ok")) ClipFiles.apply(app, r.getLong("ok"), items)
+                }
+            }
+            "fileError" -> Log.w(TAG, "a clipboard file couldn't be transferred: ${e.optString("name")} (${e.optString("error")})")
         }
+    }
+
+    /** 现在能不能把手机上的文件放进对方的剪贴板（连着） */
+    fun canOfferFiles() = handle != 0L && sid >= 0 && !closed && _phase.value == Phase.Live
+
+    /**
+     * 手机上分享给 Airhand 的文件（[ClipFiles.offer]）：放进对方的剪贴板。文件描述符不管成不成都归这里：
+     * 交给 Rust 就由 Rust 关（出错时也是），没连着时在这里关。没放成返回 false
+     */
+    fun offerFiles(files: JSONArray): Boolean {
+        val h = handle
+        val s = sid
+        if (h == 0L || s < 0 || closed) {
+            ClipFiles.closeFds(files)
+            return false
+        }
+        val cmd = JSONObject().put("cmd", "offerFiles").put("sid", s).put("files", files)
+        return !Native.ctlCall(h, cmd.toString()).contains("\"err\"")
     }
 
     private fun currentSettings(): Quality {

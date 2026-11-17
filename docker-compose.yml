@@ -28,6 +28,8 @@ services:
       # AIRHAND_NEW_CODES_PER_IP: "30"
       # 同一个来源（IPv4 地址 / IPv6 的 /64）一分钟内最多向同一台被控端发起几次连接（不低于 AIRHAND_MAX_SESSIONS）
       # AIRHAND_CONNECTS_PER_MINUTE: "6"
+      # 剪贴板传文件：一次粘贴经中转最多传多少（直连时不限）；0 是中转不传文件，unlimited 是不限
+      # AIRHAND_MAX_FILE_SIZE: "50MiB"
       # 如需使用自己的证书，挂载到 /data 并修改以下路径
       # AIRHAND_CERT: /data/cert.pem
       # AIRHAND_KEY: /data/key.pem

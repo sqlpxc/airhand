@@ -2,7 +2,7 @@
 //
 // 只在显示时调用（组件渲染时），所以切换语言后已经显示的问题和提示也会跟着变。
 // 词条在 i18n.ts 的 problem.* / notice.*；每种 kind 都必须有词条（下面的 `as const` 让 TypeScript 检查）。
-import { toProblem, type Problem, type RemoteNotice } from "./api";
+import { toProblem, type FileError, type Problem, type RemoteNotice } from "./api";
 import { t } from "./i18n";
 import type { RemoteSession } from "./session";
 
@@ -12,7 +12,11 @@ export type LocalNotice =
   | { kind: "codecFallback"; codec: string; to: string }
   | { kind: "noOpus" }
   /** 对方是 Android 手机，没有开启 Airhand 的"远程操作"（被控端发来的 missingPermissions） */
-  | { kind: "androidNoInput" };
+  | { kind: "androidNoInput" }
+  /** 剪贴板里的文件传不了（对方那边的、这边的，见 files.ts） */
+  | { kind: "fileError"; name: string; error: FileError }
+  /** 对方的版本旧，不支持剪贴板里的文件 */
+  | { kind: "filesUnsupported" };
 
 /** 被控端发来的"已恢复"：只用来撤下之前的提示，本身不显示 */
 export type RecoveredNotice = Extract<RemoteNotice, { kind: "captureRecovered" | "audioRecovered" }>;
@@ -32,6 +36,7 @@ export function problemText(p: Problem): string {
 }
 
 export function noticeText(n: SessionNotice): string {
+  if (n.kind === "fileError") return t("notice.fileError", { name: n.name, reason: t(`fileError.${n.error}` as const) });
   const { kind, ...params } = n;
   return t(`notice.${kind}` as const, params);
 }

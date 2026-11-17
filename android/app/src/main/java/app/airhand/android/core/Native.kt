@@ -43,4 +43,15 @@ object Native {
     )
 
     @JvmStatic external fun hostAudio(handle: Long, buf: ByteBuffer, offset: Int, len: Int, captureUs: Long)
+
+    // ── 剪贴板里的文件（见 Rust 端的 files 和 ClipFiles）：key 是对方的一个公告 ──
+    /** 列出目录（`path` 是 JSON 数组）：`{"entries":[...]}` 或 `{"error":"..."}`。阻塞 */
+    @JvmStatic external fun filesList(key: Long, path: String, recursive: Boolean): String
+    /** 打开对方的一个文件（读的时候才取）：文件的编号，公告不在了是 0。`mtime` 不知道时是 -1 */
+    @JvmStatic external fun filesOpen(key: Long, path: String, size: Long, mtime: Long): Long
+    /** 从 offset 开始读进 buf 的前 len 个字节：读了多少（0 是到末尾了），出错是负数。阻塞 */
+    @JvmStatic external fun filesRead(file: Long, offset: Long, buf: ByteArray, len: Int): Int
+    @JvmStatic external fun filesClose(file: Long)
+    /** 放进手机的剪贴板了（放不了也要说：对方在等） */
+    @JvmStatic external fun filesReady(key: Long)
 }

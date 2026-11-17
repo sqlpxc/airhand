@@ -38,12 +38,15 @@ use super::write::{FrameStreams, Video, Writers, write_all};
 use crate::audio::Unbundler;
 use crate::direct;
 use crate::fec::Chooser;
+use crate::files::Files;
 use crate::lanes::{Via, first_stream, open_lane};
 use crate::merge::{Merge, Policy};
 use crate::paths::{DatagramSender, Paths};
 use crate::secure::{self, Admission, Gate, Opener, ResponderParams, STEP_TIMEOUT};
 use crate::tasks::OwnedTask;
 use crate::transport::{next_msg, open_datagram};
+use airhand_proto::files::FileMsg;
+use airhand_proto::session::HostMsg;
 
 /// 被控端一个会话的链路。
 ///
@@ -67,6 +70,9 @@ pub struct HostStreams {
     reader: OwnedTask<Result<()>>,
     /// 直连任务（有直连时才有，见 [`crate::direct::host`]）：会话开始之后（[`HostStreams::started`]）才开始
     direct: Option<OwnedTask<()>>,
+    /// 剪贴板里的文件（双方都支持时才有，见 [`crate::files`]）和收文件流的任务
+    pub files: Option<Files>,
+    _files_task: Option<OwnedTask<()>>,
     started: Arc<Notify>,
     /// 在中转连接上的登记：会话结束时注销
     _registration: crate::lanes::Registration,
@@ -276,8 +282,24 @@ pub(crate) fn request(m: ControllerMsg) -> Option<Request> {
         ControllerMsg::Clipboard { text } => Request::Clipboard(text),
         ControllerMsg::Audio { enabled } => Request::Audio(enabled),
         ControllerMsg::Mic { enabled } => Request::Mic(enabled),
-        ControllerMsg::Direct(_) => return None,
+        // 直连的回答交给直连任务，剪贴板里的文件交给 Files（都在读任务里）
+        ControllerMsg::Direct(_) | ControllerMsg::Files(_) => return None,
     })
+}
+
+/// 发给控制端的文件消息（见 [`crate::files::Peer`]）：经会话的 `Outbox`。会话结束时（[`Files::close`]）放开它，
+/// 写任务才知道没有人再发了
+struct HostPeer(Mutex<Option<Outbox>>);
+
+impl crate::files::Peer for HostPeer {
+    fn send(&self, msg: FileMsg) -> bool {
+        let out = self.0.lock().unwrap().clone();
+        out.is_some_and(|o| o.send(&HostMsg::Files(Some(msg))).is_ok())
+    }
+
+    fn close(&self) {
+        self.0.lock().unwrap().take();
+    }
 }
 
 /// 写任务（几条通道一起）
@@ -367,6 +389,7 @@ impl HostStreams {
         );
         let mut secured = r.secured;
         let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
+        let use_files = admitted.negotiated.features.has(features::session::FILES);
         // 双方都支持、中转也支持：画面每帧一条帧流（见 airhand_proto::session 的"帧流"）
         let use_frames = admitted.negotiated.features.has(features::session::FRAMES) && inc.frames;
         // 用着帧流、双方又都支持纠错：增量帧可能走纠错的数据报（见 airhand_proto::session 的"前向纠错"）
@@ -443,6 +466,20 @@ impl HostStreams {
         let (answers_tx, answers) = mpsc::channel(4);
         let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
         let started = Arc::new(Notify::new());
+        // 剪贴板里的文件（双方都支持时）：对方开过来的文件流交给它
+        let (files, files_task) = if use_files {
+            let (f, t) = Files::start(
+                session_id,
+                paths.clone(),
+                secured.files,
+                inc.file_limit,
+                HostPeer(Mutex::new(Some(out.clone()))),
+                inbox.files,
+            );
+            (Some(f), Some(t))
+        } else {
+            (None, None)
+        };
         let direct = inc.direct.as_ref().map(|link| {
             OwnedTask(tokio::spawn(direct::host::run(direct::host::Session {
                 link: link.clone(),
@@ -462,6 +499,7 @@ impl HostStreams {
             session_id,
             control,
             bulk,
+            files: files.clone(),
             datagrams: (inbox.datagrams, secured.datagrams.opener),
             mic: (inbox.audio, secured.audio.opener),
             express,
@@ -480,6 +518,8 @@ impl HostStreams {
                 writer: Writer(writer),
                 reader,
                 direct,
+                files,
+                _files_task: files_task,
                 started,
                 _registration: registration,
             },
@@ -503,9 +543,15 @@ impl HostStreams {
             mut writer,
             mut reader,
             direct,
+            files,
+            _files_task,
             started: _,
             _registration,
         } = self;
+        // 剪贴板里的文件手里也有一个 Outbox：停下给到一半的、取到一半的，放开它
+        if let Some(f) = files {
+            f.close();
+        }
         // 直连任务手里也有一个 Outbox（发候选地址）：先停掉它，写任务才知道没有人再发了
         if let Some(mut d) = direct {
             d.abort();
@@ -540,6 +586,8 @@ struct Readers {
     session_id: u64,
     control: Merge,
     bulk: Merge,
+    /// 剪贴板里的文件（双方都支持时）
+    files: Option<Files>,
     /// 控制数据报（Ping、确认、回声）：从哪条路来、整个数据报，和它们的解密端
     datagrams: (mpsc::Receiver<(Via, Bytes)>, Opener),
     /// 控制端麦克风的声音数据报（整个数据报，还是密文）和它们的解密端
@@ -563,6 +611,7 @@ async fn read_all(r: Readers) -> Result<()> {
         session_id,
         mut control,
         mut bulk,
+        files,
         datagrams: (mut datagrams, mut opener),
         mic: (mut mic_rx, mut mic_opener),
         express,
@@ -616,11 +665,34 @@ async fn read_all(r: Readers) -> Result<()> {
         }
         std::future::pending::<Result<()>>().await
     };
+    // 剪贴板里的文件的消息：交给 Files；控制端的公告变成请求（平台放进本机剪贴板）。文字取代对方之前的公告
+    let files_msg = |m: &ControllerMsg| -> Option<Option<Request>> {
+        match m {
+            ControllerMsg::Files(f) => Some(
+                files
+                    .as_ref()
+                    .zip(f.clone())
+                    .and_then(|(files, f)| files.handle(f))
+                    .map(Request::ClipboardFiles),
+            ),
+            ControllerMsg::Clipboard { .. } => {
+                if let Some(f) = &files {
+                    f.remote_cleared();
+                }
+                None
+            }
+            _ => None,
+        }
+    };
     // 大块通道（剪贴板）：结束了不算会话结束，控制通道结束才是
     let bulk = async {
         while let Some(m) = next_msg::<ControllerMsg>(&mut bulk, SessionLane::Bulk).await? {
             express.heard();
-            let Some(r) = request(m) else { continue };
+            let r = match files_msg(&m) {
+                Some(r) => r,
+                None => request(m),
+            };
+            let Some(r) = r else { continue };
             if bulk_tx.send(r).await.is_err() {
                 break;
             }
@@ -670,7 +742,11 @@ async fn read_all(r: Readers) -> Result<()> {
                 }
                 m => m,
             };
-            let Some(r) = request(m) else { continue };
+            let r = match files_msg(&m) {
+                Some(r) => r,
+                None => request(m),
+            };
+            let Some(r) = r else { continue };
             if control_tx.send(r).await.is_err() {
                 break;
             }
@@ -951,6 +1027,7 @@ mod tests {
             session_id: 1,
             control,
             bulk,
+            files: None,
             datagrams: (dgram_rx, test_lane(false).1),
             mic: (mic_rx, test_lane(false).1),
             express: express.clone(),
@@ -1047,6 +1124,7 @@ mod tests {
                 session_id: 1,
                 control,
                 bulk,
+                files: None,
                 datagrams: (dgram_rx, test_lane(false).1),
                 mic: (mic_rx, test_lane(false).1),
                 express: Express::new(|_| {}),

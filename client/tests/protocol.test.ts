@@ -69,7 +69,20 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
   const button = { type: "mouseButton", button: "right", down: true };
   assert.deepEqual(events[2], button);
   const cmds = commands.map((c) => c.cmd).sort();
-  assert.deepEqual(cmds, ["ack", "audio", "clipboard", "clipboardSync", "disconnect", "display", "input", "keyframe", "mic", "settings", "view"]);
+  assert.deepEqual(cmds, [
+    "ack",
+    "audio",
+    "clipboard",
+    "clipboardCleared",
+    "clipboardSync",
+    "disconnect",
+    "display",
+    "input",
+    "keyframe",
+    "mic",
+    "settings",
+    "view",
+  ]);
   // 多屏：第 i 项是第 i 路画面，每一路带着按显示的大小要的短边上限
   const view = commands.find((c) => c.cmd === "view");
   assert.deepEqual(view, { cmd: "view", sid: 3, streams: [{ display: 1, maxShort: 720 }, { display: 0, maxShort: 0 }] });

@@ -8,7 +8,24 @@
 // * 会话的画面是一个 canvas：交给 Worker（transferControlToOffscreen）之后由它绘制，这边是 MediaView；
 // * 画面确认由 Worker 收到画面时自己发（二进制，见 ack.ts）；
 // * 显示的延迟 = 控制端服务到被控端的往返 + 这里到控制端服务的往返（网页版是网络，桌面版是本机）。
-import type { AppInfo, Codec, Command, ConnectOptions, Problem, ServerState, SessionEvent, SessionInfo } from "./api";
+import type {
+  AppInfo,
+  Codec,
+  Command,
+  ConnectOptions,
+  FileEntry,
+  FileError,
+  Problem,
+  ServerState,
+  SessionEvent,
+  SessionInfo,
+} from "./api";
+import { FILE_ERRORS, type LocalFiles } from "./files";
+
+/** 读文件时抛出来的东西变成 FileError（不认识的当作读不了） */
+function fileError(e: unknown): FileError {
+  return typeof e === "string" && (FILE_ERRORS as string[]).includes(e) ? (e as FileError) : "io";
+}
 import type { AvSyncStats } from "./avsync";
 import type { FromWorker, ToWorker } from "./console-worker";
 import type { Area, EnhanceLevel } from "./enhance";
@@ -53,7 +70,19 @@ type Incoming =
   | { type: "reply"; id: number; ok?: unknown; err?: Problem }
   | { type: "server"; state: ServerState }
   | { type: "event"; ch: number; event: SessionEvent }
-  | { type: "hostOnline"; code: number };
+  | { type: "hostOnline"; code: number }
+  /** 被控端要这里复制的文件（见 files.ts）：列出目录 */
+  | { type: "fileList"; req: number; path: string[] }
+  /** 读一块（二进制地答 `3 | req | 错误 | 数据`） */
+  | { type: "fileRead"; req: number; path: string[]; offset: number; len: number };
+
+/** 二进制消息的类型：这里复制的文件的内容（console.rs 的 BINARY_FILE） */
+const BINARY_FILE = 3;
+const NO_ERROR = 0xffffffff;
+/** 最多记着这么多次复制的文件（最新的和之前的：被控端可能还在从之前的那次复制） */
+const KEEP_LOCAL = 2;
+/** 等一块被控端的文件最多这么久 */
+const READ_TIMEOUT_MS = 120_000;
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -92,6 +121,11 @@ export class ConsoleLink {
   private onlineListeners = new Set<(code: number) => void>();
   /** 到控制端服务的往返时间（毫秒，平滑后） */
   private rtt: number | null = null;
+  /** 这里复制的文件（最新的在后面，见 files.ts） */
+  private local: LocalFiles[] = [];
+  /** 在等的被控端的文件的一块 */
+  private reads = new Map<number, { resolve: (d: Uint8Array) => void; reject: (e: FileError) => void; timer: ReturnType<typeof setTimeout> }>();
+  private nextRead = 1;
 
   /** `url`：控制端服务的 WebSocket 地址（每次连接前取一次） */
   constructor(url: () => Promise<string>) {
@@ -122,6 +156,11 @@ export class ConsoleLink {
   private onClose() {
     this.connected = false;
     this.rtt = null;
+    for (const r of this.reads.values()) {
+      clearTimeout(r.timer);
+      r.reject("closed");
+    }
+    this.reads.clear();
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
       p.reject(LOST);
@@ -220,6 +259,15 @@ export class ConsoleLink {
       case "stats":
         this.views.get(m.id)?.stats(m.decodeMs, m.sync);
         return;
+      case "fileData": {
+        const r = this.reads.get(m.req);
+        if (!r) return;
+        this.reads.delete(m.req);
+        clearTimeout(r.timer);
+        if (m.err === NO_ERROR) r.resolve(m.data);
+        else r.reject(FILE_ERRORS[m.err] ?? "io");
+        return;
+      }
     }
   }
 
@@ -249,7 +297,50 @@ export class ConsoleLink {
       case "hostOnline":
         for (const l of this.onlineListeners) l(msg.code);
         return;
+      case "fileList":
+        void this.answerList(msg.req, msg.path);
+        return;
+      case "fileRead":
+        void this.answerRead(msg.req, msg.path, msg.offset, msg.len);
+        return;
     }
+  }
+
+  /** 复制了这一项的那一次（新的优先） */
+  private localFor(path: string[]): LocalFiles | null {
+    for (let i = this.local.length - 1; i >= 0; i--) if (this.local[i].has(path[0] ?? "")) return this.local[i];
+    return null;
+  }
+
+  private async answerList(req: number, path: string[]) {
+    let reply: object;
+    try {
+      const files = this.localFor(path);
+      if (!files) throw "expired";
+      reply = { cmd: "fileListed", req, entries: await files.list(path) };
+    } catch (e) {
+      reply = { cmd: "fileListed", req, error: fileError(e) };
+    }
+    this.post({ t: "send", text: JSON.stringify(reply) });
+  }
+
+  private async answerRead(req: number, path: string[], offset: number, len: number) {
+    let data: Uint8Array = new Uint8Array(0);
+    let err = NO_ERROR;
+    try {
+      const files = this.localFor(path);
+      if (!files) throw "expired";
+      data = await files.read(path, offset, len);
+    } catch (e) {
+      err = FILE_ERRORS.indexOf(fileError(e));
+    }
+    const buf = new ArrayBuffer(9 + data.length);
+    const dv = new DataView(buf);
+    dv.setUint8(0, BINARY_FILE);
+    dv.setUint32(1, req, true);
+    dv.setUint32(5, err, true);
+    new Uint8Array(buf, 9).set(data);
+    this.post({ t: "binary", data: buf }, [buf]);
   }
 
   private onEvent(ch: number, ev: SessionEvent) {
@@ -341,6 +432,54 @@ export class ConsoleLink {
       this.unbind(ch);
       throw e;
     }
+  }
+
+  // ───────────────────────── 剪贴板里的文件（见 files.ts） ─────────────────────────
+
+  async offerFiles(sid: number, files: LocalFiles): Promise<void> {
+    this.local.push(files);
+    while (this.local.length > KEEP_LOCAL) this.local.shift();
+    await this.call<void>("offerFiles", { sid, items: files.items() });
+  }
+
+  async remoteList(sid: number, clip: number, path: string[], recursive: boolean): Promise<FileEntry[]> {
+    const r = await this.call<{ entries: FileEntry[]; error: FileError | null }>("remoteList", {
+      sid,
+      clip,
+      path,
+      recursive,
+    });
+    if (r.error) throw r.error;
+    return r.entries;
+  }
+
+  remoteRead(
+    sid: number,
+    clip: number,
+    file: number,
+    path: string[],
+    size: number,
+    mtime: number | null,
+    offset: number,
+    len: number,
+  ): Promise<Uint8Array> {
+    if (!this.connected) return Promise.reject("closed" satisfies FileError);
+    const req = this.nextRead++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.reads.delete(req);
+        reject("closed" satisfies FileError);
+      }, READ_TIMEOUT_MS);
+      this.reads.set(req, { resolve, reject, timer });
+      this.post({
+        t: "send",
+        text: JSON.stringify({ cmd: "remoteRead", sid, clip, file, req, path, size, mtime, offset, len }),
+      });
+    });
+  }
+
+  remoteClose(sid: number, file: number) {
+    if (this.connected) this.post({ t: "send", text: JSON.stringify({ cmd: "remoteClose", sid, file }) });
   }
 
   /** 对会话的操作。输入这类高频消息不等回复 */

@@ -69,6 +69,34 @@
             android:windowSoftInputMode="adjustResize|stateHidden"
             android:theme="@style/Theme.Airhand.Session" />
 
+        <!-- 剪贴板里的文件：系统分享菜单里的"发给对方"（见 core/ClipFiles.kt） -->
+        <activity
+            android:name=".ui.ShareFilesActivity"
+            android:exported="true"
+            android:label="@string/share_label"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- 剪贴板里的文件：对方复制的文件（content URI），别的应用读的时候才向对方取 -->
+        <provider
+            android:name=".core.ClipFilesProvider"
+            android:authorities="${applicationId}.clipfiles"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- 通知里的"保存到下载" -->
+        <receiver
+            android:name=".core.ClipFiles$SaveReceiver"
+            android:exported="false" />
+
         <!-- 被控端：屏幕共享前台服务 -->
         <service
             android:name=".host.HostService"

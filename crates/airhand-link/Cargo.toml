@@ -17,6 +17,7 @@ client = [
     "dep:anyhow",
     "dep:bytes",
     "dep:curve25519-dalek",
+    "dep:libc",
     "dep:quinn",
     "dep:rand",
     "dep:rcgen",
@@ -66,6 +67,10 @@ sha2 = { version = "0.10", optional = true }
 # risky-raw-split：取出 Noise 的两把密钥，再派生每条通道、每个方向各自的密钥（见 src/secure.rs）
 snow = { version = "0.10", features = ["risky-raw-split"], optional = true }
 spake2 = { version = "0.4", optional = true }
+
+# 剪贴板里的文件：打开文件时不跟随链接（O_NOFOLLOW，见 src/files/local.rs）
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # rt、macros：#[tokio::test]（只有 wire 的时候也要能跑它的测试）；test-util：测试里让时间跳着走

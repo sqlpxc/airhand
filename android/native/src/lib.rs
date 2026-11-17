@@ -8,6 +8,7 @@
 //! Rust 不回调 Java：Kotlin 的线程用 `poll*` 阻塞地取（见 [`queue`]）。
 
 pub mod ctl;
+pub mod files;
 pub mod host;
 pub mod queue;
 pub mod rt;
@@ -231,6 +232,79 @@ pub extern "system" fn Java_app_airhand_android_core_Native_ctlAck(
     if let Some(c) = ctl(h) {
         c.ack(sid as u32, seq as u32);
     }
+}
+
+// ───────────────────────────── 剪贴板里的文件（见 files） ─────────────────────────────
+
+/// 列出对方复制的文件里的目录（`path` 是 JSON 数组）：`{"entries":[...]}` 或 `{"error":"..."}`。阻塞的
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_airhand_android_core_Native_filesList(
+    mut env: JNIEnv,
+    _: JClass,
+    key: jlong,
+    path: JString,
+    recursive: jboolean,
+) -> jstring {
+    let path = get_string(&mut env, &path).unwrap_or_default();
+    let r = guard(r#"{"error":"io"}"#.to_string(), || {
+        files::list(key, &path, recursive == JNI_TRUE)
+    });
+    new_string(&mut env, Some(r))
+}
+
+/// 打开对方的一个文件（读的时候才取）：文件的编号，公告不在了是 0
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_airhand_android_core_Native_filesOpen(
+    mut env: JNIEnv,
+    _: JClass,
+    key: jlong,
+    path: JString,
+    size: jlong,
+    mtime: jlong,
+) -> jlong {
+    let path = get_string(&mut env, &path).unwrap_or_default();
+    guard(0, || files::open(key, &path, size, mtime))
+}
+
+/// 从 `offset` 开始读到 `buf` 的前 `len` 个字节里：读了多少（0 是到末尾了），出错是负数。阻塞的
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_airhand_android_core_Native_filesRead(
+    env: JNIEnv,
+    _: JClass,
+    file: jlong,
+    offset: jlong,
+    buf: jni::objects::JByteArray,
+    len: jint,
+) -> jint {
+    let mut tmp = vec![0u8; len.max(0) as usize];
+    let n = guard(-1, || files::read(file, offset.max(0) as u64, &mut tmp));
+    if n > 0 {
+        // SAFETY: u8 和 i8 一样大
+        let signed = unsafe { std::slice::from_raw_parts(tmp.as_ptr().cast::<i8>(), n as usize) };
+        if env.set_byte_array_region(&buf, 0, signed).is_err() {
+            return -1;
+        }
+    }
+    n.clamp(i32::MIN as i64, i32::MAX as i64) as jint
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_airhand_android_core_Native_filesClose(
+    _: JNIEnv,
+    _: JClass,
+    file: jlong,
+) {
+    files::close(file);
+}
+
+/// 对方复制的文件放进手机的剪贴板了（放不了也要说）
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_airhand_android_core_Native_filesReady(
+    _: JNIEnv,
+    _: JClass,
+    key: jlong,
+) {
+    guard((), || files::ready(key));
 }
 
 // ───────────────────────────── 被控端 ─────────────────────────────

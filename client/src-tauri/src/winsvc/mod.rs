@@ -22,8 +22,17 @@
 //! （勾选 Capture Global Win32）查看；日志级别同样由 `AIRHAND_LOG` 控制。
 
 mod agent;
+pub mod clip;
 pub mod ipc;
 mod service;
+
+/// 本进程是服务里的被控端（`--agent`，SYSTEM）
+static AGENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 本进程是服务里的被控端（`--agent`）：以 SYSTEM 身份运行，剪贴板里的文件交给托盘（见 [`clip`]）
+pub fn is_agent() -> bool {
+    AGENT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -80,7 +89,10 @@ pub fn cli() -> Option<i32> {
     let first = args.first()?.as_str();
     let result = match first {
         "--service" => return Some(service::run()),
-        "--agent" => return Some(agent::run(&args[1..])),
+        "--agent" => {
+            AGENT.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Some(agent::run(&args[1..]));
+        }
         "--install" => {
             init_console_logging();
             install()

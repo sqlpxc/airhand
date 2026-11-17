@@ -57,6 +57,10 @@ pub(crate) struct Phone {
 
 impl Phone {
     pub(crate) fn new(shared: Arc<Shared>, id: u64, senders: Senders) -> Self {
+        // 剪贴板里的文件（控制端也支持时）：手机分享给 Airhand 的文件公告给这个会话的控制端（见 crate::files）
+        if let Some(f) = &senders.files {
+            shared.files.lock().unwrap().insert(id, f.clone());
+        }
         Self {
             shared,
             id,
@@ -77,6 +81,7 @@ impl Phone {
 /// 会话随时可能在某个 await 处被取消（断网、更换控制码、停止共享）：清理工作放在 Drop 里
 impl Drop for Phone {
     fn drop(&mut self) {
+        self.shared.files.lock().unwrap().remove(&self.id);
         self.shared.video.remove(self.id);
         self.shared.audio.unsubscribe(self.id);
         self.shared
@@ -182,6 +187,11 @@ impl Platform for Phone {
             // 手机只有一块屏幕、一路画面
             Request::Keyframe(Some(_)) | Request::View(_) => {}
             Request::Clipboard(text) => sh.event(json!({ "type": "clipboard", "text": text })),
+            // 控制端复制了文件：交给 Kotlin 放进手机的剪贴板（content URI，别的应用读的时候才取，见 crate::files）
+            Request::ClipboardFiles(offer) => {
+                let key = crate::files::register(offer.clone());
+                sh.events.push(crate::files::event(key, &offer));
+            }
             Request::Audio(true) => {
                 sh.audio
                     .subscribe(self.id, self.audio.clone(), self.out.clone())
@@ -259,6 +269,7 @@ mod tests {
                     out,
                     video: vec![video_tx],
                     audio: audio_tx,
+                    files: None,
                 },
             );
             phone
@@ -324,6 +335,7 @@ mod tests {
                 out,
                 video: vec![video_tx],
                 audio: audio_tx,
+                files: None,
             },
         );
         phone.publish = Some((

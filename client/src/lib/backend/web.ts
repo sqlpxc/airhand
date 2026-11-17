@@ -146,7 +146,12 @@ class WebConsole extends ConsoleLink implements Backend {
     void this.writeClipboard(text);
   }
 
-  /** 本机剪贴板有变化就发给打开了同步的会话 */
+  /**
+   * 本机剪贴板有变化就发给打开了同步的会话。
+   *
+   * 读到空的时候不发 clipboardCleared：网页版的文件是粘贴时才公告的（见 Session.offerFiles），
+   * 浏览器剪贴板里是文件时 readText 也是空的，发了会把刚粘贴的文件撤回。换成文字时 Rust 那边会撤回
+   */
   private async syncClipboard(ask: boolean) {
     if (this.clipBusy) return;
     this.clipBusy = true;

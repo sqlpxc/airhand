@@ -20,6 +20,7 @@ import app.airhand.android.AirhandApp
 import app.airhand.android.BuildConfig
 import app.airhand.android.R
 import app.airhand.android.controller.ControllerClient
+import app.airhand.android.core.ClipFiles
 import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Problem
@@ -219,6 +220,8 @@ class HostService : Service() {
                 }
             }
             "clipboard" -> app.clipboard.write(e.optString("text"))
+            // 控制端复制了文件：放进手机的剪贴板（别的应用读的时候才取），通知里可以保存到下载
+            "clipboardFiles" -> e.optJSONArray("items")?.let { ClipFiles.apply(this, e.optLong("key"), it) }
             // 第一次连上服务器：记下它的证书指纹（不重新连接）
             "serverTrust" -> app.settings.learnTrust(e.optString("server"), e.optString("fp"))
             "identity" -> app.settings.learnIdentity(e.optString("key"))
@@ -421,6 +424,23 @@ class HostService : Service() {
 
         fun restartIfRunning(context: Context) {
             instance?.restartNative()
+        }
+
+        /** 现在能不能把手机上的文件放进正在控制本机的设备的剪贴板（在共享、有人连着） */
+        fun canOfferFiles() = (instance?.handle ?: 0L) != 0L && HostState.value.viewers.isNotEmpty()
+
+        /**
+         * 手机上分享给 Airhand 的文件（[ClipFiles.offer]）：放进正在控制本机的设备的剪贴板。文件描述符不管成不成都归这里：
+         * 交给 Rust 就由 Rust 关（没人连着时也是），没在共享时在这里关
+         */
+        fun offerFiles(files: JSONArray): Boolean {
+            val h = instance?.handle ?: 0L
+            if (h == 0L) {
+                ClipFiles.closeFds(files)
+                return false
+            }
+            Native.hostCall(h, JSONObject().put("op", "offerFiles").put("files", files).toString())
+            return HostState.value.viewers.isNotEmpty()
         }
 
         /** 手机自己复制了文本（只有应用在前台时读得到）：发给正在控制本机的设备 */

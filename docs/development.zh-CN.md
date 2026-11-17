@@ -61,6 +61,15 @@ cargo test --lib e2e_multi_display -- --ignored --nocapture  # 同时看两个�
 cargo test --lib e2e_mic -- --ignored --nocapture         # Windows：控制端的麦克风经过中转放进 Steam Streaming Microphone
 ```
 
+剪贴板里的文件用的是本机真的剪贴板，测试会换掉剪贴板里的东西，所以也默认跳过（一个一个跑）：
+
+```bash
+# client/src-tauri/
+cargo test --lib clipfiles -- --ignored --test-threads=1
+# Windows：虚拟文件放进剪贴板，再让资源管理器真的粘贴到一个临时目录（explorer_pastes_the_virtual_files）
+# Linux：要 FUSE 和 X11（WSLg 也行），挂载之后读文件、看剪贴板里的 text/uri-list
+```
+
 ## 调试工具
 
 ```bash

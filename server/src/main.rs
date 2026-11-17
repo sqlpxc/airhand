@@ -13,6 +13,8 @@
 //!   （取回原来的控制码不算）
 //! * `AIRHAND_CONNECTS_PER_MINUTE` 同一个来源（IPv4 地址 / IPv6 的 /64）一分钟内最多向同一台被控端发起几个会话，默认 6
 //!   （不低于 `AIRHAND_MAX_SESSIONS`；带重连凭证的也算）
+//! * `AIRHAND_MAX_FILE_SIZE` 剪贴板传文件时一次粘贴经中转最多传多少，默认 `50MiB`（可以写 `512KiB`、`2GiB`、字节数；
+//!   `0`：中转不传文件，只能走直连；`unlimited`：不限）。直连通着时不受它限制（见 `airhand_proto::files`）
 //! * `RUST_LOG`              日志级别，默认 `info`
 
 mod broker;
@@ -156,6 +158,12 @@ async fn main() -> Result<()> {
         broker::Config::DEFAULT_CONNECTS_PER_MINUTE,
     )
     .max(max_sessions);
+    let file_limit = match std::env::var("AIRHAND_MAX_FILE_SIZE") {
+        Ok(v) if !v.trim().is_empty() => {
+            parse_size(&v).with_context(|| format!("invalid AIRHAND_MAX_FILE_SIZE: {v:?}"))?
+        }
+        _ => Some(broker::Config::DEFAULT_FILE_LIMIT),
+    };
 
     let cert = tls::load_or_generate(&cert_path, &key_path, &names)?;
     info!("Certificate SHA-256 fingerprint: {}", cert.fingerprint);
@@ -175,6 +183,14 @@ async fn main() -> Result<()> {
     )
     .with_context(|| format!("can't listen on {listen}"))?;
     info!("Airhand server started on udp://{listen}, up to {max_sessions} sessions per host");
+    match file_limit {
+        None => info!("clipboard files: no limit on what the relay carries"),
+        Some(0) => info!("clipboard files: not relayed (direct connections only)"),
+        Some(n) => info!(
+            "clipboard files: up to {} per paste through the relay (no limit on direct connections)",
+            format_size(n)
+        ),
+    }
 
     let broker = broker::Broker::new(broker::Config {
         max_sessions_per_host: max_sessions,
@@ -182,6 +198,7 @@ async fn main() -> Result<()> {
         max_conns_per_ip,
         new_codes_per_ip,
         connects_per_minute,
+        file_limit,
     })?;
     tokio::spawn(broker.clone().janitor());
     {
@@ -192,7 +209,8 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 let (hosts, pending, fixed) = broker.stats();
-                info!(hosts, pending, fixed, "online");
+                let relayed_files = format_size(broker.relayed_file_bytes());
+                info!(hosts, pending, fixed, %relayed_files, "online");
             }
         });
     }
@@ -217,6 +235,44 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// 解析大小：字节数，或者带单位（`KiB` / `MiB` / `GiB`，`K` / `KB` / `M` / `MB` / `G` / `GB` 也按 1024 算，不分大小写）。
+/// `unlimited` / `none` 是不限（`None`）
+fn parse_size(s: &str) -> Result<Option<u64>> {
+    let s = s.trim().to_ascii_lowercase();
+    if s == "unlimited" || s == "none" {
+        return Ok(None);
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let n: u64 = digits.parse().context("not a number")?;
+    let shift = match unit.trim() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        other => anyhow::bail!("unknown unit {other:?}"),
+    };
+    let n = n.checked_mul(1 << shift).context("too large")?;
+    Ok(Some(n))
+}
+
+/// 日志里的大小（二进制单位，一位小数）
+fn format_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -230,5 +286,25 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("50MiB").unwrap(), Some(50 << 20));
+        assert_eq!(parse_size(" 512 kb ").unwrap(), Some(512 << 10));
+        assert_eq!(parse_size("2G").unwrap(), Some(2 << 30));
+        assert_eq!(parse_size("1048576").unwrap(), Some(1 << 20));
+        assert_eq!(parse_size("0").unwrap(), Some(0));
+        assert_eq!(parse_size("Unlimited").unwrap(), None);
+        assert!(parse_size("lots").is_err());
+        assert!(parse_size("5 parsecs").is_err());
+        assert!(parse_size("99999999999999999999").is_err());
+        assert_eq!(format_size(50 << 20), "50.0 MiB");
+        assert_eq!(format_size(12), "12 B");
     }
 }

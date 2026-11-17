@@ -14,6 +14,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { tauriBackend } from "./backend/tauri";
 import { webBackend } from "./backend/web";
 import type { MediaView, ViewOutput } from "./console";
+import type { LocalFiles } from "./files";
 import type { Lang } from "./i18n";
 
 export type Codec = "h264" | "h265" | "av1";
@@ -214,6 +215,32 @@ export interface ConnectOptions {
   view?: StreamView[];
 }
 
+/**
+ * 剪贴板里的文件的一项（airhand_proto::files::FileEntry）：公告里 path 只有一段（名称），列表里是相对被列的目录的几段。
+ * 链接带着它指向的路径（分隔符是 /）
+ */
+export interface FileEntry {
+  path: string[];
+  kind: "file" | "dir" | "link";
+  size: number;
+  /** 修改时间（Unix 毫秒） */
+  mtime: number | null;
+  target?: string;
+}
+
+/** 剪贴板里的文件为什么传不了（airhand_proto::files::FileError） */
+export type FileError =
+  | "notFound"
+  | "denied"
+  | "changed"
+  | "io"
+  | "tooLarge"
+  | "expired"
+  | "invalid"
+  | "busy"
+  | "tooMany"
+  | "closed";
+
 /** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
 export type Platform = "windows" | "mac" | "linux" | "android";
 
@@ -277,6 +304,10 @@ export type SessionEvent =
   | { type: "clipboard"; text: string }
   /** 被控端能不能接本机的麦克风：会话开始时一次，之后有变化再来；对方的版本旧时没有。detail：出错时的技术信息 */
   | { type: "mic"; state: MicState; detail: string | null }
+  /** 被控端复制了文件（只有网页版会收到；桌面版直接放进本机剪贴板）：要内容时用 remoteList / remoteRead 取 */
+  | { type: "clipboardFiles"; clip: number; items: FileEntry[] }
+  /** 剪贴板里的文件传不了（被控端那边的、这边的）：哪个文件、为什么 */
+  | { type: "fileError"; name: string; error: FileError }
   | { type: "closed"; reason: Problem; retry: boolean };
 
 export type MouseButton = "left" | "right" | "middle" | "back" | "forward";
@@ -316,6 +347,8 @@ export type Command =
   | { cmd: "clipboard"; sid: number; text: string }
   /** 打开 / 关闭剪贴板同步 */
   | { cmd: "clipboardSync"; sid: number; enabled: boolean }
+  /** 这里的剪贴板换成了文件以外的东西：之前公告的文件不再是最新的（网页版） */
+  | { cmd: "clipboardCleared"; sid: number }
   /** 收到了第 seq 帧画面（累积确认；控制台的 Worker 收到画面时自己发，走二进制，见 ack.ts） */
   | { cmd: "ack"; sid: number; seq: number; stream?: number }
   | { cmd: "disconnect"; sid: number };
@@ -361,6 +394,25 @@ export interface Backend {
   loadDevices(): Promise<SavedDevice[] | null>;
   /** 保存整个列表 */
   saveDevices(devices: SavedDevice[]): Promise<void>;
+  /**
+   * 剪贴板里的文件（见 files.ts）。这里复制的文件（粘贴到画面上、拖到画面上的）公告给被控端，它粘贴时才来取
+   * （由 `files` 读）；桌面版的本机剪贴板由 Rust 端自己同步，只有拖放走这里
+   */
+  offerFiles(sid: number, files: LocalFiles): Promise<void>;
+  /** 被控端复制的文件（clipboardFiles 事件）：列出目录 */
+  remoteList(sid: number, clip: number, path: string[], recursive: boolean): Promise<FileEntry[]>;
+  /** 被控端复制的文件：从 offset 开始最多读 len 字节（`file` 是这边选的编号，一个文件一个；读完了 remoteClose） */
+  remoteRead(
+    sid: number,
+    clip: number,
+    file: number,
+    path: string[],
+    size: number,
+    mtime: number | null,
+    offset: number,
+    len: number,
+  ): Promise<Uint8Array>;
+  remoteClose(sid: number, file: number): void;
   /** 桌面版的无边框窗口（标题栏和窗口按钮由界面自己画）；网页版在浏览器里，为 null */
   readonly frame: WindowFrame | null;
 }

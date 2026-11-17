@@ -9,7 +9,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     if let Ok(v) = decode_known::<Versions>(data) {
         // 服务器接着就要回答它
-        let answer = ServerHello::answer(v, features::signal::SUPPORTED);
+        let answer = ServerHello::answer(v, features::signal::SUPPORTED, Some(50 << 20));
         let _ = to_vec(&answer);
         if answer.version.is_some() {
             let _ = decode_known::<ClientHello>(data);

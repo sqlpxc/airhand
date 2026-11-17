@@ -202,6 +202,20 @@ When the remote computer has more than one display, the toolbar has a display bu
 - Plugging displays in and out on the remote computer is followed: a display that goes away disappears, and a new one is added while showing all displays
 - Fullscreen, actual size (1:1, scrollable) and the overview thumbnails all work as usual; Enhance processes each display separately
 
+### Copying and pasting files
+
+While clipboard sync is on (the clipboard button in the toolbar, on by default), files and folders can be copied and pasted too, in both directions: copy them on this computer and paste in the remote file manager, or copy them over there and paste here.
+
+- Copying only sends a list; the transfer starts when you paste, and the progress bar and Cancel button are the pasting file manager's own. Nothing is transferred if you copy and never paste
+- While the two ends have a direct path (see [How it works → Direct path](architecture.md#direct-path)) any size goes. When everything has to go through the relay server, one paste is limited to what the server allows (50 MiB by default, see `AIRHAND_MAX_FILE_SIZE` in the deployment guide), and you're told when it's over
+- Files changed after you copied them can't be transferred: copy them again
+- Shortcuts and symbolic links inside a folder don't bring along what they point to
+- **Web console**: press Ctrl+V (⌘V on a Mac) on the remote screen to paste files copied locally, or drop files and folders on it. When the other side copies files a banner appears above the picture: click **Download** to fetch them (Chrome / Edge let you pick a folder to save into)
+- **Android**: files copied on the other side go on the phone's clipboard, so you can paste them in other apps, and the notification can **Save to Downloads** (the only way for folders). To send files from the phone, use **Share → Send to the other device** in a file manager or the gallery, then paste on the other side
+- Files can't be pasted onto a Mac yet (files copied on a Mac can be pasted on the other side)
+
+See [Known limitations](limitations.md) for the details.
+
 ### Microphone
 
 Send this computer's microphone to the remote computer: programs there (meetings, voice typing, voice messages) hear you when they record from its virtual microphone. Off by default and turned on per connection (the microphone button in the toolbar → **Send this computer's microphone**); it's only sent while you're viewing that connection. The browser asks for microphone access the first time (the desktop console doesn't).

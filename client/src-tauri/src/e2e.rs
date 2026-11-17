@@ -437,6 +437,8 @@ async fn e2e_roundtrip() {
             HostMsg::Bye(reason) => panic!("意外的 Bye: {reason:?}"),
             // 这个协议级的控制端不建直连（不回答，被控端就一直走中转）
             HostMsg::Direct(_) => {}
+            // 剪贴板里的文件：这个测试不管（见 airhand_link::files 的测试、服务器的测试）
+            HostMsg::Files(_) => {}
             HostMsg::Displays { .. } => {}
             HostMsg::Mic { state, detail } => {
                 println!("麦克风: {state:?} {detail:?}");

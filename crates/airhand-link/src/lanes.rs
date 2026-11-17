@@ -74,6 +74,8 @@ pub struct Inbox {
     /// 画面的每一路（第 `i` 项是第 `i` 路，一共 [`airhand_proto::MAX_STREAMS`] 路）
     pub video: Vec<LaneStreams>,
     pub bulk: LaneStreams,
+    /// 文件通道：剪贴板里的文件，每次取用一条帧流（见 `airhand_proto::files`）
+    pub files: LaneStreams,
     /// 声音数据报（整个数据报，还是密文）
     pub audio: mpsc::Receiver<Bytes>,
     /// 控制数据报（同上）和它从哪条路来（探测要从同一条路弹回去）。直连通着时 Ping、Pong、确认两条路各来一份，
@@ -96,6 +98,7 @@ impl Inbox {
         };
         let control = take(SessionLane::Control);
         let bulk = take(SessionLane::Bulk);
+        let files = take(SessionLane::File);
         let video = (0..airhand_proto::MAX_STREAMS)
             .map(|s| take(SessionLane::Video(s)))
             .collect();
@@ -108,6 +111,7 @@ impl Inbox {
             control,
             video,
             bulk,
+            files,
             audio,
             datagrams,
             fec,
@@ -138,8 +142,14 @@ impl Feed {
             return stop(recv);
         };
         let frame = h.is_frame();
-        if frame && lane == SessionLane::Control {
-            debug!("ignoring a frame stream on the control lane");
+        // 控制通道只有一条（不能是帧流），文件通道每次取用一条（只能是帧流）
+        let wrong = match lane {
+            SessionLane::Control => frame,
+            SessionLane::File => !frame,
+            SessionLane::Video(_) | SessionLane::Bulk => false,
+        };
+        if wrong {
+            debug!(?lane, frame, "ignoring a stream of the wrong kind");
             return stop(recv);
         }
         let s = LaneStream { recv, via, frame };

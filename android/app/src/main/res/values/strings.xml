@@ -124,6 +124,18 @@
     <string name="a11y_guide_steps">1. Tap “Open settings” and find “Airhand remote control” under Accessibility (maybe under “Downloaded apps” or “Installed services”)\n2. Turn it on and confirm\n3. Come back to Airhand</string>
     <string name="a11y_guide_restricted">If the switch is greyed out with “Restricted setting”: tap “App info”, then ⋮ at the top right → “Allow restricted settings”, and try again.</string>
     <string name="accessibility_label">Airhand remote control</string>
+
+    <!-- 剪贴板里的文件（core/ClipFiles.kt） -->
+    <string name="share_label">Send to the other device</string>
+    <string name="clip_files_channel">Copied files</string>
+    <string name="clip_files_title">The other device copied %1$d item(s)</string>
+    <string name="clip_files_text">%1$s\nPaste them in an app, or save them to Downloads</string>
+    <string name="clip_files_save">Save to Downloads</string>
+    <string name="clip_files_saved">Saved to Downloads/Airhand</string>
+    <string name="clip_files_saved_app">Saved to %1$s</string>
+    <string name="clip_files_failed">Couldn\'t save %1$s</string>
+    <string name="clip_files_offered">Put on the other device\'s clipboard: paste over there</string>
+    <string name="clip_files_no_target">Not connected to any device</string>
     <string name="accessibility_summary">Lets devices watching this phone operate it</string>
     <string name="accessibility_description">When this is on, devices connected to this phone through Airhand can tap, swipe, go back and type text on it. Airhand doesn\'t read what\'s on the screen; it only performs actions while someone is controlling the phone remotely. It only works while you share the screen, and you can turn it off at any time.</string>
 

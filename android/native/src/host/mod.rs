@@ -16,6 +16,7 @@ pub mod audio;
 mod session;
 pub mod video;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,6 +92,8 @@ pub enum Op {
     Audio { failure: Option<String> },
     /// 手机的剪贴板有新文本（Android 10 起应用在后台读不到剪贴板，只有前台时才会有）
     Clipboard { text: String },
+    /// 手机上分享给 Airhand 的文件（打开着的文件描述符）：公告给所有控制端，它们粘贴时才来取（见 crate::files）
+    OfferFiles { files: Vec<crate::files::FdFile> },
     /// 换一个配对码（暂停了的配对随之恢复）
     NewPairingCode,
     /// 忘掉所有配对过的控制端
@@ -125,6 +128,8 @@ pub(crate) struct Shared {
     pairing: Pairing,
     /// 本机的端到端加密身份
     identity: Identity,
+    /// 每个会话的剪贴板文件（控制端也支持时才有）：会话 id → Files
+    pub files: Mutex<HashMap<u64, airhand_link::files::Files>>,
 }
 
 /// 配对状态交给 Kotlin：`{"type":"pairing","state":{code, locked, paired}}`，它保存下来、显示在"共享本机"页，
@@ -249,6 +254,7 @@ impl Host {
             controllers: Mutex::default(),
             pairing,
             identity,
+            files: Mutex::default(),
         });
         let reclaim = cfg.reclaim.and_then(|s| {
             Some(Reclaim {
@@ -339,6 +345,14 @@ impl Host {
             Op::Clipboard { text } => {
                 if !text.is_empty() && text.len() <= airhand_proto::session::MAX_CLIPBOARD_TEXT {
                     sh.broadcast(&HostMsg::Clipboard { text });
+                }
+            }
+            Op::OfferFiles { files } => {
+                let provider = Arc::new(crate::files::FdFiles::new(files));
+                if !provider.is_empty() {
+                    for f in sh.files.lock().unwrap().values() {
+                        f.offer(provider.clone());
+                    }
                 }
             }
             Op::NewPairingCode => sh.pairing.new_code(),

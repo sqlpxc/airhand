@@ -55,6 +55,7 @@ dependencies = [
  "bytes",
  "curve25519-dalek",
  "futures-util",
+ "libc",
  "quinn",
  "rand 0.9.5",
  "rcgen",

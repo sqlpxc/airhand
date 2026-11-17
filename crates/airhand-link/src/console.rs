@@ -17,7 +17,9 @@
 //! * 二进制，不走 JSON、不回复：
 //!   * 画面确认（每帧都有）：`1u8 | sid u32 LE | seq u32 LE | 第几路 u8`（[`parse_ack`]；第 0 路可以不写最后一个字节）；
 //!   * 麦克风的声音包（每 20 ms 一个，见 [`crate::controller`] 的"麦克风"）：`2u8 | sid u32 LE | 声音包`（[`parse_mic`]，
-//!     声音包是 `airhand_proto::media` 的格式：头 + Opus 包）。
+//!     声音包是 `airhand_proto::media` 的格式：头 + Opus 包）；
+//!   * 剪贴板里的文件的内容（控制台这边复制的、被控端来取，见下面的"剪贴板里的文件"）：
+//!     `3u8 | req u32 LE | 错误 u32 LE | 数据`（[`parse_file`]）。
 //!
 //! 服务 → 控制台：
 //! * 文本（JSON），见 [`Out`]：
@@ -25,9 +27,20 @@
 //!   * `{"type": "server", "state": ServerState}`：与中转服务器的连接状态，连上时和有变化时发
 //!   * `{"type": "event", "ch": 3, "event": SessionEvent}`：会话事件
 //!   * `{"type": "hostOnline", "code": 123456}`：在等的被控端上线了（见 [`HostOnline`]）
-//! * 二进制：`ch u32 LE | 媒体包`（`airhand_proto::media`）
+//! * 二进制：`ch u32 LE | 媒体包`（`airhand_proto::media`）。`ch` 是 [`FILE_CHANNEL`] 的是剪贴板里的文件的内容：
+//!   `FILE_CHANNEL | req u32 LE | 错误 u32 LE | 数据`（见下面的"剪贴板里的文件"）
 //!
 //! `ch` 是控制台在 `connect` 时自己选的编号：会话的第一批数据可能比 `connect` 的回复先到，控制台靠它认出是哪个会话的。
+//!
+//! # 剪贴板里的文件
+//!
+//! 见 [`crate::files`]。桌面版的本机剪贴板由本服务自己同步；网页版的文件在浏览器里，内容也经这条 WebSocket：
+//!
+//! * 控制台复制了文件（粘贴时、拖到画面上）：`offerFiles`（只有选中的那几项）。被控端来取时服务问控制台：
+//!   `{"type": "fileList", "req", "path"}` 答 `fileListed`；`{"type": "fileRead", "req", "path", "offset", "len"}`
+//!   答二进制的 `3u8 | req | 错误 | 数据`（比 `len` 短就是到末尾了）。错误是 `FileError` 的编号，没有错误是 `u32::MAX`；
+//! * 被控端复制了文件（`SessionEvent::ClipboardFiles`），控制台要下载：`remoteList` 答 `{"entries", "error"}`；
+//!   `remoteRead`（不带 id，带 `req`）答二进制的 `FILE_CHANNEL | req | 错误 | 数据`；读完了 `remoteClose`。
 //!
 //! 控制台收到画面后发确认（累积确认，连着到的几帧只确认最后一帧），被控端的在途帧控制因此把这一段也算进去。
 
@@ -49,9 +62,12 @@ use crate::controller::{
     ClipboardSync, Command, ConnectOptions, ControllerService, Frontend, HostOnline, SessionEvent,
     SessionUi, UiClosed,
 };
+use crate::files::{Provider, RemoteFile};
 use crate::net::Report;
 use crate::secure::Identity;
 use crate::{LinkConfig, Problem, ServerState};
+use airhand_proto::files::{FileEntry, FileError};
+use std::collections::HashMap;
 
 /// 控制台发来的单条消息上限（剪贴板文本最多 1 MiB，JSON 转义后可能变大）
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -70,6 +86,16 @@ const MAX_CONNECTING: usize = 64;
 const BINARY_ACK: u8 = 1;
 /// 二进制消息的类型：麦克风的声音包
 const BINARY_MIC: u8 = 2;
+/// 二进制消息的类型：控制台这边复制的文件的内容（见模块说明的"剪贴板里的文件"）
+const BINARY_FILE: u8 = 3;
+/// 服务 → 控制台的二进制消息里，这个通道号是剪贴板里的文件的内容（控制台不会把它选做会话的通道）
+pub const FILE_CHANNEL: u32 = u32::MAX;
+/// 文件的内容里"没有错误"
+const NO_ERROR: u32 = u32::MAX;
+/// 控制台一次最多读这么多（两个方向一样）
+const FILE_CHUNK: u32 = 1 << 20;
+/// 等控制台回答（列目录、一块数据）最多这么久
+const FILE_WAIT: Duration = Duration::from_secs(60);
 
 /// WebSocket 的一条消息。两边用的 WebSocket 库不同，各自和它互相转换
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +146,35 @@ pub fn parse_mic(b: &Bytes) -> Option<(u32, Bytes)> {
     Some((u32::from_le_bytes([s0, s1, s2, s3]), b.slice(5..)))
 }
 
+/// 控制台发来的文件内容 `3u8 | req u32 LE | 错误 u32 LE | 数据` → `(req, 结果)`
+pub fn parse_file(b: &Bytes) -> Option<(u32, Result<Bytes, FileError>)> {
+    let [BINARY_FILE, r0, r1, r2, r3, e0, e1, e2, e3, ..] = **b else {
+        return None;
+    };
+    let req = u32::from_le_bytes([r0, r1, r2, r3]);
+    Some((
+        req,
+        match u32::from_le_bytes([e0, e1, e2, e3]) {
+            NO_ERROR => Ok(b.slice(9..)),
+            code => Err(FileError::from_code(code)),
+        },
+    ))
+}
+
+/// 发给控制台的文件内容 `FILE_CHANNEL | req | 错误 | 数据`
+fn file_message(req: u32, r: Result<&[u8], FileError>) -> Bytes {
+    let (err, data) = match r {
+        Ok(d) => (NO_ERROR, d),
+        Err(e) => (e.code(), &[][..]),
+    };
+    let mut b = Vec::with_capacity(12 + data.len());
+    b.extend_from_slice(&FILE_CHANNEL.to_le_bytes());
+    b.extend_from_slice(&req.to_le_bytes());
+    b.extend_from_slice(&err.to_le_bytes());
+    b.extend_from_slice(data);
+    Bytes::from(b)
+}
+
 /// 控制台 → 服务的命令
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -137,6 +192,46 @@ pub enum Call {
     },
     /// 测量控制台到这里的往返时间
     Ping,
+    /// 控制台这边复制了文件（用户选中的那几项）：公告给被控端（见模块说明的"剪贴板里的文件"）
+    OfferFiles {
+        sid: u32,
+        items: Vec<FileEntry>,
+    },
+    /// 回答服务的 `fileList`
+    FileListed {
+        req: u32,
+        #[serde(default)]
+        entries: Vec<FileEntry>,
+        #[serde(default)]
+        error: Option<FileError>,
+    },
+    /// 被控端复制的文件（公告 `clip`）：列出目录
+    RemoteList {
+        sid: u32,
+        clip: u32,
+        path: Vec<String>,
+        #[serde(default)]
+        recursive: bool,
+    },
+    /// 被控端复制的文件：从 `offset` 开始读最多 `len` 字节（`file` 是控制台选的编号，一个文件一个：服务开着它接着读），
+    /// 二进制地回答（`req`）
+    RemoteRead {
+        sid: u32,
+        clip: u32,
+        file: u32,
+        req: u32,
+        path: Vec<String>,
+        size: u64,
+        #[serde(default)]
+        mtime: Option<u64>,
+        offset: u64,
+        len: u32,
+    },
+    /// 不再读这个文件了
+    RemoteClose {
+        sid: u32,
+        file: u32,
+    },
     /// 对会话的操作（输入、画质……）
     #[serde(untagged)]
     Session(Command),
@@ -170,6 +265,18 @@ pub enum Out<'a> {
     },
     HostOnline {
         code: u32,
+    },
+    /// 被控端要控制台这边复制的文件：列出目录（答 `fileListed`）
+    FileList {
+        req: u32,
+        path: Vec<String>,
+    },
+    /// 读一块（答二进制的 `3u8 | req | 错误 | 数据`）
+    FileRead {
+        req: u32,
+        path: Vec<String>,
+        offset: u64,
+        len: u32,
     },
 }
 
@@ -239,6 +346,12 @@ where
             host_online,
             setup.identity,
         )),
+        local: Arc::new(LocalLink {
+            out: out.clone(),
+            next: std::sync::atomic::AtomicU32::new(1),
+            pending: Mutex::default(),
+        }),
+        remote: Arc::default(),
         out,
         info: setup.info,
         clipboard: setup.clipboard,
@@ -264,6 +377,8 @@ where
                         let _ = console.svc.ack(sid, stream, seq);
                     } else if let Some((sid, packet)) = parse_mic(&b) {
                         let _ = console.svc.mic(sid, packet);
+                    } else if let Some((req, data)) = parse_file(&b) {
+                        console.local.reply(req, Reply::Data(data));
                     }
                 }
                 WsMessage::Close => return Ok(()),
@@ -359,11 +474,140 @@ impl SessionUi for ConsoleUi {
 
 struct Console {
     svc: Arc<ControllerService>,
+    /// 控制台这边复制的文件：被控端来取时问控制台
+    local: Arc<LocalLink>,
+    /// 控制台在读的被控端复制的文件：(sid, 控制台选的编号) → 文件
+    remote: Arc<Mutex<HashMap<(u32, u32), Arc<tokio::sync::Mutex<RemoteFile>>>>>,
     out: Outbox,
     info: Value,
     clipboard: Option<fn() -> Box<dyn ClipboardSync>>,
     /// 进行中的 `connect`；控制台关闭时一起中止
     tasks: JoinSet<()>,
+}
+
+/// 控制台对服务的请求的回答
+enum Reply {
+    Listed(Result<Vec<FileEntry>, FileError>),
+    Data(Result<Bytes, FileError>),
+}
+
+/// 问控制台要它那边复制的文件（见模块说明的"剪贴板里的文件"）：发请求、阻塞地等回答
+///（在 `spawn_blocking` 的线程上，见 [`Provider`]）
+struct LocalLink {
+    out: Outbox,
+    next: std::sync::atomic::AtomicU32,
+    pending: Mutex<HashMap<u32, std::sync::mpsc::Sender<Reply>>>,
+}
+
+impl LocalLink {
+    fn call(&self, msg: impl FnOnce(u32) -> Out<'static>) -> Option<Reply> {
+        let req = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending.lock().unwrap().insert(req, tx);
+        let sent = self.out.json(&msg(req)).is_ok();
+        let got = sent.then(|| rx.recv_timeout(FILE_WAIT).ok()).flatten();
+        self.pending.lock().unwrap().remove(&req);
+        got
+    }
+
+    fn reply(&self, req: u32, r: Reply) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&req) {
+            let _ = tx.send(r);
+        }
+    }
+}
+
+/// 控制台这边复制的文件（网页版：在浏览器里）：被控端来取时问控制台
+struct ConsoleFiles {
+    link: Arc<LocalLink>,
+    items: Vec<FileEntry>,
+    /// 列过的（打开时要它的大小、修改时间）：完整路径 → 样子
+    known: Mutex<HashMap<Vec<String>, FileEntry>>,
+}
+
+impl Provider for ConsoleFiles {
+    fn items(&self) -> Vec<FileEntry> {
+        self.items.clone()
+    }
+
+    fn read_dir(&self, path: &[String]) -> Result<Vec<FileEntry>, FileError> {
+        let p = path.to_vec();
+        let got = self.link.call(|req| Out::FileList { req, path: p });
+        let entries = match got {
+            Some(Reply::Listed(r)) => r?,
+            _ => return Err(FileError::Closed),
+        };
+        let mut known = self.known.lock().unwrap();
+        for e in &entries {
+            let mut full = path.to_vec();
+            full.extend(e.path.iter().cloned());
+            known.insert(full, e.clone());
+        }
+        Ok(entries)
+    }
+
+    fn open(
+        &self,
+        path: &[String],
+        offset: u64,
+    ) -> Result<(Box<dyn std::io::Read + Send>, FileEntry), FileError> {
+        let entry = match path {
+            [one] => self.items.iter().find(|i| i.name() == one).cloned(),
+            _ => self.known.lock().unwrap().get(path).cloned(),
+        }
+        .ok_or(FileError::NotFound)?;
+        let reader = ConsoleReader {
+            link: self.link.clone(),
+            path: path.to_vec(),
+            pos: offset,
+            size: entry.size,
+        };
+        Ok((
+            Box::new(reader),
+            FileEntry {
+                path: vec![entry.name().to_string()],
+                ..entry
+            },
+        ))
+    }
+}
+
+/// 控制台这边的一个文件
+struct ConsoleReader {
+    link: Arc<LocalLink>,
+    path: Vec<String>,
+    pos: u64,
+    size: u64,
+}
+
+impl std::io::Read for ConsoleReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.size {
+            return Ok(0);
+        }
+        let len = (buf.len() as u64)
+            .min(FILE_CHUNK as u64)
+            .min(self.size - self.pos) as u32;
+        let (path, offset) = (self.path.clone(), self.pos);
+        let got = self.link.call(|req| Out::FileRead {
+            req,
+            path,
+            offset,
+            len,
+        });
+        match got {
+            Some(Reply::Data(Ok(data))) => {
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                self.pos += n as u64;
+                Ok(n)
+            }
+            Some(Reply::Data(Err(FileError::Denied))) => {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            }
+            _ => Err(std::io::Error::other("the console didn't give the file")),
+        }
+    }
 }
 
 impl Console {
@@ -420,6 +664,109 @@ impl Console {
                 return;
             }
             Call::Ping => Ok(Value::Null),
+            Call::OfferFiles { sid, items } => {
+                let files = ConsoleFiles {
+                    link: self.local.clone(),
+                    items,
+                    known: Mutex::default(),
+                };
+                self.svc
+                    .offer_files(sid, Arc::new(files))
+                    .map(|()| Value::Null)
+            }
+            Call::FileListed {
+                req: r,
+                entries,
+                error,
+            } => {
+                self.local.reply(
+                    r,
+                    Reply::Listed(match error {
+                        Some(e) => Err(e),
+                        None => Ok(entries),
+                    }),
+                );
+                return;
+            }
+            Call::RemoteList {
+                sid,
+                clip,
+                path,
+                recursive,
+            } => {
+                let offer = match self.svc.remote_files(sid, clip) {
+                    Ok(o) => o,
+                    Err(e) => return self.out.reply(req.id, Err(e)),
+                };
+                let out = self.out.clone();
+                self.tasks.spawn(async move {
+                    let (entries, error) = match offer.list(&path, recursive).await {
+                        Ok(e) => (e, None),
+                        Err(e) => (Vec::new(), Some(e)),
+                    };
+                    out.reply(
+                        req.id,
+                        Ok(serde_json::json!({ "entries": entries, "error": error })),
+                    );
+                });
+                return;
+            }
+            Call::RemoteRead {
+                sid,
+                clip,
+                file,
+                req: r,
+                path,
+                size,
+                mtime,
+                offset,
+                len,
+            } => {
+                let opened = {
+                    let mut remote = self.remote.lock().unwrap();
+                    match remote.get(&(sid, file)) {
+                        Some(f) => Ok(f.clone()),
+                        None => self.svc.remote_files(sid, clip).map(|o| {
+                            let f = Arc::new(tokio::sync::Mutex::new(o.open(path, size, mtime)));
+                            remote.insert((sid, file), f.clone());
+                            f
+                        }),
+                    }
+                };
+                let out = self.out.clone();
+                self.tasks.spawn(async move {
+                    let Ok(f) = opened else {
+                        let _ =
+                            out.push(WsMessage::Binary(file_message(r, Err(FileError::Expired))));
+                        return;
+                    };
+                    let mut f = f.lock().await;
+                    f.seek(offset);
+                    let mut buf = vec![0u8; len.min(FILE_CHUNK) as usize];
+                    let mut got = 0;
+                    let mut error = None;
+                    while got < buf.len() {
+                        match f.read(&mut buf[got..]).await {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(e) => {
+                                error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    let msg = match error {
+                        Some(e) => file_message(r, Err(e)),
+                        None => file_message(r, Ok(&buf[..got])),
+                    };
+                    let _ = out.push(WsMessage::Binary(msg));
+                });
+                return;
+            }
+            Call::RemoteClose { sid, file } => {
+                self.remote.lock().unwrap().remove(&(sid, file));
+                Ok(Value::Null)
+            }
             Call::Session(c) => self.svc.command(c).map(|()| Value::Null),
         };
         self.out.reply(req.id, result);
@@ -471,6 +818,92 @@ mod tests {
         assert!(parse_mic(&Bytes::from_static(&[2, 3, 0, 0])).is_none());
         assert!(parse_mic(&Bytes::from_static(&[1, 3, 0, 0, 0, 1, 0, 0, 0])).is_none());
         assert!(parse_mic(&Bytes::new()).is_none());
+    }
+
+    /// 剪贴板里的文件的内容：控制台发来的 `3u8 | req | 错误 | 数据`，发给控制台的 `FILE_CHANNEL | req | 错误 | 数据`
+    #[test]
+    fn binary_file_data() {
+        let b = Bytes::from_static(&[3, 7, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1, 2]);
+        let (req, data) = parse_file(&b).unwrap();
+        assert_eq!((req, data.unwrap().as_ref()), (7, &[1u8, 2][..]));
+        let b = Bytes::from_static(&[3, 7, 0, 0, 0, 4, 0, 0, 0]);
+        assert_eq!(parse_file(&b).unwrap().1, Err(FileError::TooLarge));
+        assert!(parse_file(&Bytes::from_static(&[3, 7, 0, 0, 0])).is_none());
+        let m = file_message(9, Ok(b"ab"));
+        assert_eq!(
+            &m[..],
+            [
+                0xff, 0xff, 0xff, 0xff, 9, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, b'a', b'b'
+            ]
+        );
+        let m = file_message(9, Err(FileError::Changed));
+        assert_eq!(&m[8..], [2, 0, 0, 0]);
+    }
+
+    /// 被控端来取控制台这边复制的文件：服务问控制台（fileList、fileRead），控制台的回答交给在等的
+    #[test]
+    fn console_files_ask_the_console() {
+        use airhand_proto::files::FileKind;
+        let (out, mut rx) = outbox(16, 1 << 20);
+        let link = Arc::new(LocalLink {
+            out,
+            next: std::sync::atomic::AtomicU32::new(1),
+            pending: Mutex::default(),
+        });
+        let item = |path: &[&str], kind, size| FileEntry {
+            path: path.iter().map(|s| s.to_string()).collect(),
+            kind,
+            size,
+            mtime: None,
+            target: None,
+        };
+        let files = Arc::new(ConsoleFiles {
+            link: link.clone(),
+            items: vec![item(&["d"], FileKind::Dir, 0)],
+            known: Mutex::default(),
+        });
+        let f = files.clone();
+        let worker = std::thread::spawn(move || {
+            let listed = f.read_dir(&["d".to_string()]).unwrap();
+            assert_eq!(listed[0].name(), "x.txt");
+            let (mut r, e) = f.open(&["d".into(), "x.txt".into()], 1).unwrap();
+            assert_eq!(e.size, 5);
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+            out
+        });
+        let next = |rx: &mut mpsc::Receiver<Queued>| -> Value {
+            let q = rx.blocking_recv().unwrap();
+            let WsMessage::Text(t) = q.message else {
+                panic!()
+            };
+            serde_json::from_str(&t).unwrap()
+        };
+        let m = next(&mut rx);
+        assert_eq!(m["type"], "fileList");
+        assert_eq!(m["path"], json!(["d"]));
+        let req: Request = serde_json::from_value(json!({
+            "cmd": "fileListed", "req": m["req"],
+            "entries": [{ "path": ["x.txt"], "kind": "file", "size": 5, "mtime": null }]
+        }))
+        .unwrap();
+        let Call::FileListed {
+            req: r, entries, ..
+        } = req.call
+        else {
+            panic!()
+        };
+        link.reply(r, Reply::Listed(Ok(entries)));
+        let m = next(&mut rx);
+        assert_eq!(
+            (m["type"].as_str(), m["offset"].as_u64(), m["len"].as_u64()),
+            (Some("fileRead"), Some(1), Some(4))
+        );
+        link.reply(
+            m["req"].as_u64().unwrap() as u32,
+            Reply::Data(Ok(Bytes::from_static(b"ello"))),
+        );
+        assert_eq!(worker.join().unwrap(), b"ello");
     }
 
     fn outbox(messages: usize, bytes: usize) -> (Outbox, mpsc::Receiver<Queued>) {
@@ -540,6 +973,7 @@ mod tests {
                 codec: Codec::AV1,
                 priority: Default::default(),
                 transport: Default::default(),
+                draw_cursor: false,
             }
         );
         assert!(opts.audio);

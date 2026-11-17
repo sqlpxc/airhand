@@ -2,6 +2,7 @@ import { type ReactNode, type RefObject, useCallback, useEffect, useLayoutEffect
 import { closeTab, fmtCode, toggleFullscreen } from "../lib/actions";
 import { api, MOUSE_MODES, type MouseMode, type Platform } from "../lib/api";
 import { type MsgKey, t, useT } from "../lib/i18n";
+import { LocalFiles } from "../lib/files";
 import { errorText, noticeText, problemText, sessionStateText } from "../lib/messages";
 import { CODEC_LABEL } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
@@ -157,6 +158,8 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const title = useSessionTitle(s);
   const [menu, setMenu] = useState<Menu>(null);
   const [toast, setToast] = useState<string | null>(null);
+  /** 正在往画面上拖文件 */
+  const [dropping, setDropping] = useState(false);
   // 对方要求配对码、或者对方的身份变了（要重新配对）时输入的配对码
   const [pairing, setPairing] = useState("");
   const needsPairing =
@@ -413,6 +416,9 @@ export function SessionView({ s }: { s: RemoteSession }) {
                     <span className="muted small block">
                       {t(api.kind === "web" ? "session.clipSyncHintWeb" : "session.clipSyncHint")}
                     </span>
+                    <span className="muted small block">
+                      {t(api.kind === "web" ? "session.clipFilesHintWeb" : "session.clipFilesHint")}
+                    </span>
                   </span>
                   <input
                     type="checkbox"
@@ -546,8 +552,28 @@ export function SessionView({ s }: { s: RemoteSession }) {
         </div>
       </header>
 
-      <div className="stage">
+      <div
+        className={`stage ${dropping ? "dropping" : ""}`}
+        // 拖到画面上的文件（文件夹也行）：放进对方的剪贴板，在对方那里粘贴（见 files.ts）。桌面版的窗口里拖放由 Tauri 接管
+        onDragOver={(e) => {
+          if (api.kind !== "web" || !live || !e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          if (!dropping) setDropping(true);
+        }}
+        onDragLeave={(e) => {
+          if (e.currentTarget === e.target) setDropping(false);
+        }}
+        onDrop={(e) => {
+          if (api.kind !== "web" || !live) return;
+          e.preventDefault();
+          setDropping(false);
+          const files = LocalFiles.fromDataTransfer(e.dataTransfer);
+          if (files && s.offerFiles(files)) setToast(t("session.filesOffered"));
+        }}
+      >
         <CanvasHost s={s} interactive={s.state === "live"} />
+        {dropping && <div className="drop-hint">{t("session.dropFiles")}</div>}
 
         {s.state !== "live" && (
           <div className="stage-overlay">
@@ -619,6 +645,30 @@ export function SessionView({ s }: { s: RemoteSession }) {
           </div>
         )}
         {live && s.gamePaused && <div className="lock-hint">{t("session.clickToLock")}</div>}
+        {s.remoteFiles && (
+          <div className="files-bar">
+            <span className="files-bar-text">
+              {s.download
+                ? t("session.downloading", {
+                    pct: s.download.total > 0 ? Math.floor((s.download.done * 100) / s.download.total) : 0,
+                  })
+                : t("session.remoteFiles", {
+                    n: s.remoteFiles.items.length,
+                    names: s.remoteFiles.items
+                      .slice(0, 3)
+                      .map((i) => i.path[0])
+                      .join("、")
+                      .concat(s.remoteFiles.items.length > 3 ? "…" : ""),
+                  })}
+            </span>
+            <button className="primary-btn small" disabled={s.download !== null} onClick={() => void s.downloadRemoteFiles()}>
+              {t("session.download")}
+            </button>
+            <button className="ghost-btn small" disabled={s.download !== null} onClick={() => s.dismissRemoteFiles()}>
+              ✕
+            </button>
+          </div>
+        )}
         {toast && <div className="toast">{toast}</div>}
       </div>
     </div>

@@ -65,6 +65,7 @@ fn incoming(
         kick,
         direct: None,
         frames: host.version >= airhand_proto::SIGNAL_FRAMES,
+        file_limit: host.file_limit,
     };
     (inc, kick_tx)
 }
@@ -174,6 +175,7 @@ fn test_config(db: Option<std::path::PathBuf>) -> Config {
         max_conns_per_ip: Config::DEFAULT_MAX_CONNS_PER_IP,
         new_codes_per_ip: 1000,
         connects_per_minute: 1000,
+        file_limit: Some(Config::DEFAULT_FILE_LIMIT),
     }
 }
 
@@ -1089,7 +1091,7 @@ async fn host_service_retries_an_unanswered_rekey() {
         );
         let hello: ClientHello = airhand_proto::framing::decode_known(&buf).unwrap();
         assert_eq!(hello.role, Role::Host);
-        let answer = ServerHello::answer(hello.versions(), airhand_proto::Features::NONE);
+        let answer = ServerHello::answer(hello.versions(), airhand_proto::Features::NONE, None);
         assert!(answer.version.is_some());
         write_frame(&mut send, &airhand_proto::framing::to_vec(&answer))
             .await
@@ -1440,6 +1442,134 @@ async fn frame_streams_are_relayed_one_frame_each() {
     drop(open);
 }
 
+/// 文件流（剪贴板里的文件，见 airhand_proto::files）：只能是帧流；一条流转发的字节不超过上限对应的大小，
+/// 超过了两头都 reset（RELAY_LIMIT），两端都看得到原因；一端叫停 / reset 的错误码原样带给另一端；
+/// 上限是 0 的服务器不转文件流；握手里告诉客户端上限
+#[tokio::test]
+async fn file_streams_are_limited_by_the_relay() {
+    use airhand_proto::SessionHeader;
+    use airhand_proto::files::{reset, wire_size};
+    const LIMIT: u64 = 1000;
+    let (broker, cfg) = start_cfg(Config {
+        file_limit: Some(LIMIT),
+        ..test_config(None)
+    })
+    .await;
+    let (mut host, id) = register(&cfg, None).await;
+    assert_eq!(host.file_limit, Some(LIMIT));
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    assert_eq!(ctrl.file_limit, Some(LIMIT));
+    let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+    assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    let open = async |header: SessionHeader| {
+        let mut send = host.conn.open_uni().await.unwrap();
+        send.write_all(&header.encode()).await.unwrap();
+        send
+    };
+    let accept = async || {
+        let mut recv = timeout(Duration::from_secs(2), ctrl.conn.accept_uni())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut hdr = [0u8; SessionHeader::LEN];
+        recv.read_exact(&mut hdr).await.unwrap();
+        (SessionHeader::decode(&hdr).unwrap(), recv)
+    };
+    let file = SessionHeader::frame(sid, SessionLane::File);
+    // 正好是上限：转过去
+    let body = vec![7u8; wire_size(LIMIT) as usize];
+    let mut s = open(file).await;
+    s.write_all(&body).await.unwrap();
+    s.finish().unwrap();
+    let (h, mut r) = accept().await;
+    assert_eq!(h, file);
+    let got = timeout(Duration::from_secs(2), r.read_to_end(1 << 20))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.len(), body.len());
+    wait_until("the relayed bytes are counted", || {
+        broker.session_file_bytes(sid) == body.len() as u64
+    })
+    .await;
+    // 多一个字节：两头都 reset，错误码说明原因
+    let mut s = open(file).await;
+    let (_, mut r) = accept_after(&mut s, &body, &accept).await;
+    let _ = s.write_all(&[1]).await;
+    let read = timeout(Duration::from_secs(2), r.read_to_end(1 << 20))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read, Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(c))) if c == VarInt::from_u32(reset::RELAY_LIMIT)),
+        "{read:?}"
+    );
+    let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
+    assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::RELAY_LIMIT)));
+    // 取的一方叫停：给的一方看到同一个错误码
+    let mut s = open(file).await;
+    s.write_all(b"part").await.unwrap();
+    let (_, mut r) = accept().await;
+    r.stop(VarInt::from_u32(reset::CANCELLED)).unwrap();
+    let stopped = timeout(Duration::from_secs(2), async {
+        loop {
+            if s.write_all(b"more").await.is_err() {
+                break s.stopped().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::CANCELLED)));
+    // 文件通道只能是帧流
+    let plain = open(SessionHeader::new(sid, SessionLane::File)).await;
+    assert!(
+        timeout(Duration::from_secs(2), plain.stopped())
+            .await
+            .unwrap()
+            .is_ok()
+    );
+    assert!(broker.sessions.lock().contains_key(&sid));
+
+    // 上限是 0：不转文件流
+    let (_broker, cfg) = start_cfg(Config {
+        file_limit: Some(0),
+        ..test_config(None)
+    })
+    .await;
+    let (mut host, id) = register(&cfg, None).await;
+    assert_eq!(host.file_limit, Some(0));
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+    assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    let mut s = host.conn.open_uni().await.unwrap();
+    s.write_all(&SessionHeader::frame(sid, SessionLane::File).encode())
+        .await
+        .unwrap();
+    let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
+    assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::RELAY_LIMIT)));
+}
+
+/// 写完 `body`（不结束），等另一端接到这条流、读完这些字节
+async fn accept_after<F, Fut>(
+    s: &mut quinn::SendStream,
+    body: &[u8],
+    accept: &F,
+) -> (airhand_proto::SessionHeader, quinn::RecvStream)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = (airhand_proto::SessionHeader, quinn::RecvStream)>,
+{
+    s.write_all(body).await.unwrap();
+    let (h, mut r) = accept().await;
+    let mut got = vec![0u8; body.len()];
+    timeout(Duration::from_secs(2), r.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    (h, r)
+}
+
 /// 数据报按开头的会话 ID 在会话的两端之间转发（服务器批准了就转，不用等通道）；不是这个会话的连接发的、
 /// 会话 ID 不对的、会话结束之后的都不转
 #[tokio::test]
@@ -1580,6 +1710,188 @@ async fn controller_service_gets_audio_over_datagrams() {
     assert_eq!(got, [1, 2, 3, 4, 5]);
     assert!(host.conn.stats().frame_tx.datagram >= 5);
     drop(session);
+}
+
+/// 剪贴板里的文件经过中转，两个方向：被控端复制、控制端（网页版那样由界面取）粘贴；控制端复制、被控端粘贴。
+/// 控制端刚公告了文件时，之后的输入等被控端放好了才发；一次粘贴超过中转的上限时读不了，控制端的界面知道为什么
+#[tokio::test]
+async fn clipboard_files_cross_the_relay_both_ways() {
+    use airhand_link::controller::Command;
+    use airhand_link::files::{LocalFs, RemoteFile};
+    use airhand_proto::files::{FileError, FileKind};
+    use airhand_proto::session::InputEvent;
+    struct Ui(mpsc::UnboundedSender<SessionEvent>);
+    impl SessionUi for Ui {
+        fn packet(&self, _: Vec<u8>) -> Result<(), UiClosed> {
+            Ok(())
+        }
+        fn event(&self, e: SessionEvent) -> Result<(), UiClosed> {
+            let _ = self.0.send(e);
+            Ok(())
+        }
+    }
+    async fn read_all(f: &mut RemoteFile) -> Result<Vec<u8>, FileError> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = timeout(Duration::from_secs(10), f.read(&mut buf))
+                .await
+                .expect("reading timed out")?;
+            if n == 0 {
+                return Ok(out);
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "airhand-relay-files-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(dir.join("folder").join("sub")).unwrap();
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("folder").join("sub").join("big.bin"), &big).unwrap();
+    std::fs::write(dir.join("folder").join("a.txt"), b"from the host").unwrap();
+    std::fs::write(dir.join("note.txt"), b"from the controller").unwrap();
+
+    // 中转的上限：文件夹不到它，大的那个单独复制时超过它
+    let (_broker, cfg) = start_cfg(Config {
+        file_limit: Some(400_000),
+        ..test_config(None)
+    })
+    .await;
+    let (mut host, id) = register(&cfg, None).await;
+    let svc = ControllerService::start(
+        Arc::new(cfg.clone()),
+        tokio::runtime::Handle::current(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        Identity::generate(),
+    );
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let ui = Arc::new(Ui(tx));
+    let code = id.code.to_string();
+    let connecting = async {
+        loop {
+            let r = svc
+                .connect(
+                    &code,
+                    ConnectOptions::default(),
+                    ui.clone(),
+                    Frontend::Browser,
+                )
+                .await;
+            match r {
+                Err(Problem::NotConnected) => tokio::time::sleep(Duration::from_millis(20)).await,
+                r => break r,
+            }
+        }
+    };
+    let gate = KnownGate(Identity::generate());
+    let (router, _router) = Router::start(&host.conn);
+    let accepting = async {
+        let msg = next(&mut host).await;
+        let (inc, kick) = incoming(&host, &router, id.code, msg);
+        let (s, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        (s, kick)
+    };
+    let (info, (mut session, _kick)) = tokio::join!(connecting, accepting);
+    let sid = info.unwrap().sid;
+    let host_files = session
+        .files
+        .clone()
+        .expect("both ends support clipboard files");
+    let next_event = async |events: &mut mpsc::UnboundedReceiver<SessionEvent>,
+                            f: &dyn Fn(&SessionEvent) -> bool| {
+        loop {
+            let e = timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("no event")
+                .unwrap();
+            if f(&e) {
+                return e;
+            }
+        }
+    };
+
+    // 被控端复制了一个文件夹：界面只收到清单，要内容时去取
+    host_files.offer(Arc::new(LocalFs::new(&[dir.join("folder")])));
+    let SessionEvent::ClipboardFiles { clip, items } = next_event(&mut events, &|e| {
+        matches!(e, SessionEvent::ClipboardFiles { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].name(), items[0].kind), ("folder", FileKind::Dir));
+    let offer = svc.remote_files(sid, clip).unwrap();
+    let tree = offer.list(&["folder".to_string()], true).await.unwrap();
+    let files: Vec<_> = tree.iter().filter(|e| e.kind == FileKind::File).collect();
+    assert_eq!(files.len(), 2);
+    for e in files {
+        let mut path = vec!["folder".to_string()];
+        path.extend(e.path.iter().cloned());
+        let mut f = offer.open(path, e.size, e.mtime);
+        let got = read_all(&mut f).await.unwrap();
+        let want = std::fs::read(dir.join("folder").join(e.path.join("/"))).unwrap();
+        assert!(got == want, "{:?}", e.path);
+    }
+
+    // 控制端复制了一个文件：被控端的平台收到公告；它放好之前，控制端的输入扣着
+    svc.offer_files(sid, Arc::new(LocalFs::new(&[dir.join("note.txt")])))
+        .unwrap();
+    svc.command(Command::Input {
+        sid,
+        events: vec![InputEvent::Text { text: "v".into() }],
+    })
+    .unwrap();
+    let offer = match timeout(Duration::from_secs(5), session.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Request::ClipboardFiles(offer) => offer,
+        other => panic!("the input overtook the offer: {other:?}"),
+    };
+    assert!(
+        timeout(Duration::from_millis(300), session.incoming.recv())
+            .await
+            .is_err(),
+        "the input wasn't held back"
+    );
+    offer.ready();
+    assert!(matches!(
+        timeout(Duration::from_secs(5), session.incoming.recv()).await,
+        Ok(Some(Request::Input(_)))
+    ));
+    let item = offer.items()[0].clone();
+    let mut f = offer.open(item.path.clone(), item.size, item.mtime);
+    assert_eq!(read_all(&mut f).await.unwrap(), b"from the controller");
+
+    // 只有中转、一次粘贴超过了上限：取不到，控制端的界面知道为什么
+    std::fs::write(dir.join("huge.bin"), vec![1u8; 500_000]).unwrap();
+    host_files.offer(Arc::new(LocalFs::new(&[dir.join("huge.bin")])));
+    let SessionEvent::ClipboardFiles { clip, items } = next_event(&mut events, &|e| {
+        matches!(e, SessionEvent::ClipboardFiles { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let offer = svc.remote_files(sid, clip).unwrap();
+    let mut f = offer.open(items[0].path.clone(), items[0].size, items[0].mtime);
+    assert_eq!(read_all(&mut f).await, Err(FileError::TooLarge));
+    let e = next_event(&mut events, &|e| {
+        matches!(e, SessionEvent::FileError { .. })
+    })
+    .await;
+    assert!(
+        matches!(&e, SessionEvent::FileError { name, error: FileError::TooLarge } if name == "huge.bin"),
+        "{e:?}"
+    );
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 新分配的控制码按来源限量；取回自己原来的控制码不算

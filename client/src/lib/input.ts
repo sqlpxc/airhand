@@ -40,6 +40,7 @@
 // 同时看对方的好几个显示器（多屏）时，画面是几个 canvas 拼在一起的：事件挂在包着它们的元素上，绝对坐标是指针所在
 // （落在缝里时是最近）的那一路画面上的位置，带着第几路（见 screens.ts 的 hitTest）。
 import type { InputEvent, MouseButton, MouseMode } from "./api";
+import { isPasteKey } from "./files.ts";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
 const META_KEYS = new Set(["MetaLeft", "MetaRight"]);
@@ -126,6 +127,11 @@ export class RemoteInput {
   onModeChange: (() => void) | null = null;
   /** 鼠标模式变了（工具栏、快捷键）：会话据此让对方画不画光标、记进我的设备 */
   onMouseMode: ((mode: MouseMode) => void) | null = null;
+  /**
+   * 粘贴键先让浏览器触发 paste 事件（网页版：里面可能有这里复制的文件，见 files.ts），这个键等它处理完再发。
+   * 不设置时粘贴键和别的键一样直接发（桌面版的剪贴板由 Rust 端自己同步）
+   */
+  onPaste: ((e: ClipboardEvent) => void) | null = null;
 
   /** `locate`：指针在第几路画面上（多屏）；不给就是整个元素都是第 0 路画面 */
   constructor(canvas: HTMLElement, connected: () => boolean, send: (events: InputEvent[]) => void, locate?: Locate) {
@@ -489,10 +495,20 @@ export class RemoteInput {
       const clamp = (n: number) => Math.max(-32000, Math.min(32000, n));
       this.enqueue([{ type: "wheel", dx: clamp(dx), dy: clamp(dy) }], true);
     }, { passive: false });
+    on("paste", e => { if (this._interactive) this.onPaste?.(e); });
     on("keydown", e => {
       if (!this._interactive) return;
-      e.preventDefault(); e.stopPropagation();
+      // 粘贴键：不拦住浏览器，它接着触发 paste 事件（见 onPaste）；这个键放到它后面发
+      const paste = this.onPaste !== null && !e.repeat && isPasteKey(e);
+      if (!paste) e.preventDefault();
+      e.stopPropagation();
       if (!e.code || e.code === "Unidentified") return;
+      if (paste) {
+        this.pressed.add(e.code);
+        const code = e.code;
+        setTimeout(() => this.enqueue([{ type: "key", code, down: true }], true), 0);
+        return;
+      }
       if (isLockShortcut(e)) {
         if (!e.repeat) this.toggleGame();
         this.swallowed.add(e.code);

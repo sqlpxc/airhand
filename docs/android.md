@@ -20,6 +20,8 @@ On a TV, the phone entry point also switches to the TV interface.
 
 The remote screen is full screen with just one **draggable round button** (it snaps to the left / right edge) that opens the menu: keyboard, shortcuts, sound, A/V sync, quality (same presets as the desktop, plus scaling (low latency / sharp text, only for computers), loss recovery (auto / retransmit / error correction) and the video format; see the quality panel in the [usage guide](usage.md)), clipboard (send to the remote clipboard / type it in), displays (with several monitors), fit screen, gestures, disconnect. The top of the menu shows the device's name, video format, frame rate, latency, bitrate and path (plus "FEC" while error correction is in use). Rotating the phone to landscape fills the screen.
 
+**Files**: files copied on the other side go on the phone's clipboard, so you can paste them in other apps, and the notification can "Save to Downloads" (the only way for folders). To send files from the phone, use **Share → Send to the other device** in a file manager or the gallery, then paste on the other side (this also works while the phone shares its screen: they go to the device controlling it). Copying only sends a list; the contents travel when you paste (see [Usage → Copying and pasting files](usage.md#copying-and-pasting-files)).
+
 Two **touch input modes** (two big buttons in the menu switch any time, Settings sets the default; the default "Automatic" uses the trackpad for computers and touch for phones). The gestures are explained the first time each mode is used:
 
 | Gesture | Trackpad (computers) | Touch (computers) | Touch (phones) |

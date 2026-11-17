@@ -1,14 +1,17 @@
-//! 剪贴板文本双向同步（被控端与控制端共用）。
+//! 剪贴板双向同步（被控端与控制端共用）：文本，和复制的文件（只发清单，粘贴时才传，见 `airhand_link::files`）。
 //!
 //! * 检测到变化后才读取内容：Windows 用 `GetClipboardSequenceNumber`，Linux 用 XFIXES 的
 //!   选择所有者变化通知，macOS 用 `NSPasteboard.changeCount`（都不需要读取内容，几乎零开销）；
-//! * 记录"双方已一致"的文本哈希，抑制回声（A 写入 B → B 检测到变化 → 又发回 A）。
+//! * 记录"双方已一致"的内容哈希，抑制回声（A 写入 B → B 检测到变化 → 又发回 A）；
+//! * 对方复制的文件由 [`crate::clipfiles`] 放进本机剪贴板；本机剪贴板里是自己放的那些时不算本机复制了文件。
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use airhand_link::controller::Clip;
+use airhand_link::files::RemoteOffer;
 use airhand_proto::session::MAX_CLIPBOARD_TEXT;
 
 /// 轮询间隔（被控端与控制端相同）
@@ -70,13 +73,52 @@ fn hash(s: &str) -> u64 {
     h.finish() | 1
 }
 
-fn read_text() -> Result<Option<String>, arboard::Error> {
+fn hash_clip(c: &Clip) -> u64 {
+    match c {
+        Clip::Text(t) => hash(t),
+        Clip::Files(paths) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            "files".hash(&mut h);
+            paths.hash(&mut h);
+            h.finish() | 1
+        }
+    }
+}
+
+/// 剪贴板里复制的文件（没有时为 `None`）
+fn get_files() -> Result<Option<Vec<std::path::PathBuf>>, arboard::Error> {
+    match with_clipboard(|c| c.get().file_list()) {
+        // 自己放进去的对方的文件（Linux：本程序挂的文件系统里的）不算本机复制的
+        Ok(files)
+            if !files.is_empty() && !files.iter().all(|f| crate::clipfiles::is_our_path(f)) =>
+        {
+            Ok(Some(files))
+        }
+        Ok(_) | Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        // 有的平台上剪贴板里不是文件时报的是别的错误：当作没有文件，接着读文本
+        Err(arboard::Error::ConversionFailure) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 剪贴板里是什么：复制的文件优先，不然是文本。自己放进去的对方的文件不算（见模块说明）
+fn read_clip() -> Result<Option<Clip>, arboard::Error> {
+    if crate::clipfiles::is_ours() {
+        return Ok(None);
+    }
     for attempt in 0..3 {
-        match get_text() {
-            Ok(t) => return Ok(Some(t)),
-            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        let read = get_files().and_then(|files| match files {
+            Some(files) => Ok(Some(Clip::Files(files))),
+            None => match get_text() {
+                Ok(t) => Ok(Some(Clip::Text(t))),
+                Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                Err(e) => Err(e),
+            },
+        });
+        match read {
+            Ok(c) => return Ok(c),
             Err(e) if attempt == 2 => return Err(e),
-            // 其它程序正占用剪贴板，稍后重试；失败不能被缓存成这个序号没有文本。
+            // 其它程序正占用剪贴板，稍后重试；失败不能被缓存成这个序号没有内容。
             Err(_) => std::thread::sleep(Duration::from_millis(40)),
         }
     }
@@ -159,11 +201,11 @@ fn writer() -> &'static Arc<ClipboardWriter> {
 #[derive(Default)]
 struct ClipboardReader(Mutex<Reads>);
 
-type ReadResult = Result<Option<Arc<str>>, ()>;
+type ReadResult = Result<Option<Arc<Clip>>, ()>;
 
 #[derive(Default)]
 struct Reads {
-    latest: Option<(u32, Option<Arc<str>>)>,
+    latest: Option<(u32, Option<Arc<Clip>>)>,
     pending: Option<(u32, tokio::sync::oneshot::Receiver<ReadResult>)>,
 }
 
@@ -171,8 +213,8 @@ impl ClipboardReader {
     fn poll(
         &self,
         seq: u32,
-        read: impl FnOnce() -> Result<Option<String>, arboard::Error> + Send + 'static,
-    ) -> Option<Option<Arc<str>>> {
+        read: impl FnOnce() -> Result<Option<Clip>, arboard::Error> + Send + 'static,
+    ) -> Option<Option<Arc<Clip>>> {
         let mut state = self.0.lock().unwrap();
         if let Some((at, rx)) = &mut state.pending {
             match rx.try_recv() {
@@ -196,13 +238,16 @@ impl ClipboardReader {
             let (tx, rx) = tokio::sync::oneshot::channel();
             state.pending = Some((seq, rx));
             tokio::task::spawn_blocking(move || {
-                let text = read()
-                    .map(|text| {
-                        text.filter(|t| !t.is_empty() && t.len() <= MAX_CLIPBOARD_TEXT)
-                            .map(Arc::<str>::from)
+                let clip = read()
+                    .map(|clip| {
+                        clip.filter(|c| match c {
+                            Clip::Text(t) => !t.is_empty() && t.len() <= MAX_CLIPBOARD_TEXT,
+                            Clip::Files(f) => !f.is_empty(),
+                        })
+                        .map(Arc::new)
                     })
                     .map_err(|_| ());
-                let _ = tx.send(text);
+                let _ = tx.send(clip);
             });
         }
         None
@@ -218,6 +263,8 @@ fn reader() -> &'static ClipboardReader {
 pub struct ClipSync {
     last_seq: u32,
     synced: Arc<AtomicU64>,
+    /// 最近放进本机剪贴板的对方的文件：会话结束时还在剪贴板里的话拿掉
+    applied: Mutex<Option<RemoteOffer>>,
 }
 
 impl ClipSync {
@@ -226,11 +273,12 @@ impl ClipSync {
         Self {
             last_seq: sequence(),
             synced: Arc::new(AtomicU64::new(0)),
+            applied: Mutex::new(None),
         }
     }
 
-    /// 本机剪贴板有新文本（且不是对端刚写入的）时返回它。
-    pub fn poll(&mut self) -> Option<String> {
+    /// 本机剪贴板有新内容（文本、复制的文件，且不是对端刚写入的）时返回它。
+    pub fn poll(&mut self) -> Option<Clip> {
         // 写入过程中不读取中间状态，否则 A、B 连续更新时会把短暂的 A 当成本机变化回传。
         if writer().busy() {
             return None;
@@ -239,17 +287,25 @@ impl ClipSync {
         if seq == self.last_seq {
             return None;
         }
-        let text = reader().poll(seq, read_text)?;
+        let clip = reader().poll(seq, read_clip)?;
         if writer().busy() || sequence() != seq {
             return None;
         }
         self.last_seq = seq;
-        let text = text?;
-        let h = hash(&text);
+        let clip = clip?;
+        let h = hash_clip(&clip);
         if self.synced.swap(h, Ordering::AcqRel) == h {
             return None;
         }
-        Some(text.to_string())
+        Some((*clip).clone())
+    }
+
+    /// 对方复制了文件：放进本机剪贴板（粘贴时才传，见 [`crate::clipfiles`]）
+    pub fn apply_files(&self, offer: RemoteOffer) {
+        // 之后本机再复制同样的东西也要同步过去
+        self.synced.store(0, Ordering::Release);
+        *self.applied.lock().unwrap() = Some(offer.clone());
+        crate::clipfiles::apply(offer);
     }
 
     /// 串行写入对端的最新文本。只有写入成功才更新同步哈希；写入期间 poll 不回传中间状态。
@@ -270,12 +326,25 @@ impl ClipSync {
 
 /// 控制端会话用它同步本机剪贴板（见 `airhand_link::controller::Frontend::Desktop`）
 impl airhand_link::controller::ClipboardSync for ClipSync {
-    fn poll(&mut self) -> Option<String> {
+    fn poll(&mut self) -> Option<Clip> {
         ClipSync::poll(self)
     }
 
     fn apply(&self, text: String) {
         ClipSync::apply(self, text)
+    }
+
+    fn apply_files(&self, offer: RemoteOffer) {
+        ClipSync::apply_files(self, offer)
+    }
+}
+
+impl Drop for ClipSync {
+    /// 会话结束了：本机剪贴板里还是它的文件的话拿掉（之后粘贴也取不到了）
+    fn drop(&mut self) {
+        if let Some(offer) = self.applied.lock().unwrap().take() {
+            crate::clipfiles::withdraw(&offer);
+        }
     }
 }
 
@@ -294,7 +363,7 @@ mod tests {
                 .poll(1, move || {
                     let _ = started.send(());
                     wait.recv().unwrap();
-                    Ok(Some("old".into()))
+                    Ok(Some(Clip::Text("old".into())))
                 })
                 .is_none()
         );
@@ -311,7 +380,7 @@ mod tests {
         release.send(()).unwrap();
         let text = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Some(text) = reader.poll(2, || Ok(Some("new".into()))) {
+                if let Some(text) = reader.poll(2, || Ok(Some(Clip::Text("new".into())))) {
                     break text;
                 }
                 tokio::task::yield_now().await;
@@ -319,13 +388,14 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(text.as_deref(), Some("new"));
+        let new = Clip::Text("new".into());
+        assert_eq!(text.as_deref(), Some(&new));
         assert_eq!(
             reader
                 .poll(2, || panic!("reuse the same sequence"))
                 .unwrap()
                 .as_deref(),
-            Some("new")
+            Some(&new)
         );
     }
 

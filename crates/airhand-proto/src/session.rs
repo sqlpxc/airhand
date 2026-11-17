@@ -11,8 +11,8 @@
 //!   控制端测的往返时延都靠它们）。丢了的确认由控制端重发（见 [`ControllerDatagram::Ack`]）。直连通着时 Ping、Pong、
 //!   确认两条路各发一份（同一个计数，后到的那份被接收端的重放窗口挡掉）；探测和回声只发在要量的那条路上；
 //! * **控制**：输入、设置、提示……都很小，要快，不能丢、不能乱序；
-//! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标图像
-//!   （[`HostMsg::CursorImage`]，几十 KB）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
+//! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）、光标图像
+//!   （[`HostMsg::CursorImage`]，几十 KB）、剪贴板里的文件的公告和列表（[`crate::files::FileMsg::lane`]）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
 //!   会把后面的消息挡住大约 1.7 秒：确认迟到，被控端的在途帧窗口停住、测到的往返时延变大，自适应码率误判为拥塞；
 //!   输入晚到超过 [`INPUT_MAX_AGE`] 还会被当成过时的丢掉。
 //!
@@ -139,6 +139,13 @@
 //! * 画质设置（帧率、码率、编码格式……）对每一路分别生效；光标、声音、剪贴板是整个会话一份。
 //!
 //! 第 0 路的这些字段都是 0、不写进线上的数组：只看一个显示器时和没有多屏之前发的字节一样。
+//!
+//! # 剪贴板里的文件
+//!
+//! 双方都支持（会话能力位 [`crate::features::session::FILES`]）时，剪贴板里除了文字还可以是文件：复制时只发清单
+//! （[`crate::files::FileMsg::Offer`]），粘贴时才传内容（文件通道 [`crate::SessionLane::File`]），两个方向一样，
+//! 见 [`crate::files`]。消息包在 [`HostMsg::Files`] / [`ControllerMsg::Files`] 里，走哪条通道看里面的消息。
+//! 文字和文件互相取代：剪贴板里只有最近的一样。
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -148,6 +155,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::SessionLane;
 use crate::cbor::open_enum;
+use crate::files::FileMsg;
 
 /// 被控端 → 控制端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
@@ -215,6 +223,10 @@ pub enum HostMsg {
         #[n(1)]
         detail: Option<String>,
     },
+    /// 剪贴板里的文件（见模块说明的"剪贴板里的文件"）。只发给协商了 [`crate::features::session::FILES`] 的控制端。
+    /// 不认识的（对方版本新增的）是 `None`：跳过
+    #[n(13)]
+    Files(#[cbor(n(0), with = "crate::cbor::opt", has_nil)] Option<FileMsg>),
 }
 
 open_enum! {
@@ -254,7 +266,9 @@ impl HostMsg {
     /// 这条消息走哪条通道（见模块说明的"走哪条通道"）
     pub fn lane(&self) -> SessionLane {
         match self {
+            HostMsg::Files(Some(m)) => m.lane(),
             HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => SessionLane::Bulk,
+            HostMsg::Files(None) => SessionLane::Control,
             HostMsg::Hello(_)
             | HostMsg::Displays { .. }
             | HostMsg::Notice(_)
@@ -666,11 +680,17 @@ pub enum ControllerMsg {
         #[n(0)]
         streams: Vec<StreamView>,
     },
+    /// 剪贴板里的文件（见模块说明的"剪贴板里的文件"）。只发给协商了 [`crate::features::session::FILES`] 的被控端。
+    /// 不认识的（对方版本新增的）是 `None`：跳过
+    #[n(12)]
+    Files(#[cbor(n(0), with = "crate::cbor::opt", has_nil)] Option<FileMsg>),
 }
 
 impl ControllerMsg {
     pub fn lane(&self) -> SessionLane {
         match self {
+            Self::Files(Some(m)) => m.lane(),
+            Self::Files(None) => SessionLane::Control,
             Self::Clipboard { .. } => SessionLane::Bulk,
             Self::Input { .. }
             | Self::Settings(_)

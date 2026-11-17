@@ -203,6 +203,8 @@ pub struct Signal {
     /// 和服务器商定的信令版本，双方都支持的信令能力位（见 `airhand_proto::signal` 的"版本握手"）
     pub version: u16,
     pub features: Features,
+    /// 一次粘贴经中转最多传多少（剪贴板里的文件，见 `airhand_proto::files`）：`None` 不限
+    pub file_limit: Option<u64>,
     /// 连服务器的 endpoint：直连也用它（同一个 socket，见模块说明的"直连"）
     pub endpoint: Endpoint,
     /// 从这个 socket 发打洞包
@@ -460,6 +462,7 @@ async fn handshake(
         recv,
         version,
         features: resp.features.common(hello.features),
+        file_limit: resp.file_limit,
         endpoint,
         punch,
     })

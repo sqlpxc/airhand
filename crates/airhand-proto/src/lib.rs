@@ -43,6 +43,7 @@
 //! | 画面 | 被控端 → 控制端 | 画面包（双方都支持 [`features::session::FRAMES`] 时每帧一条帧流）。多屏同时显示时每个显示器一路，
 //! 各是一条通道（[`SessionLane::Video`]，见 [`session`] 的"多屏"） | 媒体包（[`media`]） |
 //! | 大块 | 双向 | 大的消息：剪贴板、光标图像（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
+//! | 文件 | 双向 | 剪贴板里的文件的内容：每次取用一条帧流，取的一方给额度（见 [`files`]） | 密文分块 |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
 //! "之后的每一帧"）。声音包，以及 Ping / Pong、画面确认、探测这些只看最新值的控制消息走 QUIC 数据报（[`datagram`]）：
@@ -71,6 +72,7 @@
 
 pub mod cbor;
 pub mod fec;
+pub mod files;
 pub mod framing;
 
 /// 消息的编码（带编号的 CBOR，见 [`framing`]）
@@ -130,6 +132,10 @@ pub const MAX_LANES: u8 = 8;
 /// 用不到这么多
 pub const MAX_FRAME_STREAMS: u16 = 256;
 
+/// 一个会话每端最多同时开着这么多条文件流（[`SessionLane::File`]，服务器的资源上限）。取的一方同时最多取
+/// [`files::MAX_FETCHES`] 个，给的一方最多给 [`files::MAX_SERVING`] 个，叫停了的流随即关掉
+pub const MAX_FILE_STREAMS: u16 = 16;
+
 /// 一个会话最多同时有这么多路画面（多屏同时显示时每个显示器一路，见 [`session`] 的"多屏"）
 pub const MAX_STREAMS: u8 = 4;
 
@@ -158,6 +164,9 @@ pub enum SessionLane {
     Video(u8),
     /// 2 号：大的消息（剪贴板、光标图像）：不挡控制通道上的输入、确认（见 [`session`] 的"走哪条通道"）
     Bulk,
+    /// 画面之后的那一号（现在是 6 号）：剪贴板里的文件的内容，每次取用一条帧流（见 [`files`]）。
+    /// 服务器认得它：经中转的文件流有大小上限（见 [`signal::ServerHello::file_limit`]）
+    File,
 }
 
 const _: () = assert!(
@@ -167,7 +176,10 @@ const _: () = assert!(
 
 impl SessionLane {
     /// 认识的通道有几条（编号是 `0..COUNT`）
-    pub const COUNT: usize = 2 + MAX_STREAMS as usize;
+    pub const COUNT: usize = 3 + MAX_STREAMS as usize;
+
+    /// 文件通道的编号
+    pub const FILE: u8 = 2 + MAX_STREAMS;
 
     /// 线上的编号（`stream` 不小于 [`MAX_STREAMS`] 的画面没有编号：调用的一方不能这样用）
     pub const fn number(self) -> u8 {
@@ -175,6 +187,7 @@ impl SessionLane {
             Self::Control => 0,
             Self::Video(0) => 1,
             Self::Bulk => 2,
+            Self::File => Self::FILE,
             Self::Video(stream) => {
                 assert!(stream < MAX_STREAMS, "no such video stream");
                 2 + stream
@@ -187,6 +200,7 @@ impl SessionLane {
             0 => Some(Self::Control),
             1 => Some(Self::Video(0)),
             2 => Some(Self::Bulk),
+            Self::FILE => Some(Self::File),
             n if n < 2 + MAX_STREAMS => Some(Self::Video(n - 2)),
             _ => None,
         }
@@ -203,15 +217,18 @@ impl SessionLane {
             Self::Control => MAX_CONTROL_MSG,
             Self::Bulk => MAX_BULK_MSG,
             Self::Video(_) => media::MAX_VIDEO_PACKET + handshake::SEAL_OVERHEAD,
+            Self::File => files::CHUNK + handshake::SEAL_OVERHEAD,
         }
     }
 
     /// 这条通道的流的优先级（越大越先发，服务器转发时也用它）：控制消息不能排在画面后面。
-    /// 大块和画面一样：QUIC 轮流发，1 MiB 的剪贴板不会把画面完全挡住，光标图像也不会排在一串画面后面
+    /// 大块和画面一样：QUIC 轮流发，1 MiB 的剪贴板不会把画面完全挡住，光标图像也不会排在一串画面后面。
+    /// 文件最低：只用画面、声音剩下的带宽
     pub const fn priority(self) -> u8 {
         match self {
             Self::Control => 10,
-            Self::Video(_) | Self::Bulk => 0,
+            Self::Video(_) | Self::Bulk => 1,
+            Self::File => 0,
         }
     }
 }
@@ -236,8 +253,8 @@ pub struct SessionHeader {
 impl SessionHeader {
     pub const LEN: usize = 16;
 
-    /// 帧流：这条流只装一个单元（一帧画面），同一条通道可以开很多条（信令 v10，见 crate 说明）。
-    /// 它结束了不代表通道结束了；控制通道不能是帧流
+    /// 帧流：这条流只装一个单元（一帧画面、一次文件取用），同一条通道可以开很多条（信令 v10，见 crate 说明）。
+    /// 它结束了不代表通道结束了；控制通道不能是帧流，文件通道只能是帧流
     pub const FRAME: u8 = 1;
 
     pub fn new(session_id: u64, lane: SessionLane) -> Self {
@@ -409,8 +426,12 @@ pub mod features {
         /// （恢复要靠 [`FRAMES`] 的那一套）
         pub const FEC: Features = Features::from_bits(1 << 2);
 
+        /// 3 号位：剪贴板里的文件（见 [`crate::files`]）。懂 [`crate::session::HostMsg::Files`]、
+        /// [`crate::session::ControllerMsg::Files`] 和文件通道（[`crate::SessionLane::File`]）
+        pub const FILES: Features = Features::from_bits(1 << 3);
+
         /// 本端支持的
-        pub const SUPPORTED: Features = MIC.with(FRAMES).with(FEC);
+        pub const SUPPORTED: Features = MIC.with(FRAMES).with(FEC).with(FILES);
     }
 }
 
@@ -452,7 +473,7 @@ mod tests {
     #[test]
     fn header_roundtrip() {
         let h = SessionHeader::new(0xdead_beef_1234, SessionLane::Video(0));
-        assert_eq!(h.priority, 0);
+        assert_eq!(h.priority, 1);
         assert_eq!(SessionHeader::decode(&h.encode()), Some(h));
         let mut bad = h.encode();
         bad[0] = b'X';
@@ -473,11 +494,14 @@ mod tests {
             Some(MAX_PRIORITY)
         );
         let b = SessionHeader::new(1, SessionLane::Bulk);
-        assert_eq!(b.encode()[12..], [2, 0, 0, 0]);
+        assert_eq!(b.encode()[12..], [2, 1, 0, 0]);
         // 帧流：标志在第 14 个字节；不认识的标志原样留着（服务器照样转发）
         let f = SessionHeader::frame(1, SessionLane::Video(0));
         assert!(f.is_frame() && !b.is_frame());
-        assert_eq!(f.encode()[12..], [1, 0, 1, 0]);
+        assert_eq!(f.encode()[12..], [1, 1, 1, 0]);
+        // 文件通道：画面之后的那一号，优先级最低
+        let file = SessionHeader::frame(1, SessionLane::File);
+        assert_eq!(file.encode()[12..], [6, 0, 1, 0]);
         assert_eq!(SessionHeader::decode(&f.encode()), Some(f));
         let mut newer = f.encode();
         newer[14] = 0x81;
@@ -492,6 +516,7 @@ mod tests {
         }
         assert_eq!(SessionLane::all().count(), SessionLane::COUNT);
         assert_eq!(SessionLane::from_u8(7), None);
+        assert_eq!(SessionLane::from_u8(6), Some(SessionLane::File));
         // 画面的第 0 路还是 1 号通道，之后的从 3 号起
         assert_eq!(SessionLane::Video(0).number(), 1);
         assert_eq!(SessionLane::Video(1).number(), 3);
@@ -499,10 +524,13 @@ mod tests {
             SessionLane::from_u8(2 + MAX_STREAMS - 1),
             Some(SessionLane::Video(MAX_STREAMS - 1))
         );
-        assert_eq!(SessionLane::from_u8(2 + MAX_STREAMS), None);
+        assert_eq!(
+            SessionLane::from_u8(2 + MAX_STREAMS),
+            Some(SessionLane::File)
+        );
         assert_eq!(
             SessionHeader::new(1, SessionLane::Video(2)).encode()[12..],
-            [4, 0, 0, 0]
+            [4, 1, 0, 0]
         );
     }
 

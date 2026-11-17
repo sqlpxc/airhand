@@ -28,9 +28,12 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::{CLIPBOARD_POLL, ClipboardSync, send_clipboard};
+use super::{CLIPBOARD_POLL, Clip, ClipboardSync, send_clipboard};
 use crate::Problem;
 use crate::clock::now_us;
+use crate::files::{Files, LocalFs, RemoteOffer};
+use crate::tasks::OwnedTask;
+use airhand_proto::files::{FileEntry, FileError};
 
 /// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
 /// 网络卡一下不断开：卡住期间排着的输入由命令队列丢掉（见 [`super::queue`]）
@@ -258,6 +261,12 @@ pub enum SessionEvent {
     Notice { notice: NoticeView },
     /// 被控端复制了文本（只发给浏览器，见 [`super::Frontend::Browser`]；桌面版直接写入本机剪贴板）
     Clipboard { text: String },
+    /// 被控端复制了文件（只发给浏览器、Android，见 [`super::Frontend::Browser`]；桌面版直接放进本机剪贴板）：
+    /// 用户选中的那几项。界面要内容时从 [`super::ControllerService::remote_files`] 取（编号是 `clip`）
+    ClipboardFiles { clip: u32, items: Vec<FileEntry> },
+    /// 剪贴板里的文件传不了（被控端那边的、本机这边的）：`name` 是哪个文件，`error` 是为什么
+    /// （例如只能走中转、又超过了服务器允许的大小），界面按自己的语言显示
+    FileError { name: String, error: FileError },
     /// 被控端现在能不能接本机的麦克风（见 [`super`] 的"麦克风"）：会话开始时一次，之后有变化再来。
     /// 被控端不支持（版本旧）时不会有。`detail`：出错时给排查问题用的技术信息（英文）
     Mic {
@@ -405,6 +414,10 @@ pub(super) struct SessionIo {
     pub direct: Direct,
     /// 麦克风：会话 ID、界面交过来的声音包、声音数据报的加密端
     pub mic: (u64, mpsc::Receiver<Bytes>, Sealer),
+    /// 剪贴板里的文件（双方都支持时才有，见 [`crate::files`]）和收文件流的任务
+    pub files: Option<(Files, OwnedTask<()>)>,
+    /// 被控端剪贴板里最新的文件（网页版、Android 从这里取）
+    pub remote: Arc<std::sync::Mutex<Option<RemoteOffer>>>,
 }
 
 /// 会话的直连任务（[`crate::direct::controller`]）：被控端发来的候选地址交给它
@@ -446,7 +459,30 @@ pub(super) async fn run(
             task: direct_task,
         },
         mic: (session_id, mut mic_rx, mut mic_sealer),
+        files,
+        remote,
     } = io;
+    let (files, _files_task) = match files {
+        Some((f, t)) => (Some(f), Some(t)),
+        None => (None, None),
+    };
+    // 剪贴板里的文件传不了：告诉界面
+    let mut file_notices = files.as_ref().map(Files::notices);
+    let notices_ui = ui.clone();
+    let notices = async move {
+        let Some(rx) = &mut file_notices else {
+            return std::future::pending().await;
+        };
+        while let Some(n) = rx.recv().await {
+            let _ = notices_ui.event(SessionEvent::FileError {
+                name: n.name,
+                error: n.error,
+            });
+        }
+        std::future::pending::<()>().await
+    };
+    let files_in = files.clone();
+    let files_out = files.clone();
     let mic_paths = paths.clone();
     // 画面最近是从直连来的：麦克风的声音也走直连（被控端按两条路的时延选的，见 crate::direct）
     let video_direct = Arc::new(AtomicBool::new(false));
@@ -607,16 +643,47 @@ pub(super) async fn run(
                 }
                 // 对方版本新增的提示：不显示
                 HostMsg::Notice(None) => debug!(sid, "skipping a notice from a newer host"),
-                HostMsg::Clipboard { text } => match &clip_in {
-                    Some((clip, enabled)) => {
-                        if enabled.load(Ordering::Relaxed) {
-                            clip.lock().unwrap().apply(text);
+                HostMsg::Clipboard { text } => {
+                    // 文字取代被控端之前公告的文件
+                    if let Some(f) = &files_in {
+                        f.remote_cleared();
+                    }
+                    match &clip_in {
+                        Some((clip, enabled)) => {
+                            if enabled.load(Ordering::Relaxed) {
+                                clip.lock().unwrap().apply(text);
+                            }
+                        }
+                        None => {
+                            let _ = out.event(SessionEvent::Clipboard { text });
                         }
                     }
-                    None => {
-                        let _ = out.event(SessionEvent::Clipboard { text });
+                }
+                HostMsg::Files(Some(m)) => {
+                    let offer = files_in.as_ref().and_then(|f| f.handle(m));
+                    if let Some(offer) = offer {
+                        *remote.lock().unwrap() = Some(offer.clone());
+                        match &clip_in {
+                            Some((clip, enabled)) => {
+                                if enabled.load(Ordering::Relaxed) {
+                                    clip.lock().unwrap().apply_files(offer);
+                                } else {
+                                    // 不同步剪贴板：不放进本机剪贴板，但别让被控端一直等
+                                    offer.ready();
+                                }
+                            }
+                            None => {
+                                let _ = out.event(SessionEvent::ClipboardFiles {
+                                    clip: offer.clip(),
+                                    items: offer.items().to_vec(),
+                                });
+                                offer.ready();
+                            }
+                        }
                     }
-                },
+                }
+                // 对方版本新增的文件消息：跳过
+                HostMsg::Files(None) => {}
                 HostMsg::Bye(reason) => {
                     if let ByeReason::Unknown(n) = reason {
                         info!(
@@ -741,11 +808,31 @@ pub(super) async fn run(
         loop {
             tick.tick().await;
             // poll 只取后台读任务已完成的结果，锁内不执行或等待剪贴板 IO。
-            let text = clip.lock().unwrap().poll();
+            let got = clip.lock().unwrap().poll();
             // 关闭同步时也要消费变化，否则重新打开时会把旧内容发过去
-            let Some(text) = text else { continue };
-            if enabled.load(Ordering::Relaxed) {
-                send_clipboard(&bulk_tx, text);
+            let Some(got) = got else { continue };
+            if !enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+            match got {
+                Clip::Text(text) => {
+                    if let Some(f) = &files_out {
+                        f.withdraw();
+                    }
+                    send_clipboard(&bulk_tx, text);
+                }
+                // 复制了文件：只发清单，被控端粘贴时才来取（被控端不支持时什么也不做）
+                Clip::Files(paths) => {
+                    if let Some(f) = &files_out {
+                        // 看一眼每个路径（可能在慢的网络驱动器上）
+                        let local = tokio::task::spawn_blocking(move || LocalFs::new(&paths)).await;
+                        if let Ok(local) = local
+                            && !local.is_empty()
+                        {
+                            f.offer(Arc::new(local));
+                        }
+                    }
+                }
             }
         }
     };
@@ -789,9 +876,14 @@ pub(super) async fn run(
         () = clipper => Ok(()),
         () = direct => Ok(()),
         () = mic => Ok(()),
+        () = notices => Ok(()),
         r = writer => r.and(Err(Problem::SessionEnded.into())),
         r = bulk_writer => r.and(Err(Problem::SessionEnded.into())),
     };
+    // 停下给到一半的、取到一半的（本机剪贴板里留着的公告之后再读也只是失败）
+    if let Some(f) = &files {
+        f.close();
+    }
     let reason = match result {
         Ok(()) => Problem::SessionEnded,
         Err(e) => Problem::from_error(e, Problem::failed),

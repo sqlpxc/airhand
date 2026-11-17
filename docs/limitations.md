@@ -4,7 +4,7 @@
 
 ## General
 
-- The clipboard syncs text only, not files
+- Clipboard file transfer (see [How it works → Files on the clipboard](architecture.md#files-on-the-clipboard)): when only the relay is available, one paste can carry at most what the server allows (`AIRHAND_MAX_FILE_SIZE`, 50 MiB by default); there's no limit while the direct path is up. Files changed after they were copied can't be fetched (size or modification time no longer match): copy them again. Links inside a folder are only recreated when they are relative and stay inside the folder, and only Linux recreates them when receiving; other platforms skip them. There's no overall progress: the progress bar is the receiving file manager's own
 - Audio is captured after the host's volume control, so a muted host sends silence
 - The controller's microphone only reaches Windows hosts that have Steam Streaming Microphone (Steam installed and Steam Remote Play used once): Airhand has no virtual sound card driver of its own. macOS, Linux and Android hosts can't take it yet, and the Android controller can't send it yet
 - Sessions are end-to-end encrypted, so the relay can't see their content, but it still knows who connected to whom, when, and how much traffic flowed, and with one stream per video frame also how large each frame is (see [Security](security.md#end-to-end-encryption))
@@ -21,6 +21,7 @@
 
 - The host only runs in the console session (the physical screen): Remote Desktop (RDP) sessions can't be controlled
 - `Ctrl+Alt+Del` can't be sent yet (it needs `SendSAS`)
+- When pasting a folder copied on the other side, paths longer than 259 characters counted from that folder (a limit of Windows virtual files) and links inside it are skipped (logged, but not shown in the UI). When the host runs in the system service, copying and pasting files goes through the tray (which reads and writes as the signed-in user): if the tray has exited, only text is synced
 - Debug builds run the host in the tray process, without SYSTEM rights, so they can't capture or control UAC prompts and the lock screen (the controller shows a capture error meanwhile)
 - The controller's microphone is written into Steam Streaming Microphone in exclusive mode when its two devices ("Speakers" and "Microphone" in the sound settings) have different default formats (the usual case): while a controller's microphone is on, Steam Remote Play can't use it and vice versa, and it can't be opened if "Allow applications to take exclusive control of this device" is turned off (giving both devices the same default format avoids exclusive mode). It isn't made the default recording device automatically: choose it in the program, or set it in the sound settings yourself
 
@@ -31,18 +32,21 @@
 - The host doesn't offer AV1 (current Apple chips can only decode it in hardware), so AV1 shows as unavailable in the console and HEVC is used instead
 - The controller (WKWebView) can't lock the keyboard: in fullscreen, Command+Tab, Command+Space and the like are still handled locally, so use "Send shortcut" in the toolbar
 - WKWebView on older macOS versions may lack Opus decoding, in which case the console says remote audio can't be played
+- Clipboard files only go out from a Mac: files copied on the other side can't be put on the Mac's clipboard yet (only text is synced)
 
 ## Linux
 
 - The host only supports **X11** desktops. Under Wayland only X11 (XWayland) applications can be seen and controlled; native Wayland windows are black and the controller suggests logging in with an X11 (Xorg) session. Full Wayland support needs xdg-desktop-portal screen sharing (the local user has to confirm each time) and isn't implemented
 - The host only has OpenH264 software encoding (no VA-API / NVENC yet), so the controller uses H.264
 - The lock screen can't be controlled (the screensaver grabs the keyboard and mouse)
+- Receiving files copied on the other side needs FUSE (`fusermount3` and `/dev/fuse`): without it (in a container, for example) only text is synced. The clipboard used is X11's CLIPBOARD, so native Wayland apps only see it through XWayland
 - Decoding on the controller relies on WebKitGTK + GStreamer: H.264 needs `gstreamer1.0-plugins-bad` (parsing) and `gstreamer1.0-libav` or openh264 (decoding); AV1 / HEVC depend on the installed GStreamer decoders. If a format turns out not to produce a picture, the controller switches to the next available format by priority
 
 ## Web console
 
 - Reloading or closing the tab disconnects its sessions; My devices isn't saved and is cleared when the page reloads
 - In Firefox, text copied locally isn't synced to the remote side automatically
+- Local files only go to the other side when you press the paste key on the remote screen or drop them on it (web pages can't read files from the clipboard). Files copied on the other side don't go into the local clipboard: click "Download". Chrome / Edge save into a folder you pick; other browsers assemble the download in memory (several files or a folder become a ZIP) and are limited to 1 GiB
 - Outside fullscreen some shortcuts (Ctrl+W…) can't reach the remote computer
 
 ## Android
@@ -55,12 +59,14 @@ Host (sharing the phone):
 - Typing only works in regular text fields (arrow keys and Tab need Android 13+)
 - A secured lock screen and screens marked secure are black
 - Since Android 10 apps can't read the clipboard in the background, so the clipboard only syncs from the controller to the phone
+- Files on the phone reach the other side through the system share menu ("Send to the other device"), and only files: the share menu can't share folders. Folders copied on the other side can't go on the phone's clipboard, only be saved to Downloads from the notification; Android 9 and earlier save them in the app's own folder (`Android/data/<app>/files/Download/Airhand`). On Android 7 other apps can only read the remote files from start to end, not jump around in them
 - Sharing sound needs Android 10+, and some apps don't allow their sound to be captured
 - HEVC and AV1 are only offered when the phone has a **hardware** encoder for them (few phones have an AV1 hardware encoder so far), otherwise H.264 is used (with the system's software encoder if there's no hardware H.264 encoder)
 
 Controller:
 
 - One device at a time; no A/V sync; TVs only watch
+- There's no foreground service while files are transferred: if the app stays in the background for long, the system may stop it and cut off a transfer
 - HEVC and AV1 are only used when the device has a **hardware** decoder for them, otherwise H.264
 
 AV1 (encoding and decoding) hasn't been verified on a real device yet: the emulator has no AV1 hardware codecs.

@@ -161,17 +161,22 @@ pub struct ServerHello {
     /// 服务器的信令能力位
     #[cbor(n(3), default)]
     pub features: Features,
+    /// 一次粘贴（剪贴板里的一个文件公告）经中转最多传这么多字节的内容（见 [`crate::files`] 的"走哪条路"）：
+    /// `None` 不限，`Some(0)` 中转不传文件（只能走直连）。服务器按单条文件流兜底
+    #[n(4)]
+    pub file_limit: Option<u64>,
 }
 
 impl ServerHello {
     /// 服务器怎么回答能说 `client` 的客户端：双方都能说的最高版本
-    pub fn answer(client: Versions, features: Features) -> Self {
+    pub fn answer(client: Versions, features: Features, file_limit: Option<u64>) -> Self {
         let ours = Versions::SIGNAL;
         Self {
             min: ours.min,
             max: ours.max,
             version: ours.common(client),
             features,
+            file_limit,
         }
     }
 }
@@ -379,12 +384,20 @@ mod tests {
             Versions { min: 9, max: 11 }
         );
         // 服务器回答的是自己的区间和双方都能说的最高版本（值随版本变，位置不变）
-        let answer = ServerHello::answer(hello.versions(), Features::NONE);
+        let answer = ServerHello::answer(hello.versions(), Features::NONE, Some(50 << 20));
         let wire = minicbor::to_vec(&answer).unwrap();
         let (min, max) = (crate::SIGNAL_MIN as u8, crate::SIGNAL_VERSION as u8);
         assert!(min < 24 && max < 24, "one-byte CBOR integers");
-        assert_eq!(wire[..5], [0xa4, 0x00, min, 0x01, max]);
+        assert_eq!(wire[..5], [0xa5, 0x00, min, 0x01, max]);
         assert_eq!(answer.version, Some(crate::SIGNAL_VERSION.min(11)));
+        let back: ServerHello = minicbor::decode(&wire).unwrap();
+        assert_eq!(back.file_limit, Some(50 << 20));
+        // 不限时不写这一项
+        let unlimited = ServerHello::answer(hello.versions(), Features::NONE, None);
+        let wire = minicbor::to_vec(&unlimited).unwrap();
+        assert_eq!(wire[..5], [0xa4, 0x00, min, 0x01, max]);
+        let back: ServerHello = minicbor::decode(&wire).unwrap();
+        assert_eq!(back.file_limit, None);
         assert_eq!(crate::ALPN, b"airhand/1");
     }
 
@@ -412,7 +425,7 @@ mod tests {
         .unwrap();
         let v: Versions = minicbor::decode(&wire).unwrap();
         assert!(minicbor::decode::<ClientHello>(&wire).is_err());
-        let answer = ServerHello::answer(v, Features::NONE);
+        let answer = ServerHello::answer(v, Features::NONE, None);
         assert_eq!(answer.version, None);
         assert_eq!(
             (answer.min, answer.max),

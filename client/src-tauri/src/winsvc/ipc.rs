@@ -46,7 +46,7 @@ use crate::status::{HostStatus, ServiceStatus, StatusHub};
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;IU)";
 
 /// 本进程所在的会话
-fn my_session() -> u32 {
+pub(super) fn my_session() -> u32 {
     let mut s = 0;
     unsafe {
         let _ = ProcessIdToSessionId(GetCurrentProcessId(), &mut s);
@@ -131,7 +131,7 @@ fn attrs() -> Result<&'static Attrs> {
     }))
 }
 
-fn create(name: &str, first: bool) -> Result<NamedPipeServer> {
+pub(super) fn create(name: &str, first: bool) -> Result<NamedPipeServer> {
     let attrs = attrs()?;
     let server = unsafe {
         ServerOptions::new()
@@ -413,7 +413,7 @@ fn open(name: &str) -> std::io::Result<NamedPipeClient> {
     open_pipe(name, true)
 }
 
-fn open_pipe(name: &str, check_owner: bool) -> std::io::Result<NamedPipeClient> {
+pub(super) fn open_pipe(name: &str, check_owner: bool) -> std::io::Result<NamedPipeClient> {
     let handle = unsafe {
         CreateFileW(
             &HSTRING::from(name),

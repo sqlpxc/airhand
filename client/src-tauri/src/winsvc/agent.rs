@@ -69,6 +69,8 @@ pub fn run(args: &[String]) -> i32 {
         gate: host.gate().clone(),
     };
     tauri::async_runtime::spawn(super::ipc::serve(hub, agent));
+    // 剪贴板里的文件交给托盘（见 super::clip）
+    tauri::async_runtime::spawn(super::clip::serve());
 
     if handles.is_empty() {
         // 手动运行（调试）：一直运行到进程被结束

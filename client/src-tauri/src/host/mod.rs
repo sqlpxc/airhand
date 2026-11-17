@@ -23,6 +23,7 @@ pub(crate) mod x11;
 use std::sync::Arc;
 
 use airhand_link::ServerState;
+use airhand_link::files::LocalFs;
 use airhand_link::host::HostEvents;
 use airhand_proto::signal::Reclaim;
 
@@ -69,6 +70,22 @@ pub(crate) fn missing_permissions() -> (bool, bool) {
     {
         (false, false)
     }
+}
+
+/// 本机复制的文件交给谁读（公告给控制端，它粘贴时来取）：一般是本进程直接读（[`LocalFs`]）；
+/// Windows 服务里的被控端是 SYSTEM，交给托盘以登录的用户的身份读（见 `winsvc::clip`），没有托盘就不公告。
+/// 一个都不在了（剪贴板里的路径都没了）时也不公告
+pub(crate) async fn clip_provider(
+    paths: Vec<std::path::PathBuf>,
+) -> Option<Arc<dyn airhand_link::files::Provider>> {
+    #[cfg(windows)]
+    if crate::winsvc::is_agent() {
+        return crate::winsvc::clip::provider(paths).await;
+    }
+    let local = tokio::task::spawn_blocking(move || LocalFs::new(&paths))
+        .await
+        .ok()?;
+    (!local.is_empty()).then(|| Arc::new(local) as Arc<dyn airhand_link::files::Provider>)
 }
 
 /// 采集失败是不是因为缺少系统权限（这种情况由会话用 `Notice::MissingPermissions` 单独说明）。

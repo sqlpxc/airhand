@@ -31,7 +31,10 @@ import {
   type Platform,
   type StreamView,
   type SystemAction,
+  type FileEntry,
+  type FileError,
 } from "./api";
+import { download as downloadFiles, LocalFiles } from "./files";
 import * as media from "./media";
 import { AudioOutput } from "./audio";
 import { MicCapture, type MicError } from "./mic";
@@ -145,6 +148,10 @@ export class RemoteSession {
   micEnabled = false;
   /** 本机采集不了麦克风的原因（用户再打开时清掉） */
   micError: MicError | null = null;
+  /** 对方复制的文件（网页版：等用户点下载，见 files.ts）；没有时为 null */
+  remoteFiles: { clip: number; items: FileEntry[] } | null = null;
+  /** 正在把对方复制的文件取下来：已经取了多少、一共多少（字节） */
+  download: { done: number; total: number } | null = null;
   /** 音画同步统计（约每秒更新） */
   syncStats: AvSyncStats = { skewMs: null, videoDelayMs: 0, extraMs: 0 };
   retries = 0;
@@ -297,6 +304,14 @@ export class RemoteSession {
       this.emit();
       this.onMouseModeChange?.(this);
     };
+    // 网页版：在画面上按粘贴键时，浏览器给的剪贴板里有这里复制的文件就先公告给对方（见 files.ts），粘贴键随后才发。
+    // 桌面版的本机剪贴板由 Rust 端自己同步
+    if (api.kind === "web") {
+      this.input.onPaste = (e) => {
+        const files = LocalFiles.fromDataTransfer(e.clipboardData);
+        if (files && this.offerFiles(files)) e.preventDefault();
+      };
+    }
     this.audio.onClock = (hostUs, localMs, appliedMs) => this.view.audioClock(hostUs, localMs, appliedMs);
     this.audio.onUnsupported = () => {
       this.notice = { kind: "noOpus" };
@@ -577,6 +592,12 @@ export class RemoteSession {
         this.micState = ev.state;
         this.micDetail = ev.detail;
         this.syncMic();
+        break;
+      case "clipboardFiles":
+        this.remoteFiles = { clip: ev.clip, items: ev.items };
+        break;
+      case "fileError":
+        this.notice = { kind: "fileError", name: ev.name, error: ev.error };
         break;
       case "notice": {
         const n = ev.notice;
@@ -1142,6 +1163,57 @@ export class RemoteSession {
   setClipboardSync(v: boolean) {
     this.clipboardSync = v;
     if (this.sid !== null) this.command({ cmd: "clipboardSync", sid: this.sid, enabled: v });
+    this.emit();
+  }
+
+  // ───────────────────────── 剪贴板里的文件（见 files.ts） ─────────────────────────
+
+  /**
+   * 这里复制的文件（粘贴、拖到画面上的）：公告给对方，它粘贴时才来取。剪贴板同步关着、还没连上时不发。
+   * 返回公告了没有
+   */
+  offerFiles(files: LocalFiles): boolean {
+    if (this.sid === null || !this.clipboardSync) return false;
+    api.offerFiles(this.sid, files).catch((e) => {
+      // 对方的版本旧，不支持剪贴板里的文件
+      this.notice = { kind: "filesUnsupported" };
+      console.warn("can't offer the files", e);
+      this.emit();
+    });
+    return true;
+  }
+
+  /** 把对方复制的文件（remoteFiles）取下来 */
+  async downloadRemoteFiles() {
+    const offer = this.remoteFiles;
+    if (!offer || this.sid === null || this.download) return;
+    this.download = { done: 0, total: 0 };
+    this.emit();
+    let last = 0;
+    try {
+      const saved = await downloadFiles(api, this.sid, offer.clip, offer.items, (done, total) => {
+        this.download = { done, total };
+        // 进度条不用每一块都刷新
+        const now = performance.now();
+        if (now - last > 200 || done === total) {
+          last = now;
+          this.emit();
+        }
+      });
+      if (saved && this.remoteFiles === offer) this.remoteFiles = null;
+    } catch (e) {
+      const error = typeof e === "string" ? (e as FileError) : "io";
+      const name = offer.items.length === 1 ? offer.items[0].path[0] : `${offer.items.length}`;
+      this.notice = { kind: "fileError", name, error };
+    } finally {
+      this.download = null;
+      this.emit();
+    }
+  }
+
+  /** 不要对方复制的文件了（关掉下载的提示） */
+  dismissRemoteFiles() {
+    this.remoteFiles = null;
     this.emit();
   }
 

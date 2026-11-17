@@ -12,6 +12,7 @@
 //!   画面和事件交给 [`controller::SessionUi`]；
 //! * [`console`]（feature `console`）：控制台和控制端服务之间的 WebSocket 协议，桌面版和网页版共用；
 //! * [`host`]：被控端与服务器的连接和会话（协议层的事在这里，采集、编码、注入输入由各平台实现 [`host::Platform`]）；
+//! * [`files`]：剪贴板里的文件（复制时只发清单，粘贴时才传内容），两端共用；
 //! * [`flow`]：被控端的在途控制（按字节）和码率控制（按排队时延和带宽估计）；[`refs`]：每一帧参考哪一帧、
 //!   控制端等不到帧时从哪一帧恢复（长期参考帧、参考帧失效）；
 //! * [`Problem`]：显示给用户的问题，以类型而不是文字的形式传给界面。
@@ -37,6 +38,8 @@ pub mod controller;
 pub mod direct;
 #[cfg(feature = "client")]
 mod fec;
+#[cfg(feature = "client")]
+pub mod files;
 #[cfg(feature = "client")]
 pub mod flow;
 #[cfg(feature = "client")]

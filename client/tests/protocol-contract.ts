@@ -71,6 +71,10 @@ export const contract = {
       "sid": 3
     },
     {
+      "cmd": "clipboardCleared",
+      "sid": 3
+    },
+    {
       "cmd": "ack",
       "seq": 99,
       "sid": 3

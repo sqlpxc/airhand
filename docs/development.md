@@ -62,6 +62,15 @@ cargo test --lib e2e_multi_display -- --ignored --nocapture  # showing two displ
 cargo test --lib e2e_mic -- --ignored --nocapture         # Windows: the controller's microphone through the relay into Steam Streaming Microphone
 ```
 
+The clipboard file tests use this computer's real clipboard and replace what's on it, so they're skipped by default too (run them one at a time):
+
+```bash
+# client/src-tauri/
+cargo test --lib clipfiles -- --ignored --test-threads=1
+# Windows: puts virtual files on the clipboard, then has Explorer really paste them into a temporary folder (explorer_pastes_the_virtual_files)
+# Linux: needs FUSE and X11 (WSLg works); mounts, reads the files and checks text/uri-list on the clipboard
+```
+
 ## Debugging tools
 
 ```bash

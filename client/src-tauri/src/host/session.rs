@@ -31,6 +31,7 @@ use super::mic::{self, MicInput, MicLease};
 use super::pipeline::{self, Pipeline};
 use crate::clipboard::{self, ClipSync};
 use crate::config;
+use airhand_link::controller::Clip;
 
 /// 画面的发送队列：在途帧控制之下最多一两帧，多了宁可让编码器等着
 const VIDEO_QUEUE: usize = 2;
@@ -159,6 +160,8 @@ struct Desktop {
     sound: Option<AudioSubscription>,
     clip: ClipSync,
     clip_tick: Interval,
+    /// 剪贴板里的文件（控制端也支持时才有，见 `airhand_link::files`）
+    files: Option<airhand_link::files::Files>,
     permission_tick: Interval,
     display_tick: Interval,
     /// 缺少的系统权限（macOS），见 [`super::missing_permissions`]
@@ -227,6 +230,7 @@ impl Desktop {
             sound: None,
             clip: ClipSync::new(),
             clip_tick: ticker(clipboard::POLL),
+            files: senders.files,
             permission_tick: ticker(PERMISSION_CHECK),
             display_tick: ticker(DISPLAY_CHECK),
             missing: (false, false),
@@ -494,6 +498,8 @@ impl Platform for Desktop {
                 }
             }
             Request::Clipboard(text) => self.clip.apply(text),
+            // 控制端复制了文件：放进本机剪贴板，粘贴时才取（见 crate::clipfiles）
+            Request::ClipboardFiles(offer) => self.clip.apply_files(offer),
             Request::Audio(enabled) => {
                 if !enabled {
                     self.sound = None;
@@ -535,14 +541,26 @@ impl Platform for Desktop {
     async fn event(&mut self, tick: Tick) -> Result<()> {
         let session_id = self.session_id;
         match tick {
-            Tick::Clipboard => {
+            Tick::Clipboard => match self.clip.poll() {
                 // 走大块通道：1 MiB 的剪贴板不挡控制消息。网络慢、前面排满了就丢掉这一次
-                if let Some(text) = self.clip.poll()
-                    && let Err(e) = self.out.send(&HostMsg::Clipboard { text })
-                {
-                    warn!(session_id, "dropped a clipboard update: {e:#}");
+                Some(Clip::Text(text)) => {
+                    if let Some(f) = &self.files {
+                        f.withdraw();
+                    }
+                    if let Err(e) = self.out.send(&HostMsg::Clipboard { text }) {
+                        warn!(session_id, "dropped a clipboard update: {e:#}");
+                    }
                 }
-            }
+                // 本机复制了文件：只发清单，控制端粘贴时才来取（控制端不支持时什么也不做）
+                Some(Clip::Files(paths)) => {
+                    if let Some(f) = self.files.clone()
+                        && let Some(provider) = super::clip_provider(paths).await
+                    {
+                        f.offer(provider);
+                    }
+                }
+                None => {}
+            },
             Tick::Audio(failure) => {
                 self.out.send(&notice(match failure {
                     Some(detail) => Notice::AudioFailed { detail },

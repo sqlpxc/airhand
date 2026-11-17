@@ -25,6 +25,8 @@ export type ToWorker =
   | { t: "close"; reason: string }
   /** 一条文本消息（JSON 命令） */
   | { t: "send"; text: string }
+  /** 一条二进制消息（剪贴板里的文件的内容，见 files.ts） */
+  | { t: "binary"; data: ArrayBuffer }
   /** 一个会话的画面（第 0 路的 canvas）：会话建立时交过来，之后一直在这里绘制 */
   | { t: "view"; id: number; canvas: OffscreenCanvas }
   /** 第 stream 路画面的 canvas（多屏）：要看这一路之前交过来 */
@@ -62,10 +64,17 @@ export type FromWorker =
   | { t: "undecodable"; id: number; codec: Codec }
   | { t: "recovered"; id: number }
   /** 约每秒一次：平均解码耗时（最慢的一路）、音画同步 */
-  | { t: "stats"; id: number; decodeMs: number; sync: AvSyncStats };
+  | { t: "stats"; id: number; decodeMs: number; sync: AvSyncStats }
+  /** 被控端复制的文件的一块（回答 remoteRead 的 req）：err 是 FileError 的编号，0xffffffff 是没有错误 */
+  | { t: "fileData"; req: number; err: number; data: Uint8Array };
+
+/** 服务 → 控制台的二进制消息里，这个通道号是剪贴板里的文件的内容（见 console.rs 的 FILE_CHANNEL） */
+const FILE_CHANNEL = 0xffffffff;
 
 /** 往控制端服务排着没发出去的超过这么多就断开（那边已经不收了） */
 const MAX_BUFFERED = 2 * 1024 * 1024;
+/** 剪贴板里的文件的内容（每块最多 1 MiB）：排着的超过这么多就等一会儿再发，加上这一块也到不了 MAX_BUFFERED */
+const MAX_BUFFERED_FILES = 512 * 1024;
 /** 同一个画面两次要关键帧至少隔这么久（解码出错时这里自己要的、主线程要的都算） */
 const KEYFRAME_GAP_MS = 500;
 const STATS_MS = 1000;
@@ -182,6 +191,28 @@ function post(m: FromWorker, transfer: Transferable[] = []) {
   self.postMessage(m, { transfer });
 }
 
+/** 排着要发的文件的内容：WebSocket 排着的不多了才发（不和画面确认、输入抢；也不因为排多了被当成对方不收而断开） */
+const fileQueue: ArrayBuffer[] = [];
+let fileTimer: ReturnType<typeof setTimeout> | null = null;
+
+function pumpFiles() {
+  if (fileTimer !== null) return;
+  while (fileQueue.length > 0) {
+    if (ws?.readyState !== WebSocket.OPEN) {
+      fileQueue.length = 0;
+      return;
+    }
+    if (ws.bufferedAmount > MAX_BUFFERED_FILES) {
+      fileTimer = setTimeout(() => {
+        fileTimer = null;
+        pumpFiles();
+      }, 20);
+      return;
+    }
+    ws.send(fileQueue.shift()!);
+  }
+}
+
 function send(data: string | ArrayBuffer) {
   if (ws?.readyState !== WebSocket.OPEN) return;
   if (ws.bufferedAmount > MAX_BUFFERED) {
@@ -211,7 +242,14 @@ function open(url: string) {
 
 function onBinary(buf: ArrayBuffer) {
   if (buf.byteLength < 4) return;
-  const chan = chans.get(new DataView(buf).getUint32(0, true));
+  const ch = new DataView(buf).getUint32(0, true);
+  if (ch === FILE_CHANNEL) {
+    if (buf.byteLength < 12) return;
+    const dv = new DataView(buf);
+    post({ t: "fileData", req: dv.getUint32(4, true), err: dv.getUint32(8, true), data: new Uint8Array(buf, 12) }, [buf]);
+    return;
+  }
+  const chan = chans.get(ch);
   if (!chan) return;
   const pkt = new Uint8Array(buf, 4);
   const dv = new DataView(buf, 4);
@@ -278,6 +316,10 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       return;
     case "send":
       send(m.text);
+      return;
+    case "binary":
+      fileQueue.push(m.data);
+      pumpFiles();
       return;
     case "view":
       views.set(m.id, new View(m.id, m.canvas));

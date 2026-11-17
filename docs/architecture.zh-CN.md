@@ -144,10 +144,10 @@ Android 被控端只有一个编码器，但每个观看者分别计在途字节
 | 目录 | 内容 |
 |---|---|
 | `crates/airhand-proto` | 协议：信令和版本握手、端到端握手的消息、会话控制消息、媒体包、帧格式和兼容规则。只做编解码：不碰 IO、不依赖异步运行时，能编译成 wasm，解析对方数据的函数都只吃字节（方便 fuzz） |
-| `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，端到端加密（`secure`：身份、Noise 握手、每条通道的加密），从流里读写帧（`wire`），会话的通道和数据报从哪里来（`lanes`）、往哪条路发（`paths`：中转、直连），两端之间的直连（`direct`：打洞、只认对方证书指纹的 TLS、画面走哪条路）和几条路上的帧按计数合并（`merge`，画面只交出解得了的帧），被控端的在途控制和码率（`flow`）、每一帧参考哪一帧和丢帧后从哪里恢复（`refs`）、画面的前向纠错（`fec`：切块、Reed-Solomon 冗余、拼回来，被控端自动选用不用），与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接和会话（`host`），`Problem`。桌面客户端、网页控制台和 Android 共用（除了 `wire` 和 `udp`（收发缓冲区调大了的 UDP socket）都在默认的 `client` feature 里，中转服务器只用这两个）；`tests/protocol.json` 是三边共用的协议样例 |
+| `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，端到端加密（`secure`：身份、Noise 握手、每条通道的加密），从流里读写帧（`wire`），会话的通道和数据报从哪里来（`lanes`）、往哪条路发（`paths`：中转、直连），两端之间的直连（`direct`：打洞、只认对方证书指纹的 TLS、画面走哪条路）和几条路上的帧按计数合并（`merge`，画面只交出解得了的帧），被控端的在途控制和码率（`flow`）、每一帧参考哪一帧和丢帧后从哪里恢复（`refs`）、画面的前向纠错（`fec`：切块、Reed-Solomon 冗余、拼回来，被控端自动选用不用），剪贴板里的文件（`files`：公告、列目录、按额度取文件，两端共用），与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接和会话（`host`），`Problem`。桌面客户端、网页控制台和 Android 共用（除了 `wire` 和 `udp`（收发缓冲区调大了的 UDP socket）都在默认的 `client` feature 里，中转服务器只用这两个）；`tests/protocol.json` 是三边共用的协议样例 |
 | `server/` | 中转服务器（quinn + rustls）及其 `Dockerfile`。`src/broker/`：`registry`（控制码登记、连接请求）、`relay`（会话通道的配对和转发、数据报）、`limits`（限速）、`tokens`（密钥和重连凭证）；锁的先后在调试构建里有检查（`lock.rs`） |
 | `web/` | 网页控制台服务（axum：静态网页 + WebSocket，HTTP / HTTPS 同一端口）及其 `Dockerfile`、`docker-compose.yml`。和 `client/src-tauri/` 一样是独立的 Cargo 工作区 |
-| `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`、托盘、控制台窗口和命令 |
+| `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`、托盘、控制台窗口和命令，对方复制的文件放进系统剪贴板（`clipfiles/`） |
 | `android/native/` | Android 的 Rust 核心（JNI）：控制端用 `airhand-link`；被控端的网络部分（服务器连接、会话和它的各条通道用 `airhand_link::host`，Android 只实现 `host::Platform`；在途控制和码率控制与桌面版相同）。和 `client/src-tauri/`、`web/` 一样是独立的 Cargo 工作区 |
 | `android/app/` | Android 应用（Kotlin + Jetpack Compose）：手机和电视界面、MediaCodec 解码 / 编码、屏幕录制、无障碍服务（远程操作） |
 | `client/src/` | `lib/session.ts` 管理会话，`connection-attempt.ts` 隔离连接代际，`media.ts` 解析媒体包，`video.ts` 管理解码 / 画面队列，`input.ts` 管理输入（含相对移动和指针锁定），`screens.ts` 摆放同时显示的几个显示器（多屏）；控制台界面（React 19 + TypeScript，不依赖 UI 库），桌面版和网页版共用，区别只在 `client/src/lib/backend/`；文案在 `client/src/locales/` |
@@ -168,6 +168,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | 声音采集 | WASAPI 环回 | ScreenCaptureKit（系统混音） | PulseAudio / PipeWire 的输出监视器 | AudioPlaybackCapture（Android 10+） |
 | 控制端的麦克风 | Steam Streaming Microphone（WASAPI，见[麦克风](#麦克风)） | 还不支持 | 还不支持 | 还不支持 |
 | 剪贴板 | 剪贴板序号检测变化 | NSPasteboard 变化计数 | XFIXES 选择所有者变化通知 | 只能写入（控制端 → 手机） |
+| 剪贴板里的文件（见[剪贴板里的文件](#剪贴板里的文件)） | OLE 虚拟文件（托盘放、托盘读） | 只能发出 | FUSE + X11 剪贴板 | content URI；手机的文件用分享菜单发 |
 | 控制台界面 | WebView2 | WKWebView | WebKitGTK（WebCodecs 由 GStreamer 解码） | Jetpack Compose（MediaCodec 解码） |
 
 ## Windows 服务
@@ -183,6 +184,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 
 - 桌面复制和 `SendInput` 只对调用线程所在的桌面有效。UAC 确认框、锁屏和登录界面在安全桌面 `Winlogon` 上，只有 SYSTEM 能打开；采集线程和注入线程在用之前先切到当前接收输入的桌面上（`client/src-tauri/src/host/desktop.rs`）
 - 托盘和被控端之间是每个会话一个的命名管道（`\\.\pipe\airhand-host-<会话>`），每行一条 JSON 消息。只有交互登录的用户能连接，不能再开一个同名管道实例冒充被控端，托盘还会核对管道属于 SYSTEM
+- 剪贴板里的文件交给托盘（`client/src-tauri/src/winsvc/clip.rs`，管道 `\\.\pipe\airhand-clip-<会话>`，安全设置同上）：SYSTEM 进程放进剪贴板的数据对象资源管理器调不了，所以对方复制的文件由托盘放、托盘粘贴时经管道向被控端取；本机复制的文件由托盘以登录的用户的身份读，不然控制端能借 SYSTEM 读到这个用户读不了的文件。没有托盘时只同步文本
 - 服务和被控端没有控制台：日志用 `OutputDebugString` 输出（见开发文档的[调试 Windows 服务](development.zh-CN.md#调试-windows-服务)）
 
 ## 画面
@@ -246,6 +248,50 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 
 画到 Canvas 之后到屏幕真正亮起来的时间按 8 ms 估算（没有用摄像头实测）。
 
+## 剪贴板里的文件
+
+在一边复制文件、文件夹，到另一边粘贴，两个方向都行。**复制时只发清单，粘贴时才传内容**：复制一个很大的文件夹不会马上开始传，不粘贴就一个字节都不传。协议在 `airhand_proto::files`，两端共用的实现在 `airhand_link::files`（一个会话一个 `Files`，被控端、控制端都既能给又能取），会话能力位 `FILES`。开关沿用剪贴板同步：控制端关了同步，文件也不同步。
+
+下面说“给的一方”是剪贴板里有文件的那一端，“取的一方”是要粘贴的那一端。
+
+**消息**（`FileMsg`，被控端发的包在 `HostMsg::Files` 里，控制端发的包在 `ControllerMsg::Files` 里）：
+
+- **公告** `Offer`：只有用户选中的那几项（名称、文件还是目录、大小、修改时间），文件夹不展开，走大块通道。公告取代对方剪贴板里之前的东西，之后的文字也取代公告。取的一方放进本机剪贴板之后回答 `Ready`：控制端在会话里按下粘贴键，而本机刚复制的文件还没放好时，先扣住这个键，等到 `Ready` 再发（最多 1 秒；公告走大块通道、按键走控制通道，两条通道之间没有先后）
+- **列目录** `List` / `Listing`：粘贴时才列，分页（每页 1000 项）。Windows 粘贴时要一次拿到整棵树（最多 10 万项），FUSE 打开哪个目录列哪个
+- **取文件** `Fetch`：从某个位置开始取一个文件，带着列表里的大小和修改时间，给的一方核对（复制之后改过的回答 `changed`）。还有额度 `Credit`、取消 `Cancel`、失败 `Failed`。除了公告和列表，都走控制通道
+- 给的一方只给最近两个公告里的东西（取的一方可能还在从之前的那个复制），路径的每一段都检查（不能是空的、`.`、`..`，不能带分隔符），第一段必须是公告里的一项。没有通用的读文件接口
+
+**文件通道**（6 号，`SessionLane::File`）：每取一次，给的一方开一条帧流，开头是明文的取用编号（4 字节），之后是一帧一帧的密文，每帧最多 256 KiB 内容，写到文件末尾就结束。
+
+- 每次取用一把密钥：从会话密钥按方向和取用编号派生，计数从 0 开始、一个接一个。中转没法把别的取用的帧搬进来、调换顺序、删掉；截短了的话，取的一方核对长度就知道。取用编号由取的一方分配、严格递增，给的一方拒绝不递增的（同一把密钥不加密两份不同的内容）
+- **额度**：给的一方最多比本机程序读走的多发 2 MiB（`WINDOW`）。所以中转上为一次取用最多积压这么多，占不满同一条连接（同一台被控端的所有会话共用）上别的流的窗口
+- 取的一方同时最多取 4 个（多的排队），给的一方同时最多给 8 个，服务器每个会话每端同时最多转 16 条文件流
+- **优先级**：控制 10，画面和大块 1，文件 0。传文件不挤画面和剪贴板文字
+- 本机程序跳着读（资源管理器的 `IStream::Seek`、FUSE 的随机读）时取消这一次，从新的位置重新取。取到一半连接断了（例如直连断了），从断的地方再取，最多 3 次
+
+**走哪条路、经中转能传多大**：直连通着时文件流走直连。只能走中转时，一次粘贴（一个公告）经中转的总量不能超过服务器的上限 `AIRHAND_MAX_FILE_SIZE`（默认 50 MiB；`0` 是中转不传文件，`unlimited` 是不限）。服务器在版本握手里把上限告诉两端（`ServerHello::file_limit`）。
+
+- 给的一方第一次要经中转发这个公告里的东西时，算一下整个公告有多大（文件夹要走一遍，超过上限就停），超过了就回答 `tooLarge`，取的一方提示“太大，经中转传不了”。复制时不算：那时还不知道会走哪条路，也不该为了复制把大文件夹走一遍
+- 服务器看不到内容，只按单条流兜底：一条文件流转发的字节超过 `wire_size(上限)`（内容加上每帧的长度和加密开销）就把两头都 reset（错误码 `RELAY_LIMIT`）。两端要是故意把一次粘贴拆成很多条流，服务器拦不住：这是资源上的限制，不是安全边界
+- 不限速，也不限每个会话的总量；错误码 `RELAY_QUOTA` 预留着。服务器记下经中转的文件字节数：每个会话结束时一行日志，每 5 分钟的统计里也有
+- 取到一半直连断了，再取的时候走中转，同样受这个上限
+
+**链接**：文件夹里的链接（符号链接、Windows 的目录联接）不跟随，列成链接，带着它指向的路径。路径中间的一段是链接就当作没有，打开文件时最后一段也不能是链接（Unix 上用 `O_NOFOLLOW`）。用户直接选中的那一项本身是链接时，给的是它指向的东西（用户要的是内容）。取的一方只重建指向相对路径、而且不出这个文件夹的链接，别的跳过；现在只有 Linux（FUSE）会重建，Windows、Android、网页控制台都跳过。
+
+**名字**：对方的名字在本机不一定合法（Linux 上可以有 `:`、`?`；Windows 不区分大小写）。放进剪贴板之前按本机的规矩改：不合法的字符换成 `_`，同一个目录里只差大小写的给后一个改名（`a (2).txt`）。改不了的跳过（Windows 上从这个文件夹算起超过 259 个字符的路径）。
+
+**各平台怎么放进剪贴板**（对方复制的文件）：
+
+| 平台 | 做法 |
+|---|---|
+| Windows | OLE 虚拟文件（`FileGroupDescriptorW` + `FileContents`，和远程桌面一样，`client/src-tauri/src/clipfiles/windows.rs`）：资源管理器粘贴时才要整棵树和每个文件的内容，`IStream::Read` 读多少取多少，进度条和取消都是资源管理器自己的。不提供 `CF_HDROP`，本机的剪贴板同步也就不会把它当成本机复制了文件、又公告回去。退出时不调 `OleFlushClipboard`（那会把所有格式都要一遍）。被控端在系统服务里时由托盘放，见 [Windows 服务](#windows-服务) |
+| Linux | 只读的 FUSE 文件系统（`fuser`），挂在 `$XDG_RUNTIME_DIR/airhand-clip/<进程号>`，每个公告一个子目录；X11 剪贴板里放 `text/uri-list`、`x-special/gnome-copied-files` 和路径文本。文件管理器列哪个目录才向对方列，读到哪里才取到哪里。上次没退干净留下的挂载点启动后卸掉。没有 FUSE 时不放，只同步文本 |
+| macOS | 还不支持（要先在 Mac 上验证“按需提供 + 占位文件”的做法）。不放，对方照样等得到 `Ready` |
+| Android | `ClipFilesProvider` 提供 content URI（`content://<包名>.clipfiles/...`），别的应用读的时候才取。Android 8 起是代理文件描述符（`StorageManager.openProxyFileDescriptor`，可以跳着读），之前是管道。剪贴板里只放文件，文件夹只能在通知里“保存到下载”（Android 10 起经 MediaStore，之前存在应用自己的目录） |
+| 网页控制台 | 不进本机剪贴板（网页写不了文件）：提示“对方复制了 N 项”，点“下载”才取。Chrome / Edge 存进用户选的文件夹 / 文件，边取边写；别的浏览器在内存里拼好（几个文件、文件夹打成不压缩的 ZIP），最多 1 GiB |
+
+**本机的文件怎么给出去**：桌面版从系统剪贴板读文件列表（和读文本是同一个轮询，`client/src-tauri/src/clipboard.rs`），自己放进去的不算；读文件的是 `LocalFs`。网页控制台在画面上粘贴（`paste` 事件的 `clipboardData`）或者把文件、文件夹拖到画面上，`airhand-web` 来问的时候浏览器读 `File` 回答（控制台 WebSocket 上的二进制消息，见 `console.rs`）；网页版读到剪贴板变空时不撤回公告：剪贴板里是文件时 `readText` 也是空的。Android 用系统的分享菜单“发给对方”，Kotlin 打开每个文件、把文件描述符交给 Rust（只有文件）。
+
 ## 磁盘上的文件
 
 - Airhand 要保存的东西（设置、本机的控制码、我的设备）都在一个 `config.toml` 里（见[配置文件](usage.zh-CN.md#配置文件)）。日志从不写文件：写到 stderr，Windows 服务写到 `OutputDebugString`
@@ -253,7 +299,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 - 单实例锁用的是内核对象而不是锁文件：Windows 是命名互斥量，Linux 是抽象命名空间的 Unix 套接字，macOS 是登记在 bootstrap 服务里的 Mach 端口名
 - 控制台的 WebView 需要数据目录：放在临时目录下的随机子目录，开启隐私模式（不保存 Cookie 和缓存），关闭窗口或退出程序时删除；进程被强制结束时，下次启动会清理残留。macOS 的 WKWebView 不需要数据目录，隐私模式下不保存网页数据
 - macOS 上还有几样东西不在 Airhand 的目录里，是系统记着的、或者系统框架以 Airhand 的名义建的：登录时自动启动（系统的登录项）、“屏幕与系统录音”“辅助功能”等权限记录、WebKit 和 Metal 在系统临时 / 缓存目录里建的几个目录（大多是空的）、用户挪动或关掉菜单栏图标时系统记下的设置（`~/Library/Preferences/app.airhand.client.plist`，Airhand 自己不用）。完整的清单和卸载时怎么一起清掉见[卸载 → macOS](usage.zh-CN.md#macos)
-- Linux 上几样只能以文件形式交出去的东西（交给 AppIndicator 的托盘图标、WebKitGTK 的 GStreamer 插件缓存）放在 `XDG_RUNTIME_DIR`（内存盘）里本进程专用的随机目录，退出时删除（收到 SIGTERM / SIGINT 也一样）；Mesa / NVIDIA 的着色器磁盘缓存直接关闭
+- Linux 上几样只能以文件形式交出去的东西（交给 AppIndicator 的托盘图标、WebKitGTK 的 GStreamer 插件缓存）放在 `XDG_RUNTIME_DIR`（内存盘）里本进程专用的随机目录，退出时删除（收到 SIGTERM / SIGINT 也一样）。对方复制的文件挂在 `XDG_RUNTIME_DIR/airhand-clip/<进程号>`（FUSE，不占磁盘；见[剪贴板里的文件](#剪贴板里的文件)）；Mesa / NVIDIA 的着色器磁盘缓存直接关闭
 - 选的界面语言记在 `config.toml` 里（`language`）；控制台的其它设置（关闭的标签……）只保存在内存里
 - Android：只在应用自己的私有目录里保存设置、连接过的设备和本机的控制码，不备份、不迁移，卸载时由系统全部删除（见[数据保存在哪里](android.zh-CN.md#数据保存在哪里)）
 - 以上说的是桌面客户端。网页控制台是部署在服务器上的服务：它把自签名的 HTTPS 证书存在 `web/data/` 里，浏览器那边也只在内存里保存设置，我的设备不保存、刷新页面后清空（登录密码时会有一个会话 Cookie）

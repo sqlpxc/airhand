@@ -14,6 +14,7 @@
 #[macro_use]
 mod i18n;
 mod clipboard;
+mod clipfiles;
 mod config;
 mod console;
 mod devices;
@@ -716,6 +717,9 @@ fn start_service_link(app: &AppHandle, hub: &StatusHub) -> Hosting {
             warn!("can't start the Airhand service: {e:#}");
         }
     });
+    // 剪贴板里的文件：替服务里的被控端（SYSTEM）放进剪贴板、以登录的用户的身份读文件（见 winsvc::clip）
+    // 任务一直跑到进程退出（不等它）
+    drop(winsvc::clip::start_tray());
     let app = app.clone();
     Hosting::Service(winsvc::ipc::AgentLink::start(hub.clone(), move || {
         app.exit(0)
