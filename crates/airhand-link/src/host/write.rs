@@ -261,10 +261,13 @@ async fn write_frames(
             c.sent(seq, Instant::now());
             if let Some(r) = c.plan(sealed.len() - PREFIX, eligible) {
                 let d = fec::fragments(session_id, stream, &sealed[PREFIX..], prev_fec, r)?;
+                // 码率控制按线上的字节算（见 crate::flow 的"纠错的冗余"）
+                c.sent_bytes(seq, sealed.len(), d.iter().map(Bytes::len).sum(), true);
                 prev_fec = true;
                 send_fragments(&paths, d).await?;
                 continue;
             }
+            c.sent_bytes(seq, sealed.len(), sealed.len(), false);
         }
         prev_fec = false;
         if let Some(conn) = paths.media() {
@@ -703,6 +706,186 @@ mod tests {
         }
         println!("{} frames, {} stalled", total.frames, total.stalled);
         assert!(total.frames >= 300, "{total:?}");
+    }
+
+    /// 帧流，真的 QUIC 走一条丢 2% 的包、往返 60 ms 的路：丢了包的帧等 QUIC 重传就到了，控制端不能抢在重传之前报告
+    /// 等不到（报告了被控端就要放弃在途的帧、编恢复帧，编码器没有长期参考帧时还是关键帧）。
+    /// 这里被控端不理会报告，每一帧最后都会到：报告了的都是报早了的
+    #[tokio::test]
+    async fn losses_are_not_reported_before_the_retransmission() {
+        use airhand_proto::session::REPORT_EVERY;
+        const SID: u64 = 9;
+        const RTT_MS: f64 = 60.0;
+        let (client, server, _relay) =
+            crate::tests::lossy_quic_pair(0.02, Duration::from_secs_f64(RTT_MS / 2000.0)).await;
+        let (router, _task) = Router::start(&server);
+        let (mut inbox, _registration) = router.register(SID);
+        let (sealer, opener) = crate::secure::test_lane(false);
+        let mut m = Merge::new(
+            SessionLane::Video(0),
+            Policy::Video,
+            opener,
+            inbox.video.remove(0),
+        );
+        m.set_rtt(RTT_MS);
+        let stats = m.stats();
+        let (tx, rx) = mpsc::channel(64);
+        let _writer = {
+            let to = Target {
+                session_id: SID,
+                stream: 0,
+                paths: Paths::new(client.clone()),
+            };
+            crate::tasks::OwnedTask(tokio::spawn(async move {
+                write_frames(&FrameStreams::default(), None, rx, sealer, to).await
+            }))
+        };
+        // 60 fps，每帧 15 KB（十几个包），只有第一帧是关键帧
+        let _source = crate::tasks::OwnedTask(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(16));
+            for seq in 1u32.. {
+                tick.tick().await;
+                let f = video(seq, seq == 1, (seq > 1).then(|| seq - 1), 15_000);
+                if tx.send(f).await.is_err() {
+                    break;
+                }
+            }
+        }));
+        let started = Instant::now();
+        let mut report_at = started + REPORT_EVERY;
+        let (mut frames, mut stalled, mut reported, mut keyframes) = (0u32, 0u32, 0u32, 0u32);
+        // 一次缺帧只算一次报告（之后定时重报的不算）
+        let mut reporting = false;
+        while started.elapsed() < Duration::from_secs(6) {
+            match tokio::time::timeout_at(report_at, m.next_video()).await {
+                Ok(v) => match v.unwrap().unwrap() {
+                    Out::Frame(_) => {
+                        frames += 1;
+                        reporting = false;
+                    }
+                    Out::Lost { .. } => {
+                        reported += u32::from(!reporting);
+                        reporting = true;
+                    }
+                    Out::Keyframe { .. } => keyframes += 1,
+                    Out::Skipped { .. } => {}
+                },
+                Err(_) => {
+                    report_at += REPORT_EVERY;
+                    stalled += stats.take().stalled;
+                }
+            }
+        }
+        println!(
+            "{frames} frames, {stalled} stalled, {reported} reported lost too early, {keyframes} keyframe requests"
+        );
+        assert!(frames >= 250, "only {frames} frames");
+        assert!(
+            stalled >= 10,
+            "the path should lose packets: {stalled} stalled"
+        );
+        assert!(
+            reported * 10 <= stalled,
+            "{reported} of {stalled} stalled frames were reported lost"
+        );
+        assert_eq!(keyframes, 0);
+    }
+
+    /// 帧流，真的 QUIC，往返 60 ms：丢 2% 的包时，帧等前面的帧重传、到达时刻跟着晚（和以前一条有序流时一样，
+    /// 见 crate::merge 的"到达时刻"），码率控制当它是排队、把码率降下来；同一条路不丢包时一直是画质设置的码率
+    #[tokio::test]
+    async fn waiting_for_retransmissions_lowers_the_bitrate() {
+        use crate::flow::{Flow, frame_bytes};
+        use std::sync::atomic::AtomicBool;
+        const SID: u64 = 10;
+        const TARGET: u32 = 8_000;
+        let mut got = Vec::new();
+        for loss in [0.0, 0.02] {
+            let (client, server, _relay) =
+                crate::tests::lossy_quic_pair(loss, Duration::from_millis(30)).await;
+            // 先跑一阵大块数据：拥塞窗口从很小开始涨，画面一开始就按 8 Mbps 发的话头几帧要在发送端排队、
+            // 码率降下来再慢慢涨回去（本来就是排队，以前一条有序流时也一样），不是这个测试要看的
+            let drain = {
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let mut r = server.accept_uni().await.unwrap();
+                    r.read_to_end(usize::MAX).await.unwrap();
+                })
+            };
+            let mut warm = client.open_uni().await.unwrap();
+            warm.write_all(&vec![0u8; 2_000_000]).await.unwrap();
+            warm.finish().unwrap();
+            drain.await.unwrap();
+            let (router, _task) = Router::start(&server);
+            let (mut inbox, _registration) = router.register(SID);
+            let (sealer, opener) = crate::secure::test_lane(false);
+            let mut m = Merge::new(
+                SessionLane::Video(0),
+                Policy::Video,
+                opener,
+                inbox.video.remove(0),
+            );
+            let flow = Arc::new(Flow::default());
+            flow.set_target(TARGET, true);
+            let (tx, rx) = mpsc::channel(64);
+            let _writer = {
+                let to = Target {
+                    session_id: SID,
+                    stream: 0,
+                    paths: Paths::new(client.clone()),
+                };
+                crate::tasks::OwnedTask(tokio::spawn(async move {
+                    write_frames(&FrameStreams::default(), None, rx, sealer, to).await
+                }))
+            };
+            // 被控端：60 fps，一帧的大小按码率控制给的码率，在途窗口不够就跳过这一帧（和编码管线一样）
+            let _source = {
+                let flow = flow.clone();
+                crate::tasks::OwnedTask(tokio::spawn(async move {
+                    let stop = AtomicBool::new(false);
+                    let mut tick = tokio::time::interval(Duration::from_millis(16));
+                    let mut prev = None;
+                    loop {
+                        tick.tick().await;
+                        if !flow.wait_window(60, &stop, Duration::ZERO) {
+                            continue;
+                        }
+                        let size = frame_bytes(flow.bitrate_kbps(), 60);
+                        let seq = flow.sent(size);
+                        let f = video(seq, prev.is_none(), prev, size);
+                        prev = Some(seq);
+                        if tx.send(f).await.is_err() {
+                            break;
+                        }
+                    }
+                }))
+            };
+            // 控制端：交出来的帧（和跳过的）带着到达时刻确认
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                let Ok(v) = tokio::time::timeout(Duration::from_millis(500), m.next_video()).await
+                else {
+                    continue;
+                };
+                match v.unwrap().unwrap() {
+                    Out::Frame(f) => {
+                        let seq = VideoHeader::decode(&f.data).unwrap().seq;
+                        flow.ack(seq, Some(f.arrived));
+                    }
+                    Out::Skipped { seq, arrived } => flow.ack(seq, Some(arrived)),
+                    Out::Lost { .. } | Out::Keyframe { .. } => {}
+                }
+            }
+            got.push(flow.bitrate_kbps());
+        }
+        println!(
+            "bitrate without loss {} kbps, with 2% loss {} kbps",
+            got[0], got[1]
+        );
+        assert_eq!(got[0], TARGET);
+        // 只看每帧自己开始到达的时刻时也会降一些（丢了帧开头的包时它自己晚到），大约到 3.6 Mbps；
+        // 加上等前面的帧之后降到 1.5～2.3 Mbps
+        assert!(got[1] * 10 <= TARGET * 3, "{got:?}");
     }
 
     /// 真的 QUIC 数据报，一路上丢了七分之一：按丢包率配了冗余的帧都拼得回来，不用重传

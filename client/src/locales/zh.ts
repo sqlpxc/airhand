@@ -135,7 +135,7 @@ export default {
   "quality.transport.streams": "重传",
   "quality.transport.streams.hint": "丢了的数据重新发一遍，不多占带宽。适合局域网、很少丢包的网络；路远又常丢包时画面会一顿一顿的",
   "quality.transport.fec": "纠错",
-  "quality.transport.fec.hint": "每帧多发几块冗余（多占百分之几到二十几的带宽），丢了几块也能马上拼回来，不用等重传。适合跨境、Wi-Fi 这类路远又常丢包的网络。对方的版本旧时照旧重传",
+  "quality.transport.fec.hint": "每帧多发几块冗余（算在码率里：画面本身少用百分之几到二十几），丢了几块也能马上拼回来，不用等重传。适合跨境、Wi-Fi 这类路远又常丢包的网络。对方的版本旧时照旧重传",
   "quality.local": "本机显示",
   "quality.enhance": "画面增强",
   "quality.enhance.off": "关",

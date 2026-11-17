@@ -127,7 +127,7 @@ const en: Record<MsgKey, Msg> = {
   "quality.transport.streams": "Retransmit",
   "quality.transport.streams.hint": "Lost data is sent again, using no extra bandwidth. Best on a LAN or a network that rarely loses packets; on long, lossy routes the picture stutters",
   "quality.transport.fec": "FEC",
-  "quality.transport.fec.hint": "Forward error correction: each frame carries a few redundant packets (a few to twenty-odd percent more bandwidth), so a lost packet or two is rebuilt right away instead of waiting for a retransmission. Best on long, lossy routes such as cross-border links or Wi-Fi. Older versions on the other side keep retransmitting",
+  "quality.transport.fec.hint": "Forward error correction: each frame carries a few redundant packets (counted within the bitrate, so the picture itself gets a few to twenty-odd percent less), so a lost packet or two is rebuilt right away instead of waiting for a retransmission. Best on long, lossy routes such as cross-border links or Wi-Fi. Older versions on the other side keep retransmitting",
   "quality.local": "On this device",
   "quality.enhance": "Enhance",
   "quality.enhance.off": "Off",

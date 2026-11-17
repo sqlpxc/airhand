@@ -220,7 +220,7 @@
     <string name="transport_streams">Retransmit</string>
     <string name="transport_streams_desc">Lost data is sent again, using no extra bandwidth. Best on a LAN or a network that rarely loses packets; on long, lossy routes the picture stutters</string>
     <string name="transport_fec">Error correction</string>
-    <string name="transport_fec_desc">Each frame carries a few redundant packets (a few to twenty-odd percent more bandwidth), so a lost packet or two is rebuilt right away instead of waiting for a retransmission. Best on long, lossy routes such as cross-border links or Wi-Fi. Older versions on the other side keep retransmitting</string>
+    <string name="transport_fec_desc">Each frame carries a few redundant packets (counted within the bitrate, so the picture itself gets a few to twenty-odd percent less), so a lost packet or two is rebuilt right away instead of waiting for a retransmission. Best on long, lossy routes such as cross-border links or Wi-Fi. Older versions on the other side keep retransmitting</string>
 
     <!-- Session -->
     <string name="session_connecting">Connecting to %1$s…</string>

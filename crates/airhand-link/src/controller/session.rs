@@ -62,7 +62,8 @@ impl Feedback {
         }
     }
 
-    /// 第 `stream` 路的第 `seq` 帧到了（界面收到了，或者界面反正解不了、这里替它确认），它开始到达的时刻是 `arrived`
+    /// 第 `stream` 路的第 `seq` 帧到了（界面收到了，或者界面反正解不了、这里替它确认），它的到达时刻是 `arrived`
+    /// （见 `crate::merge` 的"到达时刻"）
     pub fn ack(&self, stream: u8, seq: u32, arrived: u64) {
         let m = self
             .acks
@@ -379,7 +380,7 @@ impl Arrivals {
         self.last = seq;
     }
 
-    /// 界面确认了第 `seq` 帧：它开始到达的时刻（不是交给过界面的帧、已经确认过的为 `None`）
+    /// 界面确认了第 `seq` 帧：它的到达时刻（不是交给过界面的帧、已经确认过的为 `None`）
     pub(super) fn take(&mut self, seq: u32) -> Option<u64> {
         let at = self.pending.iter().find(|(s, _)| *s == seq)?.1;
         self.pending.retain(|(s, _)| s.wrapping_sub(seq) as i32 > 0);

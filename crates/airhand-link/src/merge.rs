@@ -20,11 +20,11 @@
 //! 缺着下一帧的时候：
 //!
 //! * 手里有解得了的后面的帧（关键帧、从交给过解码器的帧恢复的那一帧）：不等了，从手里最早的一帧接着交，解不了的跳过；
-//! * 收到过帧流（被控端会恢复）：后面的帧到了、下一帧却停住了一个往返（[`loss_wait`]），就报告等不到了
+//! * 收到过帧流（被控端会恢复）：后面的帧到了、下一帧却停住了比 QUIC 重传还久（[`loss_wait`]），就报告等不到了
 //!   （[`Video::Lost`]，控制端发 `ControllerDatagram::Lost`），之后定时再报，直到解得了的帧到了。等着的期间
 //!   后面的帧先留着：重传补上了下一帧，它们照样解得了。"停住"看的是读到一半的帧流：QUIC 在几条流之间
 //!   轮流发，大的帧（关键帧）本来就比跟在后面的小帧晚到，它还在一点一点地到就不是丢了；丢了包的流在重传到之前
-//!   什么也读不到（QUIC 只按顺序交出数据）。所以读到一半的帧流里最久没有新数据的那条停了一个往返才算（没有读到
+//!   什么也读不到（QUIC 只按顺序交出数据）。所以读到一半的帧流里最久没有新数据的那条停了这么久才算（没有读到
 //!   一半的：缺的那一帧连开头都没到，从缺着的时候算起）；一直有新的小帧到，不影响卡住的那条算不算停住；
 //! * 等了 [`VIDEO_WAIT`] 还是不行（直连断了、旧版本的被控端、恢复一直没到）：要一个关键帧（[`Video::Keyframe`]，
 //!   走控制通道，不会丢）。旧版本的被控端（单条流，不会恢复）这时就不等下一帧了，之后解不了的都跳过，直到关键帧。
@@ -46,6 +46,15 @@
 //! 决定用不用纠错、配多少冗余：从帧流上收完的帧里，有多少等重传卡住过（读到一半、别的帧流照样在来的时候停了至少
 //! [`STALL`]，后面的帧却先到了，或者到的时候已经不等它了；整条连接都停了的不算，见 [`Ticks`]）；
 //! 纠错的帧该到多少块、到了多少块、有几帧拼不回来。
+//!
+//! # 到达时刻
+//!
+//! 交出去的每一帧（解得了的、跳过的）带着它的到达时刻（[`Frame::arrived`]），控制端在确认里告诉被控端，
+//! 被控端的码率控制拿它算排队时延（`crate::flow`）。它是这一帧开始到达（第一个字节、第一块到了）和前一帧交出去
+//! 这两个时刻里晚的那个，和以前画面是一条有序流时读到这一帧开头的时刻一样：前面的帧在等重传时，
+//! 后面的帧即使早就到了也算晚到，码率控制把它当成排队、马上降码率。要的就是这个：公网上（尤其家宽的上行）
+//! 大流量的 UDP 常被限速，限速器超了就丢、不排队，只看每帧自己的到达时刻时码率降不下来，一直丢、一直等重传，
+//! 延迟翻倍（见 `crate::flow` 的"到达时刻"）。前一帧交出去的时刻是合并交出它的时刻（[`VideoCore::pop`] 的 `now`）。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,12 +96,18 @@ pub const STALL: Duration = Duration::from_millis(15);
 /// 记着最多这么多个拼不回来的纠错帧
 const MAX_GONE: usize = 64;
 
-/// 缺着下一帧、后面的帧到了，等多久才报告等不到了：大约一个往返。
+/// 缺着下一帧、后面的帧到了，等多久才报告等不到了：一个半往返再加 30 ms（60 ms 到 800 ms 之间）。
 ///
-/// 中转上一段路丢了包，那一段的重传大约一个那一段的往返之后到；从被控端恢复（报告过去、编一帧、发过来）至少要一个
-/// 整个的往返。所以一个包丢了一次，等重传更快，不报告；重传也丢了、路上堵着，等一个往返之后再恢复，最多晚两个往返
+/// 要等得比 QUIC 的重传晚：发送端在丢的包发出 9/8 个往返之后（或者后面三个包确认了）才断定它丢了、重发，
+/// 重发的再走半个往返；确认还可能晚到（最多 25 ms 的确认延迟）。这里从后面的帧到了（读到一半的帧流最后一次有数据）
+/// 算起，那时丢的包本该已经到了，所以重传大约在之后 9/8 个往返加上确认延迟到。只等一个往返的话一半左右会抢在重传前面
+/// （`host::write` 的 `losses_are_not_reported_before_the_retransmission`），白白放弃在途的帧、编恢复帧（甚至关键帧）。
+/// 经过中转时每一段各自重传，那一段的往返比整个往返短，重传到得更早。
+///
+/// 重传也丢了、路上堵着时晚半个往返才恢复：比每丢一个包就恢复一次划算（恢复帧参考的是更早的帧，更大；
+/// 编码器不能控制长期参考帧时就是关键帧）
 pub fn loss_wait(rtt_ms: f64) -> Duration {
-    Duration::from_secs_f64((rtt_ms / 1000.0).clamp(0.05, 0.5))
+    Duration::from_secs_f64(((rtt_ms * 1.5 + 30.0) / 1000.0).clamp(0.06, 0.8))
 }
 
 /// 报告了等不到之后，多久还没恢复就再报一次（数据报会丢）
@@ -113,7 +128,8 @@ pub enum Policy {
 #[derive(Debug)]
 pub struct Frame {
     pub data: Vec<u8>,
-    /// 开始从网络上到达的时刻（控制端的时钟，见 [`crate::wire::read_packet_timed`]）
+    /// 到达时刻（控制端的时钟，见 [`crate::wire::read_packet_timed`]）：画面交出来的帧是它开始到达、前一帧交出去
+    /// 两个里晚的那个（见模块说明的"到达时刻"）；控制、大块通道的是它开始从网络上到达的时刻
     pub arrived: u64,
     /// 从直连来的
     pub direct: bool,
@@ -146,7 +162,8 @@ impl VideoStats {
 pub enum Video {
     /// 解得了：交给解码器
     Frame(Frame),
-    /// 收到了、解不了（参考的帧没交给解码器）：不交给界面，替它确认（被控端的在途窗口才不会停住）
+    /// 收到了、解不了（参考的帧没交给解码器）：不交给界面，替它确认（被控端的在途窗口才不会停住）。
+    /// `arrived` 和 [`Frame::arrived`] 一样
     Skipped { seq: u32, arrived: u64 },
     /// 等不到一帧了：请被控端从交给解码器的最后一帧（`decoded`，还没有时为 0）恢复。恢复之前定时再来
     Lost { decoded: u32 },
@@ -281,6 +298,10 @@ struct VideoCore {
     gone: VecDeque<u64>,
     /// 帧流上收完的帧、其中卡住过的（见模块说明的"报告"），还没交给 [`VideoStats`] 的
     stats: VideoReport,
+    /// 上一帧（解得了的、跳过的）交出去的时刻（控制端的时钟，微秒；还没有时为 0），见模块说明的"到达时刻"
+    handed: u64,
+    /// 把 [`VideoCore::pop`] 的 `now` 换成控制端的时钟：(某个时刻, 那时的 `now_us()`)
+    anchor: (Instant, u64),
 }
 
 impl VideoCore {
@@ -300,7 +321,22 @@ impl VideoCore {
             rtt_ms: DEFAULT_RTT_MS,
             gone: VecDeque::new(),
             stats: VideoReport::default(),
+            handed: 0,
+            anchor: (Instant::now(), now_us()),
         }
+    }
+
+    /// `now` 是控制端的时钟的哪一微秒（和 [`crate::wire::read_packet_timed`] 记的到达时刻同一个时钟）
+    fn clock_us(&self, now: Instant) -> u64 {
+        let (at, us) = self.anchor;
+        us + now.saturating_duration_since(at).as_micros() as u64
+    }
+
+    /// 交出第 `c` 帧时它的到达时刻（见模块说明的"到达时刻"）：它开始到达、前一帧交出去，两个里晚的那个
+    fn hand_over(&mut self, h: &HeldVideo, now: Instant) -> u64 {
+        let arrived = h.arrived.max(self.handed);
+        self.handed = self.clock_us(now);
+        arrived
     }
 
     /// 测试用：流上读到的一帧，没停过
@@ -413,10 +449,11 @@ impl VideoCore {
             self.gone.retain(|&g| g >= c);
             if let Some(h) = self.take(c) {
                 self.next += 1;
+                let arrived = self.hand_over(&h, now);
                 if !self.decodable(c, &h) {
                     return Some(Video::Skipped {
                         seq: h.seq,
-                        arrived: h.arrived,
+                        arrived,
                     });
                 }
                 self.last = Some((c, h.seq));
@@ -429,7 +466,7 @@ impl VideoCore {
                 self.asked_key = false;
                 return Some(Video::Frame(Frame {
                     data: h.data,
-                    arrived: h.arrived,
+                    arrived,
                     direct: h.direct,
                     fec: h.fec,
                 }));
@@ -1104,34 +1141,65 @@ mod tests {
     }
 
     /// 帧流：后面的小帧先到了、前面的大帧（关键帧）还在一点一点地到：不是丢了，一直有数据就一直不报告；
-    /// 停住了一个往返才算
+    /// 停住了 loss_wait 才算（都在 VIDEO_WAIT 之内）
     #[test]
     fn a_large_frame_that_is_still_arriving_is_not_lost() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
         m.frames = true;
-        m.rtt_ms = 100.0;
+        m.rtt_ms = 60.0;
         let t0 = Instant::now();
         let _big_key = frame(&mut s, 1, true, None);
         let d2 = frame(&mut s, 2, false, Some(1));
         m.push(false, d2, 0).unwrap();
         assert!(m.pop(t0).is_none());
-        let wait = loss_wait(100.0);
+        let wait = loss_wait(60.0);
         // 关键帧的流上一直有数据：等多久都不报告
-        for i in 1..=5 {
+        for i in 1..=3 {
             let now = t0 + wait * i;
             m.progress = Some(now - wait / 2);
             assert!(m.pop(now).is_none(), "{i}");
         }
-        // 停住了一个往返：报告
-        let stalled = t0 + wait * 5 + wait / 2;
+        // 停住了 loss_wait：报告
+        let stalled = t0 + wait * 3 + wait / 2;
         assert_eq!(m.deadline(), Some(stalled));
         assert_eq!(drain(&mut m, stalled), [Got::L(0)]);
         // 报告之后又有数据了（重传到了）：不再重报，直到又停住
-        let resumed = stalled + loss_repeat(100.0);
+        let resumed = stalled + loss_repeat(60.0);
         m.progress = Some(resumed);
         assert!(m.pop(resumed).is_none());
-        assert_eq!(m.deadline(), Some(resumed + loss_repeat(100.0)));
+        assert_eq!(m.deadline(), Some(resumed + loss_repeat(60.0)));
+    }
+
+    /// 到达时刻（见模块说明的"到达时刻"）：一帧等前面的帧（重传）的时候不算开始到达，前一帧交出去的时候才算，
+    /// 和以前一条有序流时一样；不用等的帧就是它自己开始到达的时刻
+    #[test]
+    fn frames_waiting_for_earlier_ones_arrive_late() {
+        let (mut s, o) = test_lane(false);
+        let mut m = VideoCore::new(o);
+        m.frames = true;
+        let t0 = Instant::now();
+        let base = m.clock_us(t0);
+        let ms = Duration::from_millis;
+        let f: Vec<Vec<u8>> = (1..=4)
+            .map(|seq| frame(&mut s, seq, seq == 1, (seq > 1).then(|| seq - 1)))
+            .collect();
+        let arrived = |v: Option<Video>| match v {
+            Some(Video::Frame(f)) => f.arrived,
+            other => panic!("{other:?}"),
+        };
+        m.push(false, f[0].clone(), base + 1_000).unwrap();
+        assert_eq!(arrived(m.pop(t0 + ms(2))), base + 1_000);
+        // 第 3 帧先到了，第 2 帧在等重传
+        m.push(false, f[2].clone(), base + 20_000).unwrap();
+        assert!(m.pop(t0 + ms(21)).is_none());
+        // 第 2 帧的重传到了：它自己 15 ms 开始到达（第 1 帧早就交出去了）；第 3 帧等到第 2 帧交出去（90 ms）才算到达
+        m.push(false, f[1].clone(), base + 15_000).unwrap();
+        assert_eq!(arrived(m.pop(t0 + ms(90))), base + 15_000);
+        assert_eq!(arrived(m.pop(t0 + ms(90))), base + 90_000);
+        // 不用等的帧：就是它自己的
+        m.push(false, f[3].clone(), base + 100_000).unwrap();
+        assert_eq!(arrived(m.pop(t0 + ms(101))), base + 100_000);
     }
 
     /// 帧流：后面的帧先到了、前面的一帧在重传，带参考帧的增量帧等它；重传补上了就照常交出去，不报告
@@ -1420,13 +1488,15 @@ mod tests {
         let mut m = VideoCore::new(o);
         m.rtt_ms = 200.0;
         let t0 = Instant::now();
+        // 到达时刻和 pop 的 now 在同一个时钟上（见模块说明的"到达时刻"）
+        let base = m.clock_us(t0);
         let key = frame(&mut s, 1, true, None);
         let d2 = frame(&mut s, 2, false, Some(1));
         let mut tampered = frame(&mut s, 3, false, Some(2));
         let d4 = frame(&mut s, 4, false, Some(3));
-        m.push(false, key, 0).unwrap();
-        m.receive(true, d2, 5, Src::Fec).unwrap();
-        m.receive(false, d4, 0, Src::Fec).unwrap();
+        m.push(false, key, base).unwrap();
+        m.receive(true, d2, base + 5, Src::Fec).unwrap();
+        m.receive(false, d4, base, Src::Fec).unwrap();
         let first = m.pop(t0);
         assert!(matches!(
             first,
@@ -1435,7 +1505,10 @@ mod tests {
         let Some(Video::Frame(f)) = m.pop(t0) else {
             panic!()
         };
-        assert_eq!((seq_of(&f), f.fec, f.direct, f.arrived), (2, true, true, 5));
+        assert_eq!(
+            (seq_of(&f), f.fec, f.direct, f.arrived),
+            (2, true, true, base + 5)
+        );
         // 第 3 帧还缺着：等一个往返
         assert!(m.pop(t0).is_none());
         assert_eq!(m.deadline(), Some(t0 + loss_wait(200.0)));

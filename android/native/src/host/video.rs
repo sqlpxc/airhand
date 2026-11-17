@@ -7,13 +7,14 @@
 //!   慢的观看者跳帧，不拉低别人的画质；
 //! * 新加入的会话从关键帧开始收（[`Out::need_key`]）；
 //! * 增量帧的头里写着它参考的帧（编码器编出的前一帧，见 `airhand_proto::media` 的"参考帧"）；控制端等不到帧时
-//!   （[`VideoHub::lost`]）MediaCodec 不能从长期参考帧恢复，那个会话从关键帧重新加入。
+//!   （[`VideoHub::lost`]）MediaCodec 不能从长期参考帧恢复，那个会话从关键帧重新加入（同一处报告第二次才这样做：
+//!   第一次多半是重传还在路上）。
 //!
 //! Kotlin 的渲染线程每一轮调用 [`VideoHub::tick`]：设置变了（帧率、分辨率上限、编码格式、码率）
 //! 或者需要关键帧时返回一个 JSON，见 [`Tick`]。
 
 use airhand_link::flow::{FlowState as Flow, frame_bytes};
-use airhand_link::refs::recover_wait;
+use airhand_link::refs::{KeyframeGate, recover_wait};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -62,6 +63,8 @@ struct Out {
     last_key: u32,
     /// 那个关键帧是什么时候发的：控制端等不到帧时，太久以前发的关键帧不算还在路上（见 [`VideoHub::lost`]）
     last_key_at: Option<Instant>,
+    /// 等不到帧的第一次报告（见 [`VideoHub::lost`]）
+    key_gate: KeyframeGate,
 }
 
 /// [`VideoHub::tick`] 的结果
@@ -115,6 +118,7 @@ impl VideoHub {
                 need_key: true,
                 last_key: 0,
                 last_key_at: None,
+                key_gate: KeyframeGate::default(),
             },
         );
         st.merge_settings();
@@ -208,8 +212,15 @@ impl VideoHub {
 
     /// 会话 `id` 的控制端等不到帧了（帧流，见 `airhand_proto::session` 的"帧流"）：它解到了第 `decoded` 帧。
     /// 之后在途的帧作废，它从关键帧重新加入（MediaCodec 不能从长期参考帧恢复），返回 `true`（放弃它们的帧流）。
-    /// 刚发给它的关键帧还在路上（比 `decoded` 新、发出去不久）：重复的请求，什么也不做
-    pub fn lost(&self, id: u64, decoded: u32) -> bool {
+    /// 刚发给它的关键帧还在路上（比 `decoded` 新、发出去不久）：重复的请求，什么也不做。
+    /// 关键帧比等重传贵得多：同一处的报告第二次来了才编（第一次多半是重传还在路上，见 `airhand_link::refs`
+    /// 的"只能编关键帧时"），第一次什么也不做。`retransmitted`：等不到的那一帧走的是帧流（会重传）；
+    /// 走纠错的数据报的不会重传，马上从关键帧重新加入
+    pub fn lost(&self, id: u64, decoded: u32, retransmitted: bool) -> bool {
+        self.lost_at(id, decoded, retransmitted, Instant::now())
+    }
+
+    fn lost_at(&self, id: u64, decoded: u32, retransmitted: bool, now: Instant) -> bool {
         let mut st = self.st.lock().unwrap();
         let Some(o) = st.sessions.get_mut(&id) else {
             return false;
@@ -218,8 +229,8 @@ impl VideoHub {
         let in_flight = o.last_key != 0
             && o.last_key.wrapping_sub(decoded) as i32 > 0
             && o.last_key_at
-                .is_some_and(|t| t.elapsed() < recover_wait(srtt));
-        if in_flight {
+                .is_some_and(|t| now.saturating_duration_since(t) < recover_wait(srtt));
+        if in_flight || (retransmitted && !o.key_gate.confirm(decoded, now)) {
             return false;
         }
         o.flow.abandon(decoded);
@@ -228,6 +239,17 @@ impl VideoHub {
         drop(st);
         self.cv.notify_all();
         true
+    }
+
+    /// 会话 `id` 的控制端报告了画面收得怎么样（丢包率、纠错的冗余，见 `airhand_link::flow` 的"丢包"）：
+    /// 交给它的码率控制（共享的编码器的码率在下一次 [`VideoHub::tick`] 里跟着变）
+    pub fn feedback(&self, id: u64, fb: airhand_link::flow::Feedback) {
+        let mut st = self.st.lock().unwrap();
+        if let Some(o) = st.sessions.get_mut(&id) {
+            o.flow.feedback(fb, Instant::now());
+        }
+        drop(st);
+        self.cv.notify_all();
     }
 
     /// 渲染线程每一轮调用：需要 Kotlin 做点什么（设置变了、码率变了、要关键帧）时返回 [`Tick`]
@@ -338,6 +360,7 @@ impl VideoHub {
                     if key {
                         o.last_key = seq;
                         o.last_key_at = Some(Instant::now());
+                        o.key_gate = KeyframeGate::default();
                     }
                     o.flow.on_sent(seq, bytes.len() - 4);
                 }
@@ -577,7 +600,7 @@ mod tests {
         assert!(hub.tick().unwrap().key);
     }
 
-    /// 控制端等不到帧了：之后在途的帧不再占着窗口，从关键帧重新加入；关键帧还在路上时重复的请求不再编。
+    /// 控制端等不到帧了（同一处报告了两次）：之后在途的帧不再占着窗口，从关键帧重新加入；关键帧还在路上时重复的请求不再编。
     /// 增量帧的头里写着前一帧
     #[test]
     fn a_lost_frame_restarts_the_viewer_from_a_keyframe() {
@@ -596,20 +619,53 @@ mod tests {
         assert_eq!(frames[2].reference, Some(frames[1].seq));
         let inflight = || hub.st.lock().unwrap().sessions[&1].flow.inflight();
         assert_eq!(inflight(), 3);
-        // 解到了第一帧（关键帧），之后的等不到了：关键帧就是它自己，不算在路上
-        assert!(hub.lost(1, frames[0].seq));
+        // 解到了第一帧（关键帧），之后的等不到了：关键帧就是它自己，不算在路上。第一次报告先不管（重传多半还在路上）
+        assert!(!hub.lost(1, frames[0].seq, true));
+        assert_eq!(inflight(), 3);
+        assert!(hub.tick().is_none());
+        // 控制端重报了：之后在途的帧作废，从关键帧重新加入
+        let again = Instant::now() + airhand_link::refs::KEY_REPEAT_MIN;
+        assert!(hub.lost_at(1, frames[0].seq, true, again));
         assert_eq!(inflight(), 1);
         assert!(hub.tick().unwrap().key);
         hub.push(&[4], false, false, 0, Codec::AV1, 8, 8);
         assert!(rx.try_recv().is_err(), "delta frames before the keyframe");
         hub.push(&[5], true, false, 0, Codec::AV1, 8, 8);
-        assert!(decode(&rx.try_recv().unwrap()).key);
+        let key = decode(&rx.try_recv().unwrap());
+        assert!(key.key);
         // 等关键帧时那个增量帧又要过一次（见 push），先清掉
         let _ = hub.tick();
         // 关键帧还在路上：重复的请求不再编
-        assert!(!hub.lost(1, frames[0].seq));
+        assert!(!hub.lost(1, frames[0].seq, true));
         assert!(hub.tick().is_none());
-        assert!(!hub.lost(2, 0), "unknown session");
+        assert!(!hub.lost(2, 0, true), "unknown session");
+        // 等不到的那一帧走的是纠错的数据报（不会重传）：第一次报告就从关键帧重新加入
+        assert!(hub.lost(1, key.seq, false));
+        assert!(hub.tick().unwrap().key);
+    }
+
+    /// 控制端报告丢得太多：这个会话的码率控制降码率，共享的编码器跟着降
+    #[test]
+    fn heavy_loss_lowers_the_shared_bitrate() {
+        let (hub, _) = hub();
+        let (tx, _rx) = mpsc::channel(QUEUE);
+        hub.add(1, tx);
+        let before = hub.tick().unwrap().kbps;
+        hub.feedback(
+            1,
+            airhand_link::flow::Feedback {
+                loss: Some(0.5),
+                overhead: 1.0,
+            },
+        );
+        assert_eq!(hub.tick().unwrap().kbps, before * 3 / 4);
+        hub.feedback(
+            2,
+            airhand_link::flow::Feedback {
+                loss: Some(0.5),
+                overhead: 1.0,
+            },
+        );
     }
 
     #[test]

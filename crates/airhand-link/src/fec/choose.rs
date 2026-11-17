@@ -13,6 +13,13 @@
 //! * 每次切换之后至少 [`DWELL`] 不再切换，免得来回换。
 //!
 //! 冗余（[`crate::fec::repair_count`]）按最近 [`WINDOW`] 里报告的丢包率配。
+//!
+//! 报告也换算成码率控制要的（[`Chooser::feedback`]，见 `crate::flow` 的"丢包""纠错的冗余"）：
+//!
+//! * 最近 [`LOSS_WINDOW`] 的丢包率：有纠错的块就是没到的块的比例；不然按帧流上卡住的帧估计
+//!   （`1 - (1 - 卡住的比例)^(1 / 每帧块数)`，和改用纠错时一样；往返很短、重传很快时看不出卡住，估计得偏低）；
+//!   收到的太少时量不出来；
+//! * 画面在线上的字节是编码器出的多少倍：写任务每帧告诉它（[`Chooser::sent_bytes`]），按最近几十帧算。
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -24,7 +31,7 @@ use tokio::time::Instant;
 use tracing::info;
 
 use super::repair_count;
-use crate::flow::WindowMin;
+use crate::flow::{Feedback, WindowMin};
 
 /// 看最近这么久的报告
 pub(crate) const WINDOW: Duration = Duration::from_secs(3);
@@ -47,6 +54,13 @@ pub(crate) const FAST_FOR: Duration = Duration::from_secs(10);
 const MIN_FRAGMENTS: u32 = 20;
 /// 记着最近这么多帧的发出时刻（量往返时延）
 const SENT: usize = 128;
+/// 给码率控制的丢包率看最近这么久的报告（见模块说明）
+pub(crate) const LOSS_WINDOW: Duration = Duration::from_secs(1);
+/// 纠错的块至少这么多、或者帧流上的帧至少这么多，才量得出丢包率
+const LOSS_MIN_FRAGMENTS: u32 = 50;
+const LOSS_MIN_FRAMES: u32 = 20;
+/// 线上字节的倍数按最近几十帧算：每帧把之前的乘以它
+const BYTES_DECAY: f64 = 0.97;
 
 /// 被控端一个会话的画面怎么传（见模块说明）。写任务每帧问一次，读任务交给它控制端的报告、确认和画质设置
 pub(crate) struct Chooser(Mutex<State>);
@@ -68,6 +82,11 @@ struct State {
     fast: Option<Instant>,
     rtt: WindowMin,
     sent: VecDeque<(u32, Instant)>,
+    /// 最近的帧编码器出了多少字节、线上发了多少（衰减的和，见 [`Chooser::sent_bytes`]）
+    encoded: f64,
+    wire: f64,
+    /// 最近发的 [`SENT`] 帧：(序号, 走的是纠错)（见 [`Chooser::retransmitted_after`]）
+    how: VecDeque<(u32, bool)>,
 }
 
 impl Chooser {
@@ -85,7 +104,62 @@ impl Chooser {
             fast: None,
             rtt: WindowMin::default(),
             sent: VecDeque::new(),
+            encoded: 0.0,
+            wire: 0.0,
+            how: VecDeque::new(),
         }))
+    }
+
+    /// 第 `seq` 帧发出去了：密封单元 `encoded` 字节，线上发了 `wire` 字节（纠错的是所有数据报，帧流上的就是 `encoded`）；
+    /// `fec`：走的是纠错的数据报
+    pub(crate) fn sent_bytes(&self, seq: u32, encoded: usize, wire: usize, fec: bool) {
+        let mut s = self.0.lock().unwrap();
+        s.encoded = s.encoded * BYTES_DECAY + encoded as f64;
+        s.wire = s.wire * BYTES_DECAY + wire as f64;
+        if s.how.len() == SENT {
+            s.how.pop_front();
+        }
+        s.how.push_back((seq, fec));
+    }
+
+    /// 控制端解到第 `decoded` 帧之后等不到了：等不到的那一帧（发给它的、`decoded` 之后的第一帧）还会重传吗？
+    /// 走帧流的会（QUIC 重传），走纠错的数据报的不会；记不得了的按会算
+    pub(crate) fn retransmitted_after(&self, decoded: u32) -> bool {
+        let s = self.0.lock().unwrap();
+        s.how
+            .iter()
+            .find(|(seq, _)| seq.wrapping_sub(decoded) as i32 > 0)
+            .is_none_or(|(_, fec)| !fec)
+    }
+
+    /// 码率控制要的（见模块说明）：最近 [`LOSS_WINDOW`] 的丢包率、线上字节的倍数
+    pub(crate) fn feedback(&self, now: Instant) -> Feedback {
+        let s = self.0.lock().unwrap();
+        let recent = s
+            .reports
+            .iter()
+            .filter(|(t, _)| now.saturating_duration_since(*t) < LOSS_WINDOW)
+            .fold(VideoReport::default(), |a, (_, r)| VideoReport {
+                frames: a.frames + r.frames,
+                stalled: a.stalled + r.stalled,
+                fragments: a.fragments + r.fragments,
+                missing: a.missing + r.missing,
+                unrecovered: a.unrecovered + r.unrecovered,
+            });
+        let loss = if recent.fragments >= LOSS_MIN_FRAGMENTS {
+            Some(recent.missing as f64 / recent.fragments as f64)
+        } else if recent.frames >= LOSS_MIN_FRAMES {
+            let stalled = (recent.stalled as f64 / recent.frames as f64).min(1.0);
+            Some(1.0 - (1.0 - stalled).powf(1.0 / s.shards.max(1.0)))
+        } else {
+            None
+        };
+        let overhead = if s.encoded > 0.0 {
+            (s.wire / s.encoded).max(1.0)
+        } else {
+            1.0
+        };
+        Feedback { loss, overhead }
     }
 
     /// 控制端改了画质设置。自动的话从现在用的接着看（刚才固定用纠错，就先接着用纠错）
@@ -359,6 +433,70 @@ mod tests {
             c.report(fec(200, 10), t);
         }
         assert!(!c.using());
+    }
+
+    /// 码率控制要的：最近 LOSS_WINDOW 的丢包率（有纠错的块看块，不然按帧流上卡住的帧估计；太少量不出来）、
+    /// 线上字节的倍数（按最近的帧）
+    #[tokio::test(start_paused = true)]
+    async fn feedback_for_the_rate_control() {
+        let c = Chooser::new(VideoTransport::Streams);
+        let t0 = Instant::now();
+        assert_eq!(
+            c.feedback(t0),
+            Feedback {
+                loss: None,
+                overhead: 1.0
+            }
+        );
+        // 帧流上的帧每帧 10 块左右；30 帧里卡住了 3 帧
+        for _ in 0..100 {
+            c.plan(10 * airhand_proto::fec::MAX_SHARD - 100, true);
+        }
+        c.report(stream(30, 3), t0);
+        let loss = c.feedback(t0).loss.unwrap();
+        assert!((loss - (1.0 - 0.9f64.powf(0.1))).abs() < 1e-3, "{loss}");
+        // 帧太少：量不出来
+        c.report(stream(10, 3), t0 + LOSS_WINDOW);
+        assert_eq!(c.feedback(t0 + LOSS_WINDOW).loss, None);
+        // 有纠错的块就看块；一秒以前的报告不算
+        let t1 = t0 + LOSS_WINDOW * 2;
+        c.report(fec(100, 20), t1);
+        assert_eq!(c.feedback(t1).loss, Some(0.2));
+        c.report(fec(100, 0), t1 + LOSS_WINDOW / 2);
+        assert_eq!(c.feedback(t1 + LOSS_WINDOW / 2).loss, Some(0.1));
+        assert_eq!(c.feedback(t1 + LOSS_WINDOW).loss, Some(0.0));
+        // 线上字节：纠错的帧多出冗余，帧流上的一样多
+        c.sent_bytes(1, 1000, 1500, true);
+        assert_eq!(c.feedback(t1).overhead, 1.5);
+        c.sent_bytes(2, 1000, 1000, false);
+        let o = c.feedback(t1).overhead;
+        assert!(
+            (o - (1500.0 * BYTES_DECAY + 1000.0) / (1000.0 * BYTES_DECAY + 1000.0)).abs() < 1e-9
+        );
+        for seq in 3..300 {
+            c.sent_bytes(seq, 1000, 1000, false);
+        }
+        assert!(c.feedback(t1).overhead < 1.001);
+    }
+
+    /// 等不到的那一帧还会不会重传：看 decoded 之后发的第一帧走的是帧流还是纠错（序号会绕回）
+    #[test]
+    fn which_lost_frames_are_retransmitted() {
+        let c = Chooser::new(VideoTransport::Auto);
+        for (seq, fec) in [
+            (u32::MAX - 1, false),
+            (u32::MAX, true),
+            (0, true),
+            (1, false),
+        ] {
+            c.sent_bytes(seq, 1000, 1000, fec);
+        }
+        assert!(!c.retransmitted_after(u32::MAX - 1));
+        assert!(!c.retransmitted_after(u32::MAX));
+        assert!(c.retransmitted_after(0));
+        // 之后还没发过、记不得了：按会重传算
+        assert!(c.retransmitted_after(1));
+        assert!(Chooser::new(VideoTransport::Auto).retransmitted_after(5));
     }
 
     /// 改设置：从固定的纠错改成自动，先接着用纠错

@@ -144,7 +144,8 @@ impl ControllerReceiver {
 /// * Ping：马上回 Pong（会话的主循环忙着的时候也回：控制端不会把它当成失联）；
 /// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
 /// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
-/// * 画面收得怎么样的报告（`ControllerDatagram::Report`）：交给画面的 [`Chooser`]（用不用纠错、配多少冗余）；
+/// * 画面收得怎么样的报告（`ControllerDatagram::Report`）：交给画面的 [`Chooser`]（用不用纠错、配多少冗余），
+///   它换算出来的丢包率、冗余的倍数交给平台的 [`Acks`]（码率控制）；
 /// * 和画面有关的都带着是第几路（见 `airhand_proto::session` 的"多屏"），各交各的；没有的路不管；
 /// * 控制端麦克风的声音包：马上交给平台的 [`MicSink`]；
 /// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
@@ -230,14 +231,27 @@ impl Express {
                     c.acked(seq, tokio::time::Instant::now());
                 }
             }
+            // 也换算成码率控制要的交给平台（见 crate::flow 的"丢包""纠错的冗余"）
             ControllerDatagram::Report { report, stream } => {
                 if let Some(c) = self.fec.get(stream as usize) {
-                    c.report(report, tokio::time::Instant::now());
+                    let now = tokio::time::Instant::now();
+                    c.report(report, now);
+                    if let Some(acks) = self.acks.get() {
+                        acks.feedback(stream, c.feedback(now));
+                    }
                 }
             }
-            // 平台要恢复：这一路之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）
+            // 平台要恢复：这一路之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）。等不到的那一帧走的是
+            // 纠错的数据报的话不会重传（见 crate::refs 的"只能编关键帧时"）
             ControllerDatagram::Lost { decoded, stream } => {
-                let recover = self.acks.get().is_some_and(|a| a.lost(stream, decoded));
+                let retransmitted = self
+                    .fec
+                    .get(stream as usize)
+                    .is_none_or(|c| c.retransmitted_after(decoded));
+                let recover = self
+                    .acks
+                    .get()
+                    .is_some_and(|a| a.lost(stream, decoded, retransmitted));
                 if recover && let Some(f) = self.frames.get(stream as usize) {
                     let n = f.abandon(decoded);
                     debug!(
@@ -939,14 +953,63 @@ mod tests {
         });
     }
 
+    /// 报告也换算成码率控制要的（丢包率、冗余的倍数），交给平台的那一路
+    #[tokio::test(start_paused = true)]
+    async fn reports_feed_the_rate_control() {
+        use crate::flow::Feedback;
+        use airhand_proto::session::VideoReport;
+        #[derive(Default)]
+        struct Fb(Mutex<Vec<(u8, Feedback)>>);
+        impl Acks for Fb {
+            fn ack(&self, _: u8, _: u32, _: u64) {}
+            fn feedback(&self, stream: u8, fb: Feedback) {
+                self.0.lock().unwrap().push((stream, fb));
+            }
+        }
+        let c: Vec<_> = (0..2)
+            .map(|_| Arc::new(Chooser::new(VideoTransport::Fec)))
+            .collect();
+        let express = Express::new(|_| {}).with_fec(c.clone());
+        let incoming = ControllerReceiver::new(
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            oneshot::channel().1,
+            express.clone(),
+        );
+        let platform = Arc::new(Fb::default());
+        incoming.set_acks(platform.clone());
+        c[1].sent_bytes(1, 1000, 1200, true);
+        express.datagram(ControllerDatagram::Report {
+            report: VideoReport {
+                fragments: 100,
+                missing: 15,
+                ..Default::default()
+            },
+            stream: 1,
+        });
+        assert_eq!(
+            *platform.0.lock().unwrap(),
+            [(
+                1,
+                Feedback {
+                    loss: Some(0.15),
+                    overhead: 1.2
+                }
+            )]
+        );
+    }
+
     /// 控制端等不到帧了：读任务马上交给平台；平台要恢复的话，之后的帧流放弃，确认了的帧流忘掉
     #[tokio::test]
     async fn lost_frames_abandon_their_streams_when_the_platform_recovers() {
-        struct Recover(Mutex<Vec<(u8, u32)>>, bool);
+        struct Recover(Mutex<Vec<(u8, u32, bool)>>, bool);
         impl Acks for Recover {
             fn ack(&self, _: u8, _: u32, _: u64) {}
-            fn lost(&self, stream: u8, decoded: u32) -> bool {
-                self.0.lock().unwrap().push((stream, decoded));
+            fn lost(&self, stream: u8, decoded: u32, retransmitted: bool) -> bool {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((stream, decoded, retransmitted));
                 self.1
             }
         }
@@ -981,10 +1044,41 @@ mod tests {
             });
             assert_eq!(frames.len_for_test(), 3);
             express.datagram(lost(2, 1));
-            assert_eq!(*platform.0.lock().unwrap(), [(1, 2)]);
+            // 没有纠错：等不到的帧都走的是帧流，会重传
+            assert_eq!(*platform.0.lock().unwrap(), [(1, 2, true)]);
             assert_eq!(frames.len_for_test(), if recover { 1 } else { 3 });
             assert_eq!(other.len_for_test(), 4);
         }
+    }
+
+    /// 等不到的那一帧走的是纠错的数据报：告诉平台它不会重传（只能编关键帧时不用等第二次报告）
+    #[tokio::test(start_paused = true)]
+    async fn lost_fec_frames_are_not_retransmitted() {
+        #[derive(Default)]
+        struct Lost(Mutex<Vec<(u32, bool)>>);
+        impl Acks for Lost {
+            fn ack(&self, _: u8, _: u32, _: u64) {}
+            fn lost(&self, _: u8, decoded: u32, retransmitted: bool) -> bool {
+                self.0.lock().unwrap().push((decoded, retransmitted));
+                false
+            }
+        }
+        let c = Arc::new(Chooser::new(VideoTransport::Auto));
+        c.sent_bytes(3, 100, 100, false);
+        c.sent_bytes(4, 100, 300, true);
+        let express = Express::new(|_| {}).with_fec(vec![c]);
+        let incoming = ControllerReceiver::new(
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            oneshot::channel().1,
+            express.clone(),
+        );
+        let platform = Arc::new(Lost::default());
+        incoming.set_acks(platform.clone());
+        for decoded in [2, 3] {
+            express.datagram(ControllerDatagram::Lost { decoded, stream: 0 });
+        }
+        assert_eq!(*platform.0.lock().unwrap(), [(2, true), (3, false)]);
     }
 
     /// 控制端麦克风的声音数据报：读任务解开、去掉副本，一包一包按先后交给平台；丢了的从下一个数据报里补上。

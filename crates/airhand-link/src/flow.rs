@@ -3,14 +3,16 @@
 //!
 //! 端到端的拥塞控制只能在这里做：中转把 QUIC 连接拆成了两段，两段的拥塞控制各管各的。
 //!
-//! 控制端每收到一帧都确认（累积确认，几帧连着到时只确认最后一帧），确认里带着这一帧**开始到达**控制端的时刻
-//! （控制端的时钟，见 `ControllerDatagram::Ack`）。从确认里知道三件事：
+//! 控制端每收到一帧都确认（累积确认，几帧连着到时只确认最后一帧），确认里带着这一帧的**到达时刻**
+//! （控制端的时钟，见 `ControllerDatagram::Ack`）：它开始到达（第一个字节、第一块到了）和前一帧交出去这两个时刻里
+//! 晚的那个（`crate::merge` 的"到达时刻"），也就是以前画面是一条有序流时读到这一帧开头的时刻。前面的帧在等重传时，
+//! 后面的帧即使早就到了也算晚到：丢包等重传也算成排队（见下面的"到达时刻"）。从确认里知道三件事：
 //!
 //! * **往返时延**：发出到收到确认，含界面那一段（IPC、8 ms 的确认合并）。基础 RTT 是最近 [`MIN_RTT_WINDOW`]
 //!   里的最小值（单调队列实现的滑动窗口最小值）；
 //! * **排队时延**（[`FlowState::queue_delay`]）：到达时刻减去本端的发送时刻，是单向时延加上两边时钟之差（常数），
 //!   再减去它最近 [`MIN_RTT_WINDOW`] 里的最小值，就是这一帧在路上多排了多久的队（本端 QUIC 的发送缓冲、中转、
-//!   瓶颈链路的缓冲区）。不含界面那一段、确认回来的路，也不含这一帧自己要传多久（用的是开始到达的时刻）；
+//!   瓶颈链路的缓冲区，以及等前面的帧重传）。不含界面那一段、确认回来的路，也不含这一帧自己要传多久；
 //! * **带宽**：两次确认之间控制端收到了多少字节。只有这一帧发出时前面的还没传完（它排的队比两次到达的间隔还长），
 //!   这段时间链路才一直在忙，算出来的才是带宽；不然只是编码器出了多少。
 //!
@@ -24,8 +26,26 @@
 //!   每秒约 4%，不超过画质设置里的码率。画面静止、编码器用不了那么多时不加：没有证据说明网络撑得住；
 //! * 估计值变化 5% 以上才交给编码器，不用每帧都重新配置编码器。
 //!
-//! 关掉自适应码率时编码器一直用画质设置里的码率，估计照样做：在途字节还是按估计值限，网络跟不上时少发几帧，
-//! 不让延迟越积越多。
+//! **到达时刻**：只看排队，看不见不排队、直接丢包的网络。公网上（尤其家宽的上行）大流量的 UDP 常被限速
+//! （令牌桶，超了就丢），这时只看每一帧自己什么时候开始到，码率一直顶在上限，一直丢、一直等重传：在一条被限到
+//! 5 Mbps 的路上（往返 40 ms、上限 8 Mbps），帧的延迟从 35 ms 涨到 93 ms，帧率从 48 掉到 34。所以到达时刻含着等前面的帧
+//! 重传（见上），丢包马上就体现成排队、码率马上降下来，和以前一条有序流时一样。代价是丢包多、带宽却够用时码率
+//! 也降得多（随机丢 1% 时降到两成左右）：延迟优先。
+//!
+//! **丢包**（[`FlowState::feedback`]，控制端每 `airhand_proto::session::REPORT_EVERY` 报告一次画面收得怎么样，
+//! 双方都支持纠错时才有）：纠错拼回来的帧不用等重传，丢得再多也不体现成排队，所以另外看丢包率（最近一秒，
+//! 见 `crate::fec::Chooser::feedback`），和 WebRTC 的做法一样：
+//!
+//! * 超过 [`LOSS_HIGH`]：估计值乘以 `1 − 丢包率 / 2`，最多 [`LOSS_CUT_EVERY`] 一次；
+//! * 超过 [`LOSS_LOW`]：不再往上加；
+//! * 更少：不管。
+//!
+//! **纠错的冗余**：画面走纠错的数据报时，线上的字节比编码器出的多（冗余的块、数据报的头）。码率、在途字节都按线上的
+//! 算：画质设置里的码率是画面在网络上用多少，编码器拿到的是它除以冗余的倍数（[`FlowState::bitrate_kbps`]），
+//! 每一帧按编码器出的字节乘以这个倍数记在途（倍数也在报告到的时候更新）。
+//!
+//! 关掉自适应码率时编码器一直用画质设置里的码率（纠错时除以冗余的倍数），估计照样做：在途字节还是按估计值限，
+//! 网络跟不上时少发几帧，不让延迟越积越多。
 //!
 //! **在途字节**（已发送、未确认）不超过 码率 × (基础 RTT + [`QUEUE_ALLOWANCE_MS`])：码率估高了、带宽突然掉了，
 //! 网络里最多也只积压这么久的数据；编码器等着，等到了就编最新的画面。没有在途的帧时总能发一帧，关键帧再大也不会卡住。
@@ -72,6 +92,27 @@ const MIN_WINDOW_BYTES: usize = 16 * 1024;
 const RATE_SPAN_US: u64 = 1_000_000;
 /// 至少这么长（微秒）才算得出编码器用了多少码率
 const MIN_RATE_SPAN_US: u64 = 100_000;
+/// 丢包率超过这么多：降码率（见模块说明的"丢包"）
+pub const LOSS_HIGH: f64 = 0.10;
+/// 丢包率超过这么多：不再加码率
+pub const LOSS_LOW: f64 = 0.02;
+/// 因为丢包降码率至少隔这么久：报告里的丢包率是最近一秒的，同一段丢包不能降好几次
+pub const LOSS_CUT_EVERY: Duration = Duration::from_secs(1);
+/// 丢包率这么久没更新就不算数了（画面停着时控制端不报告）
+const LOSS_TTL: Duration = Duration::from_secs(3);
+/// 纠错的冗余倍数（线上的字节 / 编码器出的字节）变了这么多（比例）才用新的：编码器不用每次报告都重新配置
+const OVERHEAD_STEP: f64 = 0.05;
+/// 冗余倍数最多按这么多算（纠错最多配一倍的冗余，再加上数据报的头）
+const MAX_OVERHEAD: f64 = 3.0;
+
+/// 控制端的报告换算出来、交给码率控制的（[`FlowState::feedback`]，见模块说明的"丢包""纠错的冗余"）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Feedback {
+    /// 最近的丢包率（0～1）；量不出来（收到的太少）时为 `None`
+    pub loss: Option<f64>,
+    /// 画面在线上的字节是编码器出的多少倍（不走纠错时是 1）
+    pub overhead: f64,
+}
 
 /// `kbps` 的码率、`fps` 的帧率下平均一帧多少字节
 pub fn frame_bytes(kbps: u32, fps: u8) -> usize {
@@ -117,7 +158,7 @@ struct Sent {
 /// 一次带着到达时刻的确认
 #[derive(Debug, Clone, Copy)]
 struct Sample {
-    /// 这一帧开始到达控制端的时刻（控制端的时钟，微秒）
+    /// 这一帧的到达时刻（控制端的时钟，微秒，见模块说明）
     arrived: u64,
     /// 在它之前一共发了多少字节：流是有序的，到这个时刻控制端已经收到了这么多
     before: u64,
@@ -150,6 +191,8 @@ pub struct FlowState {
     old_path: Option<u32>,
     /// 每一帧参考哪一帧、等不到帧时怎么恢复（见 [`crate::refs`]）
     refs: Refs,
+    /// 线上的字节是编码器出的多少倍（见模块说明的"纠错的冗余"）
+    overhead: f64,
 }
 
 impl Default for FlowState {
@@ -170,6 +213,7 @@ impl Default for FlowState {
             blocked: false,
             old_path: None,
             refs: Refs::default(),
+            overhead: 1.0,
         }
     }
 }
@@ -180,6 +224,7 @@ impl FlowState {
     }
 
     fn on_sent_at(&mut self, seq: u32, bytes: usize, now: Instant) {
+        let bytes = self.wire(bytes);
         // Android shares a sequence across subscribers, so skipped numbers are
         // not in-flight frames. Never use sent - acked as the queue length.
         if self.pending.is_empty() {
@@ -196,7 +241,7 @@ impl FlowState {
         self.total += bytes as u64;
     }
 
-    /// 控制端确认到了第 `seq` 帧（累积）。`arrived`：这一帧开始到达控制端的时刻（控制端的时钟，微秒）
+    /// 控制端确认到了第 `seq` 帧（累积）。`arrived`：这一帧的到达时刻（控制端的时钟，微秒，见模块说明）
     pub fn on_ack(&mut self, seq: u32, arrived: Option<u64>) {
         self.on_ack_at(seq, arrived, Instant::now());
     }
@@ -321,12 +366,37 @@ impl FlowState {
         self.adaptive = adaptive;
     }
 
-    /// 编码器现在该用的码率（kbps，见模块说明）；不自适应时就是画质设置里的码率
+    /// 编码器现在该用的码率（kbps，见模块说明）；不自适应时就是画质设置里的码率。纠错时除以冗余的倍数
+    /// （见模块说明的"纠错的冗余"）
     pub fn bitrate_kbps(&self) -> u32 {
-        if self.adaptive {
+        let wire = if self.adaptive {
             self.rate.applied
         } else {
             self.rate.target
+        };
+        (wire as f64 / self.overhead).round() as u32
+    }
+
+    /// 编码器出的 `bytes` 字节在线上是多少字节（见模块说明的"纠错的冗余"）
+    fn wire(&self, bytes: usize) -> usize {
+        (bytes as f64 * self.overhead).round() as usize
+    }
+
+    /// 控制端的报告（见模块说明的"丢包""纠错的冗余"）
+    pub fn feedback(&mut self, fb: Feedback, now: Instant) {
+        let overhead = fb.overhead.clamp(1.0, MAX_OVERHEAD);
+        // 回到不用纠错（差不多是 1）时就是 1；不然变得够多才换
+        if overhead < 1.0 + OVERHEAD_STEP / 2.0
+            || (overhead - self.overhead).abs() >= self.overhead * OVERHEAD_STEP
+        {
+            self.overhead = if overhead < 1.0 + OVERHEAD_STEP / 2.0 {
+                1.0
+            } else {
+                overhead
+            };
+        }
+        if let Some(loss) = fb.loss {
+            self.rate.on_loss(loss, now);
         }
     }
 
@@ -358,11 +428,11 @@ impl FlowState {
         self.blocked = true;
     }
 
-    /// 能不能再发 `bytes` 字节的一帧。没有在途的帧时总能发
+    /// 能不能再发编码器出的 `bytes` 字节的一帧（在线上按冗余的倍数算）。没有在途的帧时总能发
     pub fn can_send(&self, bytes: usize) -> bool {
         self.pending.is_empty()
             || (self.pending.len() < MAX_WINDOW as usize
-                && self.pending_bytes + bytes <= self.window_bytes())
+                && self.pending_bytes + self.wire(bytes) <= self.window_bytes())
     }
 
     /// 在途的、第 `after` 帧之后的帧都作废（控制端等不到它们了，见模块说明的"等不到的帧"）：不再算在途
@@ -376,14 +446,15 @@ impl FlowState {
     }
 
     /// 控制端交给解码器的最后一帧是 `decoded`，之后的等不到了（`ControllerDatagram::Lost`）。返回 `true`：
-    /// 在途的、`decoded` 之后的帧作废了，它们的流也该放弃；`false`：恢复帧已经在路上了，重复的请求（见 [`crate::refs`]）
-    pub fn lost(&mut self, decoded: u32, now: Instant) -> bool {
+    /// 在途的、`decoded` 之后的帧作废了，它们的流也该放弃；`false`：恢复帧已经在路上了，重复的请求；或者只能编关键帧、
+    /// 等不到的帧还会重传（`retransmitted`）、这是第一次报告（见 [`crate::refs`]）
+    pub fn lost(&mut self, decoded: u32, retransmitted: bool, now: Instant) -> bool {
         let srtt = if self.srtt_ms > 0.0 {
             self.srtt_ms
         } else {
             DEFAULT_RTT_MS
         };
-        if !self.refs.lost(decoded, srtt, now) {
+        if !self.refs.lost(decoded, srtt, now, retransmitted) {
             return false;
         }
         self.abandon(decoded);
@@ -456,6 +527,10 @@ struct Rate {
     episode: Option<(u32, f64)>,
     /// 上次拥塞时量到的带宽（kbps）：估计值接近它时慢慢加
     capacity: Option<f64>,
+    /// 最近报告的丢包率和报告的时刻（见模块说明的"丢包"）
+    loss: Option<(f64, Instant)>,
+    /// 上次因为丢包降码率的时刻
+    loss_cut: Option<Instant>,
 }
 
 impl Rate {
@@ -468,7 +543,27 @@ impl Rate {
             hold: None,
             episode: None,
             capacity: None,
+            loss: None,
+            loss_cut: None,
         }
+    }
+
+    /// 报告了最近的丢包率（见模块说明的"丢包"）：太多了就降
+    fn on_loss(&mut self, loss: f64, now: Instant) {
+        self.loss = Some((loss, now));
+        if loss <= LOSS_HIGH || self.loss_cut.is_some_and(|t| now < t + LOSS_CUT_EVERY) {
+            return;
+        }
+        self.loss_cut = Some(now);
+        self.raised = None;
+        self.estimate = (self.estimate * (1.0 - loss.min(1.0) / 2.0)).max(self.floor());
+        self.apply();
+    }
+
+    /// 最近丢包不少（超过 [`LOSS_LOW`]）：不再往上加
+    fn lossy(&self, now: Instant) -> bool {
+        self.loss
+            .is_some_and(|(l, at)| l > LOSS_LOW && now < at + LOSS_TTL)
     }
 
     /// 最低降到这么多
@@ -521,7 +616,7 @@ impl Rate {
                 now.saturating_duration_since(t).as_secs_f64().min(0.2)
             });
             self.raised = Some(now);
-            if s.used.is_some_and(|u| u >= self.estimate * 0.5) {
+            if s.used.is_some_and(|u| u >= self.estimate * 0.5) && !self.lossy(now) {
                 let near = self.capacity.is_some_and(|c| self.estimate >= c * 0.9);
                 let per_sec = if near { 0.04 } else { 0.15 };
                 self.estimate =
@@ -589,8 +684,12 @@ impl Flow {
     }
 
     /// 见 [`FlowState::lost`]
-    pub fn lost(&self, decoded: u32) -> bool {
-        let abandoned = self.state.lock().unwrap().lost(decoded, Instant::now());
+    pub fn lost(&self, decoded: u32, retransmitted: bool) -> bool {
+        let abandoned = self
+            .state
+            .lock()
+            .unwrap()
+            .lost(decoded, retransmitted, Instant::now());
         self.cv.notify_all();
         abandoned
     }
@@ -661,6 +760,13 @@ impl Flow {
     /// 见 [`FlowState::bitrate_kbps`]
     pub fn bitrate_kbps(&self) -> u32 {
         self.state.lock().unwrap().bitrate_kbps()
+    }
+
+    /// 见 [`FlowState::feedback`]
+    pub fn feedback(&self, fb: Feedback) {
+        self.state.lock().unwrap().feedback(fb, Instant::now());
+        // 冗余的倍数变了，在途字节的余量跟着变
+        self.cv.notify_all();
     }
 
     /// 在途的帧有几个（测试用）
@@ -775,8 +881,14 @@ mod tests {
         }
         assert!(!f.wait_room(window / 4, &stop, Duration::ZERO));
         f.ack(seqs[0], Some(1));
-        // 控制端解到了第 2 帧（它的确认还在路上），第 3、4 帧作废
-        assert!(f.lost(seqs[1]));
+        // 控制端解到了第 2 帧（它的确认还在路上），之后的等不到了。编码器不能控制长期参考帧，只能编关键帧：
+        // 第一次报告先不管（重传多半还在路上），在途的帧照样等着
+        assert!(!f.lost(seqs[1], true));
+        assert!(!f.recovering());
+        assert_eq!(f.state.lock().unwrap().inflight(), 3);
+        // 控制端重报了：第 3、4 帧作废
+        let again = Instant::now() + crate::refs::KEY_REPEAT_MIN;
+        assert!(f.state.lock().unwrap().lost(seqs[1], true, again));
         assert_eq!(f.state.lock().unwrap().inflight(), 1);
         assert_eq!(f.state.lock().unwrap().pending_bytes, window / 4);
         // 恢复：编码器不能控制长期参考帧，编关键帧；关键帧在路上时重复的请求不算
@@ -785,7 +897,7 @@ mod tests {
         let (key, reference) = f.sent_frame(100, true, f.plan(0), None);
         assert_eq!(reference, None);
         assert!(!f.recovering());
-        assert!(!f.lost(seqs[1]));
+        assert!(!f.lost(seqs[1], true));
         assert_eq!(f.state.lock().unwrap().inflight(), 2);
         // 作废了的帧的确认（控制端跳过它们时替界面确认的）：确认了第 2 帧，不动关键帧
         f.ack(seqs[3], Some(2));
@@ -794,6 +906,85 @@ mod tests {
         assert_eq!(f.state.lock().unwrap().inflight(), 0);
         // 之后的增量帧参考关键帧
         assert_eq!(f.sent_frame(100, false, f.plan(0), None).1, Some(key));
+    }
+
+    /// 丢包：超过 LOSS_HIGH 降（每 LOSS_CUT_EVERY 最多一次），LOSS_LOW 到 LOSS_HIGH 之间不再加，少了照常加
+    #[test]
+    fn heavy_loss_cuts_and_moderate_loss_holds_the_bitrate() {
+        let mut r = Rate::new(10_000);
+        let t0 = Instant::now();
+        r.on_loss(0.2, t0);
+        assert_eq!(r.applied, 9_000);
+        // 同一段丢包的下一次报告：不再降
+        r.on_loss(0.2, t0 + LOSS_CUT_EVERY / 2);
+        assert_eq!(r.applied, 9_000);
+        r.on_loss(0.2, t0 + LOSS_CUT_EVERY);
+        assert_eq!(r.applied, 8_100);
+        // 丢得再多也不低于下限
+        for i in 2..40 {
+            r.on_loss(1.0, t0 + LOSS_CUT_EVERY * i);
+        }
+        assert_eq!(r.estimate, r.floor());
+
+        let mut r = Rate::new(10_000);
+        r.on_loss(0.2, t0);
+        let calm = |used| Signals {
+            standing: 0.0,
+            busy: None,
+            used: Some(used),
+            srtt: 50.0,
+            blocked: false,
+        };
+        let grows = |r: &mut Rate, at: Instant| {
+            let before = r.estimate;
+            r.update(at, calm(r.estimate));
+            r.update(at + Duration::from_millis(100), calm(r.estimate));
+            r.raised = None;
+            r.estimate > before
+        };
+        // 5%：不降，也不加
+        let t1 = t0 + LOSS_CUT_EVERY * 2;
+        r.on_loss(0.05, t1);
+        assert_eq!(r.applied, 9_000);
+        assert!(!grows(&mut r, t1));
+        // 不怎么丢了：照常加
+        r.on_loss(0.01, t1 + Duration::from_secs(1));
+        assert!(grows(&mut r, t1 + Duration::from_secs(1)));
+        // 丢包率很久没更新（画面停了、控制端不报告）：不算数
+        r.on_loss(0.05, t1 + Duration::from_secs(2));
+        assert!(!grows(&mut r, t1 + Duration::from_secs(2)));
+        assert!(grows(&mut r, t1 + Duration::from_secs(2) + LOSS_TTL));
+    }
+
+    /// 纠错的冗余：编码器拿到的码率除以倍数，在途按线上的字节算；倍数变得不多时不换，回到差不多 1 时就是 1
+    #[test]
+    fn fec_overhead_counts_against_the_bitrate() {
+        let mut f = FlowState::default();
+        f.set_target(8_000, false);
+        let now = Instant::now();
+        let fb = |overhead| Feedback {
+            loss: None,
+            overhead,
+        };
+        f.feedback(fb(1.25), now);
+        assert_eq!(f.bitrate_kbps(), 6_400);
+        assert_eq!(f.frame_bytes(30), frame_bytes(6_400, 30));
+        f.on_sent(1, 1_000);
+        assert_eq!(f.pending_bytes, 1_250);
+        // 在途的余量也按线上的算
+        let room = f.window_bytes() - 1_250;
+        assert!(f.can_send(room * 4 / 5));
+        assert!(!f.can_send(room * 4 / 5 + 2));
+        // 变化不到 5%：不换
+        f.feedback(fb(1.28), now);
+        assert_eq!(f.bitrate_kbps(), 6_400);
+        f.feedback(fb(1.5), now);
+        assert_eq!(f.bitrate_kbps(), 5_333);
+        // 不用纠错了
+        f.feedback(fb(1.01), now);
+        assert_eq!(f.bitrate_kbps(), 8_000);
+        f.on_ack(1, None);
+        assert_eq!(f.pending_bytes, 0);
     }
 
     #[test]

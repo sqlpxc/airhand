@@ -108,9 +108,16 @@ impl Acks for VideoAcks {
         self.shared.video.path_changed(self.id, lost);
     }
 
-    /// 控制端等不到帧了（帧流）：MediaCodec 不能控制长期参考帧，这个会话从关键帧重新加入
-    fn lost(&self, stream: u8, decoded: u32) -> bool {
-        stream == 0 && self.shared.video.lost(self.id, decoded)
+    /// 控制端等不到帧了（帧流）：MediaCodec 不能控制长期参考帧，这个会话从关键帧重新加入（同一处报告第二次才这样做）
+    fn lost(&self, stream: u8, decoded: u32, retransmitted: bool) -> bool {
+        stream == 0 && self.shared.video.lost(self.id, decoded, retransmitted)
+    }
+
+    /// 丢包率、纠错的冗余：交给这个会话的码率控制
+    fn feedback(&self, stream: u8, fb: airhand_link::flow::Feedback) {
+        if stream == 0 {
+            self.shared.video.feedback(self.id, fb);
+        }
     }
 }
 
