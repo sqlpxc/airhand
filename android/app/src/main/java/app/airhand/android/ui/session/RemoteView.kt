@@ -326,8 +326,10 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
     private var fracY = 0f
 
     /**
-     * 按着键（外接鼠标的键、触摸拖动）期间被控端隐藏过光标：松开之前一直当作隐藏。有的游戏按住键转视角时
-     * 光标一闪一闪（隐藏 / 出现来回跳），跟着它改回发位置，视角会乱跳，外接鼠标也来回抓住、放开
+     * 按着键（外接鼠标的键、触摸拖动）期间被控端隐藏过光标：松开之前一直当作隐藏。这是防御性的：万一转视角时
+     * 光标隐藏 / 出现来回跳（被控端的检测抖动、个别游戏自己在闪），跟着它改回发位置，视角会乱跳，外接鼠标也来回
+     * 抓住、放开。实际游戏里还没见过这样跳（以前魔兽世界里的反复锁定是控制台把按着的键当成了松开，见
+     * client/src/lib/input.ts 的 buttonsAfter）。代价：游戏在按着键时真的把光标显示出来，要等松开才改回发位置
      */
     private var hiddenWhilePressed = false
 

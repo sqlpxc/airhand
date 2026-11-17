@@ -148,7 +148,7 @@ test("被控端光标隐藏时：按着右键就锁定、发相对移动，松�
   input.dispose();
 });
 
-test("按着键转视角时被控端光标一闪一闪：一直锁定、发相对移动，松开所有键才解除", async (t) => {
+test("按着键时被控端光标来回跳（防御性，见 input.ts 开头）：一直锁定、发相对移动，松开所有键才解除", async (t) => {
   const batches: any[][] = [];
   const { canvas, fire } = fakeCanvas();
   t.after(fakeLockDocument(canvas));
