@@ -1302,7 +1302,6 @@ function sameView(a: StreamView[], b: StreamView[]): boolean {
 function sameQuality(a: QualitySettings, b: QualitySettings): boolean {
   return a.fps === b.fps && a.bitrateKbps === b.bitrateKbps && a.maxShort === b.maxShort
     && a.adaptive === b.adaptive && a.codec === b.codec
-    && (a.priority ?? "latency") === (b.priority ?? "latency")
     && (a.transport ?? "auto") === (b.transport ?? "auto")
     && !!a.drawCursor === !!b.drawCursor;
 }

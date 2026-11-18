@@ -20,7 +20,6 @@ import androidx.compose.material.icons.outlined.Navigation
 import androidx.compose.material.icons.outlined.NetworkCheck
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Smartphone
-import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
@@ -52,7 +51,6 @@ import app.airhand.android.R
 import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Preset
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.VideoTransport
 import app.airhand.android.data.TouchMode
 import app.airhand.android.host.HostService
@@ -127,7 +125,6 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
 
         SectionTitle(stringResource(R.string.settings_remote))
         Item(Icons.Outlined.HighQuality, stringResource(R.string.default_quality), presetName(Preset.of(s.preset))) { dialog = "preset" }
-        Item(Icons.Outlined.Speed, stringResource(R.string.scaling_priority), priorityName(VideoPriority.fromWire(s.priority))) { dialog = "priority" }
         Item(Icons.Outlined.NetworkCheck, stringResource(R.string.loss_recovery), transportName(VideoTransport.fromWire(s.transport))) { dialog = "transport" }
         Item(Icons.Outlined.Gesture, stringResource(R.string.touch_mode), touchModeName(s.touchMode)) { dialog = "mode" }
         Toggle(Icons.AutoMirrored.Outlined.VolumeUp, stringResource(R.string.play_audio), stringResource(R.string.play_audio_desc), s.audio) { v ->
@@ -247,22 +244,6 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 app.updateSettings { it.copy(preset = p.id) }
             },
         )
-        "priority" -> ChoiceDialog(
-            title = stringResource(R.string.scaling_priority),
-            options = VideoPriority.entries,
-            selected = VideoPriority.fromWire(s.priority),
-            label = { p ->
-                Column {
-                    Text(priorityName(p))
-                    Text(priorityDesc(p), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            },
-            onDismiss = { dialog = null },
-            onSelect = { p ->
-                dialog = null
-                app.updateSettings { it.copy(priority = p.wire) }
-            },
-        )
         "transport" -> ChoiceDialog(
             title = stringResource(R.string.loss_recovery),
             options = VideoTransport.entries,
@@ -376,22 +357,6 @@ fun presetDesc(p: Preset): String = stringResource(
         Preset.SMOOTH -> R.string.preset_smooth_desc
         Preset.HD -> R.string.preset_hd_desc
         Preset.NATIVE -> R.string.preset_native_desc
-    },
-)
-
-@Composable
-fun priorityName(p: VideoPriority): String = stringResource(
-    when (p) {
-        VideoPriority.LATENCY -> R.string.priority_latency
-        VideoPriority.CLARITY -> R.string.priority_clarity
-    },
-)
-
-@Composable
-fun priorityDesc(p: VideoPriority): String = stringResource(
-    when (p) {
-        VideoPriority.LATENCY -> R.string.priority_latency_desc
-        VideoPriority.CLARITY -> R.string.priority_clarity_desc
     },
 )
 

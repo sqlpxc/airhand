@@ -76,8 +76,6 @@ data class Settings(
     val avSync: Boolean = false,
     /** 视频编码格式：空字符串表示自动（双方都支持的压缩率最高的格式），否则是 `Codec.wire` */
     val codec: String = "",
-    /** 对方缩小画面时优先低延迟还是文字清晰（`VideoPriority.wire`）；会话里改了也记在这里，以后的连接也用 */
-    val priority: String = "latency",
     /** 丢包时画面怎么恢复（`VideoTransport.wire`：自动 / 重传 / 纠错）；会话里改了也记在这里，以后的连接也用 */
     val transport: String = "auto",
     /** 电视上画面的缩放方式 */
@@ -115,7 +113,6 @@ data class Settings(
         .put("audio", audio)
         .put("avSync", avSync)
         .put("codec", codec)
-        .put("priority", priority)
         .put("transport", transport)
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
@@ -138,7 +135,6 @@ data class Settings(
                 audio = o.optBoolean("audio", d.audio),
                 avSync = o.optBoolean("avSync", d.avSync),
                 codec = o.optString("codec", d.codec),
-                priority = o.optString("priority", d.priority),
                 transport = o.optString("transport", d.transport),
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),

@@ -4,7 +4,7 @@
 //!
 //! * **GPU 上**（[`GpuFrame`]）：Windows 的桌面复制把画面复制进自己的纹理，macOS 的 ScreenCaptureKit 直接按编码尺寸
 //!   输出 NV12。硬件编码器直接用（见 `encoder` 的"GPU 零拷贝"），画面不离开显卡；
-//! * **内存里**：X11、macOS 的原始分辨率 BGRA，以及 GPU 上的画面第一次要用像素时读回来的（CPU 缩放、软件编码，
+//! * **内存里**：X11 的 BGRA，以及 GPU 上的画面第一次要用像素时读回来的（CPU 缩放、软件编码，
 //!   见 [`Frame::pixels`]）。读回的结果留在这一帧里，几个会话共用。
 //!
 //! # 带光标的画面
@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use airhand_proto::session::{CursorShape, CursorVisibility, DisplayInfo, Notice, QualitySettings};
+use airhand_proto::session::{CursorShape, CursorVisibility, DisplayInfo, Notice};
 use anyhow::{Result, anyhow};
 use tracing::{info, warn};
 
@@ -448,42 +448,8 @@ trait Capturer {
     fn set_fps(&mut self, _fps: u8) {}
 }
 
-/// 订阅者要什么样的画面。同一个显示器、同一种画面的订阅者共用一路采集
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Output {
-    /// 原始分辨率（Windows 上在 GPU 上，编码器自己在 GPU 上缩放）
-    Native,
-    /// 系统采集时就按这个短边上限缩放好（见 `encoder::target_size`），直接输出编码器要的 NV12，在 GPU 上
-    ///（macOS 的 ScreenCaptureKit，见 sck.rs）。别的平台没有这种，当作 `Native`
-    Scaled(u16),
-}
-
-/// 按画质设置该订阅哪种画面。
-///
-/// macOS：低延迟优先时让系统直接缩放成编码尺寸的 NV12；清楚优先、而且需要缩小时要原始分辨率的 BGRA，
-/// 在 CPU 上缩放（见 `encoder` 的说明）。不用缩放时两种一样，都用系统输出的 NV12。
-pub fn output_for(index: u8, s: &QualitySettings) -> Output {
-    #[cfg(target_os = "macos")]
-    {
-        use airhand_proto::session::VideoPriority;
-        if s.priority.or_latency() == VideoPriority::Clarity
-            && let Ok(d) = super::macos::display(index)
-            && super::encoder::needs_scaling(d.width, d.height, s.max_short)
-        {
-            return Output::Native;
-        }
-        Output::Scaled(s.max_short)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (index, s);
-        Output::Native
-    }
-}
-
-/// 一路采集是什么：哪个显示器、哪种画面、系统画不画光标（只有 macOS 会是 true，见模块说明）。
-/// 同样的订阅者共用一路
-type Key = (u8, Output, bool);
+/// 哪个显示器、采集时的短边上限、系统画不画光标。后两项只影响 macOS，其余平台同一显示器共用一路采集
+type Key = (u8, u16, bool);
 
 /// 一个订阅者要什么
 #[derive(Clone, Copy)]
@@ -554,15 +520,14 @@ static HUB: LazyLock<Mutex<Hub>> = LazyLock::new(Default::default);
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
 
 /// 订阅显示器画面。若该显示器已在按同样的方式采集则直接复用。
+/// `max_short`：macOS 让系统按这个短边上限直接交付 NV12；其余平台由编码器缩放。
 /// `draw`：要带光标的画面（见模块说明，读的时候给 [`FrameSlot::wait_change`] 和 [`FrameSlot::try_newer`] 也带上它）
-pub fn subscribe(index: u8, fps: u8, output: Output, draw: bool) -> Subscription {
-    #[cfg(not(target_os = "macos"))]
-    let output = {
-        let _ = output;
-        Output::Native
+pub fn subscribe(index: u8, fps: u8, max_short: u16, draw: bool) -> Subscription {
+    let key = if cfg!(target_os = "macos") {
+        (index, max_short, draw)
+    } else {
+        (index, 0, false)
     };
-    // macOS 的光标由系统画进采集到的画面里：要不要光标各开一路；别的平台一路采集两种都出
-    let key = (index, output, cfg!(target_os = "macos") && draw);
     let want = Want { fps, draw };
     let mut hub = HUB.lock().unwrap();
     let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
@@ -591,8 +556,8 @@ pub fn subscribe(index: u8, fps: u8, output: Output, draw: bool) -> Subscription
 const REPORT_AFTER: u32 = 4;
 
 fn capture_loop(shared: Arc<CaptureShared>) {
-    let (index, output, system_cursor) = shared.key;
-    info!(screen = index, ?output, system_cursor, "capture started");
+    let (index, max_short, system_cursor) = shared.key;
+    info!(screen = index, max_short, system_cursor, "capture started");
     raise_priority();
     // 采集线程整体使用物理像素坐标
     #[cfg(windows)]
@@ -610,7 +575,7 @@ fn capture_loop(shared: Arc<CaptureShared>) {
     while !shared.stop.load(Ordering::Acquire) {
         let c = match cap.as_mut() {
             Some(c) => c,
-            None => match open(index, shared.max_fps(), output, system_cursor) {
+            None => match open(index, shared.max_fps(), max_short, system_cursor) {
                 Ok(c) => {
                     failures = 0;
                     fps = shared.max_fps();
@@ -705,24 +670,24 @@ pub(crate) fn wire_detail(e: &anyhow::Error) -> String {
 
 /// `cursor`：让系统把光标画进采集到的画面里（macOS，见模块说明）；别的平台总是 false
 #[cfg(windows)]
-fn open(index: u8, _fps: u8, _output: Output, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(index: u8, _fps: u8, _max_short: u16, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     Ok(Box::new(dxgi::DxgiCapturer::open(index)?))
 }
 
 #[cfg(target_os = "linux")]
-fn open(index: u8, _fps: u8, _output: Output, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(index: u8, _fps: u8, _max_short: u16, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     Ok(Box::new(x11::X11Capturer::open(index)?))
 }
 
 #[cfg(target_os = "macos")]
-fn open(index: u8, fps: u8, output: Output, cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(index: u8, fps: u8, max_short: u16, cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     Ok(Box::new(sck::SckCapturer::open(
-        index, fps, output, cursor,
+        index, fps, max_short, cursor,
     )?))
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn open(_index: u8, _fps: u8, _output: Output, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(_index: u8, _fps: u8, _max_short: u16, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     anyhow::bail!("screen capture isn't supported on this platform yet")
 }
 
@@ -832,8 +797,8 @@ mod tests {
     fn drawn_channel() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let raw = super::subscribe(0, 30, super::Output::Native, false);
-        let drawn = super::subscribe(0, 30, super::Output::Native, true);
+        let raw = super::subscribe(0, 30, 1080, false);
+        let drawn = super::subscribe(0, 30, 720, true);
         assert!(Arc::ptr_eq(&raw.shared, &drawn.shared), "one capture");
         let (seq, _) = drawn
             .slot()

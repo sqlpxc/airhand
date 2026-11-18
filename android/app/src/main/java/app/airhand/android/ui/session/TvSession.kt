@@ -33,7 +33,6 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.NetworkCheck
-import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.automirrored.outlined.VolumeOff
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material3.AlertDialog
@@ -73,12 +72,10 @@ import app.airhand.android.core.Code
 import app.airhand.android.core.Codec
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.VideoTransport
 import app.airhand.android.data.ScaleMode
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.phone.presetName
-import app.airhand.android.ui.phone.priorityName
 import app.airhand.android.ui.phone.transportName
 import app.airhand.android.ui.theme.Brand
 import kotlinx.coroutines.delay
@@ -334,14 +331,7 @@ private fun TvMenu(
         val preset = Preset.match(q) ?: Preset.DEFAULT
         TvMenuItem(Icons.Outlined.HighQuality, stringResource(R.string.menu_quality), presetName(preset)) {
             val next = Preset.entries[(Preset.entries.indexOf(preset) + 1) % Preset.entries.size]
-            session.setQuality(next.quality(q.codec, q.priority, q.transport))
-        }
-        // 缩放优先（低延迟 / 文字清晰）：对方是电脑时才有区别；选择会记下来
-        if (hello?.platform != OsKind.ANDROID) {
-            TvMenuItem(Icons.Outlined.Speed, stringResource(R.string.scaling_priority), priorityName(q.priority)) {
-                val all = VideoPriority.entries
-                session.setPriority(all[(all.indexOf(q.priority) + 1) % all.size])
-            }
+            session.setQuality(next.quality(q.codec, q.transport))
         }
         // 丢包恢复（自动 / 重传 / 纠错）：按一下换一个；选择会记下来
         TvMenuItem(Icons.Outlined.NetworkCheck, stringResource(R.string.loss_recovery), transportName(q.transport)) {

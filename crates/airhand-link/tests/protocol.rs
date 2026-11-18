@@ -12,7 +12,7 @@ use airhand_link::controller::{Command, ConnectOptions};
 use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
     Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, StreamView,
-    SystemAction, TouchPhase, VideoPriority, VideoTransport,
+    SystemAction, TouchPhase, VideoTransport,
 };
 use serde_json::{Value, json};
 
@@ -66,8 +66,6 @@ fn settings() -> QualitySettings {
         max_short: 1080,
         adaptive: true,
         codec: Codec::H265,
-        // 界面不带优先项时是低延迟（之前的界面、Android 都不带）
-        priority: VideoPriority::Latency,
         // 不带传输方式时是自动（之前的界面不带；自动也不带）
         transport: VideoTransport::Auto,
         // 不带时不把光标画进画面（Android 不带）
@@ -380,19 +378,6 @@ fn json_shapes_roundtrip() {
         assert_eq!(parsed, cmd);
         assert_eq!(parsed.sid(), 3);
     }
-    // 清楚优先：界面（桌面、网页、Android）只在选了它时带 priority
-    let mut sharp = json!({ "cmd": "settings", "sid": 3, "settings": serde_json::to_value(settings()).unwrap() });
-    sharp["settings"]["priority"] = json!("clarity");
-    assert_eq!(
-        serde_json::from_value::<Command>(sharp).unwrap(),
-        Command::Settings {
-            sid: 3,
-            settings: QualitySettings {
-                priority: VideoPriority::Clarity,
-                ..settings()
-            },
-        }
-    );
     // 画面的传输方式：界面只在不是自动时带 transport（"streams" / "fec"）
     for (name, transport) in [
         ("streams", VideoTransport::Streams),

@@ -104,7 +104,6 @@ import app.airhand.android.core.Codec
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
 import app.airhand.android.core.SystemAction
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.VideoTransport
 import app.airhand.android.data.TouchMode
 import app.airhand.android.ui.ConfirmDialog
@@ -112,8 +111,6 @@ import app.airhand.android.ui.Messages
 import app.airhand.android.ui.OsAvatar
 import app.airhand.android.ui.phone.presetDesc
 import app.airhand.android.ui.phone.presetName
-import app.airhand.android.ui.phone.priorityDesc
-import app.airhand.android.ui.phone.priorityName
 import app.airhand.android.ui.phone.transportDesc
 import app.airhand.android.ui.phone.transportName
 import app.airhand.android.ui.theme.Brand
@@ -713,7 +710,7 @@ private fun Quality(session: RemoteSession) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .clickable { session.setQuality(p.quality(q.codec, q.priority, q.transport)) }
+                .clickable { session.setQuality(p.quality(q.codec, q.transport)) }
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -725,27 +722,7 @@ private fun Quality(session: RemoteSession) {
             }
         }
     }
-    // 缩放优先：对方是电脑时才有区别（手机自己缩放、编码）
-    if (hello?.platform != OsKind.ANDROID) {
-        HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
-        Text(stringResource(R.string.scaling_priority), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-        FlowRow(Modifier.padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            VideoPriority.entries.forEach { p ->
-                FilterChip(
-                    selected = q.priority == p,
-                    onClick = { session.setPriority(p) },
-                    label = { Text(priorityName(p)) },
-                )
-            }
-        }
-        Text(
-            priorityDesc(q.priority),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
-        )
-    }
-    // 丢包恢复：自动 / 重传 / 纠错（对方是手机也一样有）
+    // 丢包恢复：自动 / 重传 / 纠错
     HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
     Text(stringResource(R.string.loss_recovery), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
     FlowRow(Modifier.padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

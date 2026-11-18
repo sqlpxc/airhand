@@ -971,7 +971,6 @@ mod tests {
                 max_short: 1080,
                 adaptive: true,
                 codec: Codec::AV1,
-                priority: Default::default(),
                 transport: Default::default(),
                 draw_cursor: false,
             }

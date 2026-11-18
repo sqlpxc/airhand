@@ -202,18 +202,26 @@ fn fec_formats_keep_their_wire_encoding() {
     assert_eq!(hex(&framing::to_vec(&first)), "82048185183c0219012c0401");
     let second = ControllerDatagram::Report { report, stream: 2 };
     assert_eq!(hex(&framing::to_vec(&second)), "82048285183c0219012c040102");
-    // 传输方式是画质设置的第 6 项；自动不写。写了传输方式时，前面低延迟的优先项也占着它那一位（0）
+    // 传输方式是画质设置的第 6 项，光标是第 7 项；尾部默认值不写
     let q = QualitySettings {
         transport: VideoTransport::Fec,
         ..QualitySettings::default()
     };
     assert_eq!(
         hex(&framing::to_vec(&ControllerMsg::Settings(q))),
-        "82038187181e190fa0190438f5000002"
+        "82038186181e190fa0190438f50002"
     );
     let auto = QualitySettings::default();
     assert_eq!(
         hex(&framing::to_vec(&ControllerMsg::Settings(auto))),
         "82038185181e190fa0190438f500"
+    );
+    let cursor = QualitySettings {
+        draw_cursor: true,
+        ..auto
+    };
+    assert_eq!(
+        hex(&framing::to_vec(&ControllerMsg::Settings(cursor))),
+        "82038187181e190fa0190438f50000f5"
     );
 }

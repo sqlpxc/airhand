@@ -176,11 +176,9 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
-    // 要哪种画面取决于画质设置（macOS 让系统直接缩放，见 capture::output_for），设置变了可能要换一路采集
-    let mut output = capture::output_for(screen, &settings);
     // 控制端的游戏模式要光标画进画面：读带光标的那一路（见 capture 的"带光标的画面"）
     let mut draw = settings.draw_cursor;
-    let mut sub = capture::subscribe(screen, settings.fps, output, draw);
+    let mut sub = capture::subscribe(screen, settings.fps, settings.max_short, draw);
     let mut enc: Option<Encoder> = None;
     // 硬件编码器连续失败时改用软件编码；GPU 零拷贝连续失败时硬件编码器改用内存里的画面
     let mut hw_failures = 0u32;
@@ -207,23 +205,23 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
         let v = ctrl.settings_ver.load(Ordering::Acquire);
         if v != ver {
             ver = v;
+            let prev_short = settings.max_short;
             settings = *ctrl.settings.lock().unwrap();
-            let want = capture::output_for(screen, &settings);
-            if want != output || settings.draw_cursor != draw {
+            // 只有 macOS 在采集时缩放，其余平台改分辨率不用换采集
+            let resized = cfg!(target_os = "macos") && settings.max_short != prev_short;
+            if resized || settings.draw_cursor != draw {
                 // 换一路采集：旧的画面不再用，等新的一路的第一帧（采集一开始就会给）；光标状态重新发。
                 // 只是要不要光标变了：画面只差一个光标，接着编增量帧，不用关键帧
                 info!(
-                    ?output,
-                    ?want,
+                    max_short = settings.max_short,
                     draw = settings.draw_cursor,
                     "switching the capture"
                 );
-                if want != output {
+                if resized {
                     ctrl.force_key.store(true, Ordering::Release);
                 }
-                output = want;
                 draw = settings.draw_cursor;
-                sub = capture::subscribe(screen, settings.fps, output, draw);
+                sub = capture::subscribe(screen, settings.fps, settings.max_short, draw);
                 (frame_seq, cursor_seq, shape_seq) = (0, 0, 0);
                 last_frame = None;
                 refine_left = 0;

@@ -20,12 +20,6 @@ import type { Lang } from "./i18n";
 export type Codec = "h264" | "h265" | "av1";
 
 /**
- * 被控端缩放画面时优先什么（airhand_proto::session::VideoPriority）：
- * latency：在显卡上缩放，画面不经过 CPU；clarity：在 CPU 上用更锐利的算法缩放。不需要缩放时一样
- */
-export type VideoPriority = "latency" | "clarity";
-
-/**
  * 画面怎么传（airhand_proto::session::VideoTransport）：auto 由被控端看网络情况选（默认）；streams 丢了的包重传；
  * fec 增量帧走数据报、每帧多发几块冗余，丢了几块也拼得回来，不等重传。对方的版本旧时总是重传
  */
@@ -39,8 +33,6 @@ export interface QualitySettings {
   maxShort: number;
   adaptive: boolean;
   codec: Codec;
-  /** 不带（之前保存的画质、Android）就是 latency */
-  priority?: VideoPriority;
   /** 不带（之前保存的画质）就是 auto */
   transport?: VideoTransport;
   /**

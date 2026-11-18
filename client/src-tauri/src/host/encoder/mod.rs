@@ -12,9 +12,7 @@
 //!   `MFCreateDXGISurfaceBuffer` 直接交给硬件 MFT（见 mf.rs）；macOS 的 ScreenCaptureKit 采集时就按编码尺寸输出 NV12，
 //!   `CVPixelBuffer` 原样交给 VideoToolbox（见 vt.rs、`capture/sck.rs`）。省掉了读回、大块拷贝、CPU 缩放和色彩转换
 //!   （4K、Retina 屏上这些加起来每帧十几毫秒）；
-//! * **CPU**：BGRA →（SIMD 缩放，分条多线程）→（SIMD 色彩转换）YUV 4:2:0。软件编码、Linux、显卡不支持时走这条路；
-//!   画质设置选了清楚优先（[`VideoPriority::Clarity`]）、而且需要缩小时也走这条路：GPU 的缩放滤镜由驱动决定，
-//!   缩小很多时文字不一定有 Catmull-Rom 清楚。
+//! * **CPU 回退**：软件编码、Linux 或显卡不支持零拷贝时，读出 BGRA，按需缩放并转换成 YUV 4:2:0。
 
 #[cfg(windows)]
 mod mf;
@@ -24,7 +22,7 @@ mod vt;
 
 use std::sync::OnceLock;
 
-use airhand_proto::session::{Codec, EncoderInfo, QualitySettings, VideoPriority};
+use airhand_proto::session::{Codec, EncoderInfo, QualitySettings};
 use anyhow::{Context, Result, anyhow, bail};
 use fast_image_resize as fir;
 use tracing::info;
@@ -68,8 +66,6 @@ fn resize_striped(
     let n = (resizers.len() as u32).min(h / MIN_STRIPE_ROWS).max(1);
     let rows = h.div_ceil(n);
     let scale = src_h as f64 / h as f64;
-    // 缩小用 Catmull-Rom 卷积：文字边缘比双线性清晰得多。Retina 屏（例如 2880×1800）缩到 1080p
-    // 是 0.6 这样的非整数倍，macOS 的细字体用双线性缩完明显发虚（单线程时 Catmull-Rom 比双线性慢约 60%）
     let job = |r: &mut fir::Resizer, y0: u32, band: &mut [u8]| -> Result<()> {
         let rows = (band.len() / (w as usize * 4)) as u32;
         let mut img = fir::images::Image::from_slice_u8(w, rows, band, fir::PixelType::U8x4)
@@ -148,12 +144,6 @@ pub trait VideoEncoder {
     fn encode_gpu(&mut self, _frame: &GpuFrame, _force_key: bool) -> Result<Option<EncodedFrame>> {
         bail!("this encoder only takes frames in memory")
     }
-}
-
-/// 采集的 `src_w`×`src_h` 在这个短边上限下要不要缩放（只是奇数尺寸多出来的 1 像素不算，裁掉就行）
-pub fn needs_scaling(src_w: u32, src_h: u32, max_short: u16) -> bool {
-    let (w, h) = target_size(src_w, src_h, max_short);
-    !crop_only((src_w, src_h), (w, h))
 }
 
 fn crop_only((src_w, src_h): (u32, u32), (w, h): (u32, u32)) -> bool {
@@ -243,7 +233,6 @@ pub struct Encoder {
     fps: u8,
     max_short: u16,
     codec: Codec,
-    priority: VideoPriority,
     /// 创建时画面来自哪一路 GPU 采集（[`GpuFrame::source`]）。采集重新打开了就重建：
     /// GPU 零拷贝的编码器只能处理创建时那个设备上的画面，内存里的编码器也趁这个机会试试 GPU 零拷贝
     source: Option<u64>,
@@ -253,7 +242,7 @@ pub struct Encoder {
 
 impl Encoder {
     /// 为 `frame` 这样的画面创建编码器：按"请求的格式硬件 → H.264 硬件 → OpenH264"顺序尝试。
-    /// 画面在 GPU 上、`allow_gpu` 而且不是"清楚优先并且要缩小"时，硬件编码器先试 GPU 零拷贝（见模块说明）。
+    /// 画面在 GPU 上且 `allow_gpu` 时，硬件编码器先试 GPU 零拷贝（见模块说明）。
     ///
     /// 格式的优先级（AV1 > HEVC > H.264）由控制端按双方都支持的格式来选（见 [`available_codecs`]），
     /// 这里不自作主张改用别的高效格式：控制端不一定能解码，只有 H.264 是双方都一定支持的。
@@ -266,12 +255,7 @@ impl Encoder {
     ) -> Result<Self> {
         let (src_w, src_h) = (frame.width, frame.height);
         let (w, h) = target_size(src_w, src_h, s.max_short);
-        let priority = s.priority.or_latency();
-        // 清楚优先、又要缩小：在 CPU 上用 Catmull-Rom 缩放
-        let gpu = frame.gpu.as_ref().filter(|_| {
-            allow_gpu
-                && (priority == VideoPriority::Latency || !needs_scaling(src_w, src_h, s.max_short))
-        });
+        let gpu = frame.gpu.as_ref().filter(|_| allow_gpu);
         #[allow(unused_mut)]
         let mut inner: Option<Box<dyn VideoEncoder>> = None;
 
@@ -315,7 +299,6 @@ impl Encoder {
             fps: s.fps,
             max_short: s.max_short,
             codec: s.codec,
-            priority,
             source: frame.gpu.as_ref().map(GpuFrame::source),
             gpu,
         })
@@ -329,7 +312,6 @@ impl Encoder {
             && self.fps == s.fps
             && self.max_short == s.max_short
             && self.codec == s.codec
-            && self.priority == s.priority.or_latency()
     }
 
     pub fn info(&self) -> &EncoderInfo {
@@ -414,17 +396,6 @@ pub(crate) fn annexb_nal_types(data: &[u8], hevc: bool) -> impl Iterator<Item = 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scaling_needed() {
-        assert!(!needs_scaling(1920, 1080, 1080));
-        assert!(!needs_scaling(1921, 1081, 0));
-        assert!(!needs_scaling(1280, 720, 1080));
-        assert!(needs_scaling(3840, 2160, 1080));
-        assert!(needs_scaling(2880, 1800, 1080));
-        // 不限制也要缩到编码器的上限以内
-        assert!(needs_scaling(5120, 2880, 0));
-    }
 
     #[test]
     fn sizes() {

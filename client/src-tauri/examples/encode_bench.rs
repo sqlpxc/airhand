@@ -1,69 +1,47 @@
-//! 编码的基准：采集第一个显示器 3 秒，用各种编码器、分辨率、画面来路（GPU 零拷贝 / CPU 缩放）编码同一批画面。
+//! 编码的基准：采集第一个显示器，测量各种编码器、分辨率下的每帧编码时间。
 //! `cargo run --release --example encode_bench`
 //!
 //! 每帧都当作新画面（重新读回内存），和画面一直在变时一样。时间是交给编码器到拿到码流（同步的），
 //! 包括 CPU 路径上的读回、缩放、色彩转换。
 use airhand_lib::host::{capture, encoder::Encoder};
-use airhand_proto::session::{Codec, QualitySettings, VideoPriority};
+use airhand_proto::session::{Codec, QualitySettings};
 use std::time::{Duration, Instant};
+
 fn main() {
-    let sub = capture::subscribe(0, 60, capture::Output::Native, false);
-    sub.slot()
-        .wait_change(0, u64::MAX, Duration::from_secs(3), false);
-    let (_, f) = sub.slot().try_newer(0, false).expect("capture");
-    println!(
-        "screen {}x{} ({})",
-        f.width,
-        f.height,
-        if f.gpu.is_some() {
-            "on the GPU"
-        } else {
-            "in memory"
-        }
-    );
-    let mut frames = vec![f.clone()];
-    let mut seq = 0;
-    let t = Instant::now();
-    while frames.len() < 30 && t.elapsed() < Duration::from_secs(3) {
-        sub.slot()
-            .wait_change(seq, u64::MAX, Duration::from_millis(50), false);
-        if let Some((s, f)) = sub.slot().try_newer(seq, false) {
-            seq = s;
-            frames.push(f);
-        } else {
-            frames.push(frames.last().unwrap().clone());
-        }
-    }
-    use VideoPriority::{Clarity, Latency};
-    for (codec, hw, max_short, priority) in [
-        (Codec::H264, false, 1080, Clarity),
-        (Codec::H264, true, 1080, Clarity),
-        (Codec::H264, true, 1080, Latency),
-        (Codec::H265, true, 1080, Clarity),
-        (Codec::H265, true, 1080, Latency),
-        (Codec::AV1, true, 1080, Clarity),
-        (Codec::AV1, true, 1080, Latency),
-        (Codec::H264, true, 0, Clarity),
-        (Codec::H264, true, 0, Latency),
-        (Codec::AV1, true, 0, Latency),
+    for (codec, hw, max_short) in [
+        (Codec::H264, false, 1080),
+        (Codec::H264, true, 1080),
+        (Codec::H265, true, 1080),
+        (Codec::AV1, true, 1080),
+        (Codec::H264, true, 0),
+        (Codec::AV1, true, 0),
     ] {
+        let sub = capture::subscribe(0, 60, max_short, false);
+        sub.slot()
+            .wait_change(0, u64::MAX, Duration::from_secs(3), false);
+        let (mut seq, mut f) = sub.slot().try_newer(0, false).expect("capture");
         let s = QualitySettings {
             codec,
             max_short,
             fps: 60,
-            priority,
             ..Default::default()
         };
         let mut e = Encoder::new(&f, &s, 6000, hw, true).unwrap();
-        let first = frames[0].uncached();
+        let first = f.uncached();
         let t = Instant::now();
         let k = e.encode(&first, true).unwrap().unwrap();
         let key_ms = t.elapsed().as_secs_f64() * 1e3;
         let mut total = 0;
         let mut tt = Vec::new();
         let mut n = 0;
-        for fr in &frames[1..] {
-            let fr = fr.uncached();
+        // 系统的帧缓冲池有限（ScreenCaptureKit）：逐帧取样，不持有整批 GPU 帧
+        for _ in 1..30 {
+            sub.slot()
+                .wait_change(seq, u64::MAX, Duration::from_millis(50), false);
+            if let Some(newer) = sub.slot().try_newer(seq, false) {
+                (seq, f) = newer;
+            }
+            let fr = f.uncached();
             let t = Instant::now();
             if let Some(o) = e.encode(&fr, false).unwrap() {
                 total += o.data.len();

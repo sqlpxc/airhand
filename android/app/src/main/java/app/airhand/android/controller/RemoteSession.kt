@@ -20,7 +20,6 @@ import app.airhand.android.core.Quality
 import app.airhand.android.core.ServerState
 import app.airhand.android.core.Stats
 import app.airhand.android.core.SystemAction
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.VideoTransport
 import app.airhand.android.core.optStringOrNull
 import kotlinx.coroutines.CoroutineScope
@@ -113,7 +112,6 @@ class RemoteSession(
     val quality = MutableStateFlow(
         Preset.of(app.settings.value.preset).quality(
             VideoDecoder.decodable.firstOrNull { it in Codec.PRIORITY } ?: Codec.H264,
-            VideoPriority.fromWire(app.settings.value.priority),
             VideoTransport.fromWire(app.settings.value.transport),
         ),
     )
@@ -632,12 +630,6 @@ class RemoteSession(
         val host = hello.value?.codecs ?: return
         val next = pickCodec(host)
         if (quality.value.codec != next) setQuality(quality.value.copy(codec = next))
-    }
-
-    /** 对方缩小画面时优先低延迟还是文字清晰：记进设置，以后的会话也用它 */
-    fun setPriority(p: VideoPriority) {
-        app.updateSettings { it.copy(priority = p.wire) }
-        if (quality.value.priority != p) setQuality(quality.value.copy(priority = p))
     }
 
     /** 丢包时画面怎么恢复（自动 / 重传 / 纠错）：记进设置，以后的会话也用它 */

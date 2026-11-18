@@ -561,35 +561,6 @@ impl Codec {
 }
 
 open_enum! {
-    /// 被控端缩放画面时优先什么（[`QualitySettings::priority`]）。只在需要缩放时有区别：
-    /// 不缩放时两种都在 GPU 上转换颜色（画质一样）
-    #[derive(Default)]
-    pub enum VideoPriority {
-        /// 延迟低、被控端 CPU 占用低：显卡能缩放就在显卡上缩放、转换颜色，画面不离开显卡，直接交给硬件编码器。
-        /// 显卡的缩放滤镜由驱动决定，缩小很多时（4K、Retina 屏缩到 1080p）文字不一定有 CPU 缩放清楚
-        #[default]
-        Latency = 0 => "latency",
-        /// 文字清楚：画面读回内存，在 CPU 上用 Catmull-Rom 卷积缩放（4K 缩到 1080p 每帧多十几毫秒，CPU 占用也高）
-        Clarity = 1 => "clarity",
-    }
-}
-
-impl VideoPriority {
-    fn is_latency(&self) -> bool {
-        *self == VideoPriority::Latency
-    }
-
-    /// 不认识的值（对方版本新增的）按低延迟处理
-    pub fn or_latency(self) -> Self {
-        if self.is_known() {
-            self
-        } else {
-            VideoPriority::Latency
-        }
-    }
-}
-
-open_enum! {
     /// 画面怎么传（[`QualitySettings::transport`]，见模块说明的"前向纠错"）。只管增量帧：关键帧、恢复帧总是走帧流
     #[derive(Default)]
     pub enum VideoTransport {
@@ -837,20 +808,14 @@ pub struct QualitySettings {
     /// 期望的编码格式（被控端不支持时自动回退到 H.264；不认识的格式也是 H.264，见 [`QualitySettings::sanitized`]）
     #[n(4)]
     pub codec: Codec,
-    /// 缩放画面时优先低延迟还是清楚。低延迟（默认）不写进线上的数组，和之前的版本发的字节一样；
-    /// 之前的版本不发这一项，也就是低延迟
-    #[cbor(n(5), skip_if = "VideoPriority::is_latency")]
-    #[serde(default)]
-    pub priority: VideoPriority,
-    /// 画面怎么传：重传还是前向纠错（见模块说明的"前向纠错"）。自动（默认）不写进线上的数组；
-    /// 之前的版本不发这一项，也就是自动
-    #[cbor(n(6), skip_if = "VideoTransport::is_auto")]
+    /// 画面怎么传：重传还是前向纠错（见模块说明的"前向纠错"）。自动（默认）不写进线上的数组
+    #[cbor(n(5), skip_if = "VideoTransport::is_auto")]
     #[serde(default)]
     pub transport: VideoTransport,
     /// 把被控端的光标画进画面里（控制端的游戏模式，见模块说明的"鼠标"）：光标显示着、在这一路的显示器上时画上去，
     /// 光标单独移动（画面没变）也出新的一帧。隐藏了就不画；已经是画面里的软件光标（[`CursorVisibility::InFrame`]）
     /// 也不再画一遍。不画（默认）不写进线上的数组
-    #[cbor(n(7), skip_if = "is_false")]
+    #[cbor(n(6), skip_if = "is_false")]
     #[serde(default)]
     pub draw_cursor: bool,
 }
@@ -867,7 +832,6 @@ impl Default for QualitySettings {
             max_short: 1080,
             adaptive: true,
             codec: Codec::H264,
-            priority: VideoPriority::Latency,
             transport: VideoTransport::Auto,
             draw_cursor: false,
         }
@@ -875,12 +839,11 @@ impl Default for QualitySettings {
 }
 
 impl QualitySettings {
-    /// 范围校验；不认识的编码格式（对方版本新增的）换成 H.264，不认识的优先项按低延迟、传输方式按自动
+    /// 范围校验；不认识的编码格式按 H.264、传输方式按自动处理
     pub fn sanitized(mut self) -> Self {
         self.fps = self.fps.clamp(1, 120);
         self.bitrate_kbps = self.bitrate_kbps.clamp(100, 100_000);
         self.codec = self.codec.or_h264();
-        self.priority = self.priority.or_latency();
         self.transport = self.transport.or_auto();
         self
     }
@@ -1106,25 +1069,24 @@ mod tests {
         assert_eq!(q.sanitized().codec, Codec::H264);
         let q: QualitySettings = minicbor::decode(&wire(2)).unwrap();
         assert_eq!(q.codec, Codec::AV1);
-        // 之前的版本没有优先项：低延迟
-        assert_eq!(q.priority, VideoPriority::Latency);
+        assert_eq!(q.transport, VideoTransport::Auto);
+        assert!(!q.draw_cursor);
 
-        // 新版本带了优先项（还有再新的版本加的字段）：认识的照用，不认识的优先项按低延迟
-        let newer = |priority: u8| {
+        // 不认识的传输方式按自动处理，末尾新增的字段跳过
+        let newer = |transport: u8| {
             let mut e = minicbor::Encoder::new(Vec::new());
-            e.array(9).unwrap();
+            e.array(8).unwrap();
             e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
-            e.bool(true).unwrap().u8(1).unwrap().u8(priority).unwrap();
-            e.u8(2).unwrap().bool(true).unwrap().str("later").unwrap();
+            e.bool(true).unwrap().u8(1).unwrap().u8(transport).unwrap();
+            e.bool(true).unwrap().str("later").unwrap();
             e.into_writer()
         };
-        let q: QualitySettings = minicbor::decode(&newer(1)).unwrap();
-        assert_eq!((q.codec, q.priority), (Codec::H265, VideoPriority::Clarity));
-        assert_eq!(q.transport, VideoTransport::Fec);
+        let q: QualitySettings = minicbor::decode(&newer(2)).unwrap();
+        assert_eq!((q.codec, q.transport), (Codec::H265, VideoTransport::Fec));
         assert!(q.draw_cursor);
-        let q: QualitySettings = minicbor::decode(&newer(5)).unwrap();
-        assert_eq!(q.priority, VideoPriority::Unknown(5));
-        assert_eq!(q.sanitized().priority, VideoPriority::Latency);
+        let q: QualitySettings = minicbor::decode(&newer(9)).unwrap();
+        assert_eq!(q.transport, VideoTransport::Unknown(9));
+        assert_eq!(q.sanitized().transport, VideoTransport::Auto);
         // 之前的版本解得出新版本发的（多出来的字段跳过）
         #[derive(minicbor::Decode)]
         struct Before {
@@ -1133,66 +1095,19 @@ mod tests {
             #[n(4)]
             codec: Codec,
         }
-        let q = QualitySettings {
-            priority: VideoPriority::Clarity,
-            ..Default::default()
-        };
-        let old: Before = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
-        assert_eq!((old.fps, old.codec), (q.fps, q.codec));
-
-        // 传输方式：自动不写（字节和之前一样）；写了的跟着优先项那一位。低延迟优先不写时中间空着的一位也解得出
-        let auto = QualitySettings::default();
-        // 5 项的数组，和之前的版本一样
-        assert_eq!(minicbor::to_vec(auto).unwrap()[0], 0x85);
-        for (priority, transport) in [
-            (VideoPriority::Latency, VideoTransport::Fec),
-            (VideoPriority::Clarity, VideoTransport::Streams),
-            (VideoPriority::Clarity, VideoTransport::Auto),
-        ] {
-            let q = QualitySettings {
-                priority,
-                transport,
-                ..Default::default()
-            };
-            let back: QualitySettings = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
-            assert_eq!(back, q);
-            let old: Before = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
-            assert_eq!((old.fps, old.codec), (q.fps, q.codec));
-        }
-        // 新版本加的传输方式：按自动
-        let mut e = minicbor::Encoder::new(Vec::new());
-        e.array(7).unwrap();
-        e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
-        e.bool(true)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u8(0)
-            .unwrap()
-            .u8(9)
-            .unwrap();
-        let q: QualitySettings = minicbor::decode(&e.into_writer()).unwrap();
-        assert_eq!(q.transport, VideoTransport::Unknown(9));
-        assert_eq!(q.sanitized().transport, VideoTransport::Auto);
-
-        // 光标画进画面：不画（默认）不写，字节和之前一样；画的时候前面空着的几位也解得出
-        assert!(!auto.draw_cursor);
-        for (priority, transport) in [
-            (VideoPriority::Latency, VideoTransport::Auto),
-            (VideoPriority::Clarity, VideoTransport::Fec),
-        ] {
-            let q = QualitySettings {
-                priority,
-                transport,
-                draw_cursor: true,
-                ..Default::default()
-            };
-            let wire = minicbor::to_vec(q).unwrap();
-            assert_eq!(wire[0], 0x88, "8 items");
-            let back: QualitySettings = minicbor::decode(&wire).unwrap();
-            assert_eq!(back, q);
-            let old: Before = minicbor::decode(&wire).unwrap();
-            assert_eq!((old.fps, old.codec), (q.fps, q.codec));
+        for transport in VideoTransport::KNOWN {
+            for draw_cursor in [false, true] {
+                let q = QualitySettings {
+                    transport: *transport,
+                    draw_cursor,
+                    ..Default::default()
+                };
+                let wire = minicbor::to_vec(q).unwrap();
+                let back: QualitySettings = minicbor::decode(&wire).unwrap();
+                assert_eq!(back, q);
+                let old: Before = minicbor::decode(&wire).unwrap();
+                assert_eq!((old.fps, old.codec), (q.fps, q.codec));
+            }
         }
 
         // 画面的报告：之前的被控端不认识这个控制数据报，跳过就是了（见 framing 的兼容规则）
@@ -1318,20 +1233,18 @@ mod tests {
             max_short: 1080,
             adaptive: true,
             codec: Codec::AV1,
-            priority: VideoPriority::Clarity,
             transport: VideoTransport::Fec,
             draw_cursor: true,
         };
         assert_eq!(
             serde_json::to_value(q).unwrap(),
-            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity", "transport": "fec", "drawCursor": true })
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "transport": "fec", "drawCursor": true })
         );
-        // 之前的界面不带优先项、传输方式、光标：低延迟、自动、不画
+        // 不带传输方式、光标：自动、不画
         let old: QualitySettings = serde_json::from_value(
             json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }),
         )
         .unwrap();
-        assert_eq!(old.priority, VideoPriority::Latency);
         assert_eq!(old.transport, VideoTransport::Auto);
         assert!(!old.draw_cursor);
         assert_eq!(
