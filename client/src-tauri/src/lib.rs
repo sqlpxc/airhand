@@ -58,6 +58,7 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 pub struct AppState {
     hub: StatusHub,
     services: Mutex<Services>,
+    console_opening: AtomicBool,
     webview_dirs: Mutex<Vec<PathBuf>>,
     /// Windows 安装版：被控端在系统服务里运行（托盘只负责显示和操作），切换模式不影响它
     service_mode: bool,
@@ -211,6 +212,14 @@ fn open_console(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
+    // 双击后的松键也会请求打开控制台；前一次还在异步建窗时不再创建。
+    if app
+        .state::<AppState>()
+        .console_opening
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
     let app = app.clone();
     // Windows 上在主线程同步创建 WebView2 可能死锁，放到异步任务中创建
     tauri::async_runtime::spawn(async move {
@@ -258,6 +267,9 @@ fn open_console(app: &AppHandle) {
             }
             Err(e) => warn!("can't open the console: {e}"),
         }
+        app.state::<AppState>()
+            .console_opening
+            .store(false, Ordering::Release);
     });
 }
 
@@ -586,6 +598,7 @@ pub fn run() {
         .manage(AppState {
             hub: hub.clone(),
             services: Mutex::default(),
+            console_opening: AtomicBool::new(false),
             webview_dirs: Mutex::default(),
             service_mode,
             console: Default::default(),

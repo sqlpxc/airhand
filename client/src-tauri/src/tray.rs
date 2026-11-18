@@ -81,7 +81,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
         .icon(icon_offline())
         .tooltip("Airhand")
         .menu(&build_menu(app, &st)?)
-        // macOS 的菜单栏图标习惯上左键就弹出菜单；Windows / Linux 左键在控制端模式下打开控制台
+        // macOS 保留左键菜单；Windows 用左键双击打开控制台。
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| crate::on_menu(app, event.id().as_ref()))
         .on_tray_icon_event(|tray, event| {
@@ -89,13 +89,18 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
             if cfg!(target_os = "macos") {
                 return;
             }
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                crate::on_tray_left_click(tray.app_handle());
+            match event {
+                #[cfg(windows)]
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => crate::set_mode(tray.app_handle(), Mode::Controller),
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => crate::on_tray_left_click(tray.app_handle()),
+                _ => {}
             }
         })
         .build(app)

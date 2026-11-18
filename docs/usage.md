@@ -156,7 +156,7 @@ Uninstall the app in the system: the settings, saved devices and this phone's co
 
 ## Controller
 
-Tray → **Switch to controller** opens the console. Closing the console window switches back to host mode. On Windows the item is **Open console**: the host keeps running in the service while the console is open.
+Tray → **Switch to controller** opens the console. Closing the console window switches back to host mode. On Windows, double-click the Airhand tray icon or choose **Open console** from its menu. If the console is already open, double-clicking brings it to the front. The installed host service keeps running while the console is open.
 
 - It works like a browser: each computer gets a **tab** that you can drag to reorder and close (= disconnect) with × or a middle click. Click **+** for a new connection, enter the 6-digit control code (pasting `123 456` works), and once connected that tab becomes the computer. With two or more connections a **Multi-screen overview** tab appears on the left
 - **First connection to a computer or phone**: it asks for a pairing code (every host does), and the new-connection page shows a "Pairing code" field: enter the 6-digit pairing code shown there (a computer's tray menu, a phone's Share screen tab in Airhand) and connect again (or paste all 12 digits at once: control code + pairing code). Once paired, it remembers this console
