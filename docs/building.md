@@ -12,14 +12,14 @@ The clients have the **relay server's address and certificate fingerprint** comp
 |---|---|
 | All | A recent stable Rust (edition 2024), Node.js 20+, CMake (to build libopus) |
 | Windows | Windows 10/11. WebView2 usually ships with the OS; if it's missing the installer downloads and installs it |
-| macOS | macOS 13 or later and the Xcode Command Line Tools (`xcode-select --install`); CMake can come from `brew install cmake` |
-| Linux | Tauri's dependencies, the PulseAudio development files and the GStreamer plugins the console uses to decode video (see below) |
+| macOS | macOS 13 or later and the Xcode Command Line Tools with a macOS 14.2+ SDK for microphone forwarding (`xcode-select --install`); CMake can come from `brew install cmake` |
+| Linux | Tauri's dependencies, the PulseAudio and PipeWire development files and the GStreamer plugins the console uses to decode video (see below) |
 
 Debian / Ubuntu:
 
 ```bash
 sudo apt install build-essential cmake pkg-config libssl-dev libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpulse-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpulse-dev libpipewire-0.3-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 

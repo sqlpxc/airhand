@@ -6,7 +6,10 @@
 	<!-- 启动时只有菜单栏图标、程序坞里没有图标（打开控制台时程序自己切换成普通程序） -->
 	<key>LSUIElement</key>
 	<true/>
-	<!-- 控制台里打开麦克风（把本机的麦克风发给对方）时系统询问用的说明；没有它的话 macOS 不让用麦克风 -->
+	<!-- 被控端：把本进程自己的语音播放通过 Core Audio tap 发给录音设备。 -->
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Airhand routes the controller’s voice into Airhand Microphone when microphone forwarding is on. 打开麦克风转发时，Airhand 将控制端的语音送进 Airhand Microphone。</string>
+	<!-- 控制端：读取本机麦克风。 -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Airhand sends your voice to the remote computer when you turn on the microphone in a connection. 在连接里打开麦克风时，Airhand 把你的声音发给对方电脑。</string>
 </dict>

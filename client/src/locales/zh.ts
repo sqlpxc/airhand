@@ -241,16 +241,18 @@ export default {
   "sync.audioDelayed": "已同步：声音多等 {ms} ms（{before}）",
   "sync.videoDelayed": "已同步：画面推迟 {ms} ms（{before}）",
 
-  // 麦克风：把本机的麦克风发给对方（对方电脑上是虚拟麦克风 Steam Streaming Microphone）
+  // 麦克风：对方电脑上的程序从这个录音设备读到你的声音
   "mic.send": "把本机麦克风发给对方",
-  "mic.ready": "在对方电脑的程序里把录音设备选成 Steam Streaming Microphone（或者在那台电脑的声音设置里设为默认），就能听到你说话。只在正在查看这个连接时发送",
-  "mic.live": "正在发送：对方电脑上的 Steam Streaming Microphone 里就是你的声音",
+  "mic.ready": "打开后，在对方电脑的程序里选 {device} 作为录音设备。只在查看这个连接时发送",
+  "mic.live": "正在发送，请在对方的程序里选择 {device} 录音",
+  "mic.macPermission": "Mac 可能会要求允许使用这个设备的程序录制系统音频。",
   "mic.noDevice": "打开转发后，Airhand 会在对方电脑上安装 Steam 自带的虚拟麦克风驱动",
   "mic.steamMissing": "请先在对方电脑上安装 Steam，Airhand 会用它自带的驱动转发麦克风",
-  "mic.preparing": "正在对方电脑上准备 Steam 虚拟麦克风，就绪后会自动开始转发",
+  "mic.preparing": "正在对方电脑上创建 Airhand Microphone",
+  "mic.preparingSteam": "正在对方电脑上准备 Steam 虚拟麦克风，就绪后会自动开始转发",
   "mic.setupFailed": "对方电脑上的 Steam 虚拟麦克风未就绪（{detail}）。处理后可重新打开转发来重试",
   "mic.busy": "另一个控制端正在用对方的麦克风，它关掉之后自动换成你",
-  "mic.failed": "对方电脑打不开 Steam Streaming Microphone，正在重试：{detail}",
+  "mic.failed": "对方电脑打不开 {device}，正在重试（{detail}）",
   "mic.local.unsupported": "这里不能采集麦克风（需要较新的 Chrome、Edge 或 Firefox）",
   "mic.local.denied": "没有允许使用麦克风：请在浏览器的网站设置或系统的隐私设置里允许",
   "mic.local.noDevice": "本机没有可用的麦克风",

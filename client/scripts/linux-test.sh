@@ -65,6 +65,11 @@ SERVER=$!
 PIDS+=($SERVER)
 sleep 1
 cargo test --quiet --lib e2e_roundtrip -- --ignored
+if command -v parec >/dev/null && command -v pw-cli >/dev/null && pw-cli info 0 >/dev/null 2>&1 && pactl info >/dev/null 2>&1; then
+  step "麦克风转发、断线与卸载清理（PipeWire）"
+  cargo test --quiet --lib e2e_mic -- --ignored
+  cargo test --quiet --lib native_mic_cleanup -- --ignored
+fi
 kill $SERVER
 wait $SERVER 2>/dev/null || true
 # 这个测试自己启动/重启服务器

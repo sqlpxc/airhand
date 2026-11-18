@@ -157,7 +157,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | 输入注入 | SendInput（扫描码；相对移动同真实鼠标） | CGEvent（虚拟键码；相对移动带移动量） | XTEST（evdev 物理键码；相对移动） | 无障碍服务（手势、系统操作、文字输入） |
 | 光标隐藏（自动模式改用相对移动） | DXGI + `GetCursorInfo`（拖动、缩放窗口时画进画面里的软件光标不算隐藏） | 检测不到（用游戏模式） | XFIXES（全透明光标） | — |
 | 声音采集 | WASAPI 环回 | ScreenCaptureKit（系统混音） | PulseAudio / PipeWire 的输出监视器 | AudioPlaybackCapture（Android 10+） |
-| 控制端的麦克风 | Steam Streaming Microphone（WASAPI，见[麦克风](#麦克风)） | 还不支持 | 还不支持 | 还不支持 |
+| 控制端的麦克风 | Steam Streaming Microphone（WASAPI，见[麦克风](#麦克风)） | 公开的 Core Audio tap 和聚合设备（14.2+） | 会话期间的 PipeWire 录音源 | 还不支持 |
 | 剪贴板 | 剪贴板序号检测变化 | NSPasteboard 变化计数 | XFIXES 选择所有者变化通知 | 只能写入（控制端 → 手机） |
 | 剪贴板里的文件（见[剪贴板里的文件](#剪贴板里的文件)） | OLE 虚拟文件（托盘放、托盘读） | 只能发出 | FUSE + X11 剪贴板 | content URI；手机的文件用分享菜单发 |
 | 控制台界面 | WebView2 | WKWebView | WebKitGTK（WebCodecs 由 GStreamer 解码） | Jetpack Compose（MediaCodec 解码） |
@@ -221,10 +221,11 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | 采集 | 只在用户打开、而且正在查看这个会话时：`getUserMedia`，打开浏览器的回声消除、降噪和自动增益（远程的声音从这台电脑的扬声器放出来，不会再被录回去）→ AudioWorklet 混成单声道、换成 48 kHz，每 20 ms 一块直接交给控制台的 Worker（`client/src/lib/mic.ts`、`mic-worklet.ts`） |
 | 编码 | Worker 里 WebCodecs 编 Opus，48 kHz 单声道 32 kbps，每包 20 ms；和被控端的声音包同一个格式（`media.ts` 的 `audioPacket`），以二进制 WebSocket 消息 `2 \| sid \| 声音包` 交给控制端服务（`mic-encoder.ts`） |
 | 传输 | 控制端服务和被控端一样给每个数据报带上之前几包的副本、加密成声音数据报（控制端 → 被控端用自己的密钥），走画面来的那条路（直连或中转）。控制端服务、中转跟不上时丢包 |
-| 播放 | 被控端的读任务解密、去掉副本，直接交给平台（`airhand_link::host::MicSink`）。Windows 上的播放线程解码（连着丢了不超过 3 包时用 Opus 的丢包补偿补上），抖动缓冲 60 ms（卡了一阵之后积压的丢掉，延迟不会越积越多），设备里一直排着 40 ms（`client/src-tauri/src/host/mic/`） |
+| 播放 | 被控端的读任务解密、去掉副本，直接交给平台（`airhand_link::host::MicSink`）。各桌面平台共用的播放线程解码（连着丢了不超过 3 包时用 Opus 的丢包补偿补上），抖动缓冲 60 ms（卡了一阵之后积压的丢掉，延迟不会越积越多），设备里一直排着 40 ms（`client/src-tauri/src/host/mic/`） |
 | 虚拟麦克风 | Windows：Steam 远程同乐的虚拟声卡 **Steam Streaming Microphone**，按接口名找（不按随系统语言变的显示名）。写进它“扬声器”一边的字节原样从“麦克风”一边出来，不换格式，所以两边的格式必须一样：两边的默认格式一样时用共享模式（系统换格式）；不一样时用独占模式按“麦克风”一边的格式写（测试的这台电脑上扬声器一边是 48 kHz 立体声、麦克风一边是 44.1 kHz 单声道：按扬声器的格式写，1 kHz 的声音会变成 459 Hz）。只在有控制端打开麦克风期间打开，同一时刻只给一个控制端。缺少设备时从本机 Steam 安装麦克风驱动，设备就绪后开始转发 |
+| Mac / Linux 虚拟麦克风 | Mac 只截取本进程的单声道输出，用 `CATapMuted` 静音扬声器，并将 tap 作为 Airhand Microphone 的输入。Linux 通过 PipeWire 发布客户端持有的 `Audio/Source` 节点。录音回调从有界缓冲区取样，欠载时填静音。 |
 
-端到端的测试每一段都查：`mic_reaches_steam_streaming_microphone`（被控端的播放写进真的设备）和 `e2e_mic`（协议级的控制端经过真的中转，还故意丢数据报）从“麦克风 (Steam Streaming Microphone)”录回 1 kHz 的声音。
+`e2e_mic` 让协议级控制端通过真实中转发送 1 kHz 测试音，并故意丢弃一些数据报。测试从各平台的系统录音设备录回声音，检查频率和连续性。`native_mic_cleanup` 检查 Mac 和 Linux 的强退恢复、断开和卸载。
 
 ## 音画同步（可选，默认关闭）
 

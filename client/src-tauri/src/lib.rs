@@ -590,6 +590,10 @@ pub fn run() {
     enable_dpi_awareness();
     // 先清理上次残留的目录，再创建本次的（同一个前缀）
     ephemeral::sweep_stale();
+    #[cfg(target_os = "macos")]
+    if let Err(e) = host::mic::cleanup_stale() {
+        warn!("removing a stale virtual microphone: {e}");
+    }
     #[cfg(target_os = "linux")]
     ephemeral::isolate_caches();
 
@@ -705,6 +709,10 @@ pub fn run() {
             let dirs: Vec<PathBuf> = std::mem::take(&mut *state.webview_dirs.lock().unwrap());
             for d in dirs {
                 ephemeral::remove_with_retry(&d, Duration::from_secs(3));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Err(e) = host::mic::shutdown() {
+                warn!("stopping the virtual microphone: {e}");
             }
             // Linux：托盘图标、GStreamer 缓存所在的目录（内存盘 XDG_RUNTIME_DIR 里），退出时删掉
             #[cfg(target_os = "linux")]

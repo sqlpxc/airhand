@@ -519,10 +519,7 @@ async fn e2e_roundtrip() {
     assert!(rep.pongs >= 3, "Ping/Pong 不工作");
     // 同一个版本的两端都懂麦克风：被控端会说它能不能接（Windows 看有没有 Steam Streaming Microphone）
     let mic = rep.mic.expect("被控端没有说麦克风的状态");
-    #[cfg(windows)]
-    assert_eq!(mic, crate::host::mic::wasapi::probe().0);
-    #[cfg(not(windows))]
-    assert_eq!(mic, MicState::Unsupported);
+    assert_eq!(mic, crate::host::mic::probe(0).await.0);
     if capture {
         assert!(rep.frames >= 2, "收到的视频帧太少");
         assert!(rep.keyframes >= 1);
@@ -722,15 +719,15 @@ async fn e2e_multi_display() {
     let _ = ctl.send.finish();
 }
 
-/// 控制端的麦克风，从协议级的控制端一直到 Windows 上的虚拟麦克风。设备缺失时会从本机 Steam 安装驱动。
-/// 打开麦克风，像界面那样每 20 ms 发一包 1 kHz 的声音（每个数据报带着上一包的副本，
-/// 再故意丢掉一些数据报），从"麦克风 (Steam Streaming Microphone)"录到的应该还是 1 kHz；关掉之后放开设备。
-/// 和 `e2e_roundtrip` 一样要先启动服务器
-#[cfg(windows)]
+/// 控制端的麦克风，从协议级的控制端一直到系统录音设备。每 20 ms 发一包 1 kHz 的声音，
+/// 故意丢一部分数据报，再通过独立的录音客户端检查频率和连续性。先启动中转服务器。
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "may install the microphone driver from the host's Steam installation"]
+#[ignore = "requires a relay and the system audio server; on Windows may install the Steam driver"]
 async fn e2e_mic() {
     use crate::host::mic::tests::goertzel;
+    #[cfg(not(windows))]
+    use crate::host::mic::unix_recorder::Recorder;
+    #[cfg(windows)]
     use crate::host::mic::wasapi::tests::Recorder;
     use airhand_proto::datagram;
 
@@ -788,12 +785,16 @@ async fn e2e_mic() {
         if !enabled {
             ctl.send(&ControllerMsg::Mic { enabled: true }).await;
             enabled = true;
+            // Unix publishes its device on demand. Wait for the live lease's Ready.
+            if !cfg!(windows) {
+                continue;
+            }
         }
         if state == MicState::Ready {
             break;
         }
     }
-    let mut rec = Recorder::open().expect("从 Steam Streaming Microphone 录音");
+    let mut rec = Recorder::open().expect("从远端系统的虚拟麦克风录音");
     // 像界面的音频线程那样准时地每 20 ms 发一包（tokio 的定时器在 Windows 上可能晚 15 ms，发不够每秒 50 包）
     let conn = sig.conn.clone();
     let sender = std::thread::spawn(move || {

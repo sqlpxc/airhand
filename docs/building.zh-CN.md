@@ -12,14 +12,14 @@
 |---|---|
 | 所有系统 | 较新的 stable Rust（edition 2024）、Node.js 20+、CMake（编译 libopus） |
 | Windows | Windows 10/11。WebView2 一般是系统自带的，没有时安装程序会自动下载安装 |
-| macOS | macOS 13 及以上，Xcode 命令行工具（`xcode-select --install`）；CMake 可以用 `brew install cmake` 安装 |
-| Linux | Tauri 的依赖、PulseAudio 开发库，以及控制台解码视频用的 GStreamer 插件（见下） |
+| macOS | macOS 13 及以上，Xcode 命令行工具（需 macOS 14.2 或更新的 SDK 来编译麦克风转发，`xcode-select --install`）；CMake 可以用 `brew install cmake` 安装 |
+| Linux | Tauri 的依赖、PulseAudio 和 PipeWire 开发库，以及控制台解码视频用的 GStreamer 插件（见下） |
 
 Debian / Ubuntu：
 
 ```bash
 sudo apt install build-essential cmake pkg-config libssl-dev libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpulse-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpulse-dev libpipewire-0.3-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 

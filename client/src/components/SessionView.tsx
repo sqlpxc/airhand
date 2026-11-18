@@ -500,7 +500,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
             )}
           </div>
           {s.micState !== null && s.micState !== "unsupported" && (
-            // Windows 被控端支持麦克风转发，缺驱动时也可以打开开关触发安装
+            // 支持麦克风转发时才显示，Windows 缺驱动时也能打开开关触发安装
             <div className="menu-anchor">
               <button
                 className={`tb-btn icon ${menu === "mic" ? "on" : ""}`}
@@ -749,21 +749,24 @@ function micProblem(s: RemoteSession): boolean {
 
 function micHint(s: RemoteSession): string {
   if (s.micError !== null) return t(`mic.local.${s.micError}` as const);
+  const device = s.hostPlatform === "windows" ? "Steam Streaming Microphone" : "Airhand Microphone";
   switch (s.micState) {
     case "noDevice":
       return t("mic.noDevice");
     case "steamMissing":
       return t("mic.steamMissing");
     case "preparing":
-      return t("mic.preparing");
+      return s.hostPlatform === "windows" ? t("mic.preparingSteam") : t("mic.preparing");
     case "setupFailed":
       return t("mic.setupFailed", { detail: s.micDetail ?? "—" });
     case "busy":
       return t("mic.busy");
     case "failed":
-      return t("mic.failed", { detail: s.micDetail ?? "—" });
-    default:
-      return s.micLive ? t("mic.live") : t("mic.ready");
+      return t("mic.failed", { device, detail: s.micDetail ?? "—" });
+    default: {
+      const hint = t(s.micLive ? "mic.live" : "mic.ready", { device });
+      return s.hostPlatform === "mac" ? `${hint} ${t("mic.macPermission")}` : hint;
+    }
   }
 }
 

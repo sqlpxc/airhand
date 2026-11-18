@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+# Let each running copy of the packaged executable release its PipeWire source, tray and
+# temporary files before dpkg removes it. An upgrade keeps the user's sessions running.
+if [ "$1" = remove ] && [ -x /usr/bin/airhand ]; then
+    start-stop-daemon --stop --oknodo --retry=TERM/10/KILL/2 --exec /usr/bin/airhand
+fi

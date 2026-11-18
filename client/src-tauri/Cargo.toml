@@ -15,6 +15,8 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+cc = "1"
+pkg-config = "0.3"
 
 [dependencies]
 airhand-proto = { path = "../../crates/airhand-proto" }

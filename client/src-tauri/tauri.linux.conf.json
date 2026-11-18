@@ -4,8 +4,10 @@
     "targets": ["deb"],
     "linux": {
       "deb": {
+        "preRemoveScript": "linux/prerm",
         "depends": [
           "libpulse0",
+          "libpipewire-0.3-0 (>= 0.3.49)",
           "gstreamer1.0-plugins-base",
           "gstreamer1.0-plugins-good",
           "gstreamer1.0-plugins-bad"

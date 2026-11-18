@@ -29,6 +29,8 @@ cargo test --lib ltr_probe -- --ignored --nocapture
 cargo test --lib loopback_captures_tone -- --ignored --nocapture
 # Windows: the controller's microphone into Steam Streaming Microphone (needs it on this computer), recorded back as a 1 kHz tone
 cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture
+# macOS 14.2+ / Linux with PipeWire and pactl: crash recovery, disconnect and uninstall during forwarding
+cargo test --lib native_mic_cleanup -- --ignored --nocapture
 
 # android/native/: Android Rust core (runs on this computer: in-flight control, keyframes, audio fan-out, command format)
 cargo test
@@ -58,7 +60,7 @@ AIRHAND_CERT=target/e2e/cert.pem AIRHAND_KEY=target/e2e/key.pem ./target/debug/a
 cargo test --lib e2e_roundtrip -- --ignored --nocapture   # video frame streams / codec switching / clipboard / audio / ping / disconnect
 cargo test --lib e2e_reconnect -- --ignored --nocapture   # getting the code back after a server restart, changing the code
 cargo test --lib e2e_multi_display -- --ignored --nocapture  # showing two displays at once, then one (skipped with a single display)
-cargo test --lib e2e_mic -- --ignored --nocapture         # Windows microphone forwarding. Installing a missing driver from the host’s copy of Steam requires administrator rights
+cargo test --lib e2e_mic -- --ignored --nocapture         # record a 1 kHz tone from the OS device (Swift on Mac, pipewire-pulse and parec on Linux, Steam driver on Windows)
 ```
 
 The clipboard file tests use this computer's real clipboard and replace what's on it, so they're skipped by default too (run them one at a time):

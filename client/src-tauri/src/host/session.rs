@@ -185,7 +185,7 @@ struct Mic {
 impl Mic {
     /// 没在用、现在也用不了：要等别的会话放开、设备出现
     fn waiting(&self) -> bool {
-        cfg!(windows) && self.lease.is_none()
+        mic::supported() && self.lease.is_none()
     }
 
     /// 现在用不了是因为设备（没有、打不开）：定时再找
@@ -397,7 +397,7 @@ impl Platform for Desktop {
 
     /// 控制端麦克风的声音（读任务里调用）：打开了麦克风才交给播放线程
     fn mic(&self) -> Option<Arc<dyn MicSink>> {
-        if cfg!(windows) {
+        if mic::supported() {
             Some(self.mic.input.clone())
         } else {
             None

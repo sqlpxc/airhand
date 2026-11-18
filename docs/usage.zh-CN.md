@@ -78,6 +78,7 @@ macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身。除
 
 | 项目 | 位置 | 说明 |
 |---|---|---|
+| Airhand Microphone | Core Audio 录音设备和对应的音频 tap | 退出时移除；若曾强制退出，下次启动或从菜单卸载时会清理当前用户的残留 |
 | 登录时自动启动 | “系统设置 → 通用 → 登录项”（有的系统版本叫“登录项与扩展”）里“登录时打开”和“后台 App 活动”两处 | 要由 Airhand 自己注销：先删掉 App 的话，两处都会留下一个失效的 Airhand |
 | 权限记录 | “系统设置 → 隐私与安全性”里的“屏幕与系统录音”“辅助功能”等 | 要在 App 还在的时候清除，App 删掉之后系统就找不到它了 |
 | 配置文件 | `~/Library/Application Support/app.airhand.client/` | 里面有控制码，一定要删 |
@@ -145,10 +146,10 @@ find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReport
 
 ```bash
 sudo apt remove airhand     # 删除程序（.deb 安装的）
-rm -rf ~/.config/airhand    # 配置文件：apt（包括 purge）不会删用户目录里的东西
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/airhand"  # 删除当前用户的配置和配对记录
 ```
 
-Linux 上没有开机启动项和系统权限要清理。托盘图标、控制台的临时目录（`$XDG_RUNTIME_DIR/airhand-run-*`、`/tmp/airhand-webview-*`）在 Airhand 退出时就删掉了；只有进程被强制结束过才会留下（下次启动时会清理），通常注销 / 重启时系统也会清空它们，也可以手动删掉：`rm -rf "$XDG_RUNTIME_DIR"/airhand-run-* /tmp/airhand-webview-*`。
+卸载 `.deb` 时会先停止已安装的 Airhand 进程，PipeWire 随连接关闭移除虚拟麦克风。Linux 上没有开机启动项和系统权限要清理。托盘图标、控制台的临时目录（`$XDG_RUNTIME_DIR/airhand-run-*`、`/tmp/airhand-webview-*`）在 Airhand 退出时就删掉了；只有进程被强制结束过才会留下（下次启动时会清理），通常注销 / 重启时系统也会清空它们，也可以手动删掉：`rm -rf "$XDG_RUNTIME_DIR"/airhand-run-* /tmp/airhand-webview-*`。
 
 ### Android
 
@@ -224,7 +225,8 @@ Linux 上没有开机启动项和系统权限要清理。托盘图标、控制�
 - Windows 被控端使用 Steam 自带的 **Steam Streaming Microphone**（Valve 提供、微软签名的虚拟麦克风驱动）。打开转发时，如果设备尚未就绪，Airhand 会从对方电脑的 Steam 安装目录查找并安装驱动。设备就绪后会自动开始转发。对方电脑上缺少 Steam 时，麦克风菜单会提示安装 Steam
 - 在对方电脑的程序里把录音设备选成“麦克风 (Steam Streaming Microphone)”（英文系统是 “Microphone (Steam Streaming Microphone)”），或者在那台电脑的“声音设置 → 输入”里把它设为默认，Windows 的语音输入（Win+H）等用默认麦克风的程序就直接听得到
 - 同一时刻只给一个控制端；别的控制端打开时会显示“另一个控制端正在用”，那个关掉之后自动换过来
-- 对方是 macOS、Linux、Android 时还不支持（不显示麦克风按钮）；Android 控制端还不能发麦克风
+- **macOS 14.2+ 和 Linux（PipeWire）**：打开转发后，在对方的会议或录音软件里选择 **Airhand Microphone**。Mac 首次使用时可能要允许该软件录制系统音频。关闭转发或断开连接后设备会移除。Linux 结束 Airhand 进程后由 PipeWire 自动移除；Mac 强制退出后，重新打开 Airhand 或使用菜单里的“卸载 Airhand…”会清理残留。
+- Android 被控端和 Android 控制端目前还不支持麦克风转发。
 
 ## 界面语言
 

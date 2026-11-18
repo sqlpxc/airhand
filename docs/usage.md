@@ -78,6 +78,7 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
 
 | Item | Where | Notes |
 |---|---|---|
+| Airhand Microphone | Core Audio input device and its tap | Removed on quit. Startup and the uninstall menu also remove this user’s objects after a forced quit. |
 | Open at login | System Settings → General → Login Items ("Login Items & Extensions" on some versions of macOS), under both "Open at Login" and "App Background Activity" | Has to be unregistered by Airhand itself: if you delete the app first, a dead Airhand entry stays in both places |
 | Permissions | System Settings → Privacy & Security: Screen & System Audio Recording, Accessibility and so on | Can only be cleared while the app is still there; once it's deleted macOS can't find it any more |
 | Configuration | `~/Library/Application Support/app.airhand.client/` | Holds the control codes, so be sure to delete it |
@@ -144,8 +145,8 @@ To get the old list back: in a Terminal with Full Disk Access, run `defaults imp
 ### Linux
 
 ```bash
-sudo apt remove airhand     # the program (installed from the .deb)
-rm -rf ~/.config/airhand    # the configuration file: apt (even purge) never touches files in your home directory
+sudo apt remove airhand     # stops the packaged app and releases its PipeWire microphone
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/airhand"  # remove this user's configuration and pairings
 ```
 
 There's no startup entry and no system permission to clean up on Linux. The tray icon's and the console's temporary directories (`$XDG_RUNTIME_DIR/airhand-run-*`, `/tmp/airhand-webview-*`) are deleted when Airhand quits; they're only left behind if the process was killed (they're cleaned up at the next start), and the system usually clears them when you log out or reboot. To remove them by hand: `rm -rf "$XDG_RUNTIME_DIR"/airhand-run-* /tmp/airhand-webview-*`.
@@ -224,7 +225,8 @@ Send this computer's microphone to the remote computer: programs there (meetings
 - **Windows hosts** use Steam’s **Steam Streaming Microphone** (Valve’s virtual microphone driver, signed by Microsoft). When you turn on forwarding, Airhand looks for an existing device and installs the driver from Steam on the remote computer if needed. Forwarding starts as soon as the device is ready. The microphone menu prompts you to install Steam if it’s missing from the remote computer
 - In programs on the remote computer, choose "Microphone (Steam Streaming Microphone)" as the recording device, or make it the default under Sound settings → Input there, so programs that use the default microphone (such as Windows voice typing, Win+H) hear you directly
 - Only one controller at a time: another controller sees "Another controller is using the remote microphone" and takes over when that one stops
-- Not supported yet when the remote computer runs macOS, Linux or Android (no microphone button); the Android controller can't send its microphone yet
+- **macOS 14.2+ and Linux with PipeWire** publish **Airhand Microphone** when forwarding starts. Choose it as the input in the remote app. macOS may ask for permission for that app to record system audio. Turning forwarding off or disconnecting removes the device. PipeWire also removes it when Airhand exits. After a forced quit on Mac, reopening Airhand or choosing **Uninstall Airhand…** cleans up any leftover device and tap.
+- Android hosts and the native Android controller do not yet support microphone forwarding.
 
 ## Language
 

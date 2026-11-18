@@ -42,8 +42,8 @@ pub fn confirm(mtm: MainThreadMarker) -> bool {
         "Uninstall Airhand?"
     )));
     alert.setInformativeText(&NSString::from_str(&tr!(
-        "会关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存、记下的菜单栏图标设置，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。",
-        "This turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches and menu bar icon settings macOS keeps for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected."
+        "会移除 Airhand 虚拟麦克风，关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存、记下的菜单栏图标设置，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。",
+        "This removes Airhand Microphone, turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches and menu bar icon settings macOS keeps for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected."
     )));
     // 第一个按钮是默认按钮（回车）：默认是"取消"，不会一按回车就卸载了
     alert.addButtonWithTitle(&NSString::from_str(&tr!("取消", "Cancel")));
@@ -104,6 +104,12 @@ pub fn run(plan: &Plan) -> Vec<String> {
             problems.push(what);
         }
     };
+    // Join the publisher before resetting permissions or deleting the bundle, including when
+    // a controller still holds its microphone lease. Also sweeps objects left by a forced quit.
+    step(
+        tr!("移除 Airhand 虚拟麦克风", "Remove Airhand Microphone"),
+        crate::host::mic::shutdown().map_err(|e| e.to_string()),
+    );
     // 1、2 都要在 App 还在的时候做
     step(
         tr!("关掉登录时自动启动", "Turn off open at login"),
