@@ -143,7 +143,8 @@ fn stop(mut recv: RecvStream) {
     let _ = recv.stop(0u32.into());
 }
 
-/// 开一条本端发的通道：一条单向流，开头写好会话头
+/// 开一条本端发的通道：一条单向流，开头写好会话头。开流、写会话头各最多等 [`HEADER_TIMEOUT`]
+/// （写会话头也会被流量控制挡住）；会话头没写完就 reset 这条流
 pub async fn open_lane(
     conn: &Connection,
     session_id: u64,
@@ -153,9 +154,15 @@ pub async fn open_lane(
         .await
         .context("timed out opening a session lane")??;
     send.set_priority(lane.priority())?;
-    send.write_all(&SessionHeader::new(session_id, lane).encode())
-        .await?;
-    Ok(send)
+    let header = SessionHeader::new(session_id, lane).encode();
+    let written = tokio::time::timeout(HEADER_TIMEOUT, send.write_all(&header))
+        .await
+        .context("timed out writing a session header")
+        .and_then(|r| r.map_err(Into::into));
+    if written.is_err() {
+        let _ = send.reset(0u32.into());
+    }
+    written.map(|()| send)
 }
 
 /// 对方在这条通道上开的第一条流（中转上的那条）。握手用：那时还没有直连

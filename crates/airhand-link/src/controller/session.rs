@@ -48,6 +48,8 @@ pub(super) struct Feedback {
     out: DatagramSender,
     /// 第 `i` 项是第 `i` 路
     acks: std::sync::Mutex<Vec<AckState>>,
+    /// 发了新的确认：补发的定时器闲着的话叫醒它（见 [`Feedback::run_repeats`]）
+    acked: tokio::sync::Notify,
 }
 
 impl Feedback {
@@ -59,6 +61,7 @@ impl Feedback {
                     .map(|stream| AckState { stream, last: None })
                     .collect(),
             ),
+            acked: tokio::sync::Notify::new(),
         }
     }
 
@@ -73,10 +76,25 @@ impl Feedback {
             .and_then(|a| a.ack(seq, arrived, Instant::now()));
         if let Some(m) = m {
             self.out.send(&m);
+            self.acked.notify_one();
         }
     }
 
-    /// 定时调用：好一阵没有新的确认了，最近的一个再发一次（每一路）
+    /// 补发丢了的确认（见 [`AckState`]），一直跑到会话结束。每一路都补完了（画面停了、补够了次数）就不再定时醒来，
+    /// 等到下一个确认：画面静止的会话不用每 [`ACK_REPEAT`] 醒一次
+    async fn run_repeats(&self) {
+        loop {
+            let idle = !self.acks.lock().unwrap().iter().any(AckState::repeating);
+            if idle {
+                // 闲下来之前发的确认留下的通知只会让这里多转一圈
+                self.acked.notified().await;
+            }
+            tokio::time::sleep(ACK_REPEAT).await;
+            self.repeat();
+        }
+    }
+
+    /// 好一阵没有新的确认了，最近的一个再发一次（每一路）
     fn repeat(&self) {
         let now = Instant::now();
         let repeats: Vec<_> = self
@@ -186,6 +204,11 @@ impl AckState {
     /// 最近的确认（随 Ping 再发一次）
     fn last(&self) -> Option<ControllerDatagram> {
         self.last.map(|l| l.msg())
+    }
+
+    /// 还要补发（发了确认之后还没补够 [`ACK_REPEATS`] 次）
+    fn repeating(&self) -> bool {
+        self.last.is_some_and(|l| l.left > 0)
     }
 }
 
@@ -760,14 +783,7 @@ pub(super) async fn run(
         }
     };
     // 丢了的确认（见 Feedback）
-    let repeater = async move {
-        let mut tick = tokio::time::interval(ACK_REPEAT);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            feedback.repeat();
-        }
-    };
+    let repeater = async move { feedback.run_repeats().await };
 
     let clipper = async move {
         let Some((clip, enabled)) = local_clip else {
@@ -892,6 +908,8 @@ mod tests {
         let mut a = AckState::default();
         let t0 = Instant::now();
         assert_eq!(a.repeat(t0), None);
+        // 还没发过确认：补发的定时器闲着
+        assert!(!a.repeating());
         // 60 fps：每帧都有新的确认，定时器不补
         let frame = Duration::from_micros(16_667);
         for i in 1..=10u32 {
@@ -915,10 +933,41 @@ mod tests {
         }
         assert_eq!(repeats, ACK_REPEATS);
         assert_eq!(a.last(), ack(10));
+        // 补够了：定时器闲下来，直到下一个确认
+        assert!(!a.repeating());
+        assert_eq!(a.ack(11, 0, now), ack(11));
+        assert!(a.repeating());
         // 序号绕回
         let mut a = AckState::default();
         assert_eq!(a.ack(u32::MAX, 0, t0), ack(u32::MAX));
         assert_eq!(a.ack(0, 0, t0), ack(0));
+    }
+
+    /// 补完了就闲下来（不再定时醒）；闲下来之后再来确认，照样补发 ACK_REPEATS 次
+    #[tokio::test]
+    async fn repeats_resume_after_going_idle() {
+        let (client, server) = crate::tests::quic_pair().await;
+        let (sealer, _opener) = crate::secure::test_lane(false);
+        let feedback = Arc::new(Feedback::new(DatagramSender::new(
+            1,
+            Paths::new(client),
+            sealer,
+        )));
+        let _repeater = {
+            let f = feedback.clone();
+            OwnedTask(tokio::spawn(async move { f.run_repeats().await }))
+        };
+        for seq in 1..=2u32 {
+            feedback.ack(0, seq, 0);
+            let until = tokio::time::Instant::now() + Duration::from_millis(400);
+            let mut sent = 0;
+            while let Ok(Ok(_)) = tokio::time::timeout_at(until, server.read_datagram()).await {
+                sent += 1;
+            }
+            // 确认本身 + 补发
+            assert_eq!(sent, 1 + ACK_REPEATS as usize, "frame {seq}");
+            assert!(!feedback.acks.lock().unwrap()[0].repeating());
+        }
     }
 
     /// 控制台（client/src/lib/api.ts 的 SessionEvent / Notice 类型）依赖这个 JSON 形状

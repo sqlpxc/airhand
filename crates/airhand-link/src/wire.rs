@@ -123,6 +123,20 @@ where
     read_packet_watched(r, max, clock, |_| {}).await
 }
 
+/// 读一帧负载时第一次最多分配这么多，之后数据真的到了再倍增（[`reserve_for`]）。
+///
+/// 长度前缀是对方说的（经过中转时中转也能改），上限是通道的上限（画面 32 MiB）：只凭它一次分配到位的话，
+/// 一条连接上同时开着的上千条流各报一个最大长度、却不发数据，就是几十 GiB（Windows 上按提交计算，分配失败整个进程退出）。
+/// 倍增之后分配的不超过真正收到的两倍（加上这一点起步），起步也够装下大多数画面增量帧
+const FIRST_ALLOC: usize = 64 * 1024;
+
+/// `buf` 满了（或者还是空的），这一帧一共 `len` 字节：再留出空间。第一次最多 [`FIRST_ALLOC`]，之后倍增，
+/// 最后一次正好到 `len`（读完时容量就是帧长，不多占）
+fn reserve_for(buf: &mut Vec<u8>, len: usize) {
+    let next = (buf.capacity() * 2).max(FIRST_ALLOC).min(len);
+    buf.reserve_exact(next.saturating_sub(buf.len()));
+}
+
 /// 同 [`read_packet_timed`]，另外每读到一段就调用一次 `progress(done)`（`done`：这一帧读完了）：调用的一方据此知道
 /// 读到一半的帧是还在传（大），还是卡住了（丢了包、等重传：QUIC 只按顺序交出数据）
 pub async fn read_packet_watched<R, T>(
@@ -139,9 +153,12 @@ where
     };
     let at = clock();
     progress(len == 0);
-    let mut buf = Vec::with_capacity(len);
+    let mut buf = Vec::new();
     while buf.len() < len {
-        // take 限制住这一帧剩下的长度，不会读进下一帧；buf 的容量正好够，不会再分配
+        if buf.len() == buf.capacity() {
+            reserve_for(&mut buf, len);
+        }
+        // take 限制住这一帧剩下的长度，不会读进下一帧；容量不超过 len（见 reserve_for）
         let left = (len - buf.len()) as u64;
         if (&mut *r).take(left).read_buf(&mut buf).await? == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
@@ -293,5 +310,45 @@ mod tests {
         let b = read_packet(&mut slow, 1024).await.unwrap().unwrap();
         assert_eq!(b.len(), HEADER_LEN);
         assert!(read_packet(&mut slow, 1024).await.unwrap().is_none());
+    }
+
+    /// 长度前缀说多大不算数：先分配一点，数据真的到了再倍增，最后一次正好到帧长
+    #[test]
+    fn allocation_follows_the_data_not_the_length_prefix() {
+        // 说自己有 32 MiB（画面通道的上限），还一个字节都没到
+        let mut buf = Vec::new();
+        reserve_for(&mut buf, 32 << 20);
+        assert_eq!(buf.capacity(), FIRST_ALLOC);
+        // 每次装满了才翻倍，最后一次不超过帧长
+        let len = (1 << 20) + 3;
+        let mut buf = Vec::new();
+        let mut caps = Vec::new();
+        while buf.capacity() < len {
+            reserve_for(&mut buf, len);
+            caps.push(buf.capacity());
+            buf.resize(buf.capacity(), 0);
+        }
+        let k = 1024;
+        assert_eq!(caps, [64 * k, 128 * k, 256 * k, 512 * k, 1024 * k, len]);
+        // 小帧一次就够、不多占
+        let mut small = Vec::new();
+        reserve_for(&mut small, 100);
+        assert_eq!(small.capacity(), 100);
+    }
+
+    /// 比起步分配大的帧：读的时候逐步扩容，内容不错、不多读下一帧，读完时容量正好是帧长
+    #[tokio::test]
+    async fn large_packets_grow_as_they_arrive() {
+        let body: Vec<u8> = (0..FIRST_ALLOC * 3 + 7).map(|i| (i % 251) as u8).collect();
+        let mut wire = framing::frame(&body);
+        wire.extend_from_slice(&framing::frame(b"next"));
+        let mut r = &wire[..];
+        let a = read_packet(&mut r, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(a, body);
+        assert_eq!(a.capacity(), a.len());
+        assert_eq!(
+            read_packet(&mut r, 1 << 20).await.unwrap().unwrap(),
+            b"next"
+        );
     }
 }

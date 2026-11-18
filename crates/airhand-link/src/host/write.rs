@@ -16,6 +16,7 @@ use bytes::Bytes;
 use quinn::{SendDatagramError, SendStream};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::debug;
 
 use super::queue::LaneReceiver;
@@ -154,12 +155,15 @@ async fn write_frames(
         let seq = h.seq;
         let sealed = seal(frame, &mut sealer)?;
         if let Some(conn) = paths.media() {
+            // 开流、写这一帧加起来最多等这么久：直连卡住了就改从中转发，不先在开流上等好几秒
+            let deadline = Instant::now() + DIRECT_WRITE_TIMEOUT;
             let written = async {
-                let mut s = open_lane(&conn, session_id, lane).await?;
-                tokio::time::timeout(DIRECT_WRITE_TIMEOUT, s.write_chunk(sealed.clone()))
+                let mut s = tokio::time::timeout_at(deadline, open_lane(&conn, session_id, lane))
                     .await
-                    .context("the direct path stalled")??;
-                s.finish()?;
+                    .context("timed out opening a frame stream on the direct path")??;
+                write_frame(&mut s, sealed.clone(), deadline)
+                    .await
+                    .context("the direct path stalled")?;
                 anyhow::Ok(s)
             };
             match written.await {
@@ -174,20 +178,28 @@ async fn write_frames(
             }
         }
         let mut s = open_lane(paths.relay(), session_id, lane).await?;
-        let written = async {
-            tokio::time::timeout(WRITE_TIMEOUT, s.write_chunk(sealed))
-                .await
-                .context("session writer stalled")??;
-            s.finish()?;
-            anyhow::Ok(())
-        };
-        match written.await {
+        match write_frame(&mut s, sealed, Instant::now() + WRITE_TIMEOUT).await {
             Ok(()) => streams.add(seq, s),
             Err(e) if paths.relay().close_reason().is_some() => return Err(e),
             Err(e) => debug!(stream, seq, "a video frame couldn't be written: {e:#}"),
         }
     }
     Ok(())
+}
+
+/// 往一条帧流写完这一帧、结束这条流，最多等到 `deadline`。写不完就 reset：没发出去的丢掉、不再重传。
+/// 只是丢掉流句柄的话 quinn 会正常结束它：已经排进去的半帧照样在（卡住了的）路上发完，对方读到半截就结束了，
+/// 白占一份带宽
+async fn write_frame(s: &mut SendStream, sealed: Bytes, deadline: Instant) -> Result<()> {
+    let written = match tokio::time::timeout_at(deadline, s.write_chunk(sealed)).await {
+        Ok(r) => r.map_err(anyhow::Error::from),
+        Err(_) => Err(anyhow::anyhow!("timed out writing a video frame")),
+    }
+    .and_then(|()| s.finish().map_err(Into::into));
+    if written.is_err() {
+        let _ = s.reset(0u32.into());
+    }
+    written
 }
 
 /// 声音的数据报：发送缓冲排满了最多等这么久，等不到这一包就丢了
@@ -308,6 +320,76 @@ mod tests {
         for w in writers {
             w.await.unwrap().unwrap();
         }
+    }
+
+    /// 直连卡住了（对方不读，流量控制的额度用完了）：这一帧的流要 reset，不能正常结束
+    /// （正常结束的话已经排进去的半帧照样在卡住的路上发完，对方读到半截），这一帧改从中转完整地发
+    #[tokio::test]
+    async fn a_stalled_direct_write_is_reset_and_the_frame_goes_through_the_relay() {
+        use crate::lanes::Via;
+        use airhand_proto::SessionHeader;
+        const SID: u64 = 11;
+        let (relay, relay_peer) = crate::tests::quic_pair().await;
+        let (direct, direct_peer) = crate::tests::quic_pair().await;
+        let paths = Paths::new(relay.clone());
+        let mirror = paths.attach(direct.clone(), direct.open_uni().await.unwrap());
+        drop(mirror);
+        paths.set_media(Via::Direct);
+        let broken = paths.broken();
+        let (sealer, _opener) = crate::secure::test_lane(false);
+        let (tx, rx) = mpsc::channel(1);
+        let to = Target {
+            session_id: SID,
+            stream: 0,
+            paths: paths.clone(),
+        };
+        let _writer = crate::tasks::OwnedTask(tokio::spawn(async move {
+            write_frames(&FrameStreams::default(), rx, sealer, to).await
+        }));
+        // 比直连上一条流的接收窗口（16 MiB）大
+        let frame = video(1, true, None, 20 << 20);
+        let sealed_len = frame.len() + airhand_proto::handshake::SEAL_OVERHEAD;
+        tx.send(frame).await.unwrap();
+        async fn header(recv: &mut quinn::RecvStream) -> Option<SessionHeader> {
+            let mut b = [0u8; SessionHeader::LEN];
+            recv.read_exact(&mut b).await.ok()?;
+            SessionHeader::decode(&b)
+        }
+        // 直连上：读完会话头就不读了。attach 拿的那条控制流（上面丢掉了，没有数据就结束了）先到，跳过它
+        let mut stalled = loop {
+            let mut s = direct_peer.accept_uni().await.unwrap();
+            if header(&mut s).await == Some(SessionHeader::new(SID, SessionLane::Video(0))) {
+                break s;
+            }
+        };
+        // 中转上：完整的一帧
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut r = relay_peer.accept_uni().await.unwrap();
+            assert_eq!(
+                header(&mut r).await,
+                Some(SessionHeader::new(SID, SessionLane::Video(0)))
+            );
+            r.read_to_end(usize::MAX).await.unwrap()
+        })
+        .await
+        .expect("the frame didn't come through the relay");
+        assert_eq!(got.len(), sealed_len);
+        assert!(
+            broken.has_changed().unwrap(),
+            "the direct path wasn't reported"
+        );
+        // 直连上的那条被放弃了：读下去是 reset，不是正常结束的半帧
+        let rest = tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(usize::MAX))
+            .await
+            .expect("the stalled stream neither ended nor was reset");
+        assert!(
+            matches!(
+                rest,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))
+            ),
+            "{:?}",
+            rest.map(|b| b.len())
+        );
     }
 
     /// 帧流，真的 QUIC 走一条丢 2% 的包、往返 60 ms 的路：丢了包的帧等 QUIC 重传就到了，控制端不能抢在重传之前报告
