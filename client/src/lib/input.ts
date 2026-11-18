@@ -43,6 +43,10 @@ import type { InputEvent, MouseButton, MouseMode } from "./api";
 import { isPasteKey } from "./files.ts";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
+const CTRL_COMMAND_SWAP = new Map([
+  ["ControlLeft", "MetaLeft"], ["MetaLeft", "ControlLeft"],
+  ["ControlRight", "MetaRight"], ["MetaRight", "ControlRight"],
+]);
 const META_KEYS = new Set(["MetaLeft", "MetaRight"]);
 const MODIFIERS = new Set(["ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Fn"]);
 /** PointerEvent.buttons 的位 → 鼠标键 */
@@ -101,6 +105,12 @@ export class RemoteInput {
   private generation = 0;
   private wheel = { x: 0, y: 0 };
   private pressed = new Set<string>();
+  shouldSwapCtrlCommand: (() => boolean) | null = null;
+  /** 一组按键全部松开前沿用按下时的映射，避免切换开关后松开了另一个键 */
+  private swapForChord = false;
+  private outgoingCode(code: string) {
+    return this.swapForChord ? CTRL_COMMAND_SWAP.get(code) ?? code : code;
+  }
   /** 按着的鼠标键（PointerEvent.buttons 的位） */
   private buttons = 0;
   /** 拦下来的快捷键：抬起时也不发 */
@@ -518,6 +528,7 @@ export class RemoteInput {
       e.stopPropagation();
       const code = physicalCode(e);
       if (!code) return;
+      if (!this.pressed.size) this.swapForChord = this.shouldSwapCtrlCommand?.() ?? false;
       if (paste) {
         this.pressed.add(code);
         setTimeout(() => this.enqueue([{ type: "key", code, down: true }], true), 0);
@@ -536,7 +547,7 @@ export class RemoteInput {
       if (IS_MAC && code === "CapsLock") return this.tapCaps();
       if (e.repeat && !this.pressed.has(code)) return;
       this.pressed.add(code);
-      this.enqueue([{ type: "key", code, down: true }], true);
+      this.enqueue([{ type: "key", code: this.outgoingCode(code), down: true }], true);
     });
     on("keyup", e => {
       if (!this._interactive) return;
@@ -555,7 +566,7 @@ export class RemoteInput {
           events.push({ type: "key", code: held, down: false });
         }
       }
-      events.push({ type: "key", code, down: false });
+      events.push({ type: "key", code: this.outgoingCode(code), down: false });
       this.enqueue(events, true);
     });
     on("blur", () => { this.cancelEscHold(); this.releaseAll(); });

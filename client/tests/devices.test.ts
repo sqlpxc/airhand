@@ -48,6 +48,15 @@ test("鼠标模式按设备记住：连上时记下、换了就更新，这次�
   assert.equal(patchDevice(list, "111111", { mouse: "game" }), list);
 });
 
+test("Ctrl / Command 互换只记在选中的设备，重连保留，也能关掉", () => {
+  let list = remember([], seen("482913"), 1);
+  list = remember(list, seen("731205"), 2);
+  list = patchDevice(list, "482913", { swapCtrlCommand: true });
+  list = remember(list, seen("482913"), 3);
+  assert.deepEqual(list.map(d => [d.code, d.swapCtrlCommand]), [["482913", true], ["731205", false]]);
+  assert.equal(remember(list, { ...seen("482913"), swapCtrlCommand: false }, 4)[0].swapCtrlCommand, false);
+});
+
 test("自己起的名字：重连后保留；改回对方的名字或清空就是不另起名字", () => {
   let list = remember([], seen("482913"), 1);
   list = renameDevice(list, "482913", "  书房  ");

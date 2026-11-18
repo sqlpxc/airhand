@@ -395,6 +395,24 @@ export function SessionView({ s }: { s: RemoteSession }) {
                         {t(c.label)}
                       </button>
                     ))}
+                {s.hostPlatform === "mac" && (
+                  <>
+                    <div className="dd-sep" />
+                    <label className="dd-item toggle">
+                      <span>{t("session.swapCtrlCommand")}</span>
+                      <input
+                        type="checkbox"
+                        className="switch"
+                        checked={s.swapCtrlCommand}
+                        onChange={(e) => {
+                          s.setSwapCtrlCommand(e.target.checked);
+                          closeMenu();
+                          s.focus();
+                        }}
+                      />
+                    </label>
+                  </>
+                )}
               </Dropdown>
             )}
           </div>

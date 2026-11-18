@@ -34,6 +34,59 @@ function fakeLockDocument(canvas: any) {
   return () => { delete (globalThis as any).document; };
 }
 
+test("Ctrl / Command 按左右互换，开关不改变按住的组合或菜单发出的按键", async () => {
+  const { canvas, fire } = fakeCanvas();
+  const sent: string[] = [];
+  const input = new RemoteInput(canvas, () => true, events => {
+    for (const e of events) if (e.type === "key") sent.push(`${e.code}${e.down ? "+" : "-"}`);
+  });
+  input.interactive = true;
+  let swap = false;
+  input.shouldSwapCtrlCommand = () => swap;
+  const down = (code: string, repeat = false) => fire("keydown", { code, repeat });
+  const up = (code: string) => fire("keyup", { code });
+  down("ControlLeft");
+  swap = true;
+  down("ControlLeft", true); down("MetaLeft"); up("MetaLeft"); up("ControlLeft");
+  await Promise.resolve();
+  assert.deepEqual(sent.splice(0), ["ControlLeft+", "ControlLeft+", "MetaLeft+", "MetaLeft-", "ControlLeft-"]);
+  for (const side of ["Left", "Right"]) {
+    for (const [local, remote] of [["Control", "Meta"], ["Meta", "Control"]]) {
+      down(local + side); down("KeyC"); up("KeyC"); up(local + side);
+      await Promise.resolve();
+      assert.deepEqual(sent.splice(0), [remote + side + "+", "KeyC+", "KeyC-", remote + side + "-"]);
+    }
+  }
+  // sendCombo 的键码已经是远端语义，直接入队不能再互换。
+  input.enqueue([{ type: "key", code: "MetaLeft", down: true }, { type: "key", code: "MetaLeft", down: false }], true);
+  await Promise.resolve();
+  assert.deepEqual(sent, ["MetaLeft+", "MetaLeft-"]);
+  input.dispose();
+});
+
+test("Mac 控制端按本地 Command 清理漏报的 keyup，不跟随远端映射", async (t) => {
+  t.mock.getter(globalThis, "navigator", () => ({ platform: "MacIntel" } as Navigator));
+  // IS_MAC 在模块加载时判断；用独立的模块实例模拟 Mac 控制端。
+  const moduleUrl = new URL("../src/lib/input.ts?mac-controller", import.meta.url);
+  const { RemoteInput: MacInput } = await import(moduleUrl.href) as typeof import("../src/lib/input.ts");
+  const { canvas, fire } = fakeCanvas();
+  const sent: string[] = [];
+  const input = new MacInput(canvas, () => true, events => {
+    for (const e of events) if (e.type === "key" && !e.down) sent.push(e.code);
+  });
+  input.interactive = true;
+  input.shouldSwapCtrlCommand = () => true;
+  fire("keydown", { code: "ControlLeft" }); fire("keydown", { code: "KeyC" });
+  fire("keyup", { code: "ControlLeft" });
+  await Promise.resolve();
+  assert.deepEqual(sent.splice(0), ["MetaLeft"], "本机 Ctrl 不冲刷其他键");
+  // 本机 Command 的按下可能发生在画面获得焦点之前。
+  fire("keyup", { code: "MetaLeft" });
+  await Promise.resolve();
+  assert.deepEqual(sent, ["KeyC", "ControlLeft"]);
+  input.dispose();
+});
+
 const LOCK_SHORTCUT = { code: "KeyM", ctrlKey: true, altKey: true, shiftKey: true, metaKey: false, repeat: false };
 const ESC = { code: "Escape", repeat: false };
 

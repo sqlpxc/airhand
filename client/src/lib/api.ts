@@ -174,6 +174,8 @@ export interface SavedDevice {
   quality: QualitySettings | null;
   /** 上次用的鼠标模式；没有（自动、之前的版本、网页版刚记下的）就是自动 */
   mouse?: MouseMode | null;
+  /** 操作这台 Mac 时互换物理 Ctrl 和 Command 键，默认关闭 */
+  swapCtrlCommand?: boolean;
   /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
   hostKey: string | null;
 }

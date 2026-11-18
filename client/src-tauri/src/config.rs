@@ -1282,6 +1282,7 @@ mod tests {
             last_used: 1_762_597_230_000,
             quality: None,
             mouse: None,
+            swap_ctrl_command: false,
             host_key: None,
         }
     }

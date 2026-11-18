@@ -26,6 +26,7 @@ import {
   type Problem,
   type QualitySettings,
   type ResumeToken,
+  type SavedDevice,
   type SessionEvent,
   type MicState,
   type Platform,
@@ -162,8 +163,9 @@ export class RemoteSession {
   onConnected: ((s: RemoteSession) => void) | null = null;
   /** 画质设置变了：记进我的设备，下次用同样的画质连 */
   onSettingsChange: ((s: RemoteSession) => void) | null = null;
-  /** 鼠标模式变了：记进我的设备，下次连这台还用它 */
-  onMouseModeChange: ((s: RemoteSession) => void) | null = null;
+  /** 按设备记住的偏好，只在对方报告 mac 平台时用于输入 */
+  swapCtrlCommand = false;
+  onInputSettingsChange: ((s: RemoteSession) => void) | null = null;
 
   /** 变化计数，供 React useSyncExternalStore 使用 */
   version = 0;
@@ -252,7 +254,7 @@ export class RemoteSession {
   constructor(
     code: string,
     settings: QualitySettings,
-    saved?: { resume: ResumeToken | null; name: string; os: string; hostKey?: string | null; mouse?: MouseMode | null },
+    saved?: Pick<SavedDevice, "resume" | "name" | "os" | "hostKey" | "mouse" | "swapCtrlCommand">,
     pairing?: string | null,
   ) {
     this.code = code;
@@ -297,12 +299,14 @@ export class RemoteSession {
       this.applyCursor();
       this.emit();
     };
+    this.swapCtrlCommand = saved?.swapCtrlCommand ?? false;
+    this.input.shouldSwapCtrlCommand = () => this.hostPlatform === "mac" && this.swapCtrlCommand;
     // 这台电脑上次用的鼠标模式（不算换：不用告诉谁）。之后用户换了（菜单、快捷键）：告诉对方画不画光标、记下来
     this.input.setMode(saved?.mouse ?? "auto", false);
     this.input.onMouseMode = () => {
       this.pushSettings();
       this.emit();
-      this.onMouseModeChange?.(this);
+      this.onInputSettingsChange?.(this);
     };
     // 网页版：在画面上按粘贴键时，浏览器给的剪贴板里有这里复制的文件就先公告给对方（见 files.ts），粘贴键随后才发。
     // 桌面版的本机剪贴板由 Rust 端自己同步
@@ -343,6 +347,7 @@ export class RemoteSession {
     const onEvent = (ev: SessionEvent) => {
       if (this.attempt.accepts(gen)) this.onEvent(ev);
     };
+    this.hostPlatform = null;
     // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
     this.cursorSlots.clear();
     // 在连接之前清掉旧提示：被控端紧跟在 Hello 后面发的提示可能比 connect 的返回值先到
@@ -1251,6 +1256,13 @@ export class RemoteSession {
       }
     }
     if (piece) this.enqueue([{ type: "text", text: piece }], true);
+  }
+
+  setSwapCtrlCommand(enabled: boolean) {
+    if (this.hostPlatform !== "mac" || this.swapCtrlCommand === enabled) return;
+    this.swapCtrlCommand = enabled;
+    this.onInputSettingsChange?.(this);
+    this.emit();
   }
 
   /** 鼠标模式（见 input.ts） */

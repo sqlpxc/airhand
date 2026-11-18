@@ -25,6 +25,7 @@ export function remember(
     quality: QualitySettings | null;
     hostKey?: string | null;
     mouse?: MouseMode | null;
+    swapCtrlCommand?: boolean;
   },
   now: number,
 ): SavedDevice[] {
@@ -38,17 +39,18 @@ export function remember(
     lastUsed: now,
     quality: seen.quality ?? old?.quality ?? null,
     mouse: seen.mouse ?? old?.mouse ?? null,
+    swapCtrlCommand: seen.swapCtrlCommand ?? old?.swapCtrlCommand ?? false,
     // 对方的公钥：连上时确认过的（第一次连上、或者用户信任了新的身份）代替旧的
     hostKey: seen.hostKey ?? old?.hostKey ?? null,
   };
   return sortDevices([d, ...list.filter((x) => x.code !== seen.code)]).slice(0, MAX_DEVICES);
 }
 
-/** 改一台的名字、画质或鼠标模式（列表里没有就什么也不变） */
+/** 更新设备名或会话偏好（列表里没有就什么也不变） */
 export function patchDevice(
   list: SavedDevice[],
   code: string,
-  patch: Partial<Pick<SavedDevice, "alias" | "quality" | "mouse">>,
+  patch: Partial<Pick<SavedDevice, "alias" | "quality" | "mouse" | "swapCtrlCommand">>,
 ) {
   if (!list.some((d) => d.code === code)) return list;
   return list.map((d) => (d.code === code ? { ...d, ...patch } : d));

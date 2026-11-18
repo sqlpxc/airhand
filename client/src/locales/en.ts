@@ -166,6 +166,7 @@ const en: Record<MsgKey, Msg> = {
   "session.showAllLimit": "Up to {n} displays at once (the remote computer's limit)",
   "session.quality": "Quality",
   "session.shortcuts": "Send shortcut",
+  "session.swapCtrlCommand": "Swap Ctrl and ⌘ Command",
   "session.clipboard": "Clipboard",
   "session.clipSync": "Two-way clipboard sync",
   "session.clipSyncHint": "Copied text shows up on the other side automatically",

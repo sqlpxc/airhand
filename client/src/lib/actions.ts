@@ -54,7 +54,7 @@ export async function openSession(code: string, settings: QualitySettings, opts:
     if (s.sid !== null) rememberSession(s);
     s.onConnected = rememberSession;
     s.onSettingsChange = rememberQuality;
-    s.onMouseModeChange = rememberMouse;
+    s.onInputSettingsChange = rememberInputSettings;
   } catch (e) {
     s.dispose();
     if (pending === s) store.patchDraft({ busy: false, error: toProblem(e) });
@@ -137,6 +137,7 @@ export function rememberSession(s: RemoteSession) {
     quality: s.settings,
     hostKey: s.hostKey,
     mouse: s.mouseMode,
+    swapCtrlCommand: s.swapCtrlCommand,
   };
   setDevices(devices.remember(store.get().devices, seen, Date.now()));
 }
@@ -146,9 +147,9 @@ function rememberQuality(s: RemoteSession) {
   setDevices(devices.patchDevice(store.get().devices, s.code, { quality: s.settings }));
 }
 
-/** 鼠标模式换了：下次连这台还用它（只更新已经记下的） */
-function rememberMouse(s: RemoteSession) {
-  setDevices(devices.patchDevice(store.get().devices, s.code, { mouse: s.mouseMode }));
+/** 输入偏好按设备记住（只更新已经记下的） */
+function rememberInputSettings(s: RemoteSession) {
+  setDevices(devices.patchDevice(store.get().devices, s.code, { mouse: s.mouseMode, swapCtrlCommand: s.swapCtrlCommand }));
 }
 
 export const renameDevice = (code: string, name: string) =>

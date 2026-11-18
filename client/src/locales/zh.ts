@@ -175,6 +175,7 @@ export default {
   "session.showAllLimit": "最多同时显示 {n} 个显示器（对方的上限）",
   "session.quality": "画质",
   "session.shortcuts": "发送快捷键",
+  "session.swapCtrlCommand": "互换 Ctrl 和 ⌘ Command",
   "session.clipboard": "剪贴板",
   "session.clipSync": "双向同步剪贴板",
   "session.clipSyncHint": "复制的文本自动出现在另一端",

@@ -14,6 +14,7 @@
 //! ```
 //!
 //! `mouse` 是上次用的鼠标模式（控制台的"桌面" / "游戏"，没有就是"自动"）。
+//! `swap_ctrl_command = true`：操作这台 Mac 时互换 Ctrl 和 Command；默认关闭。
 //!
 //! `host_key` 是那台电脑的端到端加密公钥（第一次连上时记下，见 `airhand_link::controller` 的"端到端加密"）：
 //! 之后只认它，对不上就警告。是公钥，不用加密。
@@ -71,6 +72,8 @@ pub struct Device {
     /// 上次用的鼠标模式："desktop" / "game"，`None` 是自动（不认识的也当自动，见 [`mouse_mode`]）
     #[serde(default)]
     pub mouse: Option<String>,
+    #[serde(default)]
+    pub swap_ctrl_command: bool,
 }
 
 /// 认识的鼠标模式（自动是默认，不记）
@@ -173,6 +176,7 @@ fn from_table(t: &Table) -> Option<Device> {
             .and_then(Item::as_str)
             .and_then(mouse_mode)
             .map(Into::into),
+        swap_ctrl_command: t.get("swap_ctrl_command").and_then(Item::as_bool) == Some(true),
         host_key: t.get("host_key").and_then(Item::as_str).and_then(host_key),
     })
 }
@@ -288,6 +292,9 @@ pub fn to_table(d: &Device) -> Option<Table> {
     if let Some(m) = d.mouse.as_deref().and_then(mouse_mode) {
         t["mouse"] = toml_edit::value(m);
     }
+    if d.swap_ctrl_command {
+        t["swap_ctrl_command"] = toml_edit::value(true);
+    }
     if let Some(r) = &d.resume {
         t["resume"] = toml_edit::value(STANDARD.encode(r));
     }
@@ -384,6 +391,7 @@ mod tests {
                 draw_cursor: false,
             }),
             mouse: Some("game".into()),
+            swap_ctrl_command: true,
             host_key: Some("ab".repeat(32)),
         }
     }
@@ -417,11 +425,14 @@ mod tests {
             resume: None,
             quality: None,
             mouse: None,
+            swap_ctrl_command: false,
             last_used: 0,
             host_key: None,
             ..d.clone()
         };
-        assert_eq!(from_table(&to_table(&bare).unwrap()), Some(bare));
+        let bare_table = to_table(&bare).unwrap();
+        assert!(!bare_table.contains_key("swap_ctrl_command"));
+        assert_eq!(from_table(&bare_table), Some(bare));
         assert!(t.to_string().contains("transport = \"fec\""));
         assert!(t.to_string().contains("mouse = \"game\""));
         // 自动（默认）和不认识的鼠标模式不写进文件，读回来是自动
