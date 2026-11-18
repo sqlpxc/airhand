@@ -6,13 +6,10 @@
 //! 3. 把一端开过来的通道（单向流）转给另一端，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音、探测，见
 //!    `airhand_proto::datagram`）按开头的会话 ID 在两端之间原样转发（见 [`relay`]）。
 //!
-//! 服务器从不解析会话内容：会话是端到端加密的（见 `airhand_proto::handshake`），服务器只看会话头里的会话 ID、
-//! 通道编号和优先级，发起会话时控制端带来的握手消息也原样交给被控端。会话有几条通道、每条是什么，服务器都不管
-//! （只限制数量，`airhand_proto::MAX_LANES`）；任何一端的控制通道（0 号）结束了，整个会话结束。所以会话层加通道、
-//! 改格式都不用升级服务器。唯一的例外是文件通道（剪贴板里的文件，`SessionLane::File`）：传文件对中转的带宽压力大，
-//! 服务器在版本握手里告诉客户端一次粘贴经中转最多多大（[`Config::file_limit`]），并按单条文件流兜底（见 [`relay`]）。
+//! 中转只读会话 ID 和通道编号，据此设置优先级、限制并发；不解析端到端密文或握手。任一端的控制通道结束时关闭会话。
+//! 文件流另外受 [`Config::file_limit`] 约束，服务器在 Hello 中告知客户端。
 //!
-//! 版本握手见 `airhand_proto::signal` 的"版本握手"：服务器接受一个区间的信令版本，不要求相等。
+//! 信令版本必须一致，见 `airhand_proto::signal`。
 //!
 //! 防暴力猜码：控制码不存在算一次猜错（[`FAIL_LIMIT`]），并且晚 400 ms 回答。控制码存在、但被控端还没准备好
 //! （正在注册、正在断开）时回答得一模一样（也算猜错、也晚回答），不能靠回答的快慢看出控制码存在。
@@ -61,10 +58,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use airhand_link::wire::{read_frame, write_frame, write_msg};
+use airhand_link::wire::{read_frame, write_msg};
 use airhand_proto::framing;
-use airhand_proto::signal::{ClientHello, ServerHello, ServerMsg, Versions};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, features};
+use airhand_proto::signal::{ClientHello, ServerHello, ServerMsg};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, SIGNAL_VERSION};
 use anyhow::{Context, Result, bail};
 use quinn::{SendStream, VarInt};
 use tokio::sync::mpsc;
@@ -295,23 +292,26 @@ impl Broker {
         if !got {
             bail!("peer closed the stream");
         }
-        // 版本握手（见 airhand_proto::signal 的"版本握手"）：先只读版本区间，任何版本的客户端都能听懂回答
-        let versions: Versions =
-            framing::decode_known(&buf).context("the first message must be Hello")?;
-        let answer =
-            ServerHello::answer(versions, features::signal::SUPPORTED, self.cfg.file_limit);
-        write_frame(&mut send, &framing::to_vec(&answer)).await?;
-        let Some(version) = answer.version else {
-            info!(%peer, min = versions.min, max = versions.max, "rejected client: no common signal version");
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let ClientHello {
+            version,
+            role,
+            mut name,
+            mut os,
+        } = framing::decode_known(&buf).context("the first message must be Hello")?;
+        write_msg(&mut send, &ServerHello::new(self.cfg.file_limit)).await?;
+        if version != SIGNAL_VERSION {
+            info!(%peer, version, "rejected client: signal version mismatch");
+            send.finish()?;
+            // 等 Hello 被确认送达再关闭，不靠固定延时。
+            let _ = timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
             return Ok(());
-        };
-        let hello: ClientHello = framing::decode_known(&buf).context("bad Hello")?;
-        let role = hello.role;
+        }
         anyhow::ensure!(role.is_known(), "unknown role {role:?}");
-        let name: String = hello.name.chars().take(64).collect();
-        let os: String = hello.os.chars().take(64).collect();
+        for field in [&mut name, &mut os] {
+            if let Some((end, _)) = field.char_indices().nth(64) {
+                field.truncate(end);
+            }
+        }
         info!(%peer, conn_id, ?role, %name, %os, version, "client connected");
 
         let (tx, rx) = mpsc::channel::<ServerMsg>(64);

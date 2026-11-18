@@ -1,14 +1,9 @@
 //! 会话中转。会话由 [`super::registry`] 登记（[`Broker::add_session`]），从那时起：
 //!
-//! * 两端开过来的通道（单向流，开头是会话头）转给另一端：服务器向另一端开一条单向流、写同样的会话头，
-//!   然后以 `Bytes` 块为单位零拷贝透传（[`pipe`]）。不用配对，也不管通道是什么：每端每条通道只能开一次，最多
-//!   [`airhand_proto::MAX_LANES`] 条；
-//! * 帧流（会话头带 `SessionHeader::FRAME`，信令 v10，见 `airhand_proto` 的 crate 说明）：同一条通道可以开很多条，
-//!   每端同时开着的不超过 [`MAX_FRAME_STREAMS`]，转发的办法一样。一端放弃了一条帧流（reset），转给另一端的那条也 reset；
-//!   另一端叫停了（stop），这一端的也叫停。控制通道不能是帧流；
-//! * 文件流（文件通道 `SessionLane::File` 上的帧流，剪贴板里的文件，见 `airhand_proto::files`）：每端同时开着的不超过
-//!   [`MAX_FILE_STREAMS`]；服务器设了上限（[`super::Config::file_limit`]）时，一条流转发的字节超过
-//!   `files::wire_size(上限)` 就两头都 reset（`files::reset::RELAY_LIMIT`）。服务器看不到内容，只能按单条流兜底：
+//! * 每条流的头只携带会话 ID 和通道编号。中转按通道设置优先级，成批转发已有的 `Bytes` 块（[`pipe`]），不解析负载；
+//! * 控制和大块通道每端各一条常驻流；视频每帧一条流，每端同时开着的不超过 [`MAX_FRAME_STREAMS`]；
+//! * 文件每次取用一条流，每端同时开着的不超过 [`MAX_FILE_STREAMS`]。当一条流超过服务器配置的
+//!   `files::wire_size(file_limit)` 就两头都 reset（`files::reset::RELAY_LIMIT`）。服务器看不到内容，只能按单条流兜底：
 //!   一次粘贴的总量由给的一方遵守；
 //! * 一端 reset / 叫停了一条流，转给另一端的那条也用同一个错误码 reset / 叫停（文件流靠它说明原因）；
 //! * 会话的数据报按开头的会话 ID 在两端之间原样转发（[`Broker::relay_datagrams`]）。
@@ -25,6 +20,7 @@ use airhand_proto::{
     MAX_FILE_STREAMS, MAX_FRAME_STREAMS, Role, SessionHeader, SessionLane, datagram,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
 use quinn::{ReadError, RecvStream, SendStream, VarInt, WriteError};
 use rand::Rng;
 use std::sync::Arc;
@@ -135,24 +131,29 @@ async fn pipe(
     mut ended: watch::Receiver<bool>,
     mut budget: Option<Budget>,
 ) {
+    // 文件接收方可能在发送方等额度时取消，不能等下一次写入才叫停源流。
+    let stopped = budget.is_some().then(|| tx.stopped());
     let copy = async {
+        let mut chunks = [const { Bytes::new() }; 16];
         loop {
-            let chunk = match rx.read_chunk(256 * 1024, true).await {
-                Ok(Some(c)) => c,
+            // 只批量处理已经可读的块，不等凑满。两端 QUIC 每批各拿一次连接锁。
+            let n = match rx.read_chunks(&mut chunks).await {
+                Ok(Some(n)) => n,
                 Ok(None) => return Ok(()),
                 Err(ReadError::Reset(code)) => return Err(Stop::Reset(code)),
                 Err(_) => return Err(Stop::Other),
             };
+            let batch = &mut chunks[..n];
             if let Some(b) = &mut budget {
-                let n = chunk.bytes.len() as u64;
-                for c in &b.counted {
-                    c.fetch_add(n, Ordering::Relaxed);
-                }
+                let n = batch.iter().map(|chunk| chunk.len() as u64).sum();
                 if let Some(left) = &mut b.left {
                     *left = left.checked_sub(n).ok_or(Stop::OverLimit)?;
                 }
+                for c in &b.counted {
+                    c.fetch_add(n, Ordering::Relaxed);
+                }
             }
-            match tx.write_chunk(chunk.bytes).await {
+            match tx.write_all_chunks(batch).await {
                 Ok(()) => {}
                 Err(WriteError::Stopped(code)) => return Err(Stop::Stopped(code)),
                 Err(_) => return Err(Stop::Other),
@@ -162,6 +163,15 @@ async fn pipe(
     let r = tokio::select! {
         r = copy => r,
         _ = ended.wait_for(|e| *e) => Err(Stop::Other),
+        r = async {
+            match stopped {
+                Some(stopped) => stopped.await,
+                None => std::future::pending().await,
+            }
+        } => Err(match r {
+            Ok(Some(code)) => Stop::Stopped(code),
+            _ => Stop::Other,
+        }),
     };
     let zero = VarInt::from_u32(0);
     let limit = VarInt::from_u32(reset::RELAY_LIMIT);
@@ -328,8 +338,8 @@ impl Broker {
             bail!("invalid session header");
         };
         let session_id = h.session_id;
-        let frame = h.is_frame();
-        let file = h.lane == SessionLane::File.number();
+        let lane = h.lane;
+        let file = lane == SessionLane::File;
         // 文件流的上限（会话头之后的字节，见模块说明）：上限是 0 的服务器不转文件
         let file_budget = file.then(|| self.cfg.file_limit.map(files::wire_size));
         if file && self.cfg.file_limit == Some(0) {
@@ -350,14 +360,13 @@ impl Broker {
                         return Some(Err("too many file streams are open"));
                     }
                     s.files[side] += 1;
-                } else if frame {
-                    // 帧流：同一条通道可以开很多条，只限制同时开着的条数
+                } else if matches!(lane, SessionLane::Video(_)) {
                     if s.frames[side] >= MAX_FRAME_STREAMS {
                         return Some(Err("too many frame streams are open"));
                     }
                     s.frames[side] += 1;
                 } else {
-                    let bit = 1 << h.lane;
+                    let bit = 1 << lane.number();
                     if s.opened[side] & bit != 0 {
                         return Some(Err("the lane was opened twice"));
                     }
@@ -375,7 +384,7 @@ impl Broker {
             Some(Ok(found)) => found,
             Some(Err(why)) => {
                 reject(recv);
-                bail!("session lane {} rejected: {why}", h.lane);
+                bail!("session lane {lane:?} rejected: {why}");
             }
             None => {
                 reject(recv);
@@ -384,9 +393,7 @@ impl Broker {
         };
         let open = async {
             let mut send = peer.open_uni().await?;
-            // 往另一端写数据时用这一端在会话头里给的优先级（解码时已经压到 MAX_PRIORITY 以内：
-            // 握手之前就转发，不压的话一端能把自己的流排到同一台被控端别的会话的控制通道前面）
-            send.set_priority(i32::from(h.priority))?;
+            send.set_priority(lane.priority())?;
             send.write_all(&h.encode()).await?;
             anyhow::Ok(send)
         };
@@ -400,10 +407,10 @@ impl Broker {
                 Err(anyhow!("can't open the lane to the other end: {r:?}"))
             }
         };
-        if frame {
-            self.frame_done(session_id, side, file);
-        } else if h.lane == SessionLane::Control.number() {
-            self.end_session(session_id);
+        match lane {
+            SessionLane::Video(_) | SessionLane::File => self.frame_done(session_id, side, file),
+            SessionLane::Control => self.end_session(session_id),
+            SessionLane::Bulk => {}
         }
         piped
     }

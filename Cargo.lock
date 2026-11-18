@@ -90,6 +90,7 @@ dependencies = [
  "airhand-link",
  "airhand-proto",
  "anyhow",
+ "bytes",
  "quinn",
  "rand 0.9.5",
  "rcgen",

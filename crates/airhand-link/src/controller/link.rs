@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use airhand_proto::SessionLane;
-use airhand_proto::handshake::{Negotiated, PublicKey};
+use airhand_proto::handshake::PublicKey;
 use anyhow::Result;
 use quinn::{Connection, SendStream};
 
@@ -20,8 +20,6 @@ pub struct Established {
     /// 被控端的公钥、安全码（见 `airhand_proto::handshake`）
     pub peer: PublicKey,
     pub safety: String,
-    /// 选定的会话版本和双方都支持的能力位
-    pub negotiated: Negotiated,
     /// 本端的控制通道（写的一半）和它的加密端（已经发出了确认，计数接着往下数）
     pub control: (SendStream, Sealer),
     /// 本端的大块通道
@@ -30,8 +28,7 @@ pub struct Established {
     pub paths: Paths,
     /// 发控制数据报（Ping、画面确认）
     pub datagrams: DatagramSender,
-    /// 麦克风的声音数据报的加密端（双方都支持 `airhand_proto::features::session::MIC` 时才用，
-    /// 见 `airhand_proto::session` 的"麦克风"）
+    /// 麦克风声音数据报的加密端，见 `airhand_proto::session` 的“麦克风”。
     pub mic: Sealer,
     /// 被控端发来的东西（被控端的探测在里面就弹回去了）
     pub receiver: HostReceiver,
@@ -82,7 +79,6 @@ pub async fn establish(
         session_id,
         peer: secured.peer,
         safety: secured.safety,
-        negotiated: done.negotiated,
         control: (control, done.sealer),
         bulk: (bulk, secured.bulk.sealer),
         paths,

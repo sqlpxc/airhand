@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::wire::read_frame;
 use airhand_proto::framing;
 use airhand_proto::signal::{ClientHello, ClientMsg, ServerHello};
-use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
+use airhand_proto::{ALPN, MAX_SIGNAL_MSG, Role, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{
@@ -200,9 +200,6 @@ pub struct Signal {
     pub conn: Connection,
     pub send: SendStream,
     pub recv: RecvStream,
-    /// 和服务器商定的信令版本，双方都支持的信令能力位（见 `airhand_proto::signal` 的"版本握手"）
-    pub version: u16,
-    pub features: Features,
     /// 一次粘贴经中转最多传多少（剪贴板里的文件，见 `airhand_proto::files`）：`None` 不限
     pub file_limit: Option<u64>,
     /// 连服务器的 endpoint：直连也用它（同一个 socket，见模块说明的"直连"）
@@ -425,9 +422,9 @@ async fn handshake(
         connect_any(&cfg.server, addrs, sni, expected, mismatch).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientHello::new(role, cfg.name.clone(), cfg.os.clone());
-    let mut out = framing::frame(&framing::to_vec(&hello));
+    let mut out = framing::encode(&hello);
     if let Some(m) = first {
-        out.extend(framing::encode(m));
+        framing::append_msg(&mut out, m);
     }
     send.write_all(&out).await?;
     let mut buf = Vec::new();
@@ -447,38 +444,21 @@ async fn handshake(
         info!(server = %cfg.server, fingerprint = %format_fingerprint(&fp), "first connection to this server, remembering its certificate");
         store.save(&cfg.server, fp);
     }
-    let Some(version) = resp.version else {
-        return Err(incompatible(resp.min, resp.max).into());
-    };
-    anyhow::ensure!(
-        (SIGNAL_MIN..=SIGNAL_VERSION).contains(&version),
-        "the server chose signal version {version}, which we can't speak"
-    );
+    if resp.version != SIGNAL_VERSION {
+        return Err(Problem::Incompatible {
+            server: resp.version,
+            client: SIGNAL_VERSION,
+        }
+        .into());
+    }
     Ok(Signal {
         conn,
         send,
         recv,
-        version,
-        features: resp.features.common(hello.features),
         file_limit: resp.file_limit,
         endpoint,
         punch,
     })
-}
-
-/// 服务器能说 `min..=max`，和本端没有交集：谁太旧了（`server` 比 `client` 大就是客户端该更新）
-fn incompatible(min: u16, max: u16) -> Problem {
-    if max < SIGNAL_MIN {
-        Problem::Incompatible {
-            server: max,
-            client: SIGNAL_MIN,
-        }
-    } else {
-        Problem::Incompatible {
-            server: min,
-            client: SIGNAL_VERSION,
-        }
-    }
 }
 
 /// 证书固定校验器：只比较叶子证书的 SHA-256 指纹，但仍然校验 TLS 1.3 握手签名。

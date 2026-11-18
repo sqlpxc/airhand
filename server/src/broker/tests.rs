@@ -26,6 +26,8 @@ use super::registry::MAX_WAITING;
 use super::tokens::{ct_eq, hmac_sha256};
 use super::*;
 
+mod relay_bench;
+
 /// 认得所有控制端的被控端（测试用：省掉配对）
 struct KnownGate(Identity);
 
@@ -187,15 +189,20 @@ async fn start_with(db: Option<std::path::PathBuf>) -> (Arc<Broker>, LinkConfig)
     start_cfg(test_config(db)).await
 }
 
-async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
+fn test_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
     let ck = rcgen::generate_simple_self_signed(vec!["airhand".into()]).unwrap();
-    let chain = vec![CertificateDer::from(ck.cert.der().to_vec())];
+    let cert = ck.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into();
     let endpoint = quinn::Endpoint::server(
-        crate::server_config(chain, key).unwrap(),
+        crate::server_config(vec![cert.clone()], key).unwrap(),
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    (endpoint, cert)
+}
+
+async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
+    let (endpoint, _) = test_endpoint();
     let server = endpoint.local_addr().unwrap().to_string();
     let broker = Broker::new(cfg).unwrap();
     let b = broker.clone();
@@ -206,6 +213,115 @@ async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
     });
     let cfg = LinkConfig::new(server, "", "test", "test").unwrap();
     (broker, cfg)
+}
+
+#[tokio::test]
+async fn a_signal_version_mismatch_cannot_register() {
+    let (server, cert) = test_endpoint();
+    let addr = server.local_addr().unwrap();
+    let broker = Broker::new(test_config(None)).unwrap();
+    let b = broker.clone();
+    let task = tokio::spawn(async move {
+        while let Some(c) = server.accept().await {
+            tokio::spawn(b.clone().handle_incoming(c));
+        }
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![airhand_proto::ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+
+    for version in [SIGNAL_VERSION - 1, SIGNAL_VERSION + 1] {
+        let conn = client.connect(addr, "airhand").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let hello = ClientHello {
+            version,
+            ..ClientHello::new(Role::Host, "test".into(), "test".into())
+        };
+        let mut out = framing::encode(&hello);
+        framing::append_msg(
+            &mut out,
+            &ClientMsg::Register {
+                reclaim: None,
+                keep: false,
+                rekey: false,
+            },
+        );
+        send.write_all(&out).await.unwrap();
+        let mut buf = Vec::new();
+        let reply: ServerHello = timeout(
+            Duration::from_secs(2),
+            read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.version, SIGNAL_VERSION);
+        assert!(matches!(
+            timeout(
+                Duration::from_secs(2),
+                read_msg::<_, ServerMsg>(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+            )
+            .await
+            .unwrap(),
+            Ok(None) | Err(_)
+        ));
+        assert_eq!(broker.stats(), (0, 0, 0));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_client_reports_the_servers_signal_version() {
+    let (endpoint, _) = test_endpoint();
+    let cfg = LinkConfig::new(
+        endpoint.local_addr().unwrap().to_string(),
+        "",
+        "test",
+        "test",
+    )
+    .unwrap();
+    let version = SIGNAL_VERSION + 1;
+    let server = async {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let mut buf = Vec::new();
+        let request: ClientHello = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.version, SIGNAL_VERSION);
+        write_msg(
+            &mut send,
+            &ServerHello {
+                version,
+                file_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+        let _ = send.stopped().await;
+    };
+    let (client, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(connect_signal(&cfg, Role::Controller, None), server)
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(client, Err(Problem::Incompatible { server, client: SIGNAL_VERSION }) if server == version)
+    );
 }
 
 async fn next(sig: &mut Signal) -> ServerMsg {
@@ -1055,14 +1171,7 @@ async fn host_service_retries_an_unanswered_rekey() {
         fn offline(&self) {}
     }
     // 只会说信令的假服务器
-    let ck = rcgen::generate_simple_self_signed(vec!["airhand".into()]).unwrap();
-    let chain = vec![CertificateDer::from(ck.cert.der().to_vec())];
-    let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into();
-    let endpoint = quinn::Endpoint::server(
-        crate::server_config(chain, key).unwrap(),
-        "127.0.0.1:0".parse().unwrap(),
-    )
-    .unwrap();
+    let (endpoint, _) = test_endpoint();
     let cfg = LinkConfig::new(endpoint.local_addr().unwrap().to_string(), "", "t", "t").unwrap();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // 不保存控制码的被控端
@@ -1090,11 +1199,8 @@ async fn host_service_retries_an_unanswered_rekey() {
         );
         let hello: ClientHello = airhand_proto::framing::decode_known(&buf).unwrap();
         assert_eq!(hello.role, Role::Host);
-        let answer = ServerHello::answer(hello.versions(), airhand_proto::Features::NONE, None);
-        assert!(answer.version.is_some());
-        write_frame(&mut send, &airhand_proto::framing::to_vec(&answer))
-            .await
-            .unwrap();
+        assert_eq!(hello.version, SIGNAL_VERSION);
+        write_msg(&mut send, &ServerHello::new(None)).await.unwrap();
         let reg: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
             .await
             .unwrap()
@@ -1268,25 +1374,20 @@ async fn a_host_that_isnt_ready_is_answered_like_an_unknown_code() {
     assert_eq!(broker.failure_count(ip), 2);
 }
 
-/// 服务器不管会话有几条通道、各是什么：以后新加的通道（这里是 7 号）照样转给另一端；
-/// 同一端把同一条通道开两次的拒绝；任何一端的控制通道结束，整个会话结束，其它通道随之断开
+/// 未知通道和重复常驻流都被拒绝。控制通道结束时，其他通道随会话一起关闭。
 #[tokio::test]
-async fn lanes_the_server_has_never_heard_of_are_relayed() {
+async fn unknown_lanes_and_duplicate_persistent_streams_are_rejected() {
     use airhand_proto::SessionHeader;
     let (broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
     let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
-    let lane = async |conn: &quinn::Connection, lane: u8| {
+    let lane = async |conn: &quinn::Connection, lane: SessionLane| {
         let mut send = conn.open_uni().await.unwrap();
-        let h = SessionHeader {
-            session_id: sid,
-            lane,
-            priority: 3,
-            flags: 0,
-        };
-        send.write_all(&h.encode()).await.unwrap();
+        send.write_all(&SessionHeader::new(sid, lane).encode())
+            .await
+            .unwrap();
         send
     };
     // 另一端收到的：同样的会话头，然后是数据
@@ -1299,22 +1400,33 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         recv.read_exact(&mut hdr).await.unwrap();
         (SessionHeader::decode(&hdr).unwrap(), recv)
     };
-    // 新的通道：不用等控制通道，另一端马上收到
-    let mut h7 = lane(&host.conn, 7).await;
-    h7.write_all(b"future lane").await.unwrap();
-    let (h, mut c7) = accept(&ctrl.conn).await;
-    assert_eq!((h.session_id, h.lane, h.priority), (sid, 7, 3));
-    let mut buf = [0u8; 11];
-    timeout(Duration::from_secs(2), c7.read_exact(&mut buf))
+    let mut unknown = host.conn.open_uni().await.unwrap();
+    let mut header = SessionHeader::new(sid, SessionLane::Bulk).encode();
+    header[SessionHeader::LEN - 1] = u8::MAX;
+    unknown.write_all(&header).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), unknown.stopped())
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(VarInt::from_u32(1))
+    );
+    // 大块流不用等控制通道，另一端马上收到。
+    let mut bulk = lane(&host.conn, SessionLane::Bulk).await;
+    bulk.write_all(b"bulk message").await.unwrap();
+    let (h, mut bulk_recv) = accept(&ctrl.conn).await;
+    assert_eq!(h, SessionHeader::new(sid, SessionLane::Bulk));
+    let mut buf = [0u8; 12];
+    timeout(Duration::from_secs(2), bulk_recv.read_exact(&mut buf))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&buf, b"future lane");
-    let hc = lane(&host.conn, SessionLane::Control.number()).await;
-    let mut cc = lane(&ctrl.conn, SessionLane::Control.number()).await;
+    assert_eq!(&buf, b"bulk message");
+    let hc = lane(&host.conn, SessionLane::Control).await;
+    let mut cc = lane(&ctrl.conn, SessionLane::Control).await;
     cc.write_all(b"ping").await.unwrap();
     let (h, mut hcr) = accept(&host.conn).await;
-    assert_eq!(h.lane, SessionLane::Control.number());
+    assert_eq!(h.lane, SessionLane::Control);
     let mut b4 = [0u8; 4];
     timeout(Duration::from_secs(2), hcr.read_exact(&mut b4))
         .await
@@ -1322,13 +1434,13 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         .unwrap();
     assert_eq!(&b4, b"ping");
     let (_, _ccr) = accept(&ctrl.conn).await;
-    // 同一端再开一次 7 号通道：拒绝
-    let dup = lane(&host.conn, 7).await;
-    assert!(
+    let dup = lane(&host.conn, SessionLane::Bulk).await;
+    assert_eq!(
         timeout(Duration::from_secs(2), dup.stopped())
             .await
             .unwrap()
-            .is_ok()
+            .unwrap(),
+        Some(VarInt::from_u32(1))
     );
     assert!(broker.sessions.lock().contains_key(&sid));
     // 一端的控制通道结束：整个会话结束，别的通道随之断开
@@ -1338,7 +1450,7 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
     })
     .await;
     assert!(
-        timeout(Duration::from_secs(2), c7.read(&mut buf))
+        timeout(Duration::from_secs(2), bulk_recv.read(&mut buf))
             .await
             .unwrap()
             .is_err()
@@ -1346,28 +1458,17 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
     drop(cc);
 }
 
-/// 帧流（信令 v10）：同一条通道可以开很多条，各自转给另一端（带着同样的会话头）；一端放弃了一条（reset），
-/// 转过去的那条也放弃。同时开着的有上限，结束了的不算；控制通道不能是帧流
+/// 同一个视频通道可以打开多条帧流，每条独立转发和 reset。
 #[tokio::test]
 async fn frame_streams_are_relayed_one_frame_each() {
     use airhand_proto::{MAX_FRAME_STREAMS, SessionHeader};
     let (broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
-    assert_eq!(host.version, airhand_proto::SIGNAL_VERSION);
     let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
     let frame = async |lane: SessionLane, body: &[u8]| {
-        let mut send = host.conn.open_uni().await.unwrap();
-        send.write_all(
-            &SessionHeader {
-                flags: SessionHeader::FRAME,
-                ..SessionHeader::new(sid, lane)
-            }
-            .encode(),
-        )
-        .await
-        .unwrap();
+        let mut send = open_lane(&host.conn, sid, lane).await.unwrap();
         send.write_all(body).await.unwrap();
         send
     };
@@ -1380,7 +1481,7 @@ async fn frame_streams_are_relayed_one_frame_each() {
         recv.read_exact(&mut hdr).await.unwrap();
         (SessionHeader::decode(&hdr).unwrap(), recv)
     };
-    // 两条画面的帧流：另一端各收到一条，会话头一样（带着帧流的标志）
+    // 两条画面的帧流：另一端各收到一条，会话头一样。
     for body in [&b"first"[..], b"second"] {
         let mut s = frame(SessionLane::Video(0), body).await;
         s.finish().unwrap();
@@ -1407,14 +1508,6 @@ async fn frame_streams_are_relayed_one_frame_each() {
             .unwrap(),
         Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))
     ));
-    // 控制通道不能是帧流
-    let control = frame(SessionLane::Control, b"x").await;
-    assert!(
-        timeout(Duration::from_secs(2), control.stopped())
-            .await
-            .unwrap()
-            .is_ok()
-    );
     // 同时开着的帧流有上限
     wait_until("the finished frame streams are gone", || {
         broker.host_frame_streams(sid) == 0
@@ -1446,9 +1539,7 @@ async fn frame_streams_are_relayed_one_frame_each() {
     drop(open);
 }
 
-/// 文件流（剪贴板里的文件，见 airhand_proto::files）：只能是帧流；一条流转发的字节不超过上限对应的大小，
-/// 超过了两头都 reset（RELAY_LIMIT），两端都看得到原因；一端叫停 / reset 的错误码原样带给另一端；
-/// 上限是 0 的服务器不转文件流；握手里告诉客户端上限
+/// 文件流不能超过换算成线上的限额；取消错误码应透传，即使文件发送方正在等待。
 #[tokio::test]
 async fn file_streams_are_limited_by_the_relay() {
     use airhand_proto::SessionHeader;
@@ -1491,7 +1582,7 @@ async fn file_streams_are_limited_by_the_relay() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(got.len(), body.len());
+    assert_eq!(got, body);
     wait_until("the relayed bytes are counted", || {
         broker.session_file_bytes(sid) == body.len() as u64
     })
@@ -1509,30 +1600,12 @@ async fn file_streams_are_limited_by_the_relay() {
     );
     let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
     assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::RELAY_LIMIT)));
-    // 取的一方叫停：给的一方看到同一个错误码
+    // 取的一方叫停：发送端不再写新数据，也应立即看到同一个错误码。
     let mut s = open(file).await;
-    s.write_all(b"part").await.unwrap();
-    let (_, mut r) = accept().await;
+    let (_, mut r) = accept_after(&mut s, b"part", &accept).await;
     r.stop(VarInt::from_u32(reset::CANCELLED)).unwrap();
-    let stopped = timeout(Duration::from_secs(2), async {
-        loop {
-            if s.write_all(b"more").await.is_err() {
-                break s.stopped().await;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
     assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::CANCELLED)));
-    // 文件通道只能是帧流
-    let plain = open(SessionHeader { flags: 0, ..file }).await;
-    assert!(
-        timeout(Duration::from_secs(2), plain.stopped())
-            .await
-            .unwrap()
-            .is_ok()
-    );
     assert!(broker.sessions.lock().contains_key(&sid));
 
     // 上限是 0：不转文件流

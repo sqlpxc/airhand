@@ -3,7 +3,7 @@
 //! * [`Identity`]：一台设备的长期 X25519 密钥（Noise 的静态密钥），由各端自己保存；
 //! * [`initiate`] / [`Initiator::finish`]：控制端开始握手（第一条消息放进发起会话的请求里），之后在控制通道上做完
 //!   （最后是控制端的确认）；[`respond`]：被控端回答（发出决定就返回，确认由会话的读任务解开）。
-//!   两边都得到 [`Secured`] 和双方协商好的 [`Negotiated`]；
+//!   两边都得到 [`Secured`]；
 //! * [`Secured`]：握手一次性派生的通道密钥：每条通道每个方向一个 [`Sealer`] / [`Opener`]，声音数据报、
 //!   控制数据报各一对。
 //!
@@ -13,23 +13,22 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::wire::{read_frame, write_frame};
+use crate::wire::{read_frame, write_msg};
 use airhand_proto::framing::{self, PREFIX};
 use airhand_proto::handshake::{
     self, Confirm, ControllerIntro, HandshakeError, HandshakeFinish, HandshakeInit, HandshakeReply,
     HostVerdict, MAX_MSG, NONCE_LEN, PAKE_CONTROLLER, PAKE_HOST, Pattern, PublicKey, Refusal,
-    SEAL_OVERHEAD, TAG_LEN,
+    SEAL_OVERHEAD,
 };
+use airhand_proto::minicbor::{self, Encode};
 use airhand_proto::session::{QualitySettings, StreamView};
-use airhand_proto::{Features, Role, SESSION_MIN, SESSION_VERSION, SessionLane, datagram};
+use airhand_proto::{Role, SESSION_VERSION, SessionLane, datagram};
 use anyhow::{Context, Result, anyhow, bail};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf;
 use spake2::{Ed25519Group, Identity as PakeId, Password, Spake2};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
-
-pub use airhand_proto::handshake::Negotiated;
 
 use crate::Problem;
 
@@ -137,10 +136,28 @@ impl Sealer {
 
     /// 数据报：`会话 ID | 种类 | 密文 | 标签 | 计数`（见 `airhand_proto::datagram`）
     pub fn seal_datagram(&mut self, session_id: u64, kind: u8, packet: &[u8]) -> Result<Vec<u8>> {
-        let mut d = Vec::with_capacity(datagram::HEADER + packet.len() + SEAL_OVERHEAD);
-        d.extend_from_slice(&session_id.to_le_bytes());
-        d.push(kind);
+        let len = datagram::HEADER + packet.len() + SEAL_OVERHEAD;
+        anyhow::ensure!(len <= datagram::MAX, "datagram payload too large");
+        let mut d = Vec::with_capacity(len);
+        d.extend_from_slice(&datagram::header(session_id, kind));
         d.extend_from_slice(packet);
+        self.seal_at(&mut d, datagram::HEADER)?;
+        Ok(d)
+    }
+
+    /// 控制消息直接编码到将要发送的缓冲区。
+    pub(crate) fn seal_control(
+        &mut self,
+        session_id: u64,
+        msg: &impl Encode<()>,
+    ) -> Result<Vec<u8>> {
+        let mut d = Vec::with_capacity(64);
+        d.extend_from_slice(&datagram::header(session_id, datagram::CONTROL));
+        minicbor::encode(msg, &mut d).expect("writing to a Vec can't fail");
+        anyhow::ensure!(
+            d.len() + SEAL_OVERHEAD <= datagram::MAX,
+            "datagram payload too large"
+        );
         self.seal_at(&mut d, datagram::HEADER)?;
         Ok(d)
     }
@@ -180,6 +197,16 @@ enum Order {
     Window(ReplayWindow),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OpenError {
+    #[error("a session frame is too short")]
+    Short,
+    #[error("a session frame was dropped, reordered or replayed")]
+    Reordered,
+    #[error("a session frame failed authentication")]
+    Authentication,
+}
+
 impl Opener {
     /// 下一个要的计数（控制、大块通道）；画面、声音是收到过的最大计数 + 1
     pub(crate) fn expected(&self) -> u64 {
@@ -201,29 +228,27 @@ impl Opener {
     /// 解不开（被改过、不是这条通道的、计数不对）是错误：控制、大块、画面通道上会话不能再继续；
     /// 数据报丢掉就是了
     pub fn open(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        let at = buf
-            .len()
-            .checked_sub(NONCE_LEN + TAG_LEN)
-            .context("a session frame is too short")?
-            + TAG_LEN;
-        let c = u64::from_le_bytes(buf[at..].try_into().expect("8 bytes"));
-        anyhow::ensure!(
-            self.is_fresh(c),
-            "a session frame was dropped, reordered or replayed"
-        );
-        buf.truncate(at);
-        let len = self
-            .key
-            .open_in_place(nonce(c), Aad::empty(), buf)
-            .map_err(|_| anyhow!("a session frame failed authentication"))?
-            .len();
+        let len = self.open_in_place(buf)?.len();
         buf.truncate(len);
+        Ok(())
+    }
+
+    pub(crate) fn open_in_place<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a [u8], OpenError> {
+        let c = counter_of(buf).ok_or(OpenError::Short)?;
+        if !self.is_fresh(c) {
+            return Err(OpenError::Reordered);
+        }
+        let at = buf.len() - NONCE_LEN;
+        let plain = self
+            .key
+            .open_in_place(nonce(c), Aad::empty(), &mut buf[..at])
+            .map_err(|_| OpenError::Authentication)?;
         // 认证通过之后才记下：伪造的单元不能把计数推走
         match &mut self.order {
             Order::Next(next) => *next = c.saturating_add(1),
             Order::Window(w) => w.accept(c),
         }
-        Ok(())
+        Ok(plain)
     }
 }
 
@@ -492,15 +517,15 @@ async fn send_step<W: AsyncWrite + Unpin, T: airhand_proto::minicbor::Encode<()>
     w: &mut W,
     msg: &T,
 ) -> Result<()> {
-    tokio::time::timeout(STEP_TIMEOUT, write_frame(w, &framing::to_vec(msg)))
+    tokio::time::timeout(STEP_TIMEOUT, write_msg(w, msg))
         .await
         .context("the end-to-end handshake writer timed out")??;
     Ok(())
 }
 
-/// Noise 消息的缓冲区（Noise 规定一条消息最多 65535 字节）
+/// Noise 消息及其明文都不能超过外层握手帧的上限。
 fn noise_buf() -> Vec<u8> {
-    vec![0u8; 65535]
+    vec![0; MAX_MSG]
 }
 
 /// 控制端握手的结果
@@ -510,8 +535,6 @@ pub struct Initiated {
     pub opener: Opener,
     /// 控制通道上控制端 → 被控端的发送端（已经发出了确认，计数接着往下数）
     pub sealer: Sealer,
-    /// 选定的会话版本、双方都支持的能力位（和被控端算出来的一样）
-    pub negotiated: Negotiated,
 }
 
 /// 控制端怎么证明自己、怎么认被控端
@@ -534,7 +557,7 @@ pub struct Initiator {
     pake: Option<Spake2<Ed25519Group>>,
     /// 介绍（CBOR），`Noise_XX` 时放在第 3 条里
     intro: Vec<u8>,
-    features: Features,
+    version: u16,
 }
 
 /// 控制端：开始握手，返回第一条消息（[`HandshakeInit`] 的 CBOR，放进 `ClientMsg::Connect::init`）。
@@ -574,7 +597,8 @@ pub fn initiate(p: InitiatorParams<'_>) -> Result<(Initiator, Vec<u8>)> {
         &[]
     };
     let n = hs.write_message(first, &mut msg)?;
-    init.noise = msg[..n].to_vec();
+    msg.truncate(n);
+    init.noise = msg;
     let init = framing::to_vec(&init);
     anyhow::ensure!(init.len() <= MAX_MSG, "the handshake message is too large");
     Ok((
@@ -583,7 +607,7 @@ pub fn initiate(p: InitiatorParams<'_>) -> Result<(Initiator, Vec<u8>)> {
             pattern,
             pake: pake.map(|(s, _)| s),
             intro,
-            features: p.intro.features,
+            version: p.intro.version,
         },
         init,
     ))
@@ -602,13 +626,13 @@ impl Initiator {
             pattern,
             pake,
             intro,
-            features,
+            version,
         } = self;
         let mut buf = Vec::new();
         read_step(recv, &mut buf).await?;
         let reply: HandshakeReply = framing::decode_known(&buf)?;
         if let Some(e) = reply.error {
-            return Err(handshake_problem(e, pattern, reply.patterns.as_deref()).into());
+            return Err(handshake_problem(e, pattern).into());
         }
         if let Some(spake) = pake {
             let theirs = reply
@@ -639,19 +663,13 @@ impl Initiator {
             reply.verdict
         } else {
             // First：之前不认识它；Pairing：配对码认的是它，换过身份也没关系
-            let mut msg = noise_buf();
-            let n = hs.write_message(&intro, &mut msg)?;
-            send_step(
-                send,
-                &HandshakeFinish {
-                    noise: msg[..n].to_vec(),
-                },
-            )
-            .await?;
+            let n = hs.write_message(&intro, &mut payload)?;
+            payload.truncate(n);
+            send_step(send, &HandshakeFinish { noise: payload }).await?;
             read_step(recv, &mut buf).await?;
             let reply: HandshakeReply = framing::decode_known(&buf)?;
             if let Some(e) = reply.error {
-                return Err(handshake_problem(e, pattern, reply.patterns.as_deref()).into());
+                return Err(handshake_problem(e, pattern).into());
             }
             reply.verdict
         };
@@ -666,33 +684,26 @@ impl Initiator {
         let mut verdict = verdict.context("the host sent no verdict")?;
         opener.open(&mut verdict)?;
         let verdict: HostVerdict = framing::decode_known(&verdict)?;
-        let version = match (verdict.version, verdict.refused) {
-            (Some(v), _) => v,
-            (None, Some(Refusal::PairingRequired)) => return Err(Problem::PairingRequired.into()),
-            (None, Some(Refusal::Incompatible)) => {
-                return Err(incompatible(verdict.min, verdict.max).into());
+        if verdict.version != version {
+            return Err(Problem::PeerIncompatible {
+                peer: verdict.version,
+                ours: version,
             }
-            (None, r) => {
-                return Err(
-                    Problem::failed(format!("the host refused the connection ({r:?})")).into(),
-                );
-            }
-        };
-        anyhow::ensure!(
-            (SESSION_MIN..=SESSION_VERSION).contains(&version),
-            "the host chose session version {version}, which we can't speak"
-        );
-        let mut negotiated = Negotiated::new(version, verdict.features);
-        negotiated.features = negotiated.features.common(features);
+            .into());
+        }
+        match verdict.refused {
+            None => {}
+            Some(Refusal::PairingRequired) => return Err(Problem::PairingRequired.into()),
+            Some(r) => bail!("the host refused the connection ({r:?})"),
+        }
         // 确认（见 airhand_proto::handshake 的"确认"）：被控端解开它才算本机进来了，重放的握手消息走不到这一步
         let mut confirm = framing::encode_with_spare(&Confirm::default(), SEAL_OVERHEAD);
         sealer.seal_frame(&mut confirm)?;
         tokio::time::timeout(STEP_TIMEOUT, send.write_all(&confirm))
             .await
             .context("the handshake confirmation writer timed out")??;
-        debug!(?pattern, ?negotiated, safety = %secured.safety, "end-to-end handshake done");
+        debug!(?pattern, version, safety = %secured.safety, "end-to-end handshake done");
         Ok(Initiated {
-            negotiated,
             secured,
             opener,
             sealer,
@@ -700,43 +711,8 @@ impl Initiator {
     }
 }
 
-/// 会话版本不兼容：`min..=max` 是对方能说的
-fn incompatible(min: u16, max: u16) -> Problem {
-    if max < SESSION_MIN {
-        // 对方太旧
-        Problem::PeerIncompatible {
-            peer: max,
-            ours: SESSION_MIN,
-        }
-    } else {
-        Problem::PeerIncompatible {
-            peer: min,
-            ours: SESSION_VERSION,
-        }
-    }
-}
-
-/// 被控端回答的握手错误。`theirs`：被控端会的模式（[`HandshakeError::Unsupported`] 时有）
-fn handshake_problem(e: HandshakeError, pattern: Pattern, theirs: Option<&[Pattern]>) -> Problem {
+fn handshake_problem(e: HandshakeError, pattern: Pattern) -> Problem {
     match e {
-        HandshakeError::Unsupported => {
-            // 模式的编号越大越新。对方会的都比这次用的旧：对方该更新了；
-            // 否则（对方会更新的模式、或者不再支持这个旧的）是本机该更新了
-            let ours = pattern.code();
-            let newest = Pattern::newest(theirs.unwrap_or_default());
-            let narrow = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
-            if ours > newest {
-                Problem::PeerIncompatible {
-                    peer: narrow(newest),
-                    ours: narrow(ours),
-                }
-            } else {
-                Problem::PeerIncompatible {
-                    peer: narrow(newest.max(ours + 1)),
-                    ours: narrow(ours),
-                }
-            }
-        }
         HandshakeError::UnknownKey if pattern == Pattern::Known => Problem::HostKeyChanged,
         HandshakeError::PairingFailed => Problem::PairingFailed,
         HandshakeError::PairingUnavailable => Problem::PairingUnavailable,
@@ -785,8 +761,6 @@ pub struct Responded {
     pub opener: Opener,
     pub intro: ControllerIntro,
     pub admission: Admission,
-    /// 选定的会话版本、双方都支持的能力位（和控制端算出来的一样）
-    pub negotiated: Negotiated,
 }
 
 pub struct ResponderParams<'a> {
@@ -812,12 +786,12 @@ where
     R: AsyncRead + Unpin,
     F: Future<Output = Result<R>>,
 {
+    if init.len() > MAX_MSG {
+        fail(send, HandshakeError::Malformed).await;
+        bail!("the controller's first handshake message is too large");
+    }
     let init: HandshakeInit = match framing::decode_known(init) {
-        Ok(i) if init.len() <= MAX_MSG => i,
-        Ok(_) => {
-            fail(send, HandshakeError::Malformed).await;
-            bail!("the controller's first handshake message is too large");
-        }
+        Ok(i) => i,
         Err(e) => {
             fail(send, HandshakeError::Malformed).await;
             return Err(e.into());
@@ -825,16 +799,7 @@ where
     };
     let pattern = init.pattern;
     if !pattern.is_known() {
-        // 以后的模式：告诉控制端本机会哪些，它据此判断该更新哪一边
-        let _ = send_step(
-            send,
-            &HandshakeReply {
-                error: Some(HandshakeError::Unsupported),
-                patterns: Some(Pattern::KNOWN.to_vec()),
-                ..Default::default()
-            },
-        )
-        .await;
+        fail(send, HandshakeError::Unsupported).await;
         bail!("unsupported end-to-end handshake pattern {pattern:?}");
     }
     let me = p.gate.identity();
@@ -887,10 +852,11 @@ where
     };
     let mut msg = noise_buf();
     let m = hs.write_message(&[], &mut msg)?;
-    reply.noise = Some(msg[..m].to_vec());
+    msg.truncate(m);
+    reply.noise = Some(msg);
 
-    let (intro_bytes, stream) = if pattern == Pattern::Known {
-        (payload[..n].to_vec(), None)
+    let (n, stream) = if pattern == Pattern::Known {
+        (n, None)
     } else {
         send_step(send, &reply).await?;
         reply = HandshakeReply::default();
@@ -899,7 +865,7 @@ where
         read_step(&mut r, &mut buf).await?;
         let finish: HandshakeFinish = framing::decode_known(&buf)?;
         match hs.read_message(&finish.noise, &mut payload) {
-            Ok(n) => (payload[..n].to_vec(), Some(r)),
+            Ok(n) => (n, Some(r)),
             Err(_) if pattern == Pattern::Pairing => {
                 drop(pairing.take());
                 fail(send, HandshakeError::PairingFailed).await;
@@ -912,7 +878,7 @@ where
         }
     };
     anyhow::ensure!(hs.is_handshake_finished(), "the handshake didn't finish");
-    let intro: ControllerIntro = match framing::decode_known(&intro_bytes) {
+    let intro: ControllerIntro = match framing::decode_known(&payload[..n]) {
         Ok(i) => i,
         Err(e) => {
             fail(send, HandshakeError::Malformed).await;
@@ -921,11 +887,11 @@ where
     };
     let (secured, LaneKeys { opener, mut sealer }) = KeyMaterial::new(Role::Host, &mut hs)?.split();
 
-    // 决定：版本，然后是让不让进来
-    let version = intro.max.min(SESSION_VERSION);
-    let compatible = version >= intro.min.max(SESSION_MIN);
-    let negotiated = Negotiated::new(version, intro.features);
-    let admission = if pattern == Pattern::Pairing {
+    // 先校验版本，只有同一会话格式才可能被接纳。
+    let compatible = intro.version == SESSION_VERSION;
+    let admission = if !compatible {
+        None
+    } else if pattern == Pattern::Pairing {
         Some(Admission::Paired)
     } else if p.gate.is_known(&secured.peer) {
         Some(Admission::Known)
@@ -949,11 +915,8 @@ where
         info!(name = %intro.name, key = %hex(&secured.peer), "a controller paired with this host");
     }
     let verdict = HostVerdict {
-        version: refused.is_none().then_some(version),
-        features: airhand_proto::features::session::SUPPORTED,
+        version: SESSION_VERSION,
         refused,
-        min: SESSION_MIN,
-        max: SESSION_VERSION,
     };
     reply.verdict = Some(sealer.seal(&framing::to_vec(&verdict))?);
     send_step(send, &reply).await?;
@@ -962,7 +925,6 @@ where
     }
     Ok((
         Responded {
-            negotiated,
             secured,
             sealer,
             opener,
@@ -994,9 +956,7 @@ pub fn controller_intro(
     view: Vec<StreamView>,
 ) -> ControllerIntro {
     ControllerIntro {
-        min: SESSION_MIN,
-        max: SESSION_VERSION,
-        features: airhand_proto::features::session::SUPPORTED,
+        version: SESSION_VERSION,
         name: name.to_string(),
         os: os.to_string(),
         settings: settings.sanitized(),
@@ -1155,9 +1115,7 @@ mod tests {
         // 开始时的画质、声音和看哪个显示器在介绍里
         assert_eq!((h.intro.settings.fps, h.intro.audio), (60, true));
         assert_eq!(h.intro.view, [StreamView::display(1)]);
-        // 两边协商出来的一样
-        assert_eq!(c.negotiated, h.negotiated);
-        assert_eq!(c.negotiated.version, SESSION_VERSION);
+        assert_eq!(h.intro.version, SESSION_VERSION);
 
         // 两边的密钥对得上
         let mut c_send = c.secured.bulk.sealer;
@@ -1284,15 +1242,43 @@ mod tests {
         read_frame(&mut fake_r, 1 << 16, &mut buf).await.unwrap();
         let reply: HandshakeReply = framing::decode_known(&buf).unwrap();
         assert!(reply.verdict.is_some() && reply.error.is_none());
-        write_frame(&mut fake_w, &[0u8; 40]).await.unwrap();
+        crate::wire::write_frame(&mut fake_w, &[0u8; 40])
+            .await
+            .unwrap();
         read_frame(&mut hr, 1 << 16, &mut buf).await.unwrap();
         let mut opener = r.opener;
         assert!(opener.open(&mut buf).is_err());
     }
 
-    /// 被控端不会控制端用的模式（以后的版本加的）：回答它会哪些，控制端据此判断该更新哪一边
     #[tokio::test]
-    async fn an_unknown_pattern_is_answered_with_the_known_ones() {
+    async fn a_session_version_mismatch_cannot_admit_or_pair() {
+        let gate = TestGate::new(Some("123456"));
+        let me = Identity::generate();
+        for version in [SESSION_VERSION - 1, SESSION_VERSION + 1] {
+            let intro = ControllerIntro {
+                version,
+                ..test_intro()
+            };
+            let (initiator, init) = initiate(params(&me, None, Some("123456"), &intro)).unwrap();
+            let ((mut cr, mut cw), (hr, mut hw)) = pipes();
+            let (controller, host) = tokio::join!(
+                initiator.finish(&mut cr, &mut cw),
+                respond(&init, &mut hw, async { Ok(hr) }, responder(&gate))
+            );
+            assert_eq!(
+                problem(controller),
+                Problem::PeerIncompatible {
+                    peer: SESSION_VERSION,
+                    ours: version
+                }
+            );
+            assert!(host.is_err());
+            assert!(!gate.is_known(me.public()));
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_handshake_inits_are_rejected() {
         let gate = TestGate::new(None);
         let ((mut cr, _cw), (hr, mut hw)) = pipes();
         let init = framing::to_vec(&HandshakeInit {
@@ -1306,22 +1292,6 @@ mod tests {
         read_frame(&mut cr, 1 << 16, &mut buf).await.unwrap();
         let reply: HandshakeReply = framing::decode_known(&buf).unwrap();
         assert_eq!(reply.error, Some(HandshakeError::Unsupported));
-        let theirs = reply.patterns.unwrap();
-        assert_eq!(theirs, Pattern::KNOWN);
-        // 本机用的比对方会的都新：对方该更新
-        let p = handshake_problem(
-            HandshakeError::Unsupported,
-            Pattern::Unknown(7),
-            Some(&theirs[..]),
-        );
-        assert!(matches!(p, Problem::PeerIncompatible { peer, ours } if peer < ours));
-        // 对方会更新的：本机该更新
-        let p = handshake_problem(
-            HandshakeError::Unsupported,
-            Pattern::Known,
-            Some(&[Pattern::Unknown(9)][..]),
-        );
-        assert!(matches!(p, Problem::PeerIncompatible { peer, ours } if peer > ours));
         // 太大的、解不出来的第一条消息：回答格式不对
         for bad in [vec![0xff; 3], vec![0x40; MAX_MSG + 1]] {
             let ((mut cr, _cw), (hr, mut hw)) = pipes();

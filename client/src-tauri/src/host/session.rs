@@ -122,9 +122,6 @@ pub async fn run(inc: Incoming, gate: Arc<DesktopGate>) -> Result<()> {
         |admitted, senders| {
             let mut desktop = Desktop::new(session_id, senders);
             desktop.identity = Some((gate.clone(), ip, admitted.clone()));
-            desktop.mic.negotiated = admitted
-                .negotiated
-                .has(airhand_proto::features::session::MIC);
             desktop
         },
     )
@@ -160,7 +157,7 @@ struct Desktop {
     sound: Option<AudioSubscription>,
     clip: ClipSync,
     clip_tick: Interval,
-    /// 剪贴板里的文件（控制端也支持时才有，见 `airhand_link::files`）
+    /// 剪贴板里的文件（见 `airhand_link::files`）。
     files: Option<airhand_link::files::Files>,
     permission_tick: Interval,
     display_tick: Interval,
@@ -171,8 +168,6 @@ struct Desktop {
 
 /// 控制端的麦克风（见 [`super::mic`]）
 struct Mic {
-    /// 控制端懂麦克风（协商了 MIC）：会话开始时告诉它这里能不能接，之后有变化再告诉它
-    negotiated: bool,
     /// 控制端麦克风的声音从读任务交到这里（打开了才交给播放线程）
     input: Arc<MicInput>,
     /// 控制端想开着麦克风：开不了（别的会话占着、没有设备）的话，等能开了自动打开
@@ -190,7 +185,7 @@ struct Mic {
 impl Mic {
     /// 没在用、现在也用不了：要等别的会话放开、设备出现
     fn waiting(&self) -> bool {
-        self.negotiated && self.lease.is_none()
+        cfg!(windows) && self.lease.is_none()
     }
 
     /// 现在用不了是因为设备（没有、打不开）：定时再找
@@ -235,7 +230,6 @@ impl Desktop {
             display_tick: ticker(DISPLAY_CHECK),
             missing: (false, false),
             mic: Mic {
-                negotiated: false,
                 input: Arc::default(),
                 wanted: false,
                 lease: None,
@@ -394,8 +388,11 @@ impl Platform for Desktop {
 
     /// 控制端麦克风的声音（读任务里调用）：打开了麦克风才交给播放线程
     fn mic(&self) -> Option<Arc<dyn MicSink>> {
-        let input: Arc<dyn MicSink> = self.mic.input.clone();
-        self.mic.negotiated.then_some(input)
+        if cfg!(windows) {
+            Some(self.mic.input.clone())
+        } else {
+            None
+        }
     }
 
     async fn start(&mut self, start: Start) -> Result<()> {
@@ -449,11 +446,8 @@ impl Platform for Desktop {
         if start.audio {
             self.subscribe_audio()?;
         }
-        // 控制端懂麦克风：告诉它这里能不能接（它据此显示麦克风的按钮）
-        if self.mic.negotiated {
-            let state = mic::probe(self.session_id).await;
-            self.send_mic((state, None))?;
-        }
+        let state = mic::probe(self.session_id).await;
+        self.send_mic((state, None))?;
         Ok(())
     }
 
@@ -507,7 +501,7 @@ impl Platform for Desktop {
                     self.subscribe_audio()?;
                 }
             }
-            Request::Mic(enabled) if self.mic.negotiated => {
+            Request::Mic(enabled) => {
                 self.mic.wanted = enabled;
                 if enabled && self.mic.lease.is_none() {
                     self.open_mic().await?;
@@ -518,8 +512,6 @@ impl Platform for Desktop {
                     self.send_mic((state, None))?;
                 }
             }
-            // 没协商麦克风的控制端不会发
-            Request::Mic(_) => {}
         }
         Ok(())
     }
@@ -551,7 +543,7 @@ impl Platform for Desktop {
                         warn!(session_id, "dropped a clipboard update: {e:#}");
                     }
                 }
-                // 本机复制了文件：只发清单，控制端粘贴时才来取（控制端不支持时什么也不做）
+                // 本机复制了文件：只发清单，控制端粘贴时才来取。
                 Some(Clip::Files(paths)) => {
                     if let Some(f) = self.files.clone()
                         && let Some(provider) = super::clip_provider(paths).await

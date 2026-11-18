@@ -4,10 +4,9 @@
 //!
 //! # 版本握手
 //!
-//! 连接后客户端先发 [`ClientHello`]，服务器回 [`ServerHello`]。两条都是 CBOR map，**0、1 号键永远是版本区间**
-//! （[`Versions`]），这是信令协议里唯一冻结的部分：服务器先只读这两个键（map 里别的键不管）、算出双方都能说的最高版本，
-//! 没有交集就回答 `version: None` 和自己的区间，客户端据此提示该更新哪一边。所以任何两个版本之间都能互相告知"不兼容"，
-//! 而握手里的其它字段照样可以按 [`crate::framing`] 的规则增减。
+//! 连接后客户端先发 [`ClientHello`]，服务器回 [`ServerHello`]。两端的 `version` 必须一致；
+//! 不一致时客户端按服务器报出的版本提示更新哪一端，服务器不再读后续消息。
+//! 客户端可以把第一条信令消息拼在 Hello 后面（例如注册），省一次往返。
 //!
 //! 握手之后的消息（[`ClientMsg`] / [`ServerMsg`]）是带编号的 CBOR，不认识的跳过（见 [`crate::framing`]）。
 //!
@@ -74,108 +73,48 @@ use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::open_enum;
-use crate::{Features, Role};
+use crate::{Role, SIGNAL_VERSION};
 
 // ───────────────────────────── 版本握手 ─────────────────────────────
 
-/// 版本握手里冻结的部分：[`ClientHello`] / [`ServerHello`] 的 0、1 号键（见模块说明的"版本握手"）
-#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
-#[cbor(map)]
-pub struct Versions {
-    /// 能说的最老的版本
-    #[n(0)]
-    pub min: u16,
-    /// 能说的最新的版本
-    #[n(1)]
-    pub max: u16,
-}
-
-impl Versions {
-    /// 本端能说的信令版本
-    pub const SIGNAL: Versions = Versions {
-        min: crate::SIGNAL_MIN,
-        max: crate::SIGNAL_VERSION,
-    };
-
-    /// 双方都能说的最高版本；没有交集时为 `None`
-    pub fn common(self, other: Versions) -> Option<u16> {
-        let v = self.max.min(other.max);
-        (v >= self.min.max(other.min)).then_some(v)
-    }
-}
-
-/// 客户端连上之后的第一条消息（见模块说明的"版本握手"）。
-///
-/// `name` 为空表示不知道本机名称，由显示的一方按自己的语言显示"未知设备"。
+/// 客户端的第一条消息；`name` 为空表示不知道本机名称。
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
-#[cbor(map)]
 pub struct ClientHello {
     #[n(0)]
-    pub min: u16,
+    pub version: u16,
     #[n(1)]
-    pub max: u16,
-    #[n(2)]
     pub role: Role,
-    #[n(3)]
+    #[n(2)]
     pub name: String,
-    #[n(4)]
+    #[n(3)]
     pub os: String,
-    /// 信令层的能力位（[`crate::features::signal`]）
-    #[cbor(n(5), default)]
-    pub features: Features,
 }
 
 impl ClientHello {
-    /// 本端的握手
     pub fn new(role: Role, name: String, os: String) -> Self {
         Self {
-            min: Versions::SIGNAL.min,
-            max: Versions::SIGNAL.max,
+            version: SIGNAL_VERSION,
             role,
             name,
             os,
-            features: crate::features::signal::SUPPORTED,
-        }
-    }
-
-    pub fn versions(&self) -> Versions {
-        Versions {
-            min: self.min,
-            max: self.max,
         }
     }
 }
 
-/// 服务器对 [`ClientHello`] 的回答（见模块说明的"版本握手"）
+/// 服务器对 [`ClientHello`] 的回答，始终报告自己的版本。
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
-#[cbor(map)]
 pub struct ServerHello {
-    /// 服务器能说的信令版本
     #[n(0)]
-    pub min: u16,
+    pub version: u16,
+    /// 单次粘贴经中转的字节上限（见 [`crate::files`]）。`None` 不限，`Some(0)` 只允许直连。
     #[n(1)]
-    pub max: u16,
-    /// 之后按这个版本说话；`None`：没有双方都能说的版本，客户端应停止重试，按 `min..=max` 提示用户更新哪一边
-    #[n(2)]
-    pub version: Option<u16>,
-    /// 服务器的信令能力位
-    #[cbor(n(3), default)]
-    pub features: Features,
-    /// 一次粘贴（剪贴板里的一个文件公告）经中转最多传这么多字节的内容（见 [`crate::files`] 的"走哪条路"）：
-    /// `None` 不限，`Some(0)` 中转不传文件（只能走直连）。服务器按单条文件流兜底
-    #[n(4)]
     pub file_limit: Option<u64>,
 }
 
 impl ServerHello {
-    /// 服务器怎么回答能说 `client` 的客户端：双方都能说的最高版本
-    pub fn answer(client: Versions, features: Features, file_limit: Option<u64>) -> Self {
-        let ours = Versions::SIGNAL;
+    pub const fn new(file_limit: Option<u64>) -> Self {
         Self {
-            min: ours.min,
-            max: ours.max,
-            version: ours.common(client),
-            features,
+            version: SIGNAL_VERSION,
             file_limit,
         }
     }
@@ -363,104 +302,6 @@ open_enum! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 版本握手冻结的部分：两条消息都是 map，0、1 号键是版本区间。这个测试守着它：
-    /// 如果它失败了，说明改动会让其它版本的客户端 / 服务器连"版本不一致"都无法得知
-    #[test]
-    fn version_handshake_is_frozen() {
-        let hello = ClientHello {
-            min: 9,
-            max: 11,
-            role: Role::Controller,
-            name: "A".into(),
-            os: "B".into(),
-            features: Features::NONE,
-        };
-        let wire = minicbor::to_vec(&hello).unwrap();
-        // map(6) | 0: 9 | 1: 11 | ...
-        assert_eq!(wire[..5], [0xa6, 0x00, 0x09, 0x01, 0x0b]);
-        assert_eq!(
-            minicbor::decode::<Versions>(&wire).unwrap(),
-            Versions { min: 9, max: 11 }
-        );
-        // 服务器回答的是自己的区间和双方都能说的最高版本（值随版本变，位置不变）
-        let answer = ServerHello::answer(hello.versions(), Features::NONE, Some(50 << 20));
-        let wire = minicbor::to_vec(&answer).unwrap();
-        let (min, max) = (crate::SIGNAL_MIN as u8, crate::SIGNAL_VERSION as u8);
-        assert!(min < 24 && max < 24, "one-byte CBOR integers");
-        assert_eq!(wire[..5], [0xa5, 0x00, min, 0x01, max]);
-        assert_eq!(answer.version, Some(crate::SIGNAL_VERSION.min(11)));
-        let back: ServerHello = minicbor::decode(&wire).unwrap();
-        assert_eq!(back.file_limit, Some(50 << 20));
-        // 不限时不写这一项
-        let unlimited = ServerHello::answer(hello.versions(), Features::NONE, None);
-        let wire = minicbor::to_vec(&unlimited).unwrap();
-        assert_eq!(wire[..5], [0xa4, 0x00, min, 0x01, max]);
-        let back: ServerHello = minicbor::decode(&wire).unwrap();
-        assert_eq!(back.file_limit, None);
-        assert_eq!(crate::ALPN, b"airhand/1");
-    }
-
-    /// 以后的版本在握手里加了字段、换了别的东西：照样读得出版本区间，照样能回答"不兼容"
-    #[test]
-    fn any_version_can_be_told_it_is_incompatible() {
-        #[derive(Encode)]
-        #[cbor(map)]
-        struct FutureHello {
-            #[n(0)]
-            min: u16,
-            #[n(1)]
-            max: u16,
-            #[n(2)]
-            role: String,
-            #[n(9)]
-            hologram: Vec<u8>,
-        }
-        let wire = minicbor::to_vec(FutureHello {
-            min: 12,
-            max: 14,
-            role: "quantum".into(),
-            hologram: vec![1, 2],
-        })
-        .unwrap();
-        let v: Versions = minicbor::decode(&wire).unwrap();
-        assert!(minicbor::decode::<ClientHello>(&wire).is_err());
-        let answer = ServerHello::answer(v, Features::NONE, None);
-        assert_eq!(answer.version, None);
-        assert_eq!(
-            (answer.min, answer.max),
-            (Versions::SIGNAL.min, Versions::SIGNAL.max)
-        );
-        // 将来的服务器少发了能力位：照样读得懂
-        #[derive(Encode)]
-        #[cbor(map)]
-        struct OldServer {
-            #[n(0)]
-            min: u16,
-            #[n(1)]
-            max: u16,
-            #[n(2)]
-            version: Option<u16>,
-        }
-        let wire = minicbor::to_vec(OldServer {
-            min: 9,
-            max: 9,
-            version: Some(9),
-        })
-        .unwrap();
-        let s: ServerHello = minicbor::decode(&wire).unwrap();
-        assert_eq!((s.version, s.features), (Some(9), Features::NONE));
-    }
-
-    #[test]
-    fn negotiation_picks_the_highest_common_version() {
-        let v = |min, max| Versions { min, max };
-        assert_eq!(v(9, 11).common(v(9, 10)), Some(10));
-        assert_eq!(v(9, 9).common(v(9, 12)), Some(9));
-        // 一边太旧 / 太新
-        assert_eq!(v(8, 8).common(v(9, 10)), None);
-        assert_eq!(v(11, 12).common(v(9, 10)), None);
-    }
 
     #[test]
     fn unknown_connect_errors_keep_their_value() {

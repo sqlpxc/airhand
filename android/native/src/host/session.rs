@@ -353,10 +353,6 @@ mod tests {
                 os: "Windows".into(),
                 safety: "482-913".into(),
                 admission: airhand_link::host::Admission::Paired,
-                negotiated: airhand_proto::handshake::Negotiated {
-                    version: 1,
-                    features: Default::default(),
-                },
                 settings: Default::default(),
                 audio: false,
                 view: Vec::new(),

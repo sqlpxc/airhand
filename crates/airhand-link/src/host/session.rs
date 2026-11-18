@@ -190,8 +190,7 @@ pub struct Senders {
     pub video: Vec<mpsc::Sender<Bytes>>,
     /// 声音包
     pub audio: mpsc::Sender<Bytes>,
-    /// 剪贴板里的文件（双方都支持时才有，见 [`crate::files`]）：本机剪贴板里有了文件时 [`crate::files::Files::offer`]，
-    /// 换成了文字时 [`crate::files::Files::withdraw`]
+    /// 剪贴板文件处理端（见 [`crate::files`]）。
     pub files: Option<crate::files::Files>,
 }
 
@@ -391,7 +390,6 @@ mod tests {
     use crate::host::streams::{Express, request};
     use crate::tasks::OwnedTask;
     use airhand_proto::framing;
-    use airhand_proto::handshake::Negotiated;
     use airhand_proto::session::{
         Codec, ControllerDatagram, ControllerMsg, MAX_CLIPBOARD_TEXT, MouseButton,
     };
@@ -484,10 +482,6 @@ mod tests {
             os: "test".into(),
             safety: "000-000".into(),
             admission,
-            negotiated: Negotiated {
-                version: 1,
-                features: Default::default(),
-            },
             settings: QualitySettings::default(),
             audio: true,
             view: Vec::new(),

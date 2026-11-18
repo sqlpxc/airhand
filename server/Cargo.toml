@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+bytes = "1"
 rand = "0.9"
 sha2 = "0.10"
 # 固定控制码的绑定表（见 src/codes.rs）。bundled：静态编译 SQLite，不依赖系统库（镜像是 distroless）

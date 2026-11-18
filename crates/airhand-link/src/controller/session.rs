@@ -13,7 +13,7 @@ use super::receiver::{FromHost, HostReceiver};
 use crate::audio::Bundler;
 use crate::merge::Video;
 use crate::paths::{DatagramSender, Paths};
-use crate::secure::{Negotiated, Sealer};
+use crate::secure::Sealer;
 use crate::transport::write_lane;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
@@ -398,8 +398,6 @@ pub(super) struct SessionIo {
     pub recv: HostReceiver,
     pub ui: Arc<dyn SessionUi>,
     pub mode: Mode,
-    /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
-    pub negotiated: Negotiated,
     /// 每一路画面的（第 `i` 项是第 `i` 路）
     pub arrivals: Arc<std::sync::Mutex<Vec<Arrivals>>>,
     /// Ping、画面确认（控制数据报）
@@ -410,8 +408,8 @@ pub(super) struct SessionIo {
     pub direct: Direct,
     /// 麦克风：会话 ID、界面交过来的声音包、声音数据报的加密端
     pub mic: (u64, mpsc::Receiver<Bytes>, Sealer),
-    /// 剪贴板里的文件（双方都支持时才有，见 [`crate::files`]）和收文件流的任务
-    pub files: Option<(Files, OwnedTask<()>)>,
+    /// 剪贴板文件会话和收文件流的任务。
+    pub files: (Files, OwnedTask<()>),
     /// 被控端剪贴板里最新的文件（网页版、Android 从这里取）
     pub remote: Arc<std::sync::Mutex<Option<RemoteOffer>>>,
 }
@@ -446,7 +444,6 @@ pub(super) async fn run(
         mut recv,
         ui,
         mode,
-        negotiated,
         arrivals,
         feedback,
         paths,
@@ -455,21 +452,13 @@ pub(super) async fn run(
             task: direct_task,
         },
         mic: (session_id, mut mic_rx, mut mic_sealer),
-        files,
+        files: (files, _files_task),
         remote,
     } = io;
-    let (files, _files_task) = match files {
-        Some((f, t)) => (Some(f), Some(t)),
-        None => (None, None),
-    };
-    // 剪贴板里的文件传不了：告诉界面
-    let mut file_notices = files.as_ref().map(Files::notices);
+    let mut file_notices = files.notices();
     let notices_ui = ui.clone();
     let notices = async move {
-        let Some(rx) = &mut file_notices else {
-            return std::future::pending().await;
-        };
-        while let Some(n) = rx.recv().await {
+        while let Some(n) = file_notices.recv().await {
             let _ = notices_ui.event(SessionEvent::FileError {
                 name: n.name,
                 error: n.error,
@@ -482,7 +471,7 @@ pub(super) async fn run(
     let mic_paths = paths.clone();
     // 画面最近是从直连来的：麦克风的声音也走直连（被控端按两条路的时延选的，见 crate::direct）
     let video_direct = Arc::new(AtomicBool::new(false));
-    info!(sid, ?negotiated, "session started");
+    info!(sid, "session started");
     let local_clip = match mode {
         Mode::Desktop { clip, enabled } => Some((clip, enabled)),
         Mode::Browser => None,
@@ -635,9 +624,7 @@ pub(super) async fn run(
                 HostMsg::Notice(None) => debug!(sid, "skipping a notice from a newer host"),
                 HostMsg::Clipboard { text } => {
                     // 文字取代被控端之前公告的文件
-                    if let Some(f) = &files_in {
-                        f.remote_cleared();
-                    }
+                    files_in.remote_cleared();
                     match &clip_in {
                         Some((clip, enabled)) => {
                             if enabled.load(Ordering::Relaxed) {
@@ -650,8 +637,7 @@ pub(super) async fn run(
                     }
                 }
                 HostMsg::Files(Some(m)) => {
-                    let offer = files_in.as_ref().and_then(|f| f.handle(m));
-                    if let Some(offer) = offer {
+                    if let Some(offer) = files_in.handle(m) {
                         *remote.lock().unwrap() = Some(offer.clone());
                         match &clip_in {
                             Some((clip, enabled)) => {
@@ -801,21 +787,16 @@ pub(super) async fn run(
             }
             match got {
                 Clip::Text(text) => {
-                    if let Some(f) = &files_out {
-                        f.withdraw();
-                    }
+                    files_out.withdraw();
                     send_clipboard(&bulk_tx, text);
                 }
-                // 复制了文件：只发清单，被控端粘贴时才来取（被控端不支持时什么也不做）
+                // 复制时只发清单，读取文件元数据可能阻塞。
                 Clip::Files(paths) => {
-                    if let Some(f) = &files_out {
-                        // 看一眼每个路径（可能在慢的网络驱动器上）
-                        let local = tokio::task::spawn_blocking(move || LocalFs::new(&paths)).await;
-                        if let Ok(local) = local
-                            && !local.is_empty()
-                        {
-                            f.offer(Arc::new(local));
-                        }
+                    let local = tokio::task::spawn_blocking(move || LocalFs::new(&paths)).await;
+                    if let Ok(local) = local
+                        && !local.is_empty()
+                    {
+                        files_out.offer(Arc::new(local));
                     }
                 }
             }
@@ -866,9 +847,7 @@ pub(super) async fn run(
         r = bulk_writer => r.and(Err(Problem::SessionEnded.into())),
     };
     // 停下给到一半的、取到一半的（本机剪贴板里留着的公告之后再读也只是失败）
-    if let Some(f) = &files {
-        f.close();
-    }
+    files.close();
     let reason = match result {
         Ok(()) => Problem::SessionEnded,
         Err(e) => Problem::from_error(e, Problem::failed),

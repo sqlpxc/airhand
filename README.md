@@ -13,7 +13,7 @@ Airhand is a **high-performance, low-latency** remote desktop: the screen is enc
 The same program is both the **host** (the device being controlled) and the **controller** (the device you control it from). The two sides meet through a **relay server** that you deploy yourself. It's small, and Docker Compose deploys it with one command. Enter the other side's 6-digit **control code** to connect.
 
 > [!NOTE]
-> **Work in progress (0.3.0).** This version requires signaling v10 on the relay and all clients. Video uses one QUIC stream per frame. [Protocol versions](docs/development.md#protocol-versions)
+> **Work in progress (0.3.0).** Build the relay, clients and web service from the same v10 revision; earlier builds cannot be mixed. Video uses one QUIC stream per frame. [Protocol versions](docs/development.md#protocol-versions)
 
 ## Performance
 

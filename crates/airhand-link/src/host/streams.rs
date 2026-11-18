@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use airhand_proto::datagram;
 use airhand_proto::framing;
-use airhand_proto::handshake::{Confirm, Negotiated, PublicKey};
+use airhand_proto::handshake::{Confirm, PublicKey};
 use airhand_proto::session::{
     ControllerDatagram, ControllerMsg, DirectOffer, HostDatagram, InputEvent, MAX_CLIPBOARD_TEXT,
     QualitySettings, StreamView,
 };
-use airhand_proto::{MAX_STREAMS, SessionLane, features};
+use airhand_proto::{MAX_STREAMS, SessionLane};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -69,7 +69,7 @@ pub struct HostStreams {
     reader: OwnedTask<Result<()>>,
     /// 直连任务（有直连时才有，见 [`crate::direct::host`]）：会话开始之后（[`HostStreams::started`]）才开始
     direct: Option<OwnedTask<()>>,
-    /// 剪贴板里的文件（双方都支持时才有，见 [`crate::files`]）和收文件流的任务
+    /// 剪贴板文件处理端和收文件流的任务（见 [`crate::files`]）。
     pub files: Option<Files>,
     _files_task: Option<OwnedTask<()>>,
     started: Arc<Notify>,
@@ -308,8 +308,6 @@ pub struct Admitted {
     pub safety: String,
     /// 为什么让它进来（刚配对的还是配对过的）
     pub admission: Admission,
-    /// 选定的会话版本、双方都支持的会话能力位
-    pub negotiated: Negotiated,
     /// 开始时的画质（已经做过范围校验）：编码管线一开始就按它建
     pub settings: QualitySettings,
     /// 开始时要不要声音
@@ -349,7 +347,6 @@ impl HostStreams {
             os: r.intro.os.chars().take(64).collect(),
             safety: r.secured.safety.clone(),
             admission: r.admission,
-            negotiated: r.negotiated,
             settings: r.intro.settings.sanitized(),
             audio: r.intro.audio,
             view: r
@@ -364,12 +361,10 @@ impl HostStreams {
             admission = ?admitted.admission,
             controller = %secure::hex(&admitted.key),
             safety = %admitted.safety,
-            negotiated = ?admitted.negotiated,
             "end-to-end session established"
         );
         let mut secured = r.secured;
         let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
-        let use_files = admitted.negotiated.features.has(features::session::FILES);
         let frames: Vec<Arc<FrameStreams>> =
             (0..secured.video.len()).map(|_| Arc::default()).collect();
         let (out, ctl_rx, bulk_rx) = queue::channel();
@@ -411,20 +406,14 @@ impl HostStreams {
         let (answers_tx, answers) = mpsc::channel(4);
         let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
         let started = Arc::new(Notify::new());
-        // 剪贴板里的文件（双方都支持时）：对方开过来的文件流交给它
-        let (files, files_task) = if use_files {
-            let (f, t) = Files::start(
-                session_id,
-                paths.clone(),
-                secured.files,
-                inc.file_limit,
-                HostPeer(Mutex::new(Some(out.clone()))),
-                inbox.files,
-            );
-            (Some(f), Some(t))
-        } else {
-            (None, None)
-        };
+        let (files, files_task) = Files::start(
+            session_id,
+            paths.clone(),
+            secured.files,
+            inc.file_limit,
+            HostPeer(Mutex::new(Some(out.clone()))),
+            inbox.files,
+        );
         let direct = inc.direct.as_ref().map(|link| {
             OwnedTask(tokio::spawn(direct::host::run(direct::host::Session {
                 link: link.clone(),
@@ -444,7 +433,7 @@ impl HostStreams {
             session_id,
             control,
             bulk,
-            files: files.clone(),
+            files: Some(files.clone()),
             datagrams: (inbox.datagrams, secured.datagrams.opener),
             mic: (inbox.audio, secured.audio.opener),
             express,
@@ -463,8 +452,8 @@ impl HostStreams {
                 writer: Writer(writer),
                 reader,
                 direct,
-                files,
-                _files_task: files_task,
+                files: Some(files),
+                _files_task: Some(files_task),
                 started,
                 _registration: registration,
             },
@@ -531,7 +520,7 @@ struct Readers {
     session_id: u64,
     control: Merge,
     bulk: Merge,
-    /// 剪贴板里的文件（双方都支持时）
+    /// 剪贴板文件处理端。
     files: Option<Files>,
     /// 控制数据报（Ping、确认、回声）：从哪条路来、整个数据报，和它们的解密端
     datagrams: (mpsc::Receiver<(Via, Bytes)>, Opener),

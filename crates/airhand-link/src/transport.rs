@@ -79,9 +79,14 @@ pub async fn write_lane(
 /// 解开一个数据报（整个数据报：会话 ID、种类、密封单元）里的消息。解不开（被改过、重放的、另一条路上后到的那一份）、
 /// 不认识（对方版本新增的）的都是 `None`：数据报本来就会丢
 pub(crate) fn open_datagram<T: for<'b> Decode<'b, ()>>(opener: &mut Opener, d: &[u8]) -> Option<T> {
-    let mut body = d.get(datagram::HEADER..)?.to_vec();
-    opener.open(&mut body).ok()?;
-    match framing::decode(&body) {
+    if datagram::kind(d) != Some(datagram::CONTROL) {
+        return None;
+    }
+    let body = d.get(datagram::HEADER..)?;
+    let mut buf = [0; datagram::MAX - datagram::HEADER];
+    let sealed = buf.get_mut(..body.len())?;
+    sealed.copy_from_slice(body);
+    match framing::decode(opener.open_in_place(sealed).ok()?) {
         Ok(Decoded::Msg(m)) => Some(m),
         _ => None,
     }
@@ -121,5 +126,40 @@ impl LaneOf for HostMsg {
 impl LaneOf for ControllerMsg {
     fn lane(&self) -> SessionLane {
         ControllerMsg::lane(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use airhand_proto::session::ControllerDatagram;
+
+    #[test]
+    fn control_datagrams_are_bounded_authenticated_and_deduplicated() {
+        let (mut sealer, mut opener) = crate::secure::test_lane(false);
+        let msg = ControllerDatagram::Ack {
+            seq: 8,
+            arrived: 19,
+            stream: 2,
+        };
+        let packet = sealer.seal_control(5, &msg).unwrap();
+        assert_eq!(datagram::session(&packet), Some(5));
+        for n in 0..packet.len() {
+            assert!(open_datagram::<ControllerDatagram>(&mut opener, &packet[..n]).is_none());
+        }
+        let mut tampered = packet.clone();
+        tampered[datagram::HEADER] ^= 1;
+        assert!(open_datagram::<ControllerDatagram>(&mut opener, &tampered).is_none());
+        tampered.resize(datagram::MAX + 1, 0);
+        assert!(open_datagram::<ControllerDatagram>(&mut opener, &tampered).is_none());
+        assert!(matches!(
+            open_datagram(&mut opener, &packet),
+            Some(ControllerDatagram::Ack {
+                seq: 8,
+                arrived: 19,
+                stream: 2
+            })
+        ));
+        assert!(open_datagram::<ControllerDatagram>(&mut opener, &packet).is_none());
     }
 }

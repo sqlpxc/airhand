@@ -41,18 +41,15 @@
 //! * [`Pattern::First`]：第一次连，还不知道被控端的公钥。`Noise_XX`，多半个往返，控制端记下对方的公钥；
 //! * [`Pattern::Pairing`]：带着配对码。`Noise_XXpsk3`，PSK 由 SPAKE2 用配对码算出（见下面的"配对"）。
 //!
-//! 握手怎么做完全由模式决定，没有另外的握手版本号：握手要改（换算法、换消息格式）就加一个新的模式。
-//! 模式是开放枚举，被控端不认识控制端用的模式时回答 [`HandshakeError::Unsupported`]，
-//! 并在 [`HandshakeReply::patterns`] 里列出自己会的模式（据此判断该更新哪一边，以后也可以换一个双方都会的模式重试）。
+//! 三种模式都是 v10 的一部分，不认识的模式直接拒绝。
 //!
 //! Noise 的 prologue 是 [`prologue`]：把握手绑定到这条 [`HandshakeInit`]（模式、SPAKE2 消息），服务器改了其中任何一样，
 //! 握手都会失败。会话 ID 不在里面：第一条消息在服务器分配会话 ID 之前就发出了，而会话 ID 本来就是服务器定的，
 //! 绑上它也挡不住服务器把一次握手挪到另一个会话里（那样它也只是换了个编号转发同一个控制端）。
 //!
-//! 控制端的介绍（[`ControllerIntro`]：会话版本、能力位、名称，开始时的画质和要不要声音）放在它最后一条
-//! Noise 消息的负载里，是加密、认证过的。被控端的决定（[`HostVerdict`]：选定的会话版本、能力位，或者拒绝的原因）
-//! 在被控端最后一条 [`HandshakeReply::verdict`] 里，已经是用会话密钥加密的第一帧（被控端 → 控制端的控制通道，计数器 0）。
-//! 所以会话版本和能力位服务器既看不到、也改不了，没法让两端降级。两端各自取双方都支持的能力位（[`Negotiated`]）。
+//! 控制端的介绍（[`ControllerIntro`]，包含会话版本和初始设置）放在最后一条 Noise 消息的负载里，经过加密和认证。
+//! 被控端的决定（[`HostVerdict`]）在最后一条 [`HandshakeReply::verdict`] 里，用控制通道的会话密钥加密（计数 0）。
+//! 双方要求会话版本精确匹配；中转看不到也不能修改这两个版本字段。
 //!
 //! # 确认：挡住重放
 //!
@@ -103,7 +100,6 @@
 
 use minicbor::{Decode, Encode};
 
-use crate::Features;
 use crate::cbor::open_enum;
 use crate::session::QualitySettings;
 
@@ -128,7 +124,7 @@ pub const PAKE_CONTROLLER: &[u8] = b"airhand controller";
 pub const PAKE_HOST: &[u8] = b"airhand host";
 
 open_enum! {
-    /// 握手的模式（见模块说明）。握手要改就加一个新的模式，编号越来越大
+    /// 握手的认证模式（见模块说明）。
     pub enum Pattern {
         /// 控制端记着被控端的公钥：`Noise_IK`
         Known = 0 => "known",
@@ -149,14 +145,9 @@ impl Pattern {
             Pattern::Unknown(_) => None,
         }
     }
-
-    /// 一组模式里最新的（编号最大的）：被控端不支持控制端的模式时，比一比谁的更新，就知道该更新哪一边
-    pub fn newest(patterns: &[Pattern]) -> u32 {
-        patterns.iter().map(|p| p.code()).max().unwrap_or(0)
-    }
 }
 
-/// 控制端 → 被控端：握手的第一条消息（经服务器转交，见模块说明）。以后的模式也从这条消息开始：只能加字段
+/// 控制端 → 被控端：握手的第一条消息（经服务器转交，见模块说明）。
 #[derive(Encode, Decode, Debug, Clone)]
 #[cbor(map)]
 pub struct HandshakeInit {
@@ -187,9 +178,6 @@ pub struct HandshakeReply {
     /// 加密的 [`HostVerdict`]：控制通道上被控端 → 控制端的第一个密封单元（计数 0，不带长度前缀）
     #[cbor(n(3), with = "minicbor::bytes")]
     pub verdict: Option<Vec<u8>>,
-    /// 被控端会的握手模式（只在 [`HandshakeError::Unsupported`] 时有）
-    #[n(4)]
-    pub patterns: Option<Vec<Pattern>>,
 }
 
 /// 控制端 → 被控端：Noise 的第 3 条消息（[`Pattern::First`] / [`Pattern::Pairing`]）
@@ -202,7 +190,7 @@ pub struct HandshakeFinish {
 open_enum! {
     /// 握手失败（明文，见 [`HandshakeReply::error`]）
     pub enum HandshakeError {
-        /// 被控端不会这个握手模式（会的在 [`HandshakeReply::patterns`] 里）
+        /// 不认识的握手模式
         Unsupported = 0 => "unsupported",
         /// 被控端解不开：控制端记着的被控端公钥不对（对方重装过、换了身份，或者有人在中间冒充）
         UnknownKey = 1 => "unknownKey",
@@ -217,51 +205,34 @@ open_enum! {
 
 /// 控制端的介绍，在控制端最后一条 Noise 消息的负载里（加密、认证过）
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
-#[cbor(map)]
 pub struct ControllerIntro {
-    /// 控制端能说的会话版本
     #[n(0)]
-    pub min: u16,
-    #[n(1)]
-    pub max: u16,
-    /// 会话层的能力位（[`crate::features::session`]）
-    #[n(2)]
-    pub features: Features,
+    pub version: u16,
     /// 控制端的名称（空字符串表示不知道）和系统
-    #[n(3)]
+    #[n(1)]
     pub name: String,
-    #[n(4)]
+    #[n(2)]
     pub os: String,
     /// 开始时的画质：被控端一开始就按它建编码器（之后的变化是 `ControllerMsg::Settings`）
-    #[n(5)]
+    #[n(3)]
     pub settings: QualitySettings,
     /// 开始时要不要声音（之后的变化是 `ControllerMsg::Audio`）
-    #[n(6)]
+    #[n(4)]
     pub audio: bool,
-    /// 开始时看哪几个显示器（见 [`crate::session`] 的"多屏"；之后的变化是 `ControllerMsg::View`）。
-    /// 空的是只看主显示器（第一次连的时候控制端还不知道对方有哪些显示器）
-    #[cbor(n(7), default)]
+    /// 开始时看哪几个显示器；空的是只看主显示器。
+    #[n(5)]
     pub view: Vec<crate::session::StreamView>,
 }
 
-/// 被控端的决定（加密，见 [`HandshakeReply::verdict`]）
+/// 被控端的决定（加密，见 [`HandshakeReply::verdict`]）。
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
-#[cbor(map)]
 pub struct HostVerdict {
-    /// 选定的会话版本；`None` 表示拒绝（原因在 `refused`）
+    /// 被控端的会话版本。
     #[n(0)]
-    pub version: Option<u16>,
-    /// 被控端的会话能力位（全部的；控制端自己取交集，见 [`Negotiated`]）
+    pub version: u16,
+    /// `None` 表示接受；拒绝时给出原因。
     #[n(1)]
-    pub features: Features,
-    /// 拒绝的原因（这时 `version` 是 `None`）
-    #[n(2)]
     pub refused: Option<Refusal>,
-    /// 被控端能说的会话版本（不兼容时告诉用户该更新哪一边）
-    #[n(3)]
-    pub min: u16,
-    #[n(4)]
-    pub max: u16,
 }
 
 open_enum! {
@@ -279,30 +250,6 @@ open_enum! {
 #[derive(Encode, Decode, Debug, Clone, Default, PartialEq, Eq)]
 #[cbor(map)]
 pub struct Confirm {}
-
-/// 握手协商出来的东西，两端一样：会话代码按它说话
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Negotiated {
-    /// 会话版本
-    pub version: u16,
-    /// 双方都支持的会话能力位（自己的 ∩ 对方的）
-    pub features: Features,
-}
-
-impl Negotiated {
-    /// `peer`：对方的会话能力位
-    pub fn new(version: u16, peer: Features) -> Self {
-        Self {
-            version,
-            features: crate::features::session::SUPPORTED.common(peer),
-        }
-    }
-
-    /// 双方都支持 `f`
-    pub fn has(&self, f: Features) -> bool {
-        self.features.has(f)
-    }
-}
 
 /// Noise 的 prologue：把握手绑定到这条 [`HandshakeInit`]（除了 Noise 消息本身）
 pub fn prologue(init: &HandshakeInit) -> Vec<u8> {
@@ -385,36 +332,7 @@ mod tests {
         assert_eq!(init.pattern, Pattern::Unknown(9));
         assert_eq!(init.pattern.noise(), None);
 
-        let mut e = minicbor::Encoder::new(Vec::new());
-        e.map(5).unwrap();
-        e.u32(0).unwrap().null().unwrap();
-        e.u32(1).unwrap().u64(0).unwrap();
-        e.u32(2).unwrap().u32(50).unwrap();
-        e.u32(3).unwrap().u16(1).unwrap();
-        e.u32(4).unwrap().u16(3).unwrap();
-        let v: HostVerdict = minicbor::decode(&e.into_writer()).unwrap();
-        assert_eq!(
-            (v.version, v.refused, v.max),
-            (None, Some(Refusal::Unknown(50)), 3)
-        );
-
-        let reply = HandshakeReply {
-            error: Some(HandshakeError::Unsupported),
-            patterns: Some(vec![Pattern::Known, Pattern::Unknown(5)]),
-            ..Default::default()
-        };
-        let back: HandshakeReply = minicbor::decode(&minicbor::to_vec(&reply).unwrap()).unwrap();
-        assert_eq!(back.error, reply.error);
-        assert_eq!(Pattern::newest(back.patterns.as_deref().unwrap()), 5);
-        assert_eq!(Pattern::newest(Pattern::KNOWN), 2);
-    }
-
-    #[test]
-    fn negotiated_features_are_the_common_ones() {
-        let n = Negotiated::new(1, Features::from_bits(u64::MAX));
-        assert_eq!(n.features, crate::features::session::SUPPORTED);
-        assert_eq!(Negotiated::new(1, Features::NONE).features, Features::NONE);
-        // 确认是一个空的 map，以后可以加字段
-        assert_eq!(minicbor::to_vec(Confirm {}).unwrap(), [0xa0]);
+        let v: HostVerdict = minicbor::decode(&[0x82, 3, 0x18, 50]).unwrap();
+        assert_eq!((v.version, v.refused), (3, Some(Refusal::Unknown(50))));
     }
 }

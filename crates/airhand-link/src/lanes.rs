@@ -9,8 +9,7 @@
 //! 合并），声音、控制数据报各一个信箱。
 //! 往里放东西的是 [`Feed`]（两条路各拿一个）。
 //!
-//! 画面使用**帧流**（[`open_lane`]，会话头带 `SessionHeader::FRAME`，见 `airhand_proto::session` 的"帧流"）：
-//! 每帧一条流，同一路视频的帧流进入同一个信箱。
+//! 视频每帧一条单向流，同一路视频的帧流进入同一个信箱。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -22,7 +21,6 @@ use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::debug;
 
 use crate::tasks::OwnedTask;
 
@@ -81,13 +79,13 @@ pub struct Inbox {
 
 impl Inbox {
     pub fn new() -> Self {
-        let (lanes, mut streams): (Vec<_>, Vec<_>) = (0..SessionLane::COUNT)
-            .map(|_| mpsc::unbounded_channel())
-            .unzip();
-        let mut take = |lane: SessionLane| {
-            let (_, rx) = mpsc::unbounded_channel();
-            std::mem::replace(&mut streams[lane.number() as usize], rx)
-        };
+        let mut streams = [const { None }; SessionLane::COUNT];
+        let lanes = std::array::from_fn(|i| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            streams[i] = Some(rx);
+            tx
+        });
+        let mut take = |lane: SessionLane| streams[lane.number() as usize].take().unwrap();
         let control = take(SessionLane::Control);
         let bulk = take(SessionLane::Bulk);
         let files = take(SessionLane::File);
@@ -104,9 +102,7 @@ impl Inbox {
             audio,
             datagrams,
             feed: Feed {
-                lanes: lanes
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("one sender per lane")),
+                lanes,
                 audio: audio_tx,
                 control: datagrams_tx,
             },
@@ -121,13 +117,8 @@ impl Default for Inbox {
 }
 
 impl Feed {
-    /// 一条通道的流到了（`h` 是它的会话头）。会话不认识的通道（对方版本新增的）、不再收的通道、
-    /// 控制通道的帧流（控制通道只有一条）：叫对方别发了
-    pub fn stream(&self, h: &SessionHeader, recv: RecvStream, via: Via) {
-        let Some(lane) = SessionLane::from_u8(h.lane) else {
-            debug!(lane = h.lane, "ignoring a lane this version doesn't know");
-            return stop(recv);
-        };
+    /// 通道不再接收时通知对方停发。
+    fn stream(&self, lane: SessionLane, recv: RecvStream, via: Via) {
         let s = LaneStream { recv, via };
         if let Err(mpsc::error::SendError(s)) = self.lanes[lane.number() as usize].send(s) {
             stop(s.recv);
@@ -161,7 +152,7 @@ pub async fn open_lane(
     let mut send = tokio::time::timeout(HEADER_TIMEOUT, conn.open_uni())
         .await
         .context("timed out opening a session lane")??;
-    send.set_priority(lane.priority() as i32)?;
+    send.set_priority(lane.priority())?;
     send.write_all(&SessionHeader::new(session_id, lane).encode())
         .await?;
     Ok(send)
@@ -241,7 +232,7 @@ impl Router {
         let early = std::mem::take(&mut st.early);
         for (at, h, recv) in early {
             if h.session_id == session_id {
-                inbox.feed.stream(&h, recv, Via::Relay);
+                inbox.feed.stream(h.lane, recv, Via::Relay);
             } else {
                 st.early.push_back((at, h, recv));
             }
@@ -257,7 +248,7 @@ impl Router {
     fn stream(&self, h: SessionHeader, recv: RecvStream) {
         let mut st = self.state.lock().unwrap();
         if let Some(feed) = st.sessions.get(&h.session_id) {
-            return feed.stream(&h, recv, Via::Relay);
+            return feed.stream(h.lane, recv, Via::Relay);
         }
         let now = Instant::now();
         while st
@@ -277,14 +268,8 @@ impl Router {
         let Some(session_id) = datagram::session(&d) else {
             return;
         };
-        let feed = self
-            .state
-            .lock()
-            .unwrap()
-            .sessions
-            .get(&session_id)
-            .cloned();
-        if let Some(feed) = feed {
+        // try_send 不等待；在同一把锁内分发，无需逐包克隆整个 Feed。
+        if let Some(feed) = self.state.lock().unwrap().sessions.get(&session_id) {
             feed.datagram(d, Via::Relay);
         }
     }
@@ -343,7 +328,7 @@ pub async fn accept_direct(
             // 只匹配 `Some(_)`（见 Router::run）
             Some(r) = headers.join_next() => match r {
                 Ok(Some((h, recv))) if h.session_id == session_id => {
-                    feed.stream(&h, recv, Via::Direct);
+                    feed.stream(h.lane, recv, Via::Direct);
                 }
                 Ok(Some((_, recv))) => stop(recv),
                 _ => {}

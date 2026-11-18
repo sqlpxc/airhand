@@ -131,24 +131,22 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 ### 协议版本
 
-有两个版本号（`crates/airhand-proto/src/lib.rs`），规则见[工作原理 → 协议的演进](architecture.zh-CN.md#协议的演进)：
+有两个版本号（`crates/airhand-proto/src/lib.rs`），分别精确校验，不做版本区间或协议能力位协商：
 
-- `SIGNAL_VERSION` / `SIGNAL_MIN` 是客户端与中转使用的信令版本，现为 10。版本无交集时服务器回复 `Incompatible`。
-- `SESSION_VERSION` / `SESSION_MIN`：被控端 ⇄ 控制端，在端到端握手里协商，服务器不看。不兼容时控制端显示 `peerIncompatible`
+- `SIGNAL_VERSION`（10）：客户端和中转交换 `ClientHello` / `ServerHello`，各报一个版本。不同就不处理后续请求。
+- `SESSION_VERSION`（1）：被控端和控制端在端到端握手里校验，中转不看。不匹配就不建立会话。
 
-改协议时先想能不能兼容地改，能就不加版本号：
+v10 开发阶段可以调整线上格式，不保留旧客户端分支。测试或部署时，请从同一版源码更新中转、桌面、Android 和网页服务，不要混用早期 v10 构建。编解码约定见[协议的演进](architecture.zh-CN.md#协议的演进)。
 
-- 加消息：给枚举加一个**新编号**的变体，旧版本会跳过它；对方可能不认识的话，先在 `features` 里分一个能力位，对方报了才发
-- 加字段：只能加 `Option`（或者带 `#[cbor(default)]`）的字段，用新的编号；必填字段要永远存在
-- 枚举加值：只有编号的枚举用 `open_enum!`（`crate::cbor`）声明，不认识的值在哪里都解成 `Unknown(原值)`；收的一方要想好怎么对待它（不管、换成默认值、当成"对方的版本更新"）
-- 带字段的枚举加变体：只有三个地方能跳过：整条消息、标了 `crate::cbor::opt` 的 `Option` 字段、标了 `crate::cbor::open_vec` 的列表元素。别的地方遇到不认识的变体故意是解码错误。不要把带字段的枚举直接放进派生的 `Option<…>`（也不要放进结构体、结构体再放进 `Option`）：minicbor 派生会把里面任何深度的不认识的变体当成 `None`，再从错的位置跳过（见 `cbor.rs` 的说明）
-- 编号一旦发布就不能改、不能复用；只有改不下去（例如要删掉必填字段）才加版本号
+中转延迟基准（本机回环，真实 QUIC，不包含编解码）：
 
-版本握手里的版本区间（`ClientHello` / `ServerHello` 这两个 CBOR map 的 0、1 号键，`signal::Versions`）和 ALPN **永远不能改**，否则不同版本之间连“版本不一致”都无法告诉对方；`version_handshake_is_frozen` 测试守着这一点。`airhand-proto` 的测试里有“新版本的对方”发来新消息、新字段、新枚举值的例子，加兼容规则时照着写一个。
+```bash
+cargo test --release -p airhand-server relay_video_bench -- --ignored --nocapture
+```
 
 ### 一份协议，三份实现
 
-`crates/airhand-proto/tests/v10.rs` 固定帧流头、参考帧扩展、`Lost`、交付报告、画质设置和多屏反馈的线上字节。通用 CBOR 消息的历史样例在 `v9.rs`。
+`crates/airhand-proto/tests/v10.rs` 固定当前 v10 的握手、流头、控制消息和媒体包头的线上字节。
 
 Rust、控制台（TypeScript）和 Android（Kotlin）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令、连接选项（`airhand_link::controller::Command`、`ConnectOptions`）。界面和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`），带字段的联合类型用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）和 `./gradlew testDebugUnitTest`（`ProtocolTest`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边的测试通过。
 

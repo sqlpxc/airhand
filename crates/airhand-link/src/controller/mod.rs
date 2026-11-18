@@ -49,7 +49,7 @@
 //!
 //! # 麦克风
 //!
-//! 双方都支持时（`airhand_proto::features::session::MIC`），被控端说明它能不能接麦克风（[`SessionEvent::Mic`]）。
+//! 被控端用 [`SessionEvent::Mic`] 说明它能不能接麦克风。
 //! 界面打开麦克风（[`Command::Mic`]）之后自己采集、编码，把打好的声音包交给 [`ControllerService::mic`]：
 //! 这里带上之前几包的副本、加密，发成声音数据报（走画面来的那条路）。界面不知道有冗余、有几条路。
 
@@ -311,10 +311,8 @@ struct SessionHandle {
     arrivals: Arc<Mutex<Vec<session::Arrivals>>>,
     /// 画面确认（控制数据报）
     feedback: Arc<session::Feedback>,
-    /// 麦克风的声音包；被控端不支持（没协商到 MIC）时为 `None`
-    mic: Option<Mic>,
-    /// 剪贴板里的文件；被控端不支持（没协商到 FILES）时为 `None`
-    files: Option<Files>,
+    mic: Mic,
+    files: Files,
     /// 本机刚公告了文件、对方还没放好时扣住的输入（见 [`ControllerService::command`] 的输入）
     held: Arc<Mutex<Option<VecDeque<ControllerMsg>>>>,
     /// 被控端剪贴板里最新的文件（网页版、Android 从这里取，见 [`ControllerService::remote_files`]）
@@ -476,32 +474,19 @@ impl ControllerService {
         let (tx, rx) = queue::channel();
         let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
         let (mic_tx, mic_rx) = mpsc::channel(MIC_QUEUE);
-        let mic = link
-            .negotiated
-            .has(airhand_proto::features::session::MIC)
-            .then(|| Mic {
-                tx: mic_tx,
-                on: AtomicBool::new(false),
-            });
-        // 剪贴板里的文件（双方都支持时）：被控端开过来的文件流交给它
-        let (file_keys, file_streams) = link.files;
-        let files = link
-            .negotiated
-            .has(airhand_proto::features::session::FILES)
-            .then(|| {
-                Files::start(
-                    grant.session_id,
-                    link.paths.clone(),
-                    file_keys,
-                    live.file_limit,
-                    ControllerPeer(Mutex::new(Some((tx.clone(), bulk_tx.clone())))),
-                    file_streams,
-                )
-            });
-        let (files, files_task) = match files {
-            Some((f, t)) => (Some(f), Some(t)),
-            None => (None, None),
+        let mic = Mic {
+            tx: mic_tx,
+            on: AtomicBool::new(false),
         };
+        let (file_keys, file_streams) = link.files;
+        let (files, files_task) = Files::start(
+            grant.session_id,
+            link.paths.clone(),
+            file_keys,
+            live.file_limit,
+            ControllerPeer(Mutex::new(Some((tx.clone(), bulk_tx.clone())))),
+            file_streams,
+        );
         let remote: Arc<Mutex<Option<RemoteOffer>>> = Arc::default();
         // Ping、画面确认：控制数据报，中转上发、直连通着时直连上也发
         let feedback = Arc::new(session::Feedback::new(link.datagrams));
@@ -537,7 +522,6 @@ impl ControllerService {
             recv: link.receiver,
             ui,
             mode,
-            negotiated: link.negotiated,
             arrivals: arrivals.clone(),
             feedback: feedback.clone(),
             paths: link.paths,
@@ -546,7 +530,7 @@ impl ControllerService {
                 task: Box::pin(direct),
             },
             mic: (grant.session_id, mic_rx, link.mic),
-            files: files.clone().zip(files_task),
+            files: (files.clone(), files_task),
             remote: remote.clone(),
         };
         let registration = link.registration;
@@ -619,18 +603,14 @@ impl ControllerService {
             Command::Mic { sid, enabled } => {
                 let sessions = self.inner.sessions.lock().unwrap();
                 let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-                // 被控端不懂麦克风（对方的版本旧）：什么也不做，界面本来也不会显示麦克风
-                let Some(mic) = &s.mic else { return Ok(()) };
-                mic.on.store(enabled, Ordering::Relaxed);
+                s.mic.on.store(enabled, Ordering::Relaxed);
                 return s.tx.send(ControllerMsg::Mic { enabled });
             }
             Command::Clipboard { sid, text } => {
                 let sessions = self.inner.sessions.lock().unwrap();
                 let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
                 // 文字取代之前公告的文件
-                if let Some(f) = &s.files {
-                    f.withdraw();
-                }
+                s.files.withdraw();
                 send_clipboard(&s.bulk, text);
                 return Ok(());
             }
@@ -646,9 +626,7 @@ impl ControllerService {
             Command::ClipboardCleared { sid } => {
                 let sessions = self.inner.sessions.lock().unwrap();
                 let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-                if let Some(f) = &s.files {
-                    f.withdraw();
-                }
+                s.files.withdraw();
                 return Ok(());
             }
             Command::Ack { sid, seq, stream } => return self.ack(sid, stream, seq),
@@ -677,12 +655,12 @@ impl ControllerService {
             q.push_back(msg);
             return Ok(());
         }
-        let Some(files) = s.files.as_ref().filter(|f| f.awaiting_ready()) else {
+        if !s.files.awaiting_ready() {
             drop(held);
             return s.tx.send(msg);
-        };
+        }
         *held = Some(VecDeque::from([msg]));
-        let (files, held, tx) = (files.clone(), s.held.clone(), s.tx.clone());
+        let (files, held, tx) = (s.files.clone(), s.held.clone(), s.tx.clone());
         self.inner.rt.spawn(async move {
             if !files.await_ready(HOLD_INPUT).await {
                 debug!(
@@ -710,16 +688,11 @@ impl ControllerService {
         Ok(())
     }
 
-    /// 界面这边复制了文件（网页版、Android：文件在界面那边，由 `provider` 读）：公告给被控端，它粘贴时才来取。
-    /// 被控端不支持时是错误
+    /// 界面这边复制了文件（由 `provider` 读）：公告给被控端，它粘贴时才来取。
     pub fn offer_files(&self, sid: u32, provider: Arc<dyn Provider>) -> Result<(), Problem> {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-        let files = s
-            .files
-            .as_ref()
-            .ok_or_else(|| Problem::failed("the host doesn't support clipboard files"))?;
-        files.offer(provider);
+        s.files.offer(provider);
         Ok(())
     }
 
@@ -758,13 +731,13 @@ impl ControllerService {
     }
 
     /// 界面采集、编码好的一个麦克风声音包（`airhand_proto::media` 格式：头 + Opus 包，见模块说明的"麦克风"）。
-    /// 被控端不支持、麦克风没打开、包不对的丢掉；网络跟不上（排满了）也丢掉
+    /// 麦克风没打开、包不对、网络跟不上（排满了）时丢掉。
     pub fn mic(&self, sid: u32, packet: Bytes) -> Result<(), Problem> {
         let sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get(&sid).ok_or(Problem::NoSession)?;
-        let Some(mic) = s.mic.as_ref().filter(|m| m.on.load(Ordering::Relaxed)) else {
+        if !s.mic.on.load(Ordering::Relaxed) {
             return Ok(());
-        };
+        }
         if packet.len() > media::MAX_AUDIO_PACKET || media::AudioHeader::decode(&packet).is_none() {
             debug!(
                 sid,
@@ -773,7 +746,7 @@ impl ControllerService {
             );
             return Ok(());
         }
-        if let Err(mpsc::error::TrySendError::Full(_)) = mic.tx.try_send(packet) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = s.mic.tx.try_send(packet) {
             debug!(sid, "the microphone queue is full, dropping a packet");
         }
         Ok(())
