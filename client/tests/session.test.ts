@@ -466,8 +466,12 @@ test("麦克风：对方说了能接、开关打开、正在查看时才告诉�
   // 对方还没说（版本旧的对方不会说）：开关打开也不发
   s.setMicEnabled(true);
   assert.deepEqual(mics(), []);
-  // 对方没有虚拟麦克风：告诉它打开（它等着设备出现），这边还不采集
+  // 对方最初没有 Steam，后来装上了：准备驱动期间不采集，也不重复发送打开请求
+  s.onEvent({ type: "mic", state: "steamMissing", detail: null });
   s.onEvent({ type: "mic", state: "noDevice", detail: null });
+  s.onEvent({ type: "mic", state: "preparing", detail: null });
+  s.onEvent({ type: "mic", state: "setupFailed", detail: "restart required" });
+  assert.equal(s.micDetail, "restart required");
   assert.deepEqual(mics(), [true]);
   assert.deepEqual(capture, []);
   // 设备有了：开始采集，不用再告诉对方

@@ -47,7 +47,7 @@ const PLATFORM: airhand_proto::session::Platform = airhand_proto::session::Platf
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
 /// 检查显示器有没有变化（插拔、旋转、改分辨率 / 缩放 / 排列）的间隔
 const DISPLAY_CHECK: Duration = Duration::from_secs(2);
-/// 没有虚拟麦克风（或者打不开）时隔多久再找一次：例如本机的用户这时才用了一次 Steam 远程同乐，驱动装上了
+/// 没有虚拟麦克风（或者打不开）时隔多久再找一次，例如对方刚装好 Steam
 const MIC_CHECK: Duration = Duration::from_secs(5);
 
 /// 显示器列表变了之后，每一路画面看的显示器在新列表里的序号：按名字找（插拔别的显示器时序号可能变），
@@ -190,7 +190,17 @@ impl Mic {
 
     /// 现在用不了是因为设备（没有、打不开）：定时再找
     fn missing(&self) -> bool {
-        self.waiting() && matches!(self.sent, Some((MicState::NoDevice | MicState::Failed, _)))
+        self.waiting()
+            && matches!(
+                self.sent,
+                Some((
+                    MicState::NoDevice
+                        | MicState::Failed
+                        | MicState::SteamMissing
+                        | MicState::SetupFailed,
+                    _
+                ))
+            )
     }
 }
 
@@ -252,16 +262,15 @@ impl Desktop {
     }
 
     /// 控制端要开着麦克风：轮到这个会话了就打开，不然告诉它为什么开不了
-    async fn open_mic(&mut self) -> Result<()> {
-        let status = match mic::open(self.session_id, &self.mic.input) {
+    fn open_mic(&mut self) -> Result<()> {
+        let initial = self.mic.sent.clone().unwrap_or((MicState::Preparing, None));
+        let status = match mic::open(self.session_id, &self.mic.input, initial) {
             Ok(lease) => {
                 let s = lease.status();
                 self.mic.lease = Some(lease);
                 s
             }
-            Err(MicState::Busy) => (MicState::Busy, None),
-            // 不支持：没什么可打开的；没有设备等等由 probe 说明
-            Err(_) => (mic::probe(self.session_id).await, None),
+            Err(state) => (state, None),
         };
         self.send_mic(status)
     }
@@ -446,8 +455,8 @@ impl Platform for Desktop {
         if start.audio {
             self.subscribe_audio()?;
         }
-        let state = mic::probe(self.session_id).await;
-        self.send_mic((state, None))?;
+        let status = mic::probe(self.session_id).await;
+        self.send_mic(status)?;
         Ok(())
     }
 
@@ -504,12 +513,12 @@ impl Platform for Desktop {
             Request::Mic(enabled) => {
                 self.mic.wanted = enabled;
                 if enabled && self.mic.lease.is_none() {
-                    self.open_mic().await?;
+                    self.open_mic()?;
                 } else if !enabled {
                     // 放开设备，别的会话就能用了
                     self.mic.lease = None;
-                    let state = mic::probe(self.session_id).await;
-                    self.send_mic((state, None))?;
+                    let status = mic::probe(self.session_id).await;
+                    self.send_mic(status)?;
                 }
             }
         }
@@ -595,10 +604,10 @@ impl Platform for Desktop {
             // 能用了的话：控制端一直想开着就打开，不然告诉它现在能开了
             Tick::MicCheck => {
                 if self.mic.wanted {
-                    self.open_mic().await?;
+                    self.open_mic()?;
                 } else {
-                    let state = mic::probe(self.session_id).await;
-                    self.send_mic((state, None))?;
+                    let status = mic::probe(self.session_id).await;
+                    self.send_mic(status)?;
                 }
             }
         }

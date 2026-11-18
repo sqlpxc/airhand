@@ -166,6 +166,19 @@ fn session_messages_layout() {
         },
         "820c82046178",
     );
+    for (state, bytes) in [
+        (MicState::SteamMissing, "820c8105"),
+        (MicState::Preparing, "820c8106"),
+        (MicState::SetupFailed, "820c8107"),
+    ] {
+        golden(
+            HostMsg::Mic {
+                state,
+                detail: None,
+            },
+            bytes,
+        );
+    }
     golden(ControllerMsg::Mic { enabled: true }, "820a81f5");
 }
 

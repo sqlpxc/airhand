@@ -58,7 +58,7 @@ AIRHAND_CERT=target/e2e/cert.pem AIRHAND_KEY=target/e2e/key.pem ./target/debug/a
 cargo test --lib e2e_roundtrip -- --ignored --nocapture   # 视频帧流/ 编码切换 / 剪贴板 / 声音 / Ping / 断开
 cargo test --lib e2e_reconnect -- --ignored --nocapture   # 服务器重启后取回控制码、更换控制码
 cargo test --lib e2e_multi_display -- --ignored --nocapture  # 同时看两个显示器、再改回只看一个（只有一个显示器时跳过）
-cargo test --lib e2e_mic -- --ignored --nocapture         # Windows：控制端的麦克风经过中转放进 Steam Streaming Microphone
+cargo test --lib e2e_mic -- --ignored --nocapture         # Windows 麦克风转发。设备缺失时会从本机 Steam 安装驱动，需要管理员权限
 ```
 
 剪贴板里的文件用的是本机真的剪贴板，测试会换掉剪贴板里的东西，所以也默认跳过（一个一个跑）：

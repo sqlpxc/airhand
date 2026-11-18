@@ -95,7 +95,7 @@
 //! 就像用着一个本地麦克风。能不能用由被控端的平台和设备决定：
 //!
 //! * 被控端在 [`HostMsg::Hello`] 之后发 [`HostMsg::Mic`]，说明它现在能不能接（[`MicState`]：平台不支持、
-//!   没有虚拟麦克风、能接、被别的控制端占着、出错了），之后有变化再发；
+//!   没有虚拟麦克风、需要安装 Steam、准备设备、能接、被别的控制端占着、出错了），之后有变化再发；
 //! * 控制端在能接时发 [`ControllerMsg::Mic`] 打开，之后的声音和被控端的声音一样走声音数据报（方向相反，
 //!   同样带着之前几包的副本，见 [`crate::media`] 的"声音数据报"）；关掉时也发 [`ControllerMsg::Mic`]。
 //!   被控端只在打开着的时候接（同一时刻只给一个控制端，后来的是 [`MicState::Busy`]）；
@@ -215,7 +215,7 @@ open_enum! {
     pub enum MicState {
         /// 这台被控端的平台还不支持
         Unsupported = 0 => "unsupported",
-        /// 支持，但没有可用的虚拟麦克风（Windows：Steam Streaming Microphone，装了 Steam、用过一次远程同乐就有）
+        /// 支持，但没有可用的虚拟麦克风。Windows 被控端可以在打开转发时从 Steam 安装驱动
         NoDevice = 1 => "noDevice",
         /// 能接：控制端打开麦克风之后，声音放进虚拟麦克风
         Ready = 2 => "ready",
@@ -223,6 +223,12 @@ open_enum! {
         Busy = 3 => "busy",
         /// 打不开（例如被别的程序独占了），被控端在重试
         Failed = 4 => "failed",
+        /// Windows 上既没有可用的设备，也没找到 Steam
+        SteamMissing = 5 => "steamMissing",
+        /// 正在打开设备、安装驱动或等 Windows 发布声音端点
+        Preparing = 6 => "preparing",
+        /// Steam 在，但驱动包不可用、安装失败或设备没有出现。detail 给出原因
+        SetupFailed = 7 => "setupFailed",
     }
 }
 

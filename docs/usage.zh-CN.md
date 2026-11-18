@@ -221,7 +221,7 @@ Linux 上没有开机启动项和系统权限要清理。托盘图标、控制�
 
 把这台电脑的麦克风发给对方：对方电脑上的程序（开会、语音输入、发语音消息）把录音设备选成它的虚拟麦克风，就能听到你说话。默认关闭，每个连接单独打开（工具栏的麦克风按钮 → **把本机麦克风发给对方**），只在正在查看那个连接时发送；第一次打开时浏览器会问能不能用麦克风（桌面版不问）。
 
-- **对方是 Windows**：用的是 Steam 远程同乐的虚拟声卡 **Steam Streaming Microphone**（Valve 的、微软签过名的驱动）。对方电脑上装了 Steam、用过一次 Steam 远程同乐（Remote Play）就有；Airhand 不带、也不安装它。没有它时麦克风菜单里会说明
+- Windows 被控端使用 Steam 自带的 **Steam Streaming Microphone**（Valve 提供、微软签名的虚拟麦克风驱动）。打开转发时，如果设备尚未就绪，Airhand 会从对方电脑的 Steam 安装目录查找并安装驱动。设备就绪后会自动开始转发。对方电脑上缺少 Steam 时，麦克风菜单会提示安装 Steam
 - 在对方电脑的程序里把录音设备选成“麦克风 (Steam Streaming Microphone)”（英文系统是 “Microphone (Steam Streaming Microphone)”），或者在那台电脑的“声音设置 → 输入”里把它设为默认，Windows 的语音输入（Win+H）等用默认麦克风的程序就直接听得到
 - 同一时刻只给一个控制端；别的控制端打开时会显示“另一个控制端正在用”，那个关掉之后自动换过来
 - 对方是 macOS、Linux、Android 时还不支持（不显示麦克风按钮）；Android 控制端还不能发麦克风

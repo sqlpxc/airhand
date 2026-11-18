@@ -232,9 +232,9 @@ export type Platform = "windows" | "mac" | "linux" | "android";
 
 /**
  * 被控端能不能接本机的麦克风（airhand_proto::session::MicState）：unsupported = 那个平台还不支持；
- * noDevice = 没有虚拟麦克风（Windows：Steam Streaming Microphone）；busy = 别的控制端在用；failed = 打不开、在重试
+ * noDevice = 打开转发时可安装驱动，steamMissing = 需要先安装 Steam，preparing = 正在准备设备，setupFailed = 驱动未就绪。
  */
-export type MicState = "unsupported" | "noDevice" | "ready" | "busy" | "failed";
+export type MicState = "unsupported" | "noDevice" | "ready" | "busy" | "failed" | "steamMissing" | "preparing" | "setupFailed";
 
 /** 系统操作（手机的导航键等），与 airhand_proto::session::SystemAction 对应 */
 export type SystemAction =

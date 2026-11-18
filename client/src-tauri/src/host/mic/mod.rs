@@ -1,8 +1,8 @@
 //! 控制端的麦克风（协议见 `airhand_proto::session` 的"麦克风"）：把控制端发来的声音放进本机的虚拟麦克风，
 //! 本机的程序（会议、语音输入）选它做录音设备，就像用着一个本地麦克风。
 //!
-//! Windows 用 Steam 的虚拟声卡 Steam Streaming Microphone（装了 Steam、用过一次远程同乐就有，见 [`wasapi`]）。
-//! Airhand 不带、也不安装这个驱动，只用已经装好的设备：没有它时控制端看到的是 `MicState::NoDevice`。
+//! Windows 用 Steam 的虚拟声卡 Steam Streaming Microphone（见 [`wasapi`]）。打开转发时如果缺少设备，
+//! 从本机 Steam 安装签名驱动（见 [`steam`]）。
 //! 其它平台还不支持（`MicState::Unsupported`）。
 //!
 //! * 同一时刻只给一个会话（[`open`]）：别的会话这时看到的是 `Busy`，空出来之后告诉它们（[`owner_changed`]）；
@@ -13,6 +13,8 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
+mod steam;
 #[cfg(windows)]
 pub(crate) mod wasapi;
 
@@ -79,25 +81,44 @@ pub fn owner_changed() -> watch::Receiver<Option<u64>> {
 
 /// 会话 `session_id` 现在能不能用麦克风（不打开设备）：会话开始时、空出来之后告诉控制端。
 /// 要列举声音设备，放在阻塞线程里
-pub async fn probe(session_id: u64) -> MicState {
+pub async fn probe(session_id: u64) -> Status {
     if OWNER.borrow().is_some_and(|o| o != session_id) {
-        return MicState::Busy;
+        return (MicState::Busy, None);
     }
     #[cfg(windows)]
     {
         tokio::task::spawn_blocking(wasapi::probe)
             .await
-            .unwrap_or(MicState::Failed)
+            .unwrap_or_else(|e| (MicState::Failed, Some(e.to_string())))
     }
     #[cfg(not(windows))]
     {
-        MicState::Unsupported
+        (MicState::Unsupported, None)
     }
 }
 
 /// 控制端打开了麦克风：占用麦克风，开始播放线程。别的会话占着时为 `Err(Busy)`，这个平台不支持时为
 /// `Err(Unsupported)`。打开设备在播放线程里做，结果从 [`MicLease::changed`] 来
-pub fn open(session_id: u64, input: &Arc<MicInput>) -> Result<MicLease, MicState> {
+pub fn open(session_id: u64, input: &Arc<MicInput>, initial: Status) -> Result<MicLease, MicState> {
+    open_with(session_id, input, initial, |rx, stop, status| {
+        #[cfg(windows)]
+        {
+            let mut setup = steam::DriverSetup::default();
+            render(rx, stop, status, wasapi::open, |notify| {
+                setup.missing(notify)
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = (rx, stop, status);
+    })
+}
+
+fn open_with(
+    session_id: u64,
+    input: &Arc<MicInput>,
+    initial: Status,
+    play: fn(Receiver<Vec<u8>>, &AtomicBool, &watch::Sender<Status>),
+) -> Result<MicLease, MicState> {
     if !cfg!(windows) {
         return Err(MicState::Unsupported);
     }
@@ -119,7 +140,7 @@ pub fn open(session_id: u64, input: &Arc<MicInput>) -> Result<MicLease, MicState
     let (tx, rx) = sync_channel(QUEUE);
     *input.tx.lock().unwrap() = Some(tx);
     let stop = Arc::new(AtomicBool::new(false));
-    let (status_tx, status) = watch::channel((MicState::Ready, None));
+    let (status_tx, status) = watch::channel(initial);
     let mut last = LAST.lock().unwrap();
     let previous = last.take();
     let thread_stop = stop.clone();
@@ -129,10 +150,7 @@ pub fn open(session_id: u64, input: &Arc<MicInput>) -> Result<MicLease, MicState
             if let Some(p) = previous {
                 let _ = p.join();
             }
-            #[cfg(windows)]
-            render(rx, &thread_stop, &status_tx, wasapi::open);
-            #[cfg(not(windows))]
-            drop((rx, thread_stop, status_tx));
+            play(rx, &thread_stop, &status_tx);
         });
     match spawned {
         Ok(t) => *last = Some(t),
@@ -423,6 +441,7 @@ pub(crate) fn render(
     stop: &AtomicBool,
     status: &watch::Sender<Status>,
     open: Opener,
+    mut missing: impl FnMut(&dyn Fn(Status)) -> Status,
 ) {
     let set = |s: Status| {
         status.send_if_modified(|now| {
@@ -465,7 +484,7 @@ pub(crate) fn render(
                     out = Some((o, Resampler::new(fmt.rate)));
                 }
                 Ok(None) => {
-                    set((MicState::NoDevice, None));
+                    set(missing(&set));
                     retry = Instant::now() + REOPEN;
                 }
                 Err(e) => {
@@ -742,7 +761,7 @@ pub(crate) mod tests {
         let stop = AtomicBool::new(false);
         let (status_tx, status) = watch::channel((MicState::Failed, None));
         std::thread::scope(|s| {
-            let t = s.spawn(|| render(rx, &stop, &status_tx, open_fake));
+            let t = s.spawn(|| render(rx, &stop, &status_tx, open_fake, |_| unreachable!()));
             // 和网络上一样每 20 ms 来一包
             let start = Instant::now();
             for (i, p) in tone_packets(40, 1000.0).into_iter().enumerate() {
@@ -780,6 +799,7 @@ pub(crate) mod tests {
         let mut changed = owner_changed();
         changed.mark_unchanged();
         let input = Arc::new(MicInput::default());
+        let open = |id, input: &Arc<_>| open_with(id, input, (MicState::Ready, None), |_, _, _| {});
         let a = open(101, &input).unwrap();
         assert_eq!(open(102, &input).err(), Some(MicState::Busy));
         assert!(changed.has_changed().unwrap());

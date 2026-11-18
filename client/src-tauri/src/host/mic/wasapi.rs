@@ -9,7 +9,7 @@
 //!   独占的只是这个虚拟设备，而且只在控制端打开麦克风期间（Steam 远程同乐这时用不了它）。
 //!
 //! 设备按接口名（"Steam Streaming Microphone"）找，不按显示名：显示名前面的"扬声器""麦克风"随系统语言变。
-//! 驱动不在、或者被禁用了就是没有（`MicState::NoDevice`）。
+//! 两个端点都可用才算就绪，缺少端点时由 [`super::steam`] 检查驱动来源。
 
 use anyhow::{Context, Result, bail};
 use windows::Win32::Foundation::PROPERTYKEY;
@@ -25,7 +25,7 @@ use windows::core::GUID;
 use airhand_proto::media::AUDIO_SAMPLE_RATE;
 use airhand_proto::session::MicState;
 
-use super::{Format, Output, Sample};
+use super::{Format, Output, Sample, Status, steam};
 
 /// 设备的接口名（`PKEY_DeviceInterface_FriendlyName`，不随系统语言变）
 const STEAM_MIC: &str = "Steam Streaming Microphone";
@@ -47,13 +47,16 @@ struct Pair {
 }
 
 /// 有没有 Steam Streaming Microphone（不打开）
-pub fn probe() -> MicState {
+pub fn probe() -> Status {
     match find() {
-        Ok(Some(_)) => MicState::Ready,
-        Ok(None) => MicState::NoDevice,
+        Ok(Some(_)) => (MicState::Ready, None),
+        Ok(None) => steam::probe_missing(),
         Err(e) => {
             tracing::warn!("can't look for the virtual microphone: {e:#}");
-            MicState::Failed
+            (
+                MicState::Failed,
+                Some(crate::host::capture::wire_detail(&e)),
+            )
         }
     }
 }
@@ -110,7 +113,11 @@ unsafe fn find_flow(
     flow: EDataFlow,
 ) -> Result<Option<(IMMDevice, Vec<u8>)>> {
     unsafe {
-        let all = en.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
+        let all = en.EnumAudioEndpoints(
+            flow,
+            DEVICE_STATE(DEVICE_STATE_ACTIVE.0 | DEVICE_STATE_DISABLED.0),
+        )?;
+        let mut disabled = false;
         for i in 0..all.GetCount()? {
             let Ok(device) = all.Item(i) else { continue };
             let Ok(store) = device.OpenPropertyStore(STGM_READ) else {
@@ -121,9 +128,16 @@ unsafe fn find_flow(
             {
                 continue;
             }
+            if device.GetState()? == DEVICE_STATE_DISABLED {
+                disabled = true;
+                continue;
+            }
             let format = blob_prop(&store, &PKEY_AudioEngine_DeviceFormat)
                 .context("Steam Streaming Microphone has no device format")?;
             return Ok(Some((device, format)));
+        }
+        if disabled {
+            bail!("Enable both Steam Streaming Microphone devices in Windows sound settings");
         }
         Ok(None)
     }
@@ -352,7 +366,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// 需要这台电脑上有 Steam Streaming Microphone（装了 Steam、用过一次远程同乐）。
+    /// 需要这台电脑上有可用的 Steam Streaming Microphone。
     /// 像控制端那样每 20 ms 发一包 1 kHz 的声音，从"麦克风 (Steam Streaming Microphone)"录到的应该还是 1 kHz：
     /// 设备的格式对不上的话会变调（见模块说明）。
     /// `cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture`
@@ -363,12 +377,12 @@ pub(crate) mod tests {
             .with_env_filter("debug")
             .try_init();
         assert_eq!(
-            probe(),
+            probe().0,
             MicState::Ready,
             "no Steam Streaming Microphone on this computer"
         );
         let input = Arc::new(MicInput::default());
-        let lease = open_mic(7, &input).expect("the microphone is free");
+        let lease = open_mic(7, &input, (MicState::Ready, None)).expect("the microphone is free");
         let mut rec = Recorder::open().expect("record from Steam Streaming Microphone");
         let mut enc = opus::Encoder::new(
             AUDIO_SAMPLE_RATE,

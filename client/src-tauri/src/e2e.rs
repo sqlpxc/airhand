@@ -519,14 +519,10 @@ async fn e2e_roundtrip() {
     assert!(rep.pongs >= 3, "Ping/Pong 不工作");
     // 同一个版本的两端都懂麦克风：被控端会说它能不能接（Windows 看有没有 Steam Streaming Microphone）
     let mic = rep.mic.expect("被控端没有说麦克风的状态");
-    if cfg!(windows) {
-        assert!(
-            matches!(mic, MicState::Ready | MicState::NoDevice),
-            "{mic:?}"
-        );
-    } else {
-        assert_eq!(mic, MicState::Unsupported);
-    }
+    #[cfg(windows)]
+    assert_eq!(mic, crate::host::mic::wasapi::probe().0);
+    #[cfg(not(windows))]
+    assert_eq!(mic, MicState::Unsupported);
     if capture {
         assert!(rep.frames >= 2, "收到的视频帧太少");
         assert!(rep.keyframes >= 1);
@@ -726,13 +722,13 @@ async fn e2e_multi_display() {
     let _ = ctl.send.finish();
 }
 
-/// 控制端的麦克风，从协议级的控制端一直到 Windows 上的虚拟麦克风（需要这台电脑上有 Steam Streaming Microphone，
-/// 没有时只检查被控端说了 noDevice）：打开麦克风，像界面那样每 20 ms 发一包 1 kHz 的声音（每个数据报带着上一包的副本，
+/// 控制端的麦克风，从协议级的控制端一直到 Windows 上的虚拟麦克风。设备缺失时会从本机 Steam 安装驱动。
+/// 打开麦克风，像界面那样每 20 ms 发一包 1 kHz 的声音（每个数据报带着上一包的副本，
 /// 再故意丢掉一些数据报），从"麦克风 (Steam Streaming Microphone)"录到的应该还是 1 kHz；关掉之后放开设备。
 /// 和 `e2e_roundtrip` 一样要先启动服务器
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "may install the microphone driver from the host's Steam installation"]
 async fn e2e_mic() {
     use crate::host::mic::tests::goertzel;
     use crate::host::mic::wasapi::tests::Recorder;
@@ -766,26 +762,37 @@ async fn e2e_mic() {
     let mut recv = link.receiver;
     let _registration = link.registration;
 
-    // 被控端在 Hello 之后说它能不能接
-    let mut state = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while state.is_none() && Instant::now() < deadline {
+    // 和界面一样只发一次打开请求，缺驱动时等安装后报 ready，才开始发送声音。
+    let mut enabled = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(Instant::now() < deadline, "等待虚拟麦克风就绪超时");
         datagrams.send(&ControllerDatagram::Ping { t: 1 });
-        if let Ok(Ok(FromHost::Control(HostMsg::Mic { state: s, detail }))) =
+        let Ok(Ok(FromHost::Control(HostMsg::Mic { state, detail }))) =
             tokio::time::timeout(Duration::from_millis(500), recv.recv()).await
-        {
-            println!("麦克风: {s:?} {detail:?}");
-            state = Some(s);
+        else {
+            continue;
+        };
+        println!("麦克风: {state:?} {detail:?}");
+        if state == MicState::SteamMissing && !enabled {
+            println!("这台电脑上没有 Steam，跳过声音的检查");
+            return;
+        }
+        assert!(
+            matches!(
+                state,
+                MicState::Ready | MicState::NoDevice | MicState::Preparing
+            ),
+            "{state:?}: {detail:?}"
+        );
+        if !enabled {
+            ctl.send(&ControllerMsg::Mic { enabled: true }).await;
+            enabled = true;
+        }
+        if state == MicState::Ready {
+            break;
         }
     }
-    let state = state.expect("被控端没有说麦克风的状态");
-    if state == MicState::NoDevice {
-        println!("这台电脑上没有 Steam Streaming Microphone，跳过声音的检查");
-        return;
-    }
-    assert_eq!(state, MicState::Ready);
-
-    ctl.send(&ControllerMsg::Mic { enabled: true }).await;
     let mut rec = Recorder::open().expect("从 Steam Streaming Microphone 录音");
     // 像界面的音频线程那样准时地每 20 ms 发一包（tokio 的定时器在 Windows 上可能晚 15 ms，发不够每秒 50 包）
     let conn = sig.conn.clone();

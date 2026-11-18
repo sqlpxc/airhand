@@ -221,7 +221,7 @@ See [Known limitations](limitations.md) for the details.
 
 Send this computer's microphone to the remote computer: programs there (meetings, voice typing, voice messages) hear you when they record from its virtual microphone. Off by default and turned on per connection (the microphone button in the toolbar → **Send this computer's microphone**); it's only sent while you're viewing that connection. The browser asks for microphone access the first time (the desktop console doesn't).
 
-- **Windows hosts** use Steam Remote Play's virtual sound card, **Steam Streaming Microphone** (Valve's driver, signed by Microsoft). It's there once Steam is installed on the remote computer and Steam Remote Play has been used once; Airhand neither ships nor installs it. Without it, the microphone menu says so
+- **Windows hosts** use Steam’s **Steam Streaming Microphone** (Valve’s virtual microphone driver, signed by Microsoft). When you turn on forwarding, Airhand looks for an existing device and installs the driver from Steam on the remote computer if needed. Forwarding starts as soon as the device is ready. The microphone menu prompts you to install Steam if it’s missing from the remote computer
 - In programs on the remote computer, choose "Microphone (Steam Streaming Microphone)" as the recording device, or make it the default under Sound settings → Input there, so programs that use the default microphone (such as Windows voice typing, Win+H) hear you directly
 - Only one controller at a time: another controller sees "Another controller is using the remote microphone" and takes over when that one stops
 - Not supported yet when the remote computer runs macOS, Linux or Android (no microphone button); the Android controller can't send its microphone yet

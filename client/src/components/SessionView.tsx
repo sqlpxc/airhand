@@ -500,7 +500,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
             )}
           </div>
           {s.micState !== null && s.micState !== "unsupported" && (
-            // 本机的麦克风：对方能接（有虚拟麦克风）时才有
+            // Windows 被控端支持麦克风转发，缺驱动时也可以打开开关触发安装
             <div className="menu-anchor">
               <button
                 className={`tb-btn icon ${menu === "mic" ? "on" : ""}`}
@@ -752,6 +752,12 @@ function micHint(s: RemoteSession): string {
   switch (s.micState) {
     case "noDevice":
       return t("mic.noDevice");
+    case "steamMissing":
+      return t("mic.steamMissing");
+    case "preparing":
+      return t("mic.preparing");
+    case "setupFailed":
+      return t("mic.setupFailed", { detail: s.micDetail ?? "—" });
     case "busy":
       return t("mic.busy");
     case "failed":
