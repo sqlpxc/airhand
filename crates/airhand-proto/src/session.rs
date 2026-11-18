@@ -75,8 +75,7 @@
 //!
 //! # 帧流
 //!
-//! 双方都支持（会话能力位 [`crate::features::session::FRAMES`]）、中转也支持（信令 v10，[`crate::SIGNAL_FRAMES`]）时，
-//! 被控端的画面不再挤在一条有序的流里，而是**每帧一条帧流**（[`crate::SessionHeader::FRAME`]，中转和直连上都是）：
+//! v10 每帧使用一条 QUIC 单向流（[`crate::SessionHeader::FRAME`]），直连和中转使用相同的格式。
 //!
 //! * 一帧丢了包只卡住它自己那一条流，后面的帧照样到；
 //! * 增量帧带着参考帧（[`crate::media`] 的"参考帧"），控制端据此判断哪些帧交得给解码器：缺了参考帧的先留着，
@@ -88,23 +87,7 @@
 //! * 一直恢复不了（等了一秒多，见 `airhand_link::merge`）就照旧要关键帧（[`ControllerMsg::RequestKeyframe`]，
 //!   走控制通道，不会丢）。
 //!
-//! 帧流和单条画面流都用同一把画面密钥、同一串计数，控制端两种都收（中转不支持帧流时被控端还是用一条流）。
-//!
-//! # 前向纠错
-//!
-//! 帧流上一帧丢了包要等 QUIC 重传（一段路的往返），后面的帧参考它，整段画面跟着晚。往返时延长、又常丢包的网络上
-//! （跨境、Wi-Fi）画面就一顿一顿的。双方都支持（会话能力位 [`crate::features::session::FEC`]）、画面用着帧流时，
-//! 被控端可以把增量帧改成**数据报 + 前向纠错**：一帧的密封单元切成几个数据报（[`crate::fec`]），再多发几个冗余数据报
-//! （Reed-Solomon），收到的够了（任意几个，个数和原来的一样）就拼得回这一帧，不等重传：
-//!
-//! * 关键帧、恢复帧（参考的不是前一帧）照旧走帧流：它们最大、最要紧，丢了包也要送到；
-//! * 冗余按丢包率配：控制端每 [`REPORT_EVERY`] 报告一次收到的情况（[`ControllerDatagram::Report`]），
-//!   被控端按最近的丢包率配，一帧补不回来的机会不到千分之五；
-//! * 补不回来的（丢得太多了）：数据报不重传，后面的帧到了它还缺着，控制端马上就知道，报告等不到
-//!   （[`ControllerDatagram::Lost`]），和帧流一样从控制端已经有的帧恢复；
-//! * 用不用由控制端的画质设置决定（[`QualitySettings::transport`]）：自动（默认）由被控端看情况，控制端报告里
-//!   等重传卡住的帧多了就改用纠错，纠错时丢包少了、或者往返时延很短（重传很快）就换回帧流；也可以固定用其中一种。
-//!   对方不支持时照旧是帧流。
+//! 控制端每 [`REPORT_EVERY`] 按显示器报告收完的帧数和等重传停顿的帧数，供被控端调整码率。
 //!
 //! # 麦克风
 //!
@@ -123,8 +106,7 @@
 //! 被控端有好几个显示器时，控制端可以同时看、同时操作其中几个（默认只看一个）。每个显示器是一**路**画面：
 //!
 //! * 第 `i` 路走画面通道的第 `i` 路（[`crate::SessionLane::Video`]，每一路一条通道、一把密钥、一串计数），
-//!   画面包头里也写着它是第几路（[`crate::media`] 的头）。每一路有自己的编码器、在途控制和码率、参考帧、帧流、
-//!   纠错，和只有一路时一模一样，互不影响：一路丢了帧只恢复这一路；
+//!   画面包头也带有路号。每一路独立编码、确认和恢复。
 //! * 控制端用 [`ControllerMsg::View`] 说看哪几个显示器（第 `i` 项是第 `i` 路），以及每一路按显示的大小要多大的画面
 //!   （[`StreamView::max_short`]，和画质设置里的短边上限取较严的）。开始时看哪几个在握手里
 //!   （[`crate::handshake::ControllerIntro::view`]，空的是只看主显示器）。被控端最多同时发 [`HostHello::streams`] 路
@@ -560,36 +542,6 @@ impl Codec {
     }
 }
 
-open_enum! {
-    /// 画面怎么传（[`QualitySettings::transport`]，见模块说明的"前向纠错"）。只管增量帧：关键帧、恢复帧总是走帧流
-    #[derive(Default)]
-    pub enum VideoTransport {
-        /// 被控端看网络情况选（默认）：等重传卡住的帧多了就改用纠错，丢包少了、往返时延很短时换回重传
-        #[default]
-        Auto = 0 => "auto",
-        /// 一直用帧流：丢了的包由 QUIC 重传，不多发冗余。适合局域网、很少丢包的网络
-        Streams = 1 => "streams",
-        /// 一直用数据报 + 前向纠错：每帧多发几个冗余数据报，丢了几个也拼得回来，不等重传。
-        /// 适合丢包多、往返时延长的网络；对方不支持时照旧是帧流
-        Fec = 2 => "fec",
-    }
-}
-
-impl VideoTransport {
-    fn is_auto(&self) -> bool {
-        *self == VideoTransport::Auto
-    }
-
-    /// 不认识的值（对方版本新增的）按自动处理
-    pub fn or_auto(self) -> Self {
-        if self.is_known() {
-            self
-        } else {
-            VideoTransport::Auto
-        }
-    }
-}
-
 /// 控制端 → 被控端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ControllerMsg {
@@ -712,8 +664,7 @@ pub enum ControllerDatagram {
         t: u64,
     },
     /// 等不到一帧了（见模块说明的"帧流"）：控制端交给解码器的最后一帧是第 `decoded` 帧（还没有时为 0），
-    /// 之后的帧都解不了。被控端放弃在途的、这之后的帧，从控制端有的帧恢复。只发给协商了
-    /// [`crate::features::session::FRAMES`] 的被控端；恢复之前控制端定时重发
+    /// 被控端从控制端有的参考帧恢复，控制端在恢复之前定时重报。
     #[n(3)]
     Lost {
         #[n(0)]
@@ -722,9 +673,7 @@ pub enum ControllerDatagram {
         #[cbor(n(1), skip_if = "is_zero")]
         stream: u8,
     },
-    /// 最近这段时间（[`REPORT_EVERY`]）第 `stream` 路画面收得怎么样（见模块说明的"前向纠错"），被控端据此决定
-    /// 这一路用不用纠错、配多少冗余。只发给协商了 [`crate::features::session::FEC`] 的被控端；这段时间这一路什么画面
-    /// 都没收到就不发。丢了就丢了（下一个报告是新的一段）
+    /// 最近一个报告周期内该路帧流的交付情况，供被控端调整码率。
     #[n(4)]
     Report {
         #[n(0)]
@@ -746,21 +695,12 @@ pub struct VideoReport {
     /// 其中等重传卡住过的：读到一半停住了一阵（丢了包，QUIC 只按顺序交出数据），后面的帧却先到了
     #[n(1)]
     pub stalled: u32,
-    /// 纠错的帧（数据报）一共该到多少个数据报（原来的加冗余的）
-    #[n(2)]
-    pub fragments: u32,
-    /// 其中没到的
-    #[n(3)]
-    pub missing: u32,
-    /// 纠错也补不回来的帧
-    #[n(4)]
-    pub unrecovered: u32,
 }
 
 impl VideoReport {
     /// 什么都没收到
     pub fn is_empty(&self) -> bool {
-        self.frames == 0 && self.fragments == 0 && self.unrecovered == 0
+        self.frames == 0
     }
 }
 
@@ -808,14 +748,10 @@ pub struct QualitySettings {
     /// 期望的编码格式（被控端不支持时自动回退到 H.264；不认识的格式也是 H.264，见 [`QualitySettings::sanitized`]）
     #[n(4)]
     pub codec: Codec,
-    /// 画面怎么传：重传还是前向纠错（见模块说明的"前向纠错"）。自动（默认）不写进线上的数组
-    #[cbor(n(5), skip_if = "VideoTransport::is_auto")]
-    #[serde(default)]
-    pub transport: VideoTransport,
     /// 把被控端的光标画进画面里（控制端的游戏模式，见模块说明的"鼠标"）：光标显示着、在这一路的显示器上时画上去，
     /// 光标单独移动（画面没变）也出新的一帧。隐藏了就不画；已经是画面里的软件光标（[`CursorVisibility::InFrame`]）
     /// 也不再画一遍。不画（默认）不写进线上的数组
-    #[cbor(n(6), skip_if = "is_false")]
+    #[cbor(n(5), skip_if = "is_false")]
     #[serde(default)]
     pub draw_cursor: bool,
 }
@@ -832,7 +768,6 @@ impl Default for QualitySettings {
             max_short: 1080,
             adaptive: true,
             codec: Codec::H264,
-            transport: VideoTransport::Auto,
             draw_cursor: false,
         }
     }
@@ -844,7 +779,6 @@ impl QualitySettings {
         self.fps = self.fps.clamp(1, 120);
         self.bitrate_kbps = self.bitrate_kbps.clamp(100, 100_000);
         self.codec = self.codec.or_h264();
-        self.transport = self.transport.or_auto();
         self
     }
 }
@@ -1069,54 +1003,11 @@ mod tests {
         assert_eq!(q.sanitized().codec, Codec::H264);
         let q: QualitySettings = minicbor::decode(&wire(2)).unwrap();
         assert_eq!(q.codec, Codec::AV1);
-        assert_eq!(q.transport, VideoTransport::Auto);
         assert!(!q.draw_cursor);
 
-        // 不认识的传输方式按自动处理，末尾新增的字段跳过
-        let newer = |transport: u8| {
-            let mut e = minicbor::Encoder::new(Vec::new());
-            e.array(8).unwrap();
-            e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
-            e.bool(true).unwrap().u8(1).unwrap().u8(transport).unwrap();
-            e.bool(true).unwrap().str("later").unwrap();
-            e.into_writer()
-        };
-        let q: QualitySettings = minicbor::decode(&newer(2)).unwrap();
-        assert_eq!((q.codec, q.transport), (Codec::H265, VideoTransport::Fec));
-        assert!(q.draw_cursor);
-        let q: QualitySettings = minicbor::decode(&newer(9)).unwrap();
-        assert_eq!(q.transport, VideoTransport::Unknown(9));
-        assert_eq!(q.sanitized().transport, VideoTransport::Auto);
-        // 之前的版本解得出新版本发的（多出来的字段跳过）
-        #[derive(minicbor::Decode)]
-        struct Before {
-            #[n(0)]
-            fps: u8,
-            #[n(4)]
-            codec: Codec,
-        }
-        for transport in VideoTransport::KNOWN {
-            for draw_cursor in [false, true] {
-                let q = QualitySettings {
-                    transport: *transport,
-                    draw_cursor,
-                    ..Default::default()
-                };
-                let wire = minicbor::to_vec(q).unwrap();
-                let back: QualitySettings = minicbor::decode(&wire).unwrap();
-                assert_eq!(back, q);
-                let old: Before = minicbor::decode(&wire).unwrap();
-                assert_eq!((old.fps, old.codec), (q.fps, q.codec));
-            }
-        }
-
-        // 画面的报告：之前的被控端不认识这个控制数据报，跳过就是了（见 framing 的兼容规则）
         let report = VideoReport {
             frames: 60,
             stalled: 2,
-            fragments: 300,
-            missing: 4,
-            unrecovered: 1,
         };
         for stream in [0, 3] {
             let r = ControllerDatagram::Report { report, stream };
@@ -1233,24 +1124,18 @@ mod tests {
             max_short: 1080,
             adaptive: true,
             codec: Codec::AV1,
-            transport: VideoTransport::Fec,
             draw_cursor: true,
         };
         assert_eq!(
             serde_json::to_value(q).unwrap(),
-            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "transport": "fec", "drawCursor": true })
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "drawCursor": true })
         );
-        // 不带传输方式、光标：自动、不画
+        // 省略光标设置时使用默认值
         let old: QualitySettings = serde_json::from_value(
             json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }),
         )
         .unwrap();
-        assert_eq!(old.transport, VideoTransport::Auto);
         assert!(!old.draw_cursor);
-        assert_eq!(
-            serde_json::to_value(VideoTransport::KNOWN).unwrap(),
-            json!(["auto", "streams", "fec"])
-        );
         let events = vec![
             InputEvent::MouseMove {
                 x: 0.5,

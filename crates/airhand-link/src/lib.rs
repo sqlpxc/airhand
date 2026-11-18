@@ -18,8 +18,7 @@
 //! * [`Problem`]：显示给用户的问题，以类型而不是文字的形式传给界面。
 //!
 //! 两端的消息通道用同一种发送队列（`queue`：只留最新值的槽位 + 有界的队列），时钟在 `clock`。
-//! 声音数据报的冗余（带上之前几包的副本、收的一方拆开补洞）在 `audio`；画面的前向纠错（增量帧切成数据报、
-//! 带上 Reed-Solomon 冗余，收的一方拼回来；被控端自动选走帧流还是纠错）在 `fec`。
+//! 声音数据报的副本在 `audio` 里处理。
 //!
 //! # feature
 //!
@@ -36,8 +35,6 @@ pub mod console;
 pub mod controller;
 #[cfg(feature = "client")]
 pub mod direct;
-#[cfg(feature = "client")]
-mod fec;
 #[cfg(feature = "client")]
 pub mod files;
 #[cfg(feature = "client")]

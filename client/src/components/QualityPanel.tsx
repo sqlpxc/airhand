@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import type { Codec, QualitySettings, VideoTransport } from "../lib/api";
+import type { Codec, QualitySettings } from "../lib/api";
 import { useT } from "../lib/i18n";
 import { CODEC_PRIORITY, codecUsable } from "../lib/codec";
 import { ENHANCE_LEVELS } from "../lib/enhance";
@@ -18,9 +18,6 @@ const RES: { v: number; label?: string }[] = [
   { v: 2160, label: "4K" },
   { v: 0 },
 ];
-
-/** 丢包时怎么办：自动（默认，被控端看网络情况选）/ 重传 / 前向纠错 */
-const TRANSPORTS: VideoTransport[] = ["auto", "streams", "fec"];
 
 // 码率滑块使用对数刻度：0.5 ~ 100 Mbps（与协议里 QualitySettings 的上限 100_000 kbps 一致）
 const MIN_KBPS = 500;
@@ -61,7 +58,6 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const adaptiveId = useId();
   const cur = s.settings;
   const preset = matchPreset(cur);
-  const transport = cur.transport ?? "auto";
 
   useEffect(() => setDraftKbps(cur.bitrateKbps), [cur.bitrateKbps]);
 
@@ -69,7 +65,6 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
   const codecOk = (c: Codec) => codecUsable(c, decoders, s.hostCodecs);
   // 高亮对方实际在用的格式（与工具栏一致）：请求的格式对方建不起来时会回退到 H.264
   const activeCodec = s.encoder?.codec ?? cur.codec;
-  const transportHint = TRANSPORTS.map((m) => `${t(`quality.transport.${m}`)} · ${t(`quality.transport.${m}.hint`)}`).join("\n\n");
   const encoderLine =
     s.encoder &&
     t("quality.encoder", {
@@ -89,7 +84,7 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
               key={p.id}
               className={preset === p.id ? "active" : ""}
               title={presetDesc(p.id)}
-              onClick={() => s.updateSettings({ ...presetSettings(p.id, cur.codec), transport: cur.transport })}
+              onClick={() => s.updateSettings(presetSettings(p.id, cur.codec))}
             >
               {presetName(p.id)}
             </button>
@@ -163,20 +158,6 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
                 </button>
               );
             })}
-          </div>
-
-          <Label text={t("quality.transport")} hint={transportHint} />
-          <div className="segmented">
-            {TRANSPORTS.map((m) => (
-              <button
-                key={m}
-                className={transport === m ? "active" : ""}
-                title={t(`quality.transport.${m}.hint`)}
-                onClick={() => apply({ transport: m })}
-              >
-                {t(`quality.transport.${m}`)}
-              </button>
-            ))}
           </div>
 
           {/* 本机显示的偏好，不发给对方；所有连接通用（见 store.ts） */}

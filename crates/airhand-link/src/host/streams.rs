@@ -22,7 +22,7 @@ use airhand_proto::framing;
 use airhand_proto::handshake::{Confirm, Negotiated, PublicKey};
 use airhand_proto::session::{
     ControllerDatagram, ControllerMsg, DirectOffer, HostDatagram, InputEvent, MAX_CLIPBOARD_TEXT,
-    QualitySettings, StreamView, VideoTransport,
+    QualitySettings, StreamView,
 };
 use airhand_proto::{MAX_STREAMS, SessionLane, features};
 use anyhow::{Context, Result, anyhow};
@@ -34,13 +34,12 @@ use super::Incoming;
 use super::clock::InputClock;
 use super::queue::{self, Outbox};
 use super::session::{Acks, MicSink, Request};
-use super::write::{FrameStreams, Video, Writers, write_all};
+use super::write::{FrameStreams, Writers, write_all};
 use crate::audio::Unbundler;
 use crate::direct;
-use crate::fec::Chooser;
 use crate::files::Files;
 use crate::lanes::{Via, first_stream, open_lane};
-use crate::merge::{Merge, Policy};
+use crate::merge::Merge;
 use crate::paths::{DatagramSender, Paths};
 use crate::secure::{self, Admission, Gate, Opener, ResponderParams, STEP_TIMEOUT};
 use crate::tasks::OwnedTask;
@@ -144,8 +143,7 @@ impl ControllerReceiver {
 /// * Ping：马上回 Pong（会话的主循环忙着的时候也回：控制端不会把它当成失联）；
 /// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
 /// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
-/// * 画面收得怎么样的报告（`ControllerDatagram::Report`）：交给画面的 [`Chooser`]（用不用纠错、配多少冗余），
-///   它换算出来的丢包率、冗余的倍数交给平台的 [`Acks`]（码率控制）；
+/// * 帧流的接收报告直接交给平台的码率控制。
 /// * 和画面有关的都带着是第几路（见 `airhand_proto::session` 的"多屏"），各交各的；没有的路不管；
 /// * 控制端麦克风的声音包：马上交给平台的 [`MicSink`]；
 /// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
@@ -156,10 +154,8 @@ pub(crate) struct Express {
     mic: Arc<OnceLock<Arc<dyn MicSink>>>,
     /// 上次收到控制端消息的时刻（tokio 的时钟：测试里可以拨）
     heard: Arc<Mutex<tokio::time::Instant>>,
-    /// 每一路在途的帧流（画面用帧流时；不用时是空的）
+    /// 每一路在途的帧流
     frames: Vec<Arc<FrameStreams>>,
-    /// 每一路走帧流还是纠错（双方都支持纠错时；不然是空的）
-    fec: Vec<Arc<Chooser>>,
 }
 
 impl Express {
@@ -171,7 +167,6 @@ impl Express {
             mic: Arc::default(),
             heard: Arc::new(Mutex::new(tokio::time::Instant::now())),
             frames: Vec::new(),
-            fec: Vec::new(),
         }
     }
 
@@ -179,19 +174,6 @@ impl Express {
     fn with_frames(mut self, frames: Vec<Arc<FrameStreams>>) -> Self {
         self.frames = frames;
         self
-    }
-
-    /// 画面可能走纠错（每一路一个）：控制端的报告、确认、画质设置交给 `fec`
-    fn with_fec(mut self, fec: Vec<Arc<Chooser>>) -> Self {
-        self.fec = fec;
-        self
-    }
-
-    /// 控制端的画质设置里画面怎么传（见 `airhand_proto::session` 的"前向纠错"）：每一路都是
-    pub(crate) fn transport(&self, t: VideoTransport) {
-        for c in &self.fec {
-            c.set_mode(t);
-        }
     }
 
     /// 控制端麦克风的一个声音包（还没有人收时丢掉）
@@ -227,31 +209,15 @@ impl Express {
                 if let Some(f) = self.frames.get(stream as usize) {
                     f.acked(seq);
                 }
-                if let Some(c) = self.fec.get(stream as usize) {
-                    c.acked(seq, tokio::time::Instant::now());
-                }
             }
-            // 也换算成码率控制要的交给平台（见 crate::flow 的"丢包""纠错的冗余"）
             ControllerDatagram::Report { report, stream } => {
-                if let Some(c) = self.fec.get(stream as usize) {
-                    let now = tokio::time::Instant::now();
-                    c.report(report, now);
-                    if let Some(acks) = self.acks.get() {
-                        acks.feedback(stream, c.feedback(now));
-                    }
+                if let Some(acks) = self.acks.get() {
+                    acks.feedback(stream, report);
                 }
             }
-            // 平台要恢复：这一路之后的帧不会再用了，它们的流放弃掉（不再重传过时的数据）。等不到的那一帧走的是
-            // 纠错的数据报的话不会重传（见 crate::refs 的"只能编关键帧时"）
+            // 平台开始恢复时，停止重传已作废的帧。
             ControllerDatagram::Lost { decoded, stream } => {
-                let retransmitted = self
-                    .fec
-                    .get(stream as usize)
-                    .is_none_or(|c| c.retransmitted_after(decoded));
-                let recover = self
-                    .acks
-                    .get()
-                    .is_some_and(|a| a.lost(stream, decoded, retransmitted));
+                let recover = self.acks.get().is_some_and(|a| a.lost(stream, decoded));
                 if recover && let Some(f) = self.frames.get(stream as usize) {
                     let n = f.abandon(decoded);
                     debug!(
@@ -404,39 +370,15 @@ impl HostStreams {
         let mut secured = r.secured;
         let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
         let use_files = admitted.negotiated.features.has(features::session::FILES);
-        // 双方都支持、中转也支持：画面每帧一条帧流（见 airhand_proto::session 的"帧流"）
-        let use_frames = admitted.negotiated.features.has(features::session::FRAMES) && inc.frames;
-        // 用着帧流、双方又都支持纠错：增量帧可能走纠错的数据报（见 airhand_proto::session 的"前向纠错"）
-        let use_fec = use_frames && admitted.negotiated.features.has(features::session::FEC);
-        // 画面的每一路各有一套（见 airhand_proto::session 的"多屏"）：只看一个显示器时别的路闲着，什么都不发
-        let frames: Vec<Arc<FrameStreams>> = (0..MAX_STREAMS)
-            .filter(|_| use_frames)
-            .map(|_| Arc::default())
-            .collect();
-        let fec: Vec<Arc<Chooser>> = (0..MAX_STREAMS)
-            .filter(|_| use_fec)
-            .map(|_| Arc::new(Chooser::new(admitted.settings.transport)))
-            .collect();
-        info!(
-            session_id,
-            frames = use_frames,
-            fec = use_fec,
-            "video lanes"
-        );
+        let frames: Vec<Arc<FrameStreams>> =
+            (0..secured.video.len()).map(|_| Arc::default()).collect();
         let (out, ctl_rx, bulk_rx) = queue::channel();
         let (video_tx, video): (Vec<_>, Vec<_>) = std::mem::take(&mut secured.video)
             .into_iter()
-            .enumerate()
-            .map(|(stream, keys)| {
-                let how = match frames.get(stream) {
-                    Some(f) => Video::Frames {
-                        streams: f.clone(),
-                        fec: fec.get(stream).cloned(),
-                    },
-                    None => Video::Stream,
-                };
+            .zip(&frames)
+            .map(|(keys, streams)| {
                 let (tx, rx) = mpsc::channel(video_queue);
-                (tx, (how, rx, keys.sealer))
+                (tx, (streams.clone(), rx, keys.sealer))
             })
             .unzip();
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
@@ -452,30 +394,19 @@ impl HostStreams {
         })));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过信箱交给会话。
         // 控制端的控制通道握手时已经等到了的（Noise_XX）先放进去，没等到的（Noise_IK）之后从信箱来
-        let mut control = Merge::new(
-            SessionLane::Control,
-            Policy::Complete,
-            r.opener,
-            inbox.control,
-        );
+        let mut control = Merge::new(SessionLane::Control, r.opener, inbox.control);
         if let Some(s) = control_in {
             control.add(s, Via::Relay)?;
         }
-        let bulk = Merge::new(
-            SessionLane::Bulk,
-            Policy::Complete,
-            secured.bulk.opener,
-            inbox.bulk,
-        );
+        let bulk = Merge::new(SessionLane::Bulk, secured.bulk.opener, inbox.bulk);
         let capacity = 4 * 1024 * 1024 / SessionLane::Control.max_frame_size();
         let (control_tx, control_rx) = mpsc::channel(capacity);
         let (bulk_tx, bulk_rx) = mpsc::channel(2);
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
         let pong = datagrams.clone();
-        let express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }))
-            .with_frames(frames)
-            .with_fec(fec);
+        let express =
+            Express::new(move |t| pong.send(&HostDatagram::Pong { t })).with_frames(frames);
         let incoming = ControllerReceiver::new(control_rx, bulk_rx, confirm_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
         let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
@@ -732,11 +663,6 @@ async fn read_all(r: Readers) -> Result<()> {
                     let _ = answers.try_send(offer);
                     continue;
                 }
-                // 画面怎么传是链路的事，在这里就交给它；别的设置交给平台
-                ControllerMsg::Settings(s) => {
-                    express.transport(s.transport);
-                    ControllerMsg::Settings(s)
-                }
                 ControllerMsg::Input { t, events } => {
                     let stale = clock.lock().unwrap().stale(t, Instant::now());
                     if !stale {
@@ -917,59 +843,19 @@ mod tests {
         assert_eq!(incoming.silent_for(), Duration::ZERO);
     }
 
-    /// 画面收得怎么样的报告、画质设置里的传输方式交给画面的 Chooser（自动时卡住的帧多了改用纠错）
-    #[tokio::test(start_paused = true)]
-    async fn reports_and_settings_reach_the_chooser() {
-        use airhand_proto::session::VideoReport;
-        let c: Vec<_> = (0..2)
-            .map(|_| Arc::new(Chooser::new(VideoTransport::Auto)))
-            .collect();
-        let express = Express::new(|_| {}).with_fec(c.clone());
-        tokio::time::advance(Duration::from_secs(6)).await;
-        let stalled = VideoReport {
-            frames: 60,
-            stalled: 10,
-            ..Default::default()
-        };
-        // 第 1 路卡住了：只有它改用纠错
-        express.datagram(ControllerDatagram::Report {
-            report: stalled,
-            stream: 1,
-        });
-        assert!(!c[0].using() && c[1].using());
-        // 传输方式每一路都是
-        express.transport(VideoTransport::Streams);
-        assert!(!c[1].using());
-        // 没有的路、没有 Chooser（对方不支持纠错）：什么也不做
-        express.datagram(ControllerDatagram::Report {
-            report: stalled,
-            stream: 3,
-        });
-        let plain = Express::new(|_| {});
-        plain.transport(VideoTransport::Fec);
-        plain.datagram(ControllerDatagram::Report {
-            report: VideoReport::default(),
-            stream: 0,
-        });
-    }
-
-    /// 报告也换算成码率控制要的（丢包率、冗余的倍数），交给平台的那一路
+    /// 每一路的交付报告交给平台的码率控制。
     #[tokio::test(start_paused = true)]
     async fn reports_feed_the_rate_control() {
-        use crate::flow::Feedback;
         use airhand_proto::session::VideoReport;
         #[derive(Default)]
-        struct Fb(Mutex<Vec<(u8, Feedback)>>);
+        struct Fb(Mutex<Vec<(u8, VideoReport)>>);
         impl Acks for Fb {
             fn ack(&self, _: u8, _: u32, _: u64) {}
-            fn feedback(&self, stream: u8, fb: Feedback) {
+            fn feedback(&self, stream: u8, fb: VideoReport) {
                 self.0.lock().unwrap().push((stream, fb));
             }
         }
-        let c: Vec<_> = (0..2)
-            .map(|_| Arc::new(Chooser::new(VideoTransport::Fec)))
-            .collect();
-        let express = Express::new(|_| {}).with_fec(c.clone());
+        let express = Express::new(|_| {});
         let incoming = ControllerReceiver::new(
             mpsc::channel(1).1,
             mpsc::channel(1).1,
@@ -978,12 +864,10 @@ mod tests {
         );
         let platform = Arc::new(Fb::default());
         incoming.set_acks(platform.clone());
-        c[1].sent_bytes(1, 1000, 1200, true);
         express.datagram(ControllerDatagram::Report {
             report: VideoReport {
-                fragments: 100,
-                missing: 15,
-                ..Default::default()
+                frames: 30,
+                stalled: 3,
             },
             stream: 1,
         });
@@ -991,9 +875,9 @@ mod tests {
             *platform.0.lock().unwrap(),
             [(
                 1,
-                Feedback {
-                    loss: Some(0.15),
-                    overhead: 1.2
+                VideoReport {
+                    frames: 30,
+                    stalled: 3
                 }
             )]
         );
@@ -1002,14 +886,11 @@ mod tests {
     /// 控制端等不到帧了：读任务马上交给平台；平台要恢复的话，之后的帧流放弃，确认了的帧流忘掉
     #[tokio::test]
     async fn lost_frames_abandon_their_streams_when_the_platform_recovers() {
-        struct Recover(Mutex<Vec<(u8, u32, bool)>>, bool);
+        struct Recover(Mutex<Vec<(u8, u32)>>, bool);
         impl Acks for Recover {
             fn ack(&self, _: u8, _: u32, _: u64) {}
-            fn lost(&self, stream: u8, decoded: u32, retransmitted: bool) -> bool {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((stream, decoded, retransmitted));
+            fn lost(&self, stream: u8, decoded: u32) -> bool {
+                self.0.lock().unwrap().push((stream, decoded));
                 self.1
             }
         }
@@ -1044,41 +925,10 @@ mod tests {
             });
             assert_eq!(frames.len_for_test(), 3);
             express.datagram(lost(2, 1));
-            // 没有纠错：等不到的帧都走的是帧流，会重传
-            assert_eq!(*platform.0.lock().unwrap(), [(1, 2, true)]);
+            assert_eq!(*platform.0.lock().unwrap(), [(1, 2)]);
             assert_eq!(frames.len_for_test(), if recover { 1 } else { 3 });
             assert_eq!(other.len_for_test(), 4);
         }
-    }
-
-    /// 等不到的那一帧走的是纠错的数据报：告诉平台它不会重传（只能编关键帧时不用等第二次报告）
-    #[tokio::test(start_paused = true)]
-    async fn lost_fec_frames_are_not_retransmitted() {
-        #[derive(Default)]
-        struct Lost(Mutex<Vec<(u32, bool)>>);
-        impl Acks for Lost {
-            fn ack(&self, _: u8, _: u32, _: u64) {}
-            fn lost(&self, _: u8, decoded: u32, retransmitted: bool) -> bool {
-                self.0.lock().unwrap().push((decoded, retransmitted));
-                false
-            }
-        }
-        let c = Arc::new(Chooser::new(VideoTransport::Auto));
-        c.sent_bytes(3, 100, 100, false);
-        c.sent_bytes(4, 100, 300, true);
-        let express = Express::new(|_| {}).with_fec(vec![c]);
-        let incoming = ControllerReceiver::new(
-            mpsc::channel(1).1,
-            mpsc::channel(1).1,
-            oneshot::channel().1,
-            express.clone(),
-        );
-        let platform = Arc::new(Lost::default());
-        incoming.set_acks(platform.clone());
-        for decoded in [2, 3] {
-            express.datagram(ControllerDatagram::Lost { decoded, stream: 0 });
-        }
-        assert_eq!(*platform.0.lock().unwrap(), [(2, true), (3, false)]);
     }
 
     /// 控制端麦克风的声音数据报：读任务解开、去掉副本，一包一包按先后交给平台；丢了的从下一个数据报里补上。
@@ -1101,19 +951,9 @@ mod tests {
 
         // 控制通道一直没有流：读任务只处理数据报
         let (_control_streams, frames) = mpsc::unbounded_channel();
-        let control = Merge::new(
-            SessionLane::Control,
-            Policy::Complete,
-            test_lane(true).1,
-            frames,
-        );
+        let control = Merge::new(SessionLane::Control, test_lane(true).1, frames);
         let (_bulk_streams, frames) = mpsc::unbounded_channel();
-        let bulk = Merge::new(
-            SessionLane::Bulk,
-            Policy::Complete,
-            test_lane(true).1,
-            frames,
-        );
+        let bulk = Merge::new(SessionLane::Bulk, test_lane(true).1, frames);
         let (mic_tx, mic_rx) = mpsc::channel(16);
         let (_dgram_tx, dgram_rx) = mpsc::channel(1);
         let express = Express::new(|_| {});
@@ -1178,14 +1018,9 @@ mod tests {
         for genuine in [true, false] {
             let (mut sealer, opener) = test_lane(true);
             let (frames_tx, frames) = mpsc::unbounded_channel();
-            let control = Merge::new(SessionLane::Control, Policy::Complete, opener, frames);
+            let control = Merge::new(SessionLane::Control, opener, frames);
             let (_bulk_frames, bulk_frames) = mpsc::unbounded_channel();
-            let bulk = Merge::new(
-                SessionLane::Bulk,
-                Policy::Complete,
-                test_lane(true).1,
-                bulk_frames,
-            );
+            let bulk = Merge::new(SessionLane::Bulk, test_lane(true).1, bulk_frames);
             // 控制端的控制通道：一条真的单向流（Merge 只认 QUIC 的流），用进程内的两个 QUIC 端点
             let (client, server) = crate::tests::quic_pair().await;
             let mut send = client.open_uni().await.unwrap();
@@ -1206,7 +1041,6 @@ mod tests {
                 .send(crate::lanes::LaneStream {
                     recv: server.accept_uni().await.unwrap(),
                     via: Via::Relay,
-                    frame: false,
                 })
                 .ok();
 

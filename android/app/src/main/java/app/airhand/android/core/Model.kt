@@ -20,22 +20,6 @@ enum class Codec(val id: Int, val wire: String, val mime: String, val label: Str
     }
 }
 
-/**
- * 丢包时画面怎么恢复，与 Rust 的 `airhand_proto::session::VideoTransport` 对应：
- * 自动（默认）由被控端看网络情况选；重传是丢了的数据重新发；纠错是增量帧走数据报、每帧多发几块冗余，
- * 丢了几块也能马上拼回来，不等重传（路远又常丢包的网络）。对方的版本旧时总是重传
- */
-enum class VideoTransport(val wire: String) {
-    AUTO("auto"),
-    STREAMS("streams"),
-    FEC("fec");
-
-    companion object {
-        /** 不认识的、没有的（之前的版本）都是自动 */
-        fun fromWire(s: String?): VideoTransport = entries.firstOrNull { it.wire == s } ?: AUTO
-    }
-}
-
 /** 画质设置，与 `QualitySettings` 对应（JSON 是 camelCase，和其它界面 JSON 一样） */
 data class Quality(
     val fps: Int,
@@ -43,16 +27,13 @@ data class Quality(
     val maxShort: Int,
     val adaptive: Boolean = true,
     val codec: Codec = Codec.H264,
-    val transport: VideoTransport = VideoTransport.AUTO,
 ) {
-    /** 自动传输是默认值，不写入 JSON */
     fun toJson(): JSONObject = JSONObject()
         .put("fps", fps)
         .put("bitrateKbps", kbps)
         .put("maxShort", maxShort)
         .put("adaptive", adaptive)
         .put("codec", codec.wire)
-        .apply { if (transport != VideoTransport.AUTO) put("transport", transport.wire) }
 }
 
 /** 画质预设：与桌面控制台（client/src/lib/presets.ts）相同 */
@@ -63,8 +44,8 @@ enum class Preset(val id: String, val fps: Int, val kbps: Int, val maxShort: Int
     HD("hd", 60, 16000, 1440),
     NATIVE("native", 60, 30000, 0);
 
-    fun quality(codec: Codec, transport: VideoTransport = VideoTransport.AUTO) =
-        Quality(fps, kbps, maxShort, true, codec, transport)
+    fun quality(codec: Codec) =
+        Quality(fps, kbps, maxShort, true, codec)
 
     companion object {
         val DEFAULT = BALANCED
@@ -181,8 +162,7 @@ data class EncoderInfo(val codec: Codec, val name: String, val hardware: Boolean
 data class Notice(val kind: String, val detail: String? = null, val screen: Boolean = false, val input: Boolean = false)
 
 /**
- * `direct`：画面是从直连来的（两台设备之间打通的路，不经过服务器），否则经过中转；
- * `fec`：这一秒里有画面是纠错的数据报拼回来的（前向纠错正在用）
+ * `direct`：画面是从直连来的（两台设备之间打通的路，不经过服务器），否则经过中转。
  */
 data class Stats(
     val fps: Float,
@@ -191,7 +171,6 @@ data class Stats(
     val width: Int,
     val height: Int,
     val direct: Boolean,
-    val fec: Boolean = false,
 )
 
 /**

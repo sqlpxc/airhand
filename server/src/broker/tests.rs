@@ -64,7 +64,6 @@ fn incoming(
         peer,
         kick,
         direct: None,
-        frames: host.version >= airhand_proto::SIGNAL_FRAMES,
         file_limit: host.file_limit,
     };
     (inc, kick_tx)
@@ -1269,7 +1268,7 @@ async fn a_host_that_isnt_ready_is_answered_like_an_unknown_code() {
     assert_eq!(broker.failure_count(ip), 2);
 }
 
-/// 服务器不管会话有几条通道、各是什么：以后新加的通道（这里是 5 号）照样转给另一端；
+/// 服务器不管会话有几条通道、各是什么：以后新加的通道（这里是 7 号）照样转给另一端；
 /// 同一端把同一条通道开两次的拒绝；任何一端的控制通道结束，整个会话结束，其它通道随之断开
 #[tokio::test]
 async fn lanes_the_server_has_never_heard_of_are_relayed() {
@@ -1301,12 +1300,12 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         (SessionHeader::decode(&hdr).unwrap(), recv)
     };
     // 新的通道：不用等控制通道，另一端马上收到
-    let mut h5 = lane(&host.conn, 5).await;
-    h5.write_all(b"future lane").await.unwrap();
-    let (h, mut c5) = accept(&ctrl.conn).await;
-    assert_eq!((h.session_id, h.lane, h.priority), (sid, 5, 3));
+    let mut h7 = lane(&host.conn, 7).await;
+    h7.write_all(b"future lane").await.unwrap();
+    let (h, mut c7) = accept(&ctrl.conn).await;
+    assert_eq!((h.session_id, h.lane, h.priority), (sid, 7, 3));
     let mut buf = [0u8; 11];
-    timeout(Duration::from_secs(2), c5.read_exact(&mut buf))
+    timeout(Duration::from_secs(2), c7.read_exact(&mut buf))
         .await
         .unwrap()
         .unwrap();
@@ -1323,8 +1322,8 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         .unwrap();
     assert_eq!(&b4, b"ping");
     let (_, _ccr) = accept(&ctrl.conn).await;
-    // 同一端再开一次 5 号通道：拒绝
-    let dup = lane(&host.conn, 5).await;
+    // 同一端再开一次 7 号通道：拒绝
+    let dup = lane(&host.conn, 7).await;
     assert!(
         timeout(Duration::from_secs(2), dup.stopped())
             .await
@@ -1339,7 +1338,7 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
     })
     .await;
     assert!(
-        timeout(Duration::from_secs(2), c5.read(&mut buf))
+        timeout(Duration::from_secs(2), c7.read(&mut buf))
             .await
             .unwrap()
             .is_err()
@@ -1355,15 +1354,20 @@ async fn frame_streams_are_relayed_one_frame_each() {
     let (broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
     assert_eq!(host.version, airhand_proto::SIGNAL_VERSION);
-    assert!(host.version >= airhand_proto::SIGNAL_FRAMES);
     let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
     let frame = async |lane: SessionLane, body: &[u8]| {
         let mut send = host.conn.open_uni().await.unwrap();
-        send.write_all(&SessionHeader::frame(sid, lane).encode())
-            .await
-            .unwrap();
+        send.write_all(
+            &SessionHeader {
+                flags: SessionHeader::FRAME,
+                ..SessionHeader::new(sid, lane)
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
         send.write_all(body).await.unwrap();
         send
     };
@@ -1381,7 +1385,7 @@ async fn frame_streams_are_relayed_one_frame_each() {
         let mut s = frame(SessionLane::Video(0), body).await;
         s.finish().unwrap();
         let (h, mut r) = accept().await;
-        assert_eq!(h, SessionHeader::frame(sid, SessionLane::Video(0)));
+        assert_eq!(h, SessionHeader::new(sid, SessionLane::Video(0)));
         let got = timeout(Duration::from_secs(2), r.read_to_end(64))
             .await
             .unwrap()
@@ -1475,7 +1479,7 @@ async fn file_streams_are_limited_by_the_relay() {
         recv.read_exact(&mut hdr).await.unwrap();
         (SessionHeader::decode(&hdr).unwrap(), recv)
     };
-    let file = SessionHeader::frame(sid, SessionLane::File);
+    let file = SessionHeader::new(sid, SessionLane::File);
     // 正好是上限：转过去
     let body = vec![7u8; wire_size(LIMIT) as usize];
     let mut s = open(file).await;
@@ -1522,7 +1526,7 @@ async fn file_streams_are_limited_by_the_relay() {
     .unwrap();
     assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::CANCELLED)));
     // 文件通道只能是帧流
-    let plain = open(SessionHeader::new(sid, SessionLane::File)).await;
+    let plain = open(SessionHeader { flags: 0, ..file }).await;
     assert!(
         timeout(Duration::from_secs(2), plain.stopped())
             .await
@@ -1543,7 +1547,7 @@ async fn file_streams_are_limited_by_the_relay() {
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
     let mut s = host.conn.open_uni().await.unwrap();
-    s.write_all(&SessionHeader::frame(sid, SessionLane::File).encode())
+    s.write_all(&SessionHeader::new(sid, SessionLane::File).encode())
         .await
         .unwrap();
     let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();

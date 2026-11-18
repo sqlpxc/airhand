@@ -263,11 +263,6 @@ export function SessionView({ s }: { s: RemoteSession }) {
                     {st.direct ? t("session.direct") : t("session.relayed")}
                   </span>
                 )}
-                {st.width > 0 && st.fec && (
-                  <span className="muted" title={t("session.fecTitle")}>
-                    {t("session.fec")}
-                  </span>
-                )}
                 {s.syncActive && s.syncStats.videoDelayMs >= 5 && (
                   <span className="muted" title={t("session.syncTitle")}>
                     {t("session.sync", { ms: Math.round(s.syncStats.videoDelayMs) })}

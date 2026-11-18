@@ -20,7 +20,6 @@ import app.airhand.android.core.Quality
 import app.airhand.android.core.ServerState
 import app.airhand.android.core.Stats
 import app.airhand.android.core.SystemAction
-import app.airhand.android.core.VideoTransport
 import app.airhand.android.core.optStringOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -112,7 +111,6 @@ class RemoteSession(
     val quality = MutableStateFlow(
         Preset.of(app.settings.value.preset).quality(
             VideoDecoder.decodable.firstOrNull { it in Codec.PRIORITY } ?: Codec.H264,
-            VideoTransport.fromWire(app.settings.value.transport),
         ),
     )
 
@@ -471,7 +469,6 @@ class RemoteSession(
                 e.optInt("width"),
                 e.optInt("height"),
                 e.optBoolean("direct"),
-                e.optBoolean("fec"),
             )
             "notice" -> {
                 val o = e.optJSONObject("notice") ?: return
@@ -630,12 +627,6 @@ class RemoteSession(
         val host = hello.value?.codecs ?: return
         val next = pickCodec(host)
         if (quality.value.codec != next) setQuality(quality.value.copy(codec = next))
-    }
-
-    /** 丢包时画面怎么恢复（自动 / 重传 / 纠错）：记进设置，以后的会话也用它 */
-    fun setTransport(t: VideoTransport) {
-        app.updateSettings { it.copy(transport = t.wire) }
-        if (quality.value.transport != t) setQuality(quality.value.copy(transport = t))
     }
 
     fun selectDisplay(index: Int) {

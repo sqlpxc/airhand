@@ -23,7 +23,7 @@ use tokio::task::AbortHandle;
 use tracing::debug;
 
 use super::{Inner, Provider};
-use crate::lanes::open_frame;
+use crate::lanes::open_lane;
 
 /// 最多留着这么多个本端的公告（最新的和之前的：对方可能还在从之前的那个复制）
 const KEEP_OFFERS: usize = 2;
@@ -465,7 +465,7 @@ async fn send_file(
         }
     };
     let s = stream.insert(
-        open_frame(&conn, inner.session_id, SessionLane::File)
+        open_lane(&conn, inner.session_id, SessionLane::File)
             .await
             .map_err(|_| Stop::Broken)?,
     );

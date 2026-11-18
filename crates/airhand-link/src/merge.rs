@@ -4,48 +4,36 @@
 //! 每个密封单元末尾的计数是明文（[`crate::secure::counter_of`]），每条路自己是有序的，发送端的计数一个接一个，
 //! 所以接收端看计数就知道该交哪一帧、哪一帧是重复的：
 //!
-//! * **控制、大块通道**（[`Policy::Complete`]）：中转上是完整的一份，直连上是同样的帧（发送端来不及时可能少几帧）。
+//! * **控制、大块通道**：中转上是完整的一份，直连上是同样的帧（发送端来不及时可能少几帧）。
 //!   计数正好是下一个的交出去，已经交出去了的（另一条路先到了）丢掉；直连上来早了的先放着，等中转把中间的补上。
 //!   中转上的帧必须正好是下一个、或者已经交出去了的：和只有中转时一样，中转删不掉、调换不了一条消息
 //!   （直连已经送到了的除外，那对接收端没有区别）；
-//! * **画面**（[`Policy::Video`]，[`Merge::next_video`]）：每一帧只走一条路，被控端换路时新路上的帧可能先到，要等旧路上的；
+//! * **画面**（[`Merge::next_video`]）：每一帧只走一条路，被控端换路时新路上的帧可能先到，要等旧路上的；
 //!   帧流（每帧一条流，见 `airhand_proto::session` 的"帧流"）上后面的帧也可能先到。按计数交出去，但只交
 //!   **解得了**的帧（见下面的"解得了"）：解不了的不交给解码器（[`Video::Skipped`]，控制端替界面确认）。
 //!
 //! # 解得了
 //!
 //! 每一帧依赖什么看画面包头（`airhand_proto::media` 的"参考帧"）：关键帧什么都不依赖；带参考帧的增量帧依赖那一帧
-//! （它交给过解码器就解得了，中间缺了哪些帧不要紧）；不带的（旧版本的被控端）依赖计数紧挨着的前一帧。
+//! （它交给过解码器就解得了，中间缺了哪些帧不要紧）；省略参考帧扩展时依赖计数紧挨着的前一帧。
 //!
 //! 缺着下一帧的时候：
 //!
 //! * 手里有解得了的后面的帧（关键帧、从交给过解码器的帧恢复的那一帧）：不等了，从手里最早的一帧接着交，解不了的跳过；
-//! * 收到过帧流（被控端会恢复）：后面的帧到了、下一帧却停住了比 QUIC 重传还久（[`loss_wait`]），就报告等不到了
+//! * 后面的帧到了、下一帧却停住了比 QUIC 重传还久（[`loss_wait`]），就报告等不到了
 //!   （[`Video::Lost`]，控制端发 `ControllerDatagram::Lost`），之后定时再报，直到解得了的帧到了。等着的期间
 //!   后面的帧先留着：重传补上了下一帧，它们照样解得了。"停住"看的是读到一半的帧流：QUIC 在几条流之间
 //!   轮流发，大的帧（关键帧）本来就比跟在后面的小帧晚到，它还在一点一点地到就不是丢了；丢了包的流在重传到之前
 //!   什么也读不到（QUIC 只按顺序交出数据）。所以读到一半的帧流里最久没有新数据的那条停了这么久才算（没有读到
 //!   一半的：缺的那一帧连开头都没到，从缺着的时候算起）；一直有新的小帧到，不影响卡住的那条算不算停住；
-//! * 等了 [`VIDEO_WAIT`] 还是不行（直连断了、旧版本的被控端、恢复一直没到）：要一个关键帧（[`Video::Keyframe`]，
-//!   走控制通道，不会丢）。旧版本的被控端（单条流，不会恢复）这时就不等下一帧了，之后解不了的都跳过，直到关键帧。
+//! * 等了 [`VIDEO_WAIT`] 还没恢复，通过控制通道要一个关键帧（[`Video::Keyframe`]）。
 //!
 //! 每条路（每条流）一个读任务，把读到的帧放进同一个信箱。对方的流（中转上的那条、每次直连通了之后直连上的那条、
 //! 每一条帧流）从这条通道的信箱（[`crate::lanes::Inbox`]）来。
 //!
-//! # 纠错的帧
-//!
-//! 增量帧也可能走数据报、带着前向纠错的冗余（见 `airhand_proto::session` 的"前向纠错"，[`Merge::with_datagrams`]）：
-//! [`crate::fec::Reassembler`] 拼回来的密封单元和流上读到的一样按计数排好、解密、按依赖交出去。不一样的地方：
-//!
-//! * 拼不回来的帧不会再来了（数据报不重传）：缺着的正好是它时马上报告等不到，不等一个往返；
-//! * 拼出来的解不开（中转改过其中一块）只算这一帧丢了，不算错：中转本来就能丢包，流上的解不开才说明有人在捣乱。
-//!
 //! # 报告
 //!
-//! 画面收得怎么样记在 [`VideoStats`] 里，控制端定时取走、报告给被控端（`ControllerDatagram::Report`），被控端据此
-//! 决定用不用纠错、配多少冗余：从帧流上收完的帧里，有多少等重传卡住过（读到一半、别的帧流照样在来的时候停了至少
-//! [`STALL`]，后面的帧却先到了，或者到的时候已经不等它了；整条连接都停了的不算，见 [`Ticks`]）；
-//! 纠错的帧该到多少块、到了多少块、有几帧拼不回来。
+//! 每路统计收完的帧和其中因重传停顿过的帧（[`VideoStats`]、[`Ticks`]），定时报告给被控端的码率控制。
 //!
 //! # 到达时刻
 //!
@@ -65,7 +53,6 @@ use airhand_proto::SessionLane;
 use airhand_proto::media::{Kind, VideoHeader};
 use airhand_proto::session::VideoReport;
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
 use quinn::RecvStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -73,12 +60,11 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use crate::clock::now_us;
-use crate::fec::Reassembler;
 use crate::lanes::{LaneStream, LaneStreams, Via};
 use crate::secure::{Opener, counter_of};
 use crate::wire::read_packet_watched;
 
-/// 画面：等前面的帧最多等这么久（一直等不到说明断在直连上了、恢复不了），之后要一个关键帧
+/// 画面等前面的帧最多等这么久，之后通过控制通道要一个关键帧。
 pub const VIDEO_WAIT: Duration = Duration::from_secs(1);
 /// 画面：最多先放着这么多帧、这么多字节（被控端在途的帧不超过 `flow::MAX_WINDOW` 帧、`flow::MAX_INFLIGHT_BYTES`），
 /// 再多就不等了
@@ -91,10 +77,8 @@ const DECODED: usize = 1024;
 /// 还没量到往返时延时按这么多算（毫秒）
 const DEFAULT_RTT_MS: f64 = 100.0;
 /// 帧流上一帧读到一半、别的帧流照样在来的时候停了这么久（后面的帧又先到了），算是等重传卡住过
-/// （见模块说明的"报告"、[`Ticks`]）。往返时延比它短的路上重传很快，看不出来，也用不着纠错
+/// （见模块说明的“报告”和 [`Ticks`]）。
 pub const STALL: Duration = Duration::from_millis(15);
-/// 记着最多这么多个拼不回来的纠错帧
-const MAX_GONE: usize = 64;
 
 /// 缺着下一帧、后面的帧到了，等多久才报告等不到了：一个半往返再加 30 ms（60 ms 到 800 ms 之间）。
 ///
@@ -115,15 +99,6 @@ fn loss_repeat(rtt_ms: f64) -> Duration {
     Duration::from_secs_f64((rtt_ms * 2.0 / 1000.0).clamp(0.1, 1.0))
 }
 
-/// 怎么合并（见模块说明）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Policy {
-    /// 控制、大块通道：中转上是完整的一份
-    Complete,
-    /// 画面：每一帧只走一条路
-    Video,
-}
-
 /// 交出去的一帧（已经解密）
 #[derive(Debug)]
 pub struct Frame {
@@ -133,8 +108,6 @@ pub struct Frame {
     pub arrived: u64,
     /// 从直连来的
     pub direct: bool,
-    /// 纠错的数据报拼回来的（见模块说明的"纠错的帧"）
-    pub fec: bool,
 }
 
 /// 画面收得怎么样（见模块说明的"报告"）：合并的一方记，报告的一方定时取走。复制出来的是同一个
@@ -147,13 +120,10 @@ impl VideoStats {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
 
-    fn add(&self, r: VideoReport) {
-        let mut s = self.0.lock().unwrap();
-        s.frames += r.frames;
-        s.stalled += r.stalled;
-        s.fragments += r.fragments;
-        s.missing += r.missing;
-        s.unrecovered += r.unrecovered;
+    fn record(&self, stalled: bool) {
+        let mut report = self.0.lock().unwrap();
+        report.frames += 1;
+        report.stalled += u32::from(stalled);
     }
 }
 
@@ -235,7 +205,6 @@ impl Core {
             data: h.data,
             arrived: h.arrived,
             direct: h.direct,
-            fec: false,
         }))
     }
 }
@@ -256,18 +225,8 @@ struct HeldVideo {
     data: Vec<u8>,
     arrived: u64,
     direct: bool,
-    fec: bool,
     seq: u32,
     dep: Dep,
-}
-
-/// 一帧画面从哪里来
-#[derive(Debug, Clone, Copy)]
-enum Src {
-    /// 流上读的：读到一半、别的帧流照样在来的时候最长停了多久（见模块说明的"报告"）
-    Stream { gap: Duration },
-    /// 纠错的数据报拼回来的
-    Fec,
 }
 
 /// 画面的合并（不碰 IO，测试直接用）
@@ -290,14 +249,10 @@ struct VideoCore {
     lost_at: Option<Instant>,
     /// 这一轮已经要过关键帧了
     asked_key: bool,
-    /// 收到过帧流（或者纠错的帧）：被控端会响应等不到的报告（见模块说明）
-    frames: bool,
     /// 往返时延（毫秒）
     rtt_ms: f64,
-    /// 拼不回来的纠错帧（计数）：缺着的是它们时不用等
-    gone: VecDeque<u64>,
-    /// 帧流上收完的帧、其中卡住过的（见模块说明的"报告"），还没交给 [`VideoStats`] 的
-    stats: VideoReport,
+    /// 报告任务定时取走的帧数与停顿数。
+    stats: VideoStats,
     /// 上一帧（解得了的、跳过的）交出去的时刻（控制端的时钟，微秒；还没有时为 0），见模块说明的"到达时刻"
     handed: u64,
     /// 把 [`VideoCore::pop`] 的 `now` 换成控制端的时钟：(某个时刻, 那时的 `now_us()`)
@@ -317,10 +272,8 @@ impl VideoCore {
             progress: None,
             lost_at: None,
             asked_key: false,
-            frames: false,
             rtt_ms: DEFAULT_RTT_MS,
-            gone: VecDeque::new(),
-            stats: VideoReport::default(),
+            stats: VideoStats::default(),
             handed: 0,
             anchor: (Instant::now(), now_us()),
         }
@@ -342,43 +295,26 @@ impl VideoCore {
     /// 测试用：流上读到的一帧，没停过
     #[cfg(test)]
     fn push(&mut self, direct: bool, data: Vec<u8>, arrived: u64) -> Result<()> {
-        self.receive(
-            direct,
-            data,
-            arrived,
-            Src::Stream {
-                gap: Duration::ZERO,
-            },
-        )
+        self.receive(direct, data, arrived, Duration::ZERO)
     }
 
     /// 收到一帧（密封单元）：收到就解开（要看它依赖什么）
-    fn receive(&mut self, direct: bool, mut data: Vec<u8>, arrived: u64, src: Src) -> Result<()> {
+    fn receive(
+        &mut self,
+        direct: bool,
+        mut data: Vec<u8>,
+        arrived: u64,
+        gap: Duration,
+    ) -> Result<()> {
         let c = counter_of(&data).context("a session frame is too short")?;
-        let stream = matches!(src, Src::Stream { .. });
         if c < self.next || self.held.contains_key(&c) || !self.opener.is_fresh(c) {
             // 另一条路先送到了、太晚了（已经不等它了：流上的算卡住过）
-            if stream && c < self.next && self.opener.is_fresh(c) {
-                self.stats.frames += 1;
-                self.stats.stalled += 1;
+            if c < self.next && self.opener.is_fresh(c) {
+                self.stats.record(true);
             }
             return Ok(());
         }
-        match src {
-            Src::Stream { .. } => self.opener.open(&mut data)?,
-            // 拼出来的解不开：中转改过其中一块，和丢了一样（见模块说明的"纠错的帧"）
-            Src::Fec => {
-                if let Err(e) = self.opener.open(&mut data) {
-                    debug!(
-                        counter = c,
-                        "a video frame sent as datagrams didn't open: {e:#}"
-                    );
-                    self.gone(c);
-                    return Ok(());
-                }
-                self.frames = true;
-            }
-        }
+        self.opener.open(&mut data)?;
         anyhow::ensure!(
             Kind::of(&data) == Some(Kind::Video),
             "unexpected packet on the video stream"
@@ -389,13 +325,8 @@ impl VideoCore {
             (false, Some(r)) => Dep::Ref(r),
             (false, None) => Dep::Prev,
         };
-        if let Src::Stream { gap } = src {
-            self.stats.frames += 1;
-            let overtaken = self.held.keys().next_back().is_some_and(|&l| l > c);
-            if gap >= STALL && overtaken {
-                self.stats.stalled += 1;
-            }
-        }
+        let overtaken = self.held.keys().next_back().is_some_and(|&l| l > c);
+        self.stats.record(gap >= STALL && overtaken);
         self.held_bytes += data.len();
         self.held.insert(
             c,
@@ -403,23 +334,11 @@ impl VideoCore {
                 data,
                 arrived,
                 direct,
-                fec: !stream,
                 seq: h.seq,
                 dep,
             },
         );
         Ok(())
-    }
-
-    /// 纠错的第 `c` 帧拼不回来了（见模块说明的"纠错的帧"）
-    fn gone(&mut self, c: u64) {
-        if c < self.next || self.held.contains_key(&c) || self.gone.contains(&c) {
-            return;
-        }
-        if self.gone.len() == MAX_GONE {
-            self.gone.pop_front();
-        }
-        self.gone.push_back(c);
     }
 
     /// 计数 `c` 上的这一帧现在解得了（见模块说明的"解得了"）
@@ -446,7 +365,6 @@ impl VideoCore {
     fn pop(&mut self, now: Instant) -> Option<Video> {
         loop {
             let c = self.next;
-            self.gone.retain(|&g| g >= c);
             if let Some(h) = self.take(c) {
                 self.next += 1;
                 let arrived = self.hand_over(&h, now);
@@ -468,21 +386,17 @@ impl VideoCore {
                     data: h.data,
                     arrived,
                     direct: h.direct,
-                    fec: h.fec,
                 }));
             }
-            let first = self.held.keys().next().copied();
-            // 手里什么都没有：没什么可等的，除非缺着的是拼不回来的纠错帧（画面停在了它上面，要请被控端恢复）
-            if first.is_none() && !self.gone.contains(&c) {
+            let Some(first) = self.held.keys().next().copied() else {
                 self.waiting = None;
                 return None;
-            }
+            };
             // 手里有解得了的后面的帧：缺着的不等了，从手里最早的一帧接着交（解不了的跳过）。
             // 手里的帧太多了也不留了：反正解不了
-            if let Some(first) = first
-                && (self.held.iter().any(|(c, h)| self.decodable(*c, h))
-                    || self.held.len() >= MAX_HELD_FRAMES
-                    || self.held_bytes > MAX_HELD_VIDEO_BYTES)
+            if self.held.iter().any(|(c, h)| self.decodable(*c, h))
+                || self.held.len() >= MAX_HELD_FRAMES
+                || self.held_bytes > MAX_HELD_VIDEO_BYTES
             {
                 debug!(
                     from = self.next,
@@ -503,17 +417,6 @@ impl VideoCore {
             }
             if !self.asked_key && now >= since + VIDEO_WAIT {
                 self.asked_key = true;
-                // 旧版本的被控端不会恢复：不等了，之后解不了的都跳过，直到关键帧
-                if !self.frames
-                    && let Some(first) = first
-                {
-                    debug!(
-                        from = self.next,
-                        to = first,
-                        "video: gave up waiting for frames"
-                    );
-                    self.next = first;
-                }
                 return Some(Video::Keyframe { after: decoded });
             }
             return None;
@@ -521,15 +424,9 @@ impl VideoCore {
     }
 
     /// 缺着的帧到这个时候还是停着，就报告（再报）等不到了：从开始缺着（上次报告）、帧流上最后一次有数据的时刻
-    /// 里晚的那个算起；缺着的是拼不回来的纠错帧时马上报告。没收到过帧流（被控端不会恢复）、没在等时为 `None`
+    /// 里晚的那个算起。
     fn lost_due(&self) -> Option<Instant> {
-        let since = self.waiting.filter(|_| self.frames)?;
-        if self.gone.contains(&self.next) {
-            return Some(match self.lost_at {
-                None => since,
-                Some(t) => t + loss_repeat(self.rtt_ms),
-            });
-        }
+        let since = self.waiting?;
         let (from, wait) = match self.lost_at {
             None => (since, loss_wait(self.rtt_ms)),
             Some(t) => (t, loss_repeat(self.rtt_ms)),
@@ -558,27 +455,20 @@ enum Source {
     /// 直连上的那条
     Direct,
     /// 一条帧流（`direct`：在直连上）
-    Frame { direct: bool },
+    Frame { direct: bool, reader: u64 },
 }
 
 impl Source {
     fn direct(self) -> bool {
-        matches!(self, Source::Direct | Source::Frame { direct: true })
+        matches!(self, Source::Direct | Source::Frame { direct: true, .. })
     }
 }
 
-enum Event {
-    Frame {
-        direct: bool,
-        data: Vec<u8>,
-        arrived: u64,
-        /// 读到一半、别的帧流照样在来的时候最长停了多久
-        gap: Duration,
-    },
-    End {
-        source: Source,
-        error: Option<anyhow::Error>,
-    },
+struct Event {
+    source: Source,
+    packet: Result<Option<(Vec<u8>, u64)>>,
+    /// 读到一半、别的帧流照样在来的时候最长停了多久
+    gap: Duration,
 }
 
 /// 中转上的那条流
@@ -599,8 +489,6 @@ pub struct Merge {
     streams: LaneStreams,
     streams_open: bool,
     relay: Relay,
-    /// 还开着的直连的流
-    direct: usize,
     /// 还开着的帧流
     frames: usize,
     /// 读到一半的帧流（读任务的编号）和它们最后一次读到数据的时刻：读任务写，合并时看（见模块说明的"停住"）
@@ -608,16 +496,6 @@ pub struct Merge {
     /// 帧流上最近读到数据的时刻（所有的帧流）：一条帧流停住的时候别的有没有在来（见 [`Ticks`]）
     ticks: Arc<Mutex<Ticks>>,
     readers: JoinSet<()>,
-    /// 画面的纠错数据报（见模块说明的"纠错的帧"）
-    fec: Option<FecIn>,
-    stats: VideoStats,
-}
-
-/// 画面的纠错数据报从哪里来、拼它们的
-struct FecIn {
-    rx: mpsc::Receiver<(Via, Bytes)>,
-    open: bool,
-    reasm: Reassembler,
 }
 
 /// 读任务的编号（[`Merge::partial`] 的键）
@@ -656,12 +534,12 @@ impl Ticks {
 
 impl Merge {
     /// `streams`：对方在这条通道上开的流（[`crate::lanes::Inbox`] 里这条通道的信箱）
-    pub fn new(lane: SessionLane, policy: Policy, opener: Opener, streams: LaneStreams) -> Self {
+    pub fn new(lane: SessionLane, opener: Opener, streams: LaneStreams) -> Self {
         let capacity = (4 * 1024 * 1024 / lane.max_frame_size()).clamp(2, 16);
         let (tx, rx) = mpsc::channel(capacity);
-        let core = match policy {
-            Policy::Complete => Cores::Complete(Core::new(opener)),
-            Policy::Video => Cores::Video(VideoCore::new(opener)),
+        let core = match lane {
+            SessionLane::Video(_) => Cores::Video(VideoCore::new(opener)),
+            _ => Cores::Complete(Core::new(opener)),
         };
         Self {
             lane,
@@ -671,47 +549,18 @@ impl Merge {
             streams,
             streams_open: true,
             relay: Relay::Waiting,
-            direct: 0,
             frames: 0,
             partial: Arc::default(),
             ticks: Arc::default(),
             readers: JoinSet::new(),
-            fec: None,
-            stats: VideoStats::default(),
         }
-    }
-
-    /// 画面：纠错的数据报从 `rx` 来（[`crate::lanes::Inbox::fec`]），拼好的帧和流上的一起合并（见模块说明的"纠错的帧"）
-    pub fn with_datagrams(mut self, rx: mpsc::Receiver<(Via, Bytes)>) -> Self {
-        if matches!(self.core, Cores::Video(_)) {
-            self.fec = Some(FecIn {
-                rx,
-                open: true,
-                reasm: Reassembler::default(),
-            });
-        }
-        self
     }
 
     /// 画面收得怎么样（见模块说明的"报告"）
     pub fn stats(&self) -> VideoStats {
-        self.stats.clone()
-    }
-
-    /// 合并、拼帧时记下的交给 [`VideoStats`]
-    fn flush_stats(&mut self) {
-        let mut add = match &mut self.core {
-            Cores::Video(v) => std::mem::take(&mut v.stats),
-            Cores::Complete(_) => return,
-        };
-        if let Some(f) = &mut self.fec {
-            let t = f.reasm.take_tally();
-            add.fragments += t.fragments;
-            add.missing += t.missing;
-            add.unrecovered += t.unrecovered;
-        }
-        if !add.is_empty() {
-            self.stats.add(add);
+        match &self.core {
+            Cores::Video(v) => v.stats.clone(),
+            Cores::Complete(_) => VideoStats::default(),
         }
     }
 
@@ -724,29 +573,23 @@ impl Merge {
 
     /// 加一条已经拿到的流（握手时在控制通道上读过的那条）
     pub fn add(&mut self, recv: RecvStream, via: Via) -> Result<()> {
-        self.add_stream(LaneStream {
-            recv,
-            via,
-            frame: false,
-        })
+        self.add_stream(LaneStream { recv, via })
     }
 
     fn add_stream(&mut self, s: LaneStream) -> Result<()> {
         let direct = s.via == Via::Direct;
-        if s.frame {
-            let Cores::Video(v) = &mut self.core else {
-                // 只有画面有帧流
-                let mut recv = s.recv;
-                let _ = recv.stop(0u32.into());
-                return Ok(());
-            };
-            v.frames = true;
+        if matches!(self.core, Cores::Video(_)) {
             self.frames += 1;
-            self.read(s.recv, Source::Frame { direct });
+            self.read(
+                s.recv,
+                Source::Frame {
+                    direct,
+                    reader: READERS.fetch_add(1, Ordering::Relaxed),
+                },
+            );
             return Ok(());
         }
         if direct {
-            self.direct += 1;
             self.read(s.recv, Source::Direct);
             return Ok(());
         }
@@ -763,59 +606,77 @@ impl Merge {
     fn read(&mut self, mut recv: RecvStream, source: Source) {
         let tx = self.tx.clone();
         let max = self.lane.max_frame_size();
-        let direct = source.direct();
         // 帧流读到一半时记下最后一次读到数据的时刻：大的帧还在一点一点地到，不是丢了
-        let frame = matches!(source, Source::Frame { .. });
-        let partial = frame.then(|| self.partial.clone());
-        let ticks = frame.then(|| self.ticks.clone());
-        let id = READERS.fetch_add(1, Ordering::Relaxed);
+        let progress = match source {
+            Source::Frame { reader, .. } => {
+                Some((reader, self.partial.clone(), self.ticks.clone()))
+            }
+            _ => None,
+        };
         self.readers.spawn(async move {
-            let _forget = Forget(partial.clone(), id);
             loop {
-                // 这一帧读到一半、别的帧流照样在来的时候最长停了多久（见模块说明的"报告"）
-                let mut last: Option<Instant> = None;
+                let mut last = None;
                 let mut gap = Duration::ZERO;
-                let tick = |done: bool| {
+                let tick = |_| {
+                    let Some((id, partial, ticks)) = &progress else {
+                        return;
+                    };
                     let now = Instant::now();
-                    if let Some(t) = &ticks {
-                        let mut t = t.lock().unwrap();
-                        if let Some(l) = last {
-                            gap = gap.max(t.blocked(l, now));
-                        }
-                        t.push(now);
+                    let mut ticks = ticks.lock().unwrap();
+                    if let Some(l) = last {
+                        gap = gap.max(ticks.blocked(l, now));
                     }
+                    ticks.push(now);
                     last = Some(now);
-                    if let Some(p) = &partial {
-                        let mut p = p.lock().unwrap();
-                        if done {
-                            p.remove(&id);
-                        } else {
-                            p.insert(id, now);
-                        }
-                    }
+                    // 直到合并任务收到这一帧才移除。否则刚读完的大帧在信箱里等待时会被误报丢失。
+                    partial.lock().unwrap().insert(*id, now);
                 };
-                let ev = match read_packet_watched(&mut recv, max, now_us, tick).await {
-                    Ok(Some((data, arrived))) => Event::Frame {
-                        direct,
-                        data,
-                        arrived,
+                let packet = read_packet_watched(&mut recv, max, now_us, tick)
+                    .await
+                    .map_err(Into::into);
+                let end = progress.is_some() || !matches!(packet, Ok(Some(_)));
+                if tx
+                    .send(Event {
+                        source,
+                        packet,
                         gap,
-                    },
-                    Ok(None) => Event::End {
-                        source,
-                        error: None,
-                    },
-                    Err(e) => Event::End {
-                        source,
-                        error: Some(e.into()),
-                    },
-                };
-                let end = matches!(ev, Event::End { .. });
-                if tx.send(ev).await.is_err() || end {
+                    })
+                    .await
+                    .is_err()
+                    || end
+                {
                     return;
                 }
             }
         });
+    }
+
+    fn received(
+        &mut self,
+        Event {
+            source,
+            packet,
+            gap,
+        }: Event,
+    ) -> Result<()> {
+        if let Source::Frame { reader, .. } = source {
+            self.partial.lock().unwrap().remove(&reader);
+            self.frames -= 1;
+        }
+        match packet {
+            Ok(Some((data, arrived))) => match &mut self.core {
+                Cores::Complete(c) => c.push(source.direct(), data, arrived)?,
+                Cores::Video(v) => v.receive(source.direct(), data, arrived, gap)?,
+            },
+            end if source == Source::Relay => {
+                end?;
+                self.relay = Relay::Ended;
+            }
+            // 被放弃的帧流和断开的直连不会结束会话。
+            Err(e) => debug!(lane = ?self.lane, ?source, "a session stream ended: {e:#}"),
+            Ok(None) => {}
+        }
+        Ok(())
     }
 
     /// 下一帧（已经解密）。中转上的流结束了就是这条通道结束了（`None`）；
@@ -838,14 +699,7 @@ impl Merge {
             let now = Instant::now();
             if let Cores::Video(v) = &mut self.core {
                 v.progress = self.partial.lock().unwrap().values().min().copied();
-                // 拼不回来的纠错帧：缺着的是它们时不用等
-                if let Some(f) = &mut self.fec {
-                    for c in f.reasm.poll(now) {
-                        v.gone(c);
-                    }
-                }
             }
-            self.flush_stats();
             let out = match &mut self.core {
                 Cores::Complete(c) => c.pop()?.map(Video::Frame),
                 Cores::Video(v) => v.pop(now),
@@ -862,78 +716,24 @@ impl Merge {
             let (ended, deadline) = match &self.core {
                 // 中转上的是完整的一份：它结束了，手里剩下的也补不齐了
                 Cores::Complete(_) => (relay_done, None),
-                Cores::Video(v) => {
-                    let fec = self.fec.as_ref().and_then(|f| f.reasm.deadline());
-                    (
-                        relay_done && self.direct == 0 && self.frames == 0 && v.held.is_empty(),
-                        v.deadline().into_iter().chain(fec).min(),
-                    )
-                }
+                Cores::Video(v) => (!self.streams_open && self.frames == 0, v.deadline()),
             };
             if ended {
                 return Ok(None);
             }
             tokio::select! {
                 biased;
-                ev = self.rx.recv() => match ev.expect("we keep a sender") {
-                    Event::Frame { direct, data, arrived, gap } => match &mut self.core {
-                        Cores::Complete(c) => c.push(direct, data, arrived)?,
-                        Cores::Video(v) => v.receive(direct, data, arrived, Src::Stream { gap })?,
-                    },
-                    Event::End { source: Source::Relay, error } => {
-                        if let Some(e) = error {
-                            return Err(e);
-                        }
-                        self.relay = Relay::Ended;
-                    }
-                    Event::End { source: Source::Direct, error } => {
-                        self.direct -= 1;
-                        if let Some(e) = error {
-                            debug!(lane = ?self.lane, "a direct stream ended: {e:#}");
-                        }
-                    }
-                    // 帧流断了：被控端放弃了这一帧（或者直连断了），不算错
-                    Event::End { source: Source::Frame { .. }, error } => {
-                        self.frames -= 1;
-                        if let Some(e) = error {
-                            debug!(lane = ?self.lane, "a frame stream ended: {e:#}");
-                        }
-                    }
-                },
-                d = fec_datagram(&mut self.fec) => match (d, &mut self.fec, &mut self.core) {
-                    (Some((via, d)), Some(f), Cores::Video(v)) => {
-                        if let Some(a) = f.reasm.fragment(d, via, Instant::now()) {
-                            v.receive(a.direct, a.data, a.arrived, Src::Fec)?;
-                        }
-                    }
-                    (None, Some(f), _) => f.open = false,
-                    _ => {}
-                },
+                // 已结束的读任务也要回收，否则每播放一帧就会留下一个任务句柄。
+                Some(done) = self.readers.join_next(), if !self.readers.is_empty() => {
+                    done.context("session stream reader failed")?;
+                }
+                ev = self.rx.recv() => self.received(ev.expect("we keep a sender"))?,
                 s = self.streams.recv(), if self.streams_open => match s {
                     Some(s) => self.add_stream(s)?,
                     None => self.streams_open = false,
                 },
                 () = sleep_until(deadline) => {}
             }
-        }
-    }
-}
-
-/// 下一个纠错数据报；没有纠错的数据报（不是画面、信箱关了）时一直等
-async fn fec_datagram(f: &mut Option<FecIn>) -> Option<(Via, Bytes)> {
-    match f {
-        Some(f) if f.open => f.rx.recv().await,
-        _ => std::future::pending().await,
-    }
-}
-
-/// 读任务结束时（流断了、会话结束了），它读到一半的帧不算了
-struct Forget(Option<Arc<Mutex<HashMap<u64, Instant>>>>, u64);
-
-impl Drop for Forget {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            p.lock().unwrap().remove(&self.1);
         }
     }
 }
@@ -956,7 +756,7 @@ mod tests {
         s.seal(body).unwrap()
     }
 
-    /// 一帧画面：`reference` 是参考帧（`None`：旧版本，依赖前一帧）
+    /// 一帧画面。省略参考帧扩展的增量帧依赖前一帧。
     fn frame(s: &mut Sealer, seq: u32, key: bool, reference: Option<u32>) -> Vec<u8> {
         let h = VideoHeader {
             seq,
@@ -1104,8 +904,7 @@ mod tests {
         assert_eq!(drain(&mut m, now), [Got::F(4), Got::F(5)]);
     }
 
-    /// 直连断了（旧版本的被控端）：断在上面的帧等不到。关键帧来了就不等了；没有关键帧，等一会儿要一个关键帧，
-    /// 之后解不了的跳过、直到关键帧
+    /// 换路后可靠关键帧可以越过断在旧路上的帧。
     #[test]
     fn video_does_not_wait_for_frames_lost_on_a_dead_path() {
         let (mut s, o) = test_lane(false);
@@ -1126,18 +925,6 @@ mod tests {
         // 断在直连上的帧后来又到了：太晚了
         m.push(true, f[3].clone(), 0).unwrap();
         assert!(m.pop(t0).is_none());
-        // 6 丢了，后面没有关键帧：等一会儿（旧版本的被控端不会恢复，不报告等不到）
-        m.push(false, f[7].clone(), 0).unwrap();
-        assert!(m.pop(t0).is_none());
-        assert_eq!(m.deadline(), Some(t0 + VIDEO_WAIT));
-        assert!(m.pop(t0 + VIDEO_WAIT / 2).is_none());
-        // 不等了：要关键帧，解不了的跳过
-        assert_eq!(drain(&mut m, t0 + VIDEO_WAIT), [Got::K(5), Got::S(7)]);
-        assert_eq!(m.deadline(), None);
-        m.push(false, f[8].clone(), 0).unwrap();
-        m.push(false, f[9].clone(), 0).unwrap();
-        let late = t0 + VIDEO_WAIT;
-        assert_eq!(drain(&mut m, late), [Got::S(8), Got::F(9)]);
     }
 
     /// 帧流：后面的小帧先到了、前面的大帧（关键帧）还在一点一点地到：不是丢了，一直有数据就一直不报告；
@@ -1146,7 +933,6 @@ mod tests {
     fn a_large_frame_that_is_still_arriving_is_not_lost() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         m.rtt_ms = 60.0;
         let t0 = Instant::now();
         let _big_key = frame(&mut s, 1, true, None);
@@ -1177,7 +963,6 @@ mod tests {
     fn frames_waiting_for_earlier_ones_arrive_late() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         let t0 = Instant::now();
         let base = m.clock_us(t0);
         let ms = Duration::from_millis;
@@ -1210,7 +995,6 @@ mod tests {
             .map(|i| frame(&mut s, i, i == 0, (i > 0).then(|| i - 1)))
             .collect();
         let mut m = VideoCore::new(o);
-        m.frames = true;
         m.rtt_ms = 80.0;
         let t0 = Instant::now();
         m.push(false, f[0].clone(), 0).unwrap();
@@ -1233,7 +1017,6 @@ mod tests {
     fn a_lost_frame_is_reported_and_recovered_from() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         m.rtt_ms = 100.0;
         let t0 = Instant::now();
         let k = frame(&mut s, 1, true, None);
@@ -1273,7 +1056,6 @@ mod tests {
     fn a_late_retransmission_is_still_used() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         let t0 = Instant::now();
         let k = frame(&mut s, 1, true, None);
         let slow = frame(&mut s, 2, false, Some(1));
@@ -1296,7 +1078,6 @@ mod tests {
     fn frames_fall_back_to_a_keyframe() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         let t0 = Instant::now();
         let k = frame(&mut s, 1, true, None);
         let _lost = frame(&mut s, 2, false, Some(1));
@@ -1317,21 +1098,19 @@ mod tests {
     fn a_reference_that_was_never_decoded_is_not_decodable() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         let t0 = Instant::now();
         m.push(false, frame(&mut s, 1, true, None), 0).unwrap();
         m.push(false, frame(&mut s, 2, false, Some(77)), 0).unwrap();
         assert_eq!(drain(&mut m, t0), [Got::F(1), Got::S(2)]);
     }
 
-    /// 帧流的读任务：一条帧流结束了、断了（被控端放弃了）都不算通道结束，也不算错；中转上没有长期的那条流，
-    /// 会话结束了（信箱关了）才结束
+    /// 写了一半就 reset 的帧可能丢失。信箱关闭且所有读任务结束后，剩余的缺口也结束等待。
     #[tokio::test]
     async fn frame_streams_come_and_go() {
         let (client, server) = crate::tests::quic_pair().await;
         let (mut s, o) = test_lane(false);
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut m = Merge::new(SessionLane::Video(0), Policy::Video, o, rx);
+        let mut m = Merge::new(SessionLane::Video(0), o, rx);
         let accept = async || server.accept_uni().await.unwrap();
         for seq in 0..3u32 {
             let mut send = client.open_uni().await.unwrap();
@@ -1348,7 +1127,6 @@ mod tests {
             tx.send(LaneStream {
                 recv: accept().await,
                 via: Via::Relay,
-                frame: true,
             })
             .unwrap();
         }
@@ -1371,14 +1149,39 @@ mod tests {
                 Video::Lost { decoded } => Got::L(decoded),
                 Video::Keyframe { after } => Got::K(after),
             });
-            if rest.len() > 4 {
-                break;
-            }
+            assert!(rest.len() <= 2, "unexpected frame events: {rest:?}");
         }
         assert!(
-            rest == [Got::F(1), Got::F(2)] || rest.starts_with(&[Got::L(0)]),
+            rest.is_empty() || rest == [Got::F(1), Got::F(2)],
             "{rest:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_video_stream_delivers_only_its_first_frame() {
+        let (client, server) = crate::tests::quic_pair().await;
+        let (mut sealer, opener) = test_lane(false);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut video = Merge::new(SessionLane::Video(0), opener, rx);
+        let mut send = client.open_uni().await.unwrap();
+        for seq in [1, 2] {
+            let data = frame(&mut sealer, seq, true, None);
+            send.write_all(&(data.len() as u32).to_le_bytes())
+                .await
+                .unwrap();
+            send.write_all(&data).await.unwrap();
+        }
+        send.finish().unwrap();
+        tx.send(LaneStream {
+            recv: server.accept_uni().await.unwrap(),
+            via: Via::Relay,
+        })
+        .unwrap();
+        drop(tx);
+        assert!(
+            matches!(video.next_video().await.unwrap(), Some(Video::Frame(f)) if seq_of(&f) == 1)
+        );
+        assert!(video.next_video().await.unwrap().is_none());
     }
 
     /// 真的 QUIC 帧流：后面的小帧先到了、前面的大帧还在一点一点地到（比一个往返还久）：不算等不到；
@@ -1388,7 +1191,7 @@ mod tests {
         let (client, server) = crate::tests::quic_pair().await;
         let (mut s, o) = test_lane(false);
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut m = Merge::new(SessionLane::Video(0), Policy::Video, o, rx);
+        let mut m = Merge::new(SessionLane::Video(0), o, rx);
         m.set_rtt(100.0);
         let wire = |f: Vec<u8>| [&(f.len() as u32).to_le_bytes()[..], &f].concat();
         let accept = async |tx: &mpsc::UnboundedSender<LaneStream>| {
@@ -1396,7 +1199,6 @@ mod tests {
             tx.send(LaneStream {
                 recv,
                 via: Via::Relay,
-                frame: true,
             })
             .unwrap();
         };
@@ -1480,82 +1282,18 @@ mod tests {
         );
     }
 
-    /// 纠错的帧：拼回来的和流上的一样交出去（带着 fec）；拼不回来的缺着时马上报告等不到，不等一个往返；
-    /// 拼出来却解不开的只算丢了（不是错误）
-    #[test]
-    fn fec_frames_and_frames_that_cannot_be_rebuilt() {
-        let (mut s, o) = test_lane(false);
-        let mut m = VideoCore::new(o);
-        m.rtt_ms = 200.0;
-        let t0 = Instant::now();
-        // 到达时刻和 pop 的 now 在同一个时钟上（见模块说明的"到达时刻"）
-        let base = m.clock_us(t0);
-        let key = frame(&mut s, 1, true, None);
-        let d2 = frame(&mut s, 2, false, Some(1));
-        let mut tampered = frame(&mut s, 3, false, Some(2));
-        let d4 = frame(&mut s, 4, false, Some(3));
-        m.push(false, key, base).unwrap();
-        m.receive(true, d2, base + 5, Src::Fec).unwrap();
-        m.receive(false, d4, base, Src::Fec).unwrap();
-        let first = m.pop(t0);
-        assert!(matches!(
-            first,
-            Some(Video::Frame(Frame { fec: false, .. }))
-        ));
-        let Some(Video::Frame(f)) = m.pop(t0) else {
-            panic!()
-        };
-        assert_eq!(
-            (seq_of(&f), f.fec, f.direct, f.arrived),
-            (2, true, true, base + 5)
-        );
-        // 第 3 帧还缺着：等一个往返
-        assert!(m.pop(t0).is_none());
-        assert_eq!(m.deadline(), Some(t0 + loss_wait(200.0)));
-        // 它拼出来了却解不开（中转改过）：不是错误，算拼不回来，马上报告
-        tampered[0] ^= 1;
-        m.receive(false, tampered, 0, Src::Fec).unwrap();
-        assert_eq!(drain(&mut m, t0), [Got::L(2)]);
-        // 之后按往返再报
-        assert_eq!(m.deadline(), Some(t0 + loss_repeat(200.0)));
-        // 被控端从第 2 帧恢复
-        let r5 = frame(&mut s, 5, false, Some(2));
-        m.push(false, r5, 0).unwrap();
-        assert_eq!(drain(&mut m, t0), [Got::S(4), Got::F(5)]);
-        assert!(m.gone.is_empty());
-    }
-
-    /// 画面停在一帧拼不回来的纠错帧上（后面没有帧了）：也马上报告，不然画面一直停在前一帧
-    #[test]
-    fn a_last_frame_that_cannot_be_rebuilt_is_reported() {
-        let (mut s, o) = test_lane(false);
-        let mut m = VideoCore::new(o);
-        let t0 = Instant::now();
-        m.push(false, frame(&mut s, 1, true, None), 0).unwrap();
-        m.receive(false, frame(&mut s, 2, false, Some(1)), 0, Src::Fec)
-            .unwrap();
-        assert_eq!(drain(&mut m, t0), [Got::F(1), Got::F(2)]);
-        assert_eq!(m.deadline(), None);
-        m.gone(2);
-        // 已经交过的、很老的不算
-        m.gone(1);
-        assert_eq!(drain(&mut m, t0), [Got::L(2)]);
-        assert_eq!(m.gone, [2]);
-    }
-
     /// 报告：帧流上读到一半停过、后面的帧又先到了的算卡住过；停得短的、没被赶超的不算；
-    /// 到的时候已经不等它了的也算。纠错的帧不算在帧流里
+    /// 到的时候已经不等它了的也算
     #[test]
     fn stalls_are_counted_for_the_report() {
         let (mut s, o) = test_lane(false);
         let mut m = VideoCore::new(o);
-        m.frames = true;
         let t0 = Instant::now();
         let f: Vec<Vec<u8>> = (0..7)
             .map(|i| frame(&mut s, i, i == 0, (i > 0).then(|| i - 1)))
             .collect();
-        let stalled = Src::Stream { gap: STALL * 2 };
-        let short = Src::Stream { gap: STALL / 2 };
+        let stalled = STALL * 2;
+        let short = STALL / 2;
         m.receive(false, f[0].clone(), 0, stalled).unwrap();
         m.receive(false, f[2].clone(), 0, short).unwrap();
         // 停了很久、第 2 帧先到了
@@ -1564,8 +1302,7 @@ mod tests {
         m.receive(false, f[4].clone(), 0, short).unwrap();
         m.receive(false, f[3].clone(), 0, short).unwrap();
         assert_eq!(drain(&mut m, t0).len(), 5);
-        // 纠错的不算；第 5 帧等不到、恢复了之后才到（已经不等它了）
-        m.receive(false, f[6].clone(), 0, Src::Fec).unwrap();
+        m.receive(false, f[6].clone(), 0, Duration::ZERO).unwrap();
         assert!(drain(&mut m, t0).is_empty());
         let late = t0 + loss_wait(DEFAULT_RTT_MS);
         assert_eq!(drain(&mut m, late), [Got::L(4)]);
@@ -1573,8 +1310,8 @@ mod tests {
         m.push(false, r, 0).unwrap();
         assert_eq!(drain(&mut m, late), [Got::S(6), Got::F(7)]);
         m.receive(false, f[5].clone(), 0, short).unwrap();
-        let r = std::mem::take(&mut m.stats);
-        assert_eq!((r.frames, r.stalled), (7, 2));
+        let r = m.stats.take();
+        assert_eq!((r.frames, r.stalled), (8, 2));
     }
 
     #[test]

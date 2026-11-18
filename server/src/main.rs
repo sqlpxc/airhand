@@ -67,7 +67,7 @@ fn env_path(key: &str, default: PathBuf) -> PathBuf {
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
     // 双向流只有信令流；会话的通道是单向流，每个会话每端几条（服务器限制每端最多 MAX_LANES 条），
-    // 画面用帧流时还有每帧一条（每个会话每端同时开着的不超过 MAX_FRAME_STREAMS 条）
+    // 画面每帧一条（每个会话每端同时开着的不超过 MAX_FRAME_STREAMS 条）
     t.max_concurrent_bidi_streams(VarInt::from_u32(1));
     t.max_concurrent_uni_streams(VarInt::from_u32(1024));
     t.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
@@ -80,9 +80,7 @@ pub fn transport_config() -> TransportConfig {
     t.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
     t.receive_window(VarInt::from_u32(16 * 1024 * 1024));
     t.send_window(16 * 1024 * 1024);
-    // 数据报收到就转出去：收的缓冲不用大。转出去的除了声音（带着之前两包的副本，约 40 KB/s 一路），画面用前向纠错时
-    // 增量帧也是数据报（见 airhand_proto::session 的"前向纠错"）：那一段网络跟不上时它们在这里排队。排得下大约 30 ms 的画面
-    // （70 Mbps 时）：被控端的码率控制先从排队时延看出来、降码率；再多就丢掉最旧的，不替接收方放过时的画面和声音
+    // 多会话共享一条连接。限制声音及控制数据报的缓存，满时优先发新包。
     t.datagram_receive_buffer_size(Some(256 * 1024));
     t.datagram_send_buffer_size(256 * 1024);
     // BBR：在有随机丢包的网络（Wi-Fi/跨境）上比 Cubic 更能维持吞吐，且排队延迟更低

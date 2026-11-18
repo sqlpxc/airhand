@@ -7,7 +7,7 @@
 //! alias = "设计部"
 //! os = "Windows 11 Pro"
 //! last_used = 2026-11-08T10:20:30Z
-//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264", transport = "fec" }
+//! quality = { fps = 30, bitrate_kbps = 4000, max_short = 1080, adaptive = true, codec = "h264" }
 //! mouse = "game"
 //! resume = "q83vEjRWeJCrze8SNFZ4kA=="
 //! host_key = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
@@ -26,7 +26,7 @@
 //!
 //! 手动添加时 `code` 写 6 位数字在所有平台上都可以。
 
-use airhand_proto::session::{Codec, QualitySettings, VideoTransport};
+use airhand_proto::session::{Codec, QualitySettings};
 use airhand_proto::signal::ResumeToken;
 use anyhow::Result;
 use base64::Engine;
@@ -194,12 +194,6 @@ fn quality_from(item: &Item) -> Option<QualitySettings> {
         max_short: u16::try_from(int("max_short")?).ok()?,
         adaptive: t.get("adaptive").and_then(Item::as_bool)?,
         codec,
-        // 自动（默认）不写
-        transport: t
-            .get("transport")
-            .and_then(Item::as_str)
-            .and_then(VideoTransport::from_name)
-            .unwrap_or_default(),
         // 画不画光标跟着鼠标模式走（上面的 `mouse`），不算画质
         draw_cursor: false,
     })
@@ -271,11 +265,6 @@ pub fn to_table(d: &Device) -> Option<Table> {
         it.insert("max_short", i64::from(q.max_short).into());
         it.insert("adaptive", q.adaptive.into());
         it.insert("codec", q.codec.or_h264().name().unwrap_or("h264").into());
-        if let Some(p) = q.transport.or_auto().name()
-            && q.transport.or_auto() != VideoTransport::Auto
-        {
-            it.insert("transport", p.into());
-        }
         t["quality"] = toml_edit::value(it);
     }
     if let Some(m) = d.mouse.as_deref().and_then(mouse_mode) {
@@ -375,7 +364,6 @@ mod tests {
                 max_short: 1080,
                 adaptive: true,
                 codec: Codec::H265,
-                transport: VideoTransport::Fec,
                 draw_cursor: false,
             }),
             mouse: Some("game".into()),
@@ -421,7 +409,6 @@ mod tests {
         let bare_table = to_table(&bare).unwrap();
         assert!(!bare_table.contains_key("swap_ctrl_command"));
         assert_eq!(from_table(&bare_table), Some(bare));
-        assert!(t.to_string().contains("transport = \"fec\""));
         assert!(t.to_string().contains("mouse = \"game\""));
         // 自动（默认）和不认识的鼠标模式不写进文件，读回来是自动
         for m in ["auto", "warp"] {
@@ -434,16 +421,6 @@ mod tests {
             assert_eq!(from_table(&t).unwrap().mouse, None);
             assert_eq!(normalize(vec![other])[0].mouse, None);
         }
-        // 自动的传输方式（默认）不写进文件
-        let mut q = d.quality.unwrap();
-        q.transport = VideoTransport::Auto;
-        let auto = Device {
-            quality: Some(q),
-            ..d
-        };
-        let t = to_table(&auto).unwrap();
-        assert!(!t.to_string().contains("transport"));
-        assert_eq!(from_table(&t), Some(auto));
     }
 
     #[test]
@@ -474,11 +451,7 @@ name = "no code"
         assert!(list[1].last_used > 0);
         // 帧率超出范围：画质整个不要，用控制台的默认
         assert_eq!(list[1].quality, None);
-        // 编码格式不分大小写；没有传输方式时用自动
-        assert_eq!(
-            list[2].quality.map(|q| (q.codec, q.transport)),
-            Some((Codec::H265, VideoTransport::Auto))
-        );
+        assert_eq!(list[2].quality.map(|q| q.codec), Some(Codec::H265));
         assert!(list.into_iter().all(|d| open(d).is_some()));
     }
 

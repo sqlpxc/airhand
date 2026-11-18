@@ -20,7 +20,7 @@ use airhand_proto::session::{
     ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostMsg,
     MicState, Notice, Platform, REPORT_EVERY, SystemAction, VideoReport,
 };
-use airhand_proto::{MAX_STREAMS, datagram, features};
+use airhand_proto::{MAX_STREAMS, datagram};
 use anyhow::Result;
 use bytes::Bytes;
 use quinn::SendStream;
@@ -96,7 +96,7 @@ impl Feedback {
         self.out.send(&ControllerDatagram::Lost { decoded, stream });
     }
 
-    /// 第 `stream` 路画面最近收得怎么样（见 `airhand_proto::session` 的"前向纠错"）：被控端据此决定用不用纠错、配多少冗余
+    /// 告诉被控端该路视频收完和等待重传的帧数。
     fn report(&self, stream: u8, report: VideoReport) {
         self.out
             .send(&ControllerDatagram::Report { report, stream });
@@ -255,8 +255,6 @@ pub enum SessionEvent {
         frames: u64,
         /// 画面是从直连来的（不经过中转，见 [`crate::direct`]）
         direct: bool,
-        /// 这一秒里有画面是纠错的数据报拼回来的（见 `airhand_proto::session` 的"前向纠错"）
-        fec: bool,
     },
     /// 被控端发来的提示，由控制台按自己的界面语言显示
     Notice { notice: NoticeView },
@@ -334,8 +332,6 @@ struct Stats {
     last_msg: Instant,
     /// 最近一帧画面是从直连来的
     direct: bool,
-    /// 这一秒里纠错的数据报拼回来的帧
-    fec_frames: u32,
 }
 
 impl Default for Stats {
@@ -349,7 +345,6 @@ impl Default for Stats {
             rtt: None,
             last_msg: Instant::now(),
             direct: false,
-            fec_frames: 0,
         }
     }
 }
@@ -517,10 +512,7 @@ pub(super) async fn run(
     let keyframe_tx = tx.clone();
     let acker = feedback.clone();
     let on_direct = video_direct.clone();
-    let frames = negotiated.features.has(features::session::FRAMES);
-    // 画面收得怎么样：定时报告给被控端（只有懂的被控端才报，见 reporter）
     let video_stats = recv.video_stats();
-    let report_fec = negotiated.features.has(features::session::FEC);
     let reporter_feedback = feedback.clone();
     let reader = async move {
         let mut cursor = super::cursor::CursorReceiver::default();
@@ -533,7 +525,6 @@ pub(super) async fn run(
                     packet: p,
                     arrived,
                     direct,
-                    fec,
                 } => {
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
@@ -555,7 +546,6 @@ pub(super) async fn run(
                             s.h = h.height;
                         }
                         s.direct = direct;
-                        s.fec_frames += u32::from(fec);
                     }
                     on_direct.store(direct, Ordering::Relaxed);
                     arrivals.lock().unwrap()[stream as usize].record(h.seq, arrived);
@@ -569,9 +559,8 @@ pub(super) async fn run(
                             st.lock().unwrap().last_msg = Instant::now();
                             acker.ack(stream, seq, arrived);
                         }
-                        // 等不到一帧了：请被控端恢复这一路（只有协商了帧流的被控端懂）
-                        Video::Lost { decoded } if frames => acker.lost(stream, decoded),
-                        Video::Lost { .. } => {}
+                        // 等不到一帧了：请被控端恢复这一路
+                        Video::Lost { decoded } => acker.lost(stream, decoded),
                         // 被控端在这一帧之后发过关键帧就不用再编了
                         Video::Keyframe { after } => {
                             keyframe_tx.send(ControllerMsg::RequestKeyframe { after, stream })?;
@@ -758,11 +747,9 @@ pub(super) async fn run(
                     height: s.h,
                     frames: s.total,
                     direct: s.direct,
-                    fec: s.fec_frames > 0,
                 };
                 s.frames = [0; MAX_STREAMS as usize];
                 s.bytes = 0;
-                s.fec_frames = 0;
                 e
             };
             out.event(event).map_err(|_| ui_closed())?;
@@ -774,9 +761,6 @@ pub(super) async fn run(
     };
     // 画面收得怎么样（见 crate::merge 的"报告"）：每 REPORT_EVERY 告诉被控端一次，这段时间什么画面都没收到就不报
     let reporter = async move {
-        if !report_fec {
-            return std::future::pending().await;
-        }
         let mut tick = tokio::time::interval(REPORT_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1074,11 +1058,9 @@ mod tests {
             height: 1,
             frames: 2,
             direct: true,
-            fec: true,
         };
         assert_eq!(serde_json::to_value(&s).unwrap()["rttMs"], json!(null));
         assert_eq!(serde_json::to_value(&s).unwrap()["direct"], json!(true));
-        assert_eq!(serde_json::to_value(&s).unwrap()["fec"], json!(true));
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::CodeChanged),
             retry: false,

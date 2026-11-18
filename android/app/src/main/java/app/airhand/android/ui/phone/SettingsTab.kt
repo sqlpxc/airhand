@@ -17,7 +17,6 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Navigation
-import androidx.compose.material.icons.outlined.NetworkCheck
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Smartphone
 import androidx.compose.material.icons.outlined.Sync
@@ -51,7 +50,6 @@ import app.airhand.android.R
 import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Preset
-import app.airhand.android.core.VideoTransport
 import app.airhand.android.data.TouchMode
 import app.airhand.android.host.HostService
 import app.airhand.android.host.HostState
@@ -125,7 +123,6 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
 
         SectionTitle(stringResource(R.string.settings_remote))
         Item(Icons.Outlined.HighQuality, stringResource(R.string.default_quality), presetName(Preset.of(s.preset))) { dialog = "preset" }
-        Item(Icons.Outlined.NetworkCheck, stringResource(R.string.loss_recovery), transportName(VideoTransport.fromWire(s.transport))) { dialog = "transport" }
         Item(Icons.Outlined.Gesture, stringResource(R.string.touch_mode), touchModeName(s.touchMode)) { dialog = "mode" }
         Toggle(Icons.AutoMirrored.Outlined.VolumeUp, stringResource(R.string.play_audio), stringResource(R.string.play_audio_desc), s.audio) { v ->
             app.updateSettings { it.copy(audio = v) }
@@ -244,22 +241,6 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 app.updateSettings { it.copy(preset = p.id) }
             },
         )
-        "transport" -> ChoiceDialog(
-            title = stringResource(R.string.loss_recovery),
-            options = VideoTransport.entries,
-            selected = VideoTransport.fromWire(s.transport),
-            label = { t ->
-                Column {
-                    Text(transportName(t))
-                    Text(transportDesc(t), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            },
-            onDismiss = { dialog = null },
-            onSelect = { t ->
-                dialog = null
-                app.updateSettings { it.copy(transport = t.wire) }
-            },
-        )
         "mode" -> ChoiceDialog(
             title = stringResource(R.string.touch_mode),
             options = TouchMode.entries,
@@ -360,23 +341,6 @@ fun presetDesc(p: Preset): String = stringResource(
     },
 )
 
-@Composable
-fun transportName(t: VideoTransport): String = stringResource(
-    when (t) {
-        VideoTransport.AUTO -> R.string.transport_auto
-        VideoTransport.STREAMS -> R.string.transport_streams
-        VideoTransport.FEC -> R.string.transport_fec
-    },
-)
-
-@Composable
-fun transportDesc(t: VideoTransport): String = stringResource(
-    when (t) {
-        VideoTransport.AUTO -> R.string.transport_auto_desc
-        VideoTransport.STREAMS -> R.string.transport_streams_desc
-        VideoTransport.FEC -> R.string.transport_fec_desc
-    },
-)
 
 @Composable
 fun touchModeName(m: TouchMode): String = stringResource(

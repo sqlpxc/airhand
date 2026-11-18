@@ -40,15 +40,14 @@
 //! | 通道 | 方向 | 内容 | 编码 |
 //! |------|------|------|------|
 //! | 控制 | 双向 | 小而急的 [`session::HostMsg`] / [`session::ControllerMsg`]：输入、设置、提示…… | CBOR（[`framing`]） |
-//! | 画面 | 被控端 → 控制端 | 画面包（双方都支持 [`features::session::FRAMES`] 时每帧一条帧流）。多屏同时显示时每个显示器一路，
+//! | 画面 | 被控端 → 控制端 | 画面包（每帧一条帧流）。多屏同时显示时每个显示器一路，
 //! 各是一条通道（[`SessionLane::Video`]，见 [`session`] 的"多屏"） | 媒体包（[`media`]） |
 //! | 大块 | 双向 | 大的消息：剪贴板、光标图像（见 [`session`] 的"走哪条通道"） | CBOR（[`framing`]） |
 //! | 文件 | 双向 | 剪贴板里的文件的内容：每次取用一条帧流，取的一方给额度（见 [`files`]） | 密文分块 |
 //!
 //! 每条流上都是 `u32 LE 长度前缀 | 负载`，握手之后负载是密封单元 `密文 | 标签 | 计数`（见 [`handshake`] 的
 //! "之后的每一帧"）。声音包，以及 Ping / Pong、画面确认、探测这些只看最新值的控制消息走 QUIC 数据报（[`datagram`]）：
-//! 丢了就丢了，不重传，也不用排在丢了的包、流里别的消息后面等。画面的增量帧也可以走数据报，带着前向纠错的冗余
-//! （[`fec`]，见 [`session`] 的"前向纠错"）。
+//! 丢失的数据报不重传。
 //!
 //! # 直连
 //!
@@ -71,7 +70,6 @@
 //! （IPv6 一般没有 NAT，IPv4 的对称 NAT、运营商级 NAT 打不通时它往往通）。
 
 pub mod cbor;
-pub mod fec;
 pub mod files;
 pub mod framing;
 
@@ -92,9 +90,7 @@ use cbor::open_enum;
 ///   9 的客户端照样连得上 10 的服务器，什么都不用变
 pub const SIGNAL_VERSION: u16 = 10;
 /// 本端还能说的最老的信令版本
-pub const SIGNAL_MIN: u16 = 9;
-/// 从这个信令版本起服务器转发帧流（[`SessionHeader::FRAME`]）
-pub const SIGNAL_FRAMES: u16 = 10;
+pub const SIGNAL_MIN: u16 = SIGNAL_VERSION;
 
 /// 会话协议版本（被控端 ⇄ 控制端，服务器不看）。两端在端到端握手里取双方都支持的最高版本
 pub const SESSION_VERSION: u16 = 1;
@@ -175,6 +171,11 @@ const _: () = assert!(
 );
 
 impl SessionLane {
+    /// 画面每帧、文件每次取用各开一条流。控制和大块通道各用一条常驻流。
+    pub fn is_frame_lane(self) -> bool {
+        matches!(self, Self::Video(_) | Self::File)
+    }
+
     /// 认识的通道有几条（编号是 `0..COUNT`）
     pub const COUNT: usize = 3 + MAX_STREAMS as usize;
 
@@ -262,15 +263,7 @@ impl SessionHeader {
             session_id,
             lane: lane.number(),
             priority: lane.priority(),
-            flags: 0,
-        }
-    }
-
-    /// 一条帧流的头（见 [`SessionHeader::FRAME`]）
-    pub fn frame(session_id: u64, lane: SessionLane) -> Self {
-        Self {
-            flags: Self::FRAME,
-            ..Self::new(session_id, lane)
+            flags: if lane.is_frame_lane() { Self::FRAME } else { 0 },
         }
     }
 
@@ -293,6 +286,11 @@ impl SessionHeader {
         if b[..4] != SESSION_MAGIC || b[12] >= MAX_LANES {
             return None;
         }
+        if let Some(lane) = SessionLane::from_u8(b[12])
+            && lane.is_frame_lane() != (b[14] & Self::FRAME != 0)
+        {
+            return None;
+        }
         Some(Self {
             session_id: u64::from_le_bytes(b[4..12].try_into().ok()?),
             lane: b[12],
@@ -307,13 +305,10 @@ impl SessionHeader {
 /// 服务器只看开头的会话 ID：发送方是这个会话的一端，就原样转给另一端，否则丢掉。
 /// 后面是端到端加密的内容（见 [`handshake`] 的"之后的每一帧"），种类决定用哪把密钥：
 ///
-/// * [`AUDIO`]：声音：最新的一包和之前一两包的副本（见 [`media`] 的"声音数据报"）。被控端发的是它的系统声音，
+/// * [`datagram::AUDIO`]：声音：最新的一包和之前一两包的副本（见 [`media`] 的"声音数据报"）。被控端发的是它的系统声音，
 ///   控制端发的是它的麦克风（双方都支持 [`features::session::MIC`]、控制端打开了麦克风时，见 [`session`] 的"麦克风"）；
-/// * [`CONTROL`]：控制数据报（[`session::ControllerDatagram`] / [`session::HostDatagram`]：Ping、Pong、画面确认、
+/// * [`datagram::CONTROL`]：控制数据报（[`session::ControllerDatagram`] / [`session::HostDatagram`]：Ping、Pong、画面确认、
 ///   量两条路往返时延的探测和回声），CBOR，和控制通道上的消息一样不认识的跳过；
-/// * [`VIDEO`]：画面的一帧切出来的一块，或者它的冗余（见 [`fec`]）。和别的不一样，种类后面不是一个密封单元：
-///   被控端先把整帧加密成一个密封单元（和帧流上的一样），再切开、算冗余，收的一方拼回密封单元再解密。
-///   明文的头里有它是第几路画面（[`fec::Fragment::stream`]，多屏同时显示时）。
 ///
 /// 直连上的数据报格式一样（会话 ID 用不着，但两条路上的包可以用同一段代码处理）。服务器不管种类，以后加种类不用升级服务器。
 pub mod datagram {
@@ -323,8 +318,6 @@ pub mod datagram {
     pub const AUDIO: u8 = 0;
     /// 控制数据报
     pub const CONTROL: u8 = 1;
-    /// 画面：纠错的一块（见 [`crate::fec`]）
-    pub const VIDEO: u8 = 2;
     /// 数据报最多这么大。被控端 → 服务器、服务器 → 控制端是两段路径，MTU 可能不一样：
     /// QUIC 保证任何路径上都放得下一千出头的数据报，按这个下限来，服务器转发时就不会因为太大而丢掉
     pub const MAX: usize = 1000;
@@ -334,7 +327,7 @@ pub mod datagram {
         Some(u64::from_le_bytes(d.get(..8)?.try_into().ok()?))
     }
 
-    /// 数据报的种类（[`AUDIO`]、[`CONTROL`]、[`VIDEO`]）；不到一个头长时为 `None`
+    /// 数据报的种类（[`AUDIO`]、[`CONTROL`]）；不到一个头长时为 `None`
     pub fn kind(d: &[u8]) -> Option<u8> {
         d.get(8).copied()
     }
@@ -414,24 +407,12 @@ pub mod features {
         /// 是 `HostMsg::Mic` 里的状态，不是能力位
         pub const MIC: Features = Features::from_bits(1 << 0);
 
-        /// 1 号位：画面的帧流（见 [`crate::session`] 的"帧流"）。控制端收得了一帧一条的帧流、看得懂画面包头里的
-        /// 参考帧（[`crate::media`] 的"参考帧"），会发 [`crate::session::ControllerDatagram::Lost`]；
-        /// 被控端收到 `Lost` 会放弃在途的帧、从控制端有的帧恢复。被控端在中转上用帧流还要服务器说信令 v10
-        /// （[`crate::SIGNAL_FRAMES`]）
-        pub const FRAMES: Features = Features::from_bits(1 << 1);
-
-        /// 2 号位：画面的前向纠错（见 [`crate::session`] 的"前向纠错"）。控制端收得了画面的纠错数据报
-        /// （[`crate::datagram::VIDEO`]、[`crate::fec`]），会发 [`crate::session::ControllerDatagram::Report`]；
-        /// 被控端看得懂 `Report`、[`crate::session::QualitySettings::transport`]。被控端只在画面用着帧流时用它
-        /// （恢复要靠 [`FRAMES`] 的那一套）
-        pub const FEC: Features = Features::from_bits(1 << 2);
-
         /// 3 号位：剪贴板里的文件（见 [`crate::files`]）。懂 [`crate::session::HostMsg::Files`]、
         /// [`crate::session::ControllerMsg::Files`] 和文件通道（[`crate::SessionLane::File`]）
         pub const FILES: Features = Features::from_bits(1 << 3);
 
         /// 本端支持的
-        pub const SUPPORTED: Features = MIC.with(FRAMES).with(FEC).with(FILES);
+        pub const SUPPORTED: Features = MIC.with(FILES);
     }
 }
 
@@ -480,8 +461,8 @@ mod tests {
         assert_eq!(SessionHeader::decode(&bad), None);
         // 服务器不认识的通道照样转发（以后加的通道），只要不超过上限
         let mut other = h.encode();
-        other[12] = 5;
-        assert_eq!(SessionHeader::decode(&other).map(|h| h.lane), Some(5));
+        other[12] = 7;
+        assert_eq!(SessionHeader::decode(&other).map(|h| h.lane), Some(7));
         other[12] = MAX_LANES;
         assert_eq!(SessionHeader::decode(&other), None);
         let c = SessionHeader::new(1, SessionLane::Control);
@@ -496,11 +477,11 @@ mod tests {
         let b = SessionHeader::new(1, SessionLane::Bulk);
         assert_eq!(b.encode()[12..], [2, 1, 0, 0]);
         // 帧流：标志在第 14 个字节；不认识的标志原样留着（服务器照样转发）
-        let f = SessionHeader::frame(1, SessionLane::Video(0));
+        let f = SessionHeader::new(1, SessionLane::Video(0));
         assert!(f.is_frame() && !b.is_frame());
         assert_eq!(f.encode()[12..], [1, 1, 1, 0]);
         // 文件通道：画面之后的那一号，优先级最低
-        let file = SessionHeader::frame(1, SessionLane::File);
+        let file = SessionHeader::new(1, SessionLane::File);
         assert_eq!(file.encode()[12..], [6, 0, 1, 0]);
         assert_eq!(SessionHeader::decode(&f.encode()), Some(f));
         let mut newer = f.encode();
@@ -508,8 +489,12 @@ mod tests {
         let n = SessionHeader::decode(&newer).unwrap();
         assert!(n.is_frame());
         assert_eq!(n.encode(), newer);
-        // v9 写的头（第 14 个字节是 0）不是帧流
-        assert!(!SessionHeader::decode(&h.encode()).unwrap().is_frame());
+        // 已知通道只接受其指定的流类型。
+        for lane in SessionLane::all() {
+            let mut wrong = SessionHeader::new(1, lane).encode();
+            wrong[14] ^= SessionHeader::FRAME;
+            assert!(SessionHeader::decode(&wrong).is_none());
+        }
         for lane in SessionLane::all() {
             assert!(lane.number() < MAX_LANES);
             assert_eq!(SessionLane::from_u8(lane.number()), Some(lane));
@@ -530,7 +515,7 @@ mod tests {
         );
         assert_eq!(
             SessionHeader::new(1, SessionLane::Video(2)).encode()[12..],
-            [4, 1, 0, 0]
+            [4, 1, 1, 0]
         );
     }
 

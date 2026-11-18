@@ -214,13 +214,12 @@ impl VideoHub {
     /// 之后在途的帧作废，它从关键帧重新加入（MediaCodec 不能从长期参考帧恢复），返回 `true`（放弃它们的帧流）。
     /// 刚发给它的关键帧还在路上（比 `decoded` 新、发出去不久）：重复的请求，什么也不做。
     /// 关键帧比等重传贵得多：同一处的报告第二次来了才编（第一次多半是重传还在路上，见 `airhand_link::refs`
-    /// 的"只能编关键帧时"），第一次什么也不做。`retransmitted`：等不到的那一帧走的是帧流（会重传）；
-    /// 走纠错的数据报的不会重传，马上从关键帧重新加入
-    pub fn lost(&self, id: u64, decoded: u32, retransmitted: bool) -> bool {
-        self.lost_at(id, decoded, retransmitted, Instant::now())
+    /// 的“只能编关键帧时”）。
+    pub fn lost(&self, id: u64, decoded: u32) -> bool {
+        self.lost_at(id, decoded, Instant::now())
     }
 
-    fn lost_at(&self, id: u64, decoded: u32, retransmitted: bool, now: Instant) -> bool {
+    fn lost_at(&self, id: u64, decoded: u32, now: Instant) -> bool {
         let mut st = self.st.lock().unwrap();
         let Some(o) = st.sessions.get_mut(&id) else {
             return false;
@@ -230,7 +229,7 @@ impl VideoHub {
             && o.last_key.wrapping_sub(decoded) as i32 > 0
             && o.last_key_at
                 .is_some_and(|t| now.saturating_duration_since(t) < recover_wait(srtt));
-        if in_flight || (retransmitted && !o.key_gate.confirm(decoded, now)) {
+        if in_flight || !o.key_gate.confirm(decoded, now) {
             return false;
         }
         o.flow.abandon(decoded);
@@ -241,9 +240,9 @@ impl VideoHub {
         true
     }
 
-    /// 会话 `id` 的控制端报告了画面收得怎么样（丢包率、纠错的冗余，见 `airhand_link::flow` 的"丢包"）：
+    /// 会话 `id` 的控制端报告了画面收得怎么样：
     /// 交给它的码率控制（共享的编码器的码率在下一次 [`VideoHub::tick`] 里跟着变）
-    pub fn feedback(&self, id: u64, fb: airhand_link::flow::Feedback) {
+    pub fn feedback(&self, id: u64, fb: airhand_proto::session::VideoReport) {
         let mut st = self.st.lock().unwrap();
         if let Some(o) = st.sessions.get_mut(&id) {
             o.flow.feedback(fb, Instant::now());
@@ -620,12 +619,12 @@ mod tests {
         let inflight = || hub.st.lock().unwrap().sessions[&1].flow.inflight();
         assert_eq!(inflight(), 3);
         // 解到了第一帧（关键帧），之后的等不到了：关键帧就是它自己，不算在路上。第一次报告先不管（重传多半还在路上）
-        assert!(!hub.lost(1, frames[0].seq, true));
+        assert!(!hub.lost(1, frames[0].seq));
         assert_eq!(inflight(), 3);
         assert!(hub.tick().is_none());
         // 控制端重报了：之后在途的帧作废，从关键帧重新加入
         let again = Instant::now() + airhand_link::refs::KEY_REPEAT_MIN;
-        assert!(hub.lost_at(1, frames[0].seq, true, again));
+        assert!(hub.lost_at(1, frames[0].seq, again));
         assert_eq!(inflight(), 1);
         assert!(hub.tick().unwrap().key);
         hub.push(&[4], false, false, 0, Codec::AV1, 8, 8);
@@ -636,12 +635,9 @@ mod tests {
         // 等关键帧时那个增量帧又要过一次（见 push），先清掉
         let _ = hub.tick();
         // 关键帧还在路上：重复的请求不再编
-        assert!(!hub.lost(1, frames[0].seq, true));
+        assert!(!hub.lost(1, frames[0].seq));
         assert!(hub.tick().is_none());
-        assert!(!hub.lost(2, 0, true), "unknown session");
-        // 等不到的那一帧走的是纠错的数据报（不会重传）：第一次报告就从关键帧重新加入
-        assert!(hub.lost(1, key.seq, false));
-        assert!(hub.tick().unwrap().key);
+        assert!(!hub.lost(2, 0), "unknown session");
     }
 
     /// 控制端报告丢得太多：这个会话的码率控制降码率，共享的编码器跟着降
@@ -651,21 +647,13 @@ mod tests {
         let (tx, _rx) = mpsc::channel(QUEUE);
         hub.add(1, tx);
         let before = hub.tick().unwrap().kbps;
-        hub.feedback(
-            1,
-            airhand_link::flow::Feedback {
-                loss: Some(0.5),
-                overhead: 1.0,
-            },
-        );
+        let report = airhand_proto::session::VideoReport {
+            frames: 60,
+            stalled: 30,
+        };
+        hub.feedback(1, report);
         assert_eq!(hub.tick().unwrap().kbps, before * 3 / 4);
-        hub.feedback(
-            2,
-            airhand_link::flow::Feedback {
-                loss: Some(0.5),
-                overhead: 1.0,
-            },
-        );
+        hub.feedback(2, report);
     }
 
     #[test]

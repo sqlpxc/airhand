@@ -19,7 +19,7 @@ use airhand_proto::handshake::SEAL_OVERHEAD;
 use airhand_proto::media::{self, AudioHeader, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerDatagram, ControllerMsg, HostMsg, InputEvent, MicState, Notice,
-    QualitySettings, VideoTransport,
+    QualitySettings,
 };
 use airhand_proto::signal::{ClientMsg, ConnectError, ServerMsg, connect_outcome};
 use airhand_proto::{MAX_SIGNAL_MSG, Role};
@@ -91,8 +91,6 @@ struct Report {
     audio_failed: u32,
     /// 被控端说的麦克风状态（同一个版本：都懂麦克风）
     mic: Option<MicState>,
-    /// 纠错的数据报拼回来的帧（见 airhand_proto::session 的"前向纠错"）
-    fec_frames: u32,
 }
 
 /// 用配对码连上被控端 `code`（请求编号 `req_id`），做完端到端握手。和真正的控制端一样：开始时的画质和声音在握手里
@@ -199,12 +197,10 @@ async fn e2e_roundtrip() {
     );
 
     // 正确控制码。端到端握手的第一条消息随请求一起发：第一次连，用配对码（测试里的被控端默认要配对码）。
-    // 开始时就要声音（被控端一开始就按握手里的画质建编码器、采集声音）。画面固定用前向纠错：
-    // 增量帧经过真的中转走数据报，关键帧还是帧流
+    // 开始时就要声音，被控端按握手里的画质建立编码器。
     let settings = QualitySettings {
         codec: Codec::H264,
         fps: 30,
-        transport: VideoTransport::Fec,
         ..Default::default()
     };
     let link = open_session(
@@ -268,7 +264,6 @@ async fn e2e_roundtrip() {
         capture_failed: 0,
         audio_failed: 0,
         mic: None,
-        fec_frames: 0,
     };
     // 被控端在同一进程里，可以直接读它的时钟：画面和声音的采集时间戳都应落在"刚刚"
     let age_ms = |capture_us: u64| {
@@ -326,15 +321,9 @@ async fn e2e_roundtrip() {
         };
         let msg = match msg {
             FromHost::Video {
-                packet: p,
-                arrived,
-                fec,
-                ..
+                packet: p, arrived, ..
             } => {
                 let v = VideoHeader::decode(&p).expect("画面包的头");
-                // 关键帧总是走帧流
-                assert!(!(fec && v.key), "a keyframe came as datagrams");
-                rep.fec_frames += u32::from(fec);
                 let data = media::payload(&p).expect("画面包的负载");
                 let age = age_ms(v.capture_us);
                 assert!(age >= 0.0, "画面时间戳在未来: {age} ms");
@@ -484,10 +473,9 @@ async fn e2e_roundtrip() {
     );
     let _ = ctl.send.finish();
     println!(
-        "帧 {} (关键帧 {}, 纠错 {}) · {:.1} KB · H.264 解码成功 {} · pong {} · 光标 {} · 声音包 {} (start {}, RMS {:.6}, 关闭后 {})",
+        "帧 {} (关键帧 {}) · {:.1} KB · H.264 解码成功 {} · pong {} · 光标 {} · 声音包 {} (start {}, RMS {:.6}, 关闭后 {})",
         rep.frames,
         rep.keyframes,
-        rep.fec_frames,
         rep.bytes as f64 / 1024.0,
         rep.decoded,
         rep.pongs,
@@ -545,10 +533,6 @@ async fn e2e_roundtrip() {
         assert!(!rep.encoders.is_empty());
         assert!(rep.encoders.len() >= 2, "切换编码格式后应重建编码器");
         assert!(rep.decoded >= 1, "H.264 的关键帧无法解码");
-        // 静止的画面也有补画质的增量帧（参考的都是前一帧）：走纠错
-        if rep.frames > rep.keyframes {
-            assert!(rep.fec_frames >= 1, "增量帧没有走纠错的数据报");
-        }
         // 画面静止时会重新编码上一帧（时间戳不变），所以只检查不离谱
         assert!(
             rep.video_age_ms < 10_000.0,

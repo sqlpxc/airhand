@@ -21,7 +21,6 @@ client = [
     "dep:quinn",
     "dep:rand",
     "dep:rcgen",
-    "dep:reed-solomon-simd",
     "dep:ring",
     "dep:rustls",
     "dep:serde",
@@ -57,8 +56,6 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rand = { version = "0.9", optional = true }
 # 被控端接受直连时用的自签名证书（每次运行生成一张；对面是谁由会话密钥证明，见 src/direct/tls.rs）
 rcgen = { version = "0.14", default-features = false, features = ["ring"], optional = true }
-# 画面的前向纠错（见 src/fec）：Reed-Solomon，O(n log n)，x86 的 SSSE3 / AVX2、ARM 的 NEON 都有
-reed-solomon-simd = { version = "3.1", optional = true }
 ring = { version = "0.17", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

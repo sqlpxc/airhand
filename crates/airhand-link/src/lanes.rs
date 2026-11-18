@@ -6,11 +6,11 @@
 //! 直连上由 [`accept_direct`] 做（一条直连只属于一个会话）。数据报也一样按会话 ID 和种类分发。
 //!
 //! 一个会话在收的一端是一个 [`Inbox`]：每条通道一个信箱（中转、直连上来的流都放进来，交给 [`crate::merge::Merge`]
-//! 合并；画面的每一路是一条通道），声音、控制数据报各一个信箱，画面（纠错）数据报每一路一个。
+//! 合并），声音、控制数据报各一个信箱。
 //! 往里放东西的是 [`Feed`]（两条路各拿一个）。
 //!
-//! 画面还可以是**帧流**（[`open_frame`]，会话头带 `SessionHeader::FRAME`，见 `airhand_proto::session` 的"帧流"）：
-//! 每帧一条流，同一条通道上来很多条。它们和普通的流放进同一个信箱，带着 [`LaneStream::frame`]。
+//! 画面使用**帧流**（[`open_lane`]，会话头带 `SessionHeader::FRAME`，见 `airhand_proto::session` 的"帧流"）：
+//! 每帧一条流，同一路视频的帧流进入同一个信箱。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -38,8 +38,6 @@ pub enum Via {
 pub struct LaneStream {
     pub recv: RecvStream,
     pub via: Via,
-    /// 帧流（每帧一条，见模块说明）：它结束了不代表这条通道结束了
-    pub frame: bool,
 }
 
 /// 一条通道的流：中转上的一条，直连上的（每次直连通了一条），还有帧流
@@ -49,8 +47,6 @@ pub type LaneStreams = mpsc::UnboundedReceiver<LaneStream>;
 const AUDIO_QUEUE: usize = 16;
 /// 控制数据报（确认每秒可能有上百个，直连通着时每个来两份，还有两条路上的探测和回声）
 const CONTROL_QUEUE: usize = 64;
-/// 画面的纠错数据报（见 `crate::fec`）：一帧就有几十上百个，一下子来一串
-const VIDEO_QUEUE: usize = 1024;
 /// 读会话头最多等这么久
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// 会话还没登记就先到了的流（中转转过来的时候，本端还没处理完服务器的回答）：最多留这么多条、这么久
@@ -64,8 +60,6 @@ pub struct Feed {
     lanes: [mpsc::UnboundedSender<LaneStream>; SessionLane::COUNT],
     audio: mpsc::Sender<Bytes>,
     control: mpsc::Sender<(Via, Bytes)>,
-    /// 画面的每一路
-    video: Vec<mpsc::Sender<(Via, Bytes)>>,
 }
 
 /// 一个会话收的一端（见模块说明）
@@ -81,8 +75,6 @@ pub struct Inbox {
     /// 控制数据报（同上）和它从哪条路来（探测要从同一条路弹回去）。直连通着时 Ping、Pong、确认两条路各来一份，
     /// 后到的那份解密时被当成重放丢掉
     pub datagrams: mpsc::Receiver<(Via, Bytes)>,
-    /// 画面的纠错数据报（整个数据报）和它从哪条路来，每一路一个：交给那一路画面的合并（见 `crate::fec`）
-    pub fec: Vec<mpsc::Receiver<(Via, Bytes)>>,
     /// 直连上来的流、数据报也放进来
     pub feed: Feed,
 }
@@ -104,9 +96,6 @@ impl Inbox {
             .collect();
         let (audio_tx, audio) = mpsc::channel(AUDIO_QUEUE);
         let (datagrams_tx, datagrams) = mpsc::channel(CONTROL_QUEUE);
-        let (fec_tx, fec) = (0..airhand_proto::MAX_STREAMS)
-            .map(|_| mpsc::channel(VIDEO_QUEUE))
-            .unzip();
         Self {
             control,
             video,
@@ -114,14 +103,12 @@ impl Inbox {
             files,
             audio,
             datagrams,
-            fec,
             feed: Feed {
                 lanes: lanes
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("one sender per lane")),
                 audio: audio_tx,
                 control: datagrams_tx,
-                video: fec_tx,
             },
         }
     }
@@ -141,18 +128,7 @@ impl Feed {
             debug!(lane = h.lane, "ignoring a lane this version doesn't know");
             return stop(recv);
         };
-        let frame = h.is_frame();
-        // 控制通道只有一条（不能是帧流），文件通道每次取用一条（只能是帧流）
-        let wrong = match lane {
-            SessionLane::Control => frame,
-            SessionLane::File => !frame,
-            SessionLane::Video(_) | SessionLane::Bulk => false,
-        };
-        if wrong {
-            debug!(?lane, frame, "ignoring a stream of the wrong kind");
-            return stop(recv);
-        }
-        let s = LaneStream { recv, via, frame };
+        let s = LaneStream { recv, via };
         if let Err(mpsc::error::SendError(s)) = self.lanes[lane.number() as usize].send(s) {
             stop(s.recv);
         }
@@ -166,13 +142,6 @@ impl Feed {
             }
             Some(datagram::CONTROL) => {
                 let _ = self.control.try_send((via, d));
-            }
-            Some(datagram::VIDEO) => {
-                // 交给它那一路（头里写着是第几路）；没有那一路的丢掉
-                let to = airhand_proto::fec::stream_of(&d).and_then(|s| self.video.get(s as usize));
-                if let Some(tx) = to {
-                    let _ = tx.try_send((via, d));
-                }
             }
             _ => {}
         }
@@ -195,23 +164,6 @@ pub async fn open_lane(
     send.set_priority(lane.priority() as i32)?;
     send.write_all(&SessionHeader::new(session_id, lane).encode())
         .await?;
-    Ok(send)
-}
-
-/// 开一条帧流（见模块说明），写好会话头（带 `SessionHeader::FRAME`）。调用的一方接着写一帧、结束这条流
-pub async fn open_frame(
-    conn: &Connection,
-    session_id: u64,
-    lane: SessionLane,
-) -> Result<SendStream> {
-    let mut send = tokio::time::timeout(HEADER_TIMEOUT, conn.open_uni())
-        .await
-        .context("timed out opening a frame stream")??;
-    send.set_priority(lane.priority() as i32)?;
-    send.write_chunk(Bytes::copy_from_slice(
-        &SessionHeader::frame(session_id, lane).encode(),
-    ))
-    .await?;
     Ok(send)
 }
 
@@ -427,7 +379,6 @@ mod tests {
                 got,
                 Ok(Some(LaneStream {
                     via: Via::Relay,
-                    frame: false,
                     ..
                 }))
             ),

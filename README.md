@@ -13,7 +13,7 @@ Airhand is a **high-performance, low-latency** remote desktop: the screen is enc
 The same program is both the **host** (the device being controlled) and the **controller** (the device you control it from). The two sides meet through a **relay server** that you deploy yourself. It's small, and Docker Compose deploys it with one command. Enter the other side's 6-digit **control code** to connect.
 
 > [!NOTE]
-> **Work in progress (0.3.0).** Since protocol v9, client ⇄ server and host ⇄ controller each support a range of versions, new features are negotiated with capability bits and unknown messages are skipped, so later versions can be mixed; versions before v9 are incompatible, which is detected and reported (see [Protocol versions](docs/development.md#protocol-versions)).
+> **Work in progress (0.3.0).** This version requires signaling v10 on the relay and all clients. Video uses one QUIC stream per frame. [Protocol versions](docs/development.md#protocol-versions)
 
 ## Performance
 
@@ -25,7 +25,6 @@ Every stage from capture to display is built for low latency:
 - **Direct path**: besides the relay, the two ends punch a direct path through their NATs (on the same LAN, or whenever the NAT isn't symmetric), so video and audio stop detouring through the server; the lower-latency path is picked automatically, and if the direct path breaks the session falls back to the relay without dropping
 - **QUIC + BBR**: BBR congestion control is steadier than Cubic on lossy networks such as Wi-Fi or long-distance links; control messages, audio and video are queued separately, so mouse input and pings never wait behind a large frame; the relay only forwards bytes and never parses the video
 - **Loss doesn't stall the picture**: each frame travels on its own QUIC stream, so a lost packet only holds up that frame. A frame that keeps not arriving is abandoned (no more retransmitting stale data) and the encoder continues from a long-term reference frame the controller already has (reference invalidation) instead of sending a large keyframe (Windows H.264, NVIDIA AV1; other encoders send a keyframe)
-- **Smooth on lossy networks too**: on long, lossy routes (cross-border links, Wi-Fi), delta frames automatically switch to datagrams carrying a few Reed-Solomon redundant packets each, so lost packets are rebuilt at once instead of waiting for retransmissions; it switches back once the network is fine (Retransmit or FEC can also be picked under Loss recovery in the quality settings)
 - **Decode and show**: the decoder runs in low-latency mode, and each frame is drawn to a desynchronized canvas as soon as it's decoded, without waiting for vsync
 - **Local pointer**: the remote cursor's shape is mirrored locally, and moving it happens locally
 - **Low bandwidth**: no frames are sent while the screen is still, so an idle desktop uses almost nothing; sessions that aren't on screen drop to 5 fps

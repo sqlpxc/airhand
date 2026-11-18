@@ -1,4 +1,4 @@
-# 服务器在认证之前就要解析的东西：版本握手、信令消息、会话头；还有控制端解密之前就要解析的画面纠错数据报。
+# Fuzz the signaling handshake, messages and session stream headers.
 # 协议库只吃字节、不碰 IO，所以直接拿来当入口。
 #
 #   cargo install cargo-fuzz
@@ -38,13 +38,6 @@ bench = false
 [[bin]]
 name = "session_header"
 path = "fuzz_targets/session_header.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fec_fragment"
-path = "fuzz_targets/fec_fragment.rs"
 test = false
 doc = false
 bench = false

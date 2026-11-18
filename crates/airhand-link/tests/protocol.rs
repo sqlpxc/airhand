@@ -12,7 +12,7 @@ use airhand_link::controller::{Command, ConnectOptions};
 use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
     Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, StreamView,
-    SystemAction, TouchPhase, VideoTransport,
+    SystemAction, TouchPhase,
 };
 use serde_json::{Value, json};
 
@@ -66,8 +66,6 @@ fn settings() -> QualitySettings {
         max_short: 1080,
         adaptive: true,
         codec: Codec::H265,
-        // 不带传输方式时是自动（之前的界面不带；自动也不带）
-        transport: VideoTransport::Auto,
         // 不带时不把光标画进画面（Android 不带）
         draw_cursor: false,
     }
@@ -377,24 +375,6 @@ fn json_shapes_roundtrip() {
             serde_json::from_value(json.clone()).unwrap_or_else(|e| panic!("{json}: {e}"));
         assert_eq!(parsed, cmd);
         assert_eq!(parsed.sid(), 3);
-    }
-    // 画面的传输方式：界面只在不是自动时带 transport（"streams" / "fec"）
-    for (name, transport) in [
-        ("streams", VideoTransport::Streams),
-        ("fec", VideoTransport::Fec),
-    ] {
-        let mut s = json!({ "cmd": "settings", "sid": 3, "settings": serde_json::to_value(settings()).unwrap() });
-        s["settings"]["transport"] = json!(name);
-        assert_eq!(
-            serde_json::from_value::<Command>(s).unwrap(),
-            Command::Settings {
-                sid: 3,
-                settings: QualitySettings {
-                    transport,
-                    ..settings()
-                },
-            }
-        );
     }
     // 认不出的命令是错误（界面会收到 failed）
     assert!(serde_json::from_value::<Command>(json!({ "cmd": "nope", "sid": 1 })).is_err());

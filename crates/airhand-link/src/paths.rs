@@ -9,8 +9,7 @@
 //! 直连任务在直连通了、断了的时候改它（[`Paths::attach`] / [`Paths::detach`]），写任务每一帧、每个数据报看一眼。
 //!
 //! 数据报都经 [`send_datagram`] / [`DatagramSender`] 发：QUIC 的数据报发送缓冲（`net::transport_config`）排满了时
-//! 等一会儿空位，而不是让 quinn 挤掉排在最前面的那个。画面用纠错时缓冲里排的多半是画面的块，挤掉一块就白白多丢一块
-//! （见 `airhand_proto::session` 的"前向纠错"）。
+//! 最多等待一个发送期限，避免旧声音和控制数据报一直排队。
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};

@@ -51,15 +51,13 @@ pub trait Acks: Send + Sync + 'static {
     /// 它交给解码器的最后一帧是 `decoded`。返回 `true`：这一路这之后在途的帧作废了（下一帧从控制端有的帧恢复），
     /// 它们的帧流放弃掉；`false`：什么也不做（恢复帧已经在路上了；恢复只能编关键帧、等不到的帧还会重传、
     /// 这是同一处的第一次报告，见 `crate::refs` 的"只能编关键帧时"；默认：这个平台不恢复，控制端等久了会要关键帧）。
-    /// `retransmitted`：等不到的那一帧走的是帧流，QUIC 还会重传它（走纠错的数据报的不会）
-    fn lost(&self, stream: u8, decoded: u32, retransmitted: bool) -> bool {
-        let _ = (stream, decoded, retransmitted);
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        let _ = (stream, decoded);
         false
     }
 
-    /// 第 `stream` 路画面的码率控制要的（丢包率、纠错的冗余，见 `crate::flow` 的"丢包""纠错的冗余"）：
-    /// 控制端的报告到了的时候（每 `airhand_proto::session::REPORT_EVERY` 一个，双方都支持纠错时才有）。默认不管
-    fn feedback(&self, stream: u8, fb: crate::flow::Feedback) {
+    /// 控制端定时上报每路收完和停顿的帧数。
+    fn feedback(&self, stream: u8, fb: airhand_proto::session::VideoReport) {
         let _ = (stream, fb);
     }
 }
@@ -103,12 +101,11 @@ impl Acks for Flows {
         }
     }
 
-    fn lost(&self, stream: u8, decoded: u32, retransmitted: bool) -> bool {
-        self.get(stream)
-            .is_some_and(|f| f.lost(decoded, retransmitted))
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        self.get(stream).is_some_and(|f| f.lost(decoded))
     }
 
-    fn feedback(&self, stream: u8, fb: crate::flow::Feedback) {
+    fn feedback(&self, stream: u8, fb: airhand_proto::session::VideoReport) {
         if let Some(f) = self.get(stream) {
             f.feedback(fb);
         }
@@ -762,6 +759,6 @@ mod tests {
         assert_eq!(flows.get(1).unwrap().inflight_for_test(), 0);
         flows.ack(airhand_proto::MAX_STREAMS, seq, 5);
         assert!(flows.get(airhand_proto::MAX_STREAMS).is_none());
-        assert!(!flows.lost(airhand_proto::MAX_STREAMS, 0, true));
+        assert!(!flows.lost(airhand_proto::MAX_STREAMS, 0));
     }
 }

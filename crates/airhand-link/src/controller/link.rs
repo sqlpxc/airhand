@@ -10,7 +10,7 @@ use quinn::{Connection, SendStream};
 
 use super::receiver::HostReceiver;
 use crate::lanes::{Feed, LaneStreams, Registration, Router, Via, first_stream, open_lane};
-use crate::merge::{Merge, Policy};
+use crate::merge::Merge;
 use crate::paths::{DatagramSender, Paths};
 use crate::secure::{FileKeys, Initiator, STEP_TIMEOUT, Sealer};
 
@@ -59,37 +59,20 @@ pub async fn establish(
     let mut secured = done.secured;
     let paths = Paths::new(conn.clone());
     let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
-    let mut control_merge = Merge::new(
-        SessionLane::Control,
-        Policy::Complete,
-        done.opener,
-        inbox.control,
-    );
+    let mut control_merge = Merge::new(SessionLane::Control, done.opener, inbox.control);
     control_merge.add(control_in, Via::Relay)?;
-    // 画面的每一路（见 airhand_proto::session 的"多屏"）：各自的通道、密钥、纠错数据报
+    // 画面的每一路（见 airhand_proto::session 的"多屏"）：各自的帧流和密钥
     let video = std::mem::take(&mut secured.video)
         .into_iter()
         .zip(inbox.video.drain(..))
-        .zip(inbox.fec.drain(..))
         .enumerate()
-        .map(|(stream, ((keys, streams), fec))| {
-            Merge::new(
-                SessionLane::Video(stream as u8),
-                Policy::Video,
-                keys.opener,
-                streams,
-            )
-            .with_datagrams(fec)
+        .map(|(stream, (keys, streams))| {
+            Merge::new(SessionLane::Video(stream as u8), keys.opener, streams)
         })
         .collect();
     let receiver = HostReceiver::new(
         control_merge,
-        Merge::new(
-            SessionLane::Bulk,
-            Policy::Complete,
-            secured.bulk.opener,
-            inbox.bulk,
-        ),
+        Merge::new(SessionLane::Bulk, secured.bulk.opener, inbox.bulk),
         video,
         (inbox.audio, secured.audio.opener),
         (inbox.datagrams, secured.datagrams.opener),

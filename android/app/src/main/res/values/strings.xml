@@ -209,13 +209,6 @@
     <string name="preset_native_desc">Native resolution · 60 fps · 30 Mbps</string>
     <string name="codec">Video format</string>
     <string name="encoder_info">Using %1$s %2$d×%3$d (%4$s, %5$s)</string>
-    <string name="loss_recovery">Loss recovery</string>
-    <string name="transport_auto">Auto</string>
-    <string name="transport_auto_desc">Follows the network: switches to error correction when lost packets keep making the picture wait for retransmissions, and back to retransmitting once the network is fine</string>
-    <string name="transport_streams">Retransmit</string>
-    <string name="transport_streams_desc">Lost data is sent again, using no extra bandwidth. Best on a LAN or a network that rarely loses packets; on long, lossy routes the picture stutters</string>
-    <string name="transport_fec">Error correction</string>
-    <string name="transport_fec_desc">Each frame carries a few redundant packets (counted within the bitrate, so the picture itself gets a few to twenty-odd percent less), so a lost packet or two is rebuilt right away instead of waiting for a retransmission. Best on long, lossy routes such as cross-border links or Wi-Fi. Older versions on the other side keep retransmitting</string>
 
     <!-- Session -->
     <string name="session_connecting">Connecting to %1$s…</string>
@@ -231,7 +224,6 @@
     <!-- 画面走的路：直连不经过服务器，中转经过服务器 -->
     <string name="path_direct">Direct</string>
     <string name="path_relayed">Relayed</string>
-    <string name="path_fec">FEC</string>
     <string name="clipboard_received">Copied the remote clipboard</string>
     <string name="audio_playback_failed">Can\'t play the sound: %1$s</string>
     <string name="menu_keyboard">Keyboard</string>

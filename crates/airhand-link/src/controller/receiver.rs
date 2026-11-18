@@ -1,4 +1,4 @@
-//! 控制端收被控端的东西：控制、大块通道，画面的每一路（画面还有纠错的数据报，见 `crate::fec`），声音数据报和
+//! 控制端解密被控端的控制、大块、视频帧流和音频数据报。
 //! 控制数据报，解密之后交出来（[`HostReceiver`]）。被控端的探测（`HostDatagram::Probe`）在这里就从原来的那条路弹回去，
 //! 不交出来。
 //!
@@ -32,13 +32,12 @@ pub enum FromHost {
     Pong(u64),
     /// 第 `stream` 路的画面包（`airhand_proto::media` 格式：头 + 码流），解得了，原样交给界面。`arrived`：开始从网络上
     /// 到达的时刻（控制端的时钟，微秒，见 [`crate::wire::read_packet_timed`]），确认时带给被控端（见 `ControllerDatagram::Ack`）。
-    /// `direct`：从直连来的；`fec`：纠错的数据报拼回来的
+    /// `direct`：从直连来的
     Video {
         stream: u8,
         packet: Vec<u8>,
         arrived: u64,
         direct: bool,
-        fec: bool,
     },
     /// 第几路画面上别的事：解不了的帧、等不到的帧、要关键帧（见 [`crate::merge::Video`]）
     VideoEvent(u8, Video),
@@ -146,7 +145,6 @@ impl HostReceiver {
                                 packet: f.data,
                                 arrived: f.arrived,
                                 direct: f.direct,
-                                fec: f.fec,
                             });
                         }
                         Some(other) => return Ok(FromHost::VideoEvent(stream, other)),

@@ -27,9 +27,8 @@
 //!
 //! 关键帧比等重传贵得多：它大，要传好几帧的时间，之后的帧都得等它。控制端报告等不到的时候多半是重传还在路上
 //! （帧流上的帧最后总会到，除非被放弃了），所以恢复只能编关键帧时（没有能用的槽位、编码器做不到），
-//! 等不到的那一帧又走的是帧流（会重传；纠错的数据报不重传，照样马上编），同一处（控制端解到的帧一样）的报告
-//! **第二次**来了才编、才放弃在途的帧（[`KeyframeGate`]）：控制端没收到恢复帧，
-//! 每两个往返重报一次（`crate::merge`），第一次报告之后重传到了就不用编了。能从长期参考帧恢复的照样马上恢复：恢复帧不大。
+//! 等同一处的第二次报告才编关键帧（[`KeyframeGate`]）。控制端每两个往返重报一次（`crate::merge`）。
+//! 期间重传到了就不用编关键帧，有可用的长期参考帧则在第一次报告时恢复。
 //!
 //! # 什么时候标长期参考帧
 //!
@@ -148,9 +147,8 @@ impl Refs {
 
     /// 控制端交给解码器的最后一帧是 `decoded`，之后的等不到了（见模块说明的"恢复"）。返回 `true`：要恢复，
     /// 在途的、`decoded` 之后的帧作废；`false`：控制端解得了的恢复帧已经在路上了，这是重复的请求；
-    /// 或者只能编关键帧、等不到的帧还会重传（`retransmitted`：帧流上的；纠错的数据报不重传）、这是第一次报告
-    /// （见模块说明的"只能编关键帧时"）
-    pub fn lost(&mut self, decoded: u32, srtt_ms: f64, now: Instant, retransmitted: bool) -> bool {
+    /// 或者只能编关键帧且这是同一处的第一次报告。
+    pub fn lost(&mut self, decoded: u32, srtt_ms: f64, now: Instant) -> bool {
         if let Some(r) = self.recovered
             && after(r.seq, decoded)
             && r.base.is_none_or(|b| !after(b, decoded))
@@ -158,10 +156,7 @@ impl Refs {
         {
             return false;
         }
-        if retransmitted
-            && self.usable_slot(decoded).is_none()
-            && !self.key_gate.confirm(decoded, now)
-        {
+        if self.usable_slot(decoded).is_none() && !self.key_gate.confirm(decoded, now) {
             return false;
         }
         self.pending = Some(decoded);
@@ -384,41 +379,24 @@ mod tests {
             s.frame(false);
         }
         // 第一次报告：不恢复，接着编增量帧
-        assert!(!s.refs.lost(2, 50.0, s.now, true));
+        assert!(!s.refs.lost(2, 50.0, s.now));
         assert!(!s.refs.recovering());
         assert_eq!(s.frame(false), (5, false, Some(4)));
         // 紧跟着的副本不算第二次
-        assert!(
-            !s.refs
-                .lost(2, 50.0, s.now - Duration::from_millis(90), true)
-        );
+        assert!(!s.refs.lost(2, 50.0, s.now - Duration::from_millis(90)));
         // 控制端重报（还是解到第 2 帧）：编关键帧
-        assert!(
-            s.refs
-                .lost(2, 50.0, s.now + Duration::from_millis(100), true)
-        );
+        assert!(s.refs.lost(2, 50.0, s.now + Duration::from_millis(100)));
         assert!(s.refs.recovering());
         assert_eq!(s.frame(false), (6, true, None));
         assert!(!s.refs.recovering());
         assert_eq!(s.frame(false), (7, false, Some(6)));
         // 别处（控制端解到的帧不一样）的报告从头算
-        assert!(!s.refs.lost(5, 50.0, s.now + recover_wait(50.0), true));
-        assert!(!s.refs.lost(7, 50.0, s.now + recover_wait(50.0), true));
+        assert!(!s.refs.lost(5, 50.0, s.now + recover_wait(50.0)));
+        assert!(!s.refs.lost(7, 50.0, s.now + recover_wait(50.0)));
         assert!(
             s.refs
-                .lost(7, 50.0, s.now + recover_wait(50.0) + KEY_REPEAT_MIN, true)
+                .lost(7, 50.0, s.now + recover_wait(50.0) + KEY_REPEAT_MIN)
         );
-    }
-
-    /// 只能编关键帧、等不到的那一帧走的是纠错的数据报（不会重传）：不用等第二次报告
-    #[test]
-    fn a_frame_that_is_not_retransmitted_is_recovered_at_once() {
-        let mut s = Sim::new(0);
-        for _ in 0..3 {
-            s.frame(false);
-        }
-        assert!(s.refs.lost(2, 50.0, s.now, false));
-        assert_eq!(s.frame(false), (4, true, None));
     }
 
     /// 第一次报告过了太久才又来一次：当作第一次
@@ -460,13 +438,13 @@ mod tests {
             s.frame(false);
         }
         // 控制端解到了 5：第 7 帧比 5 新，用第 2 帧（1 号槽位）恢复
-        assert!(s.refs.lost(5, 50.0, s.now, true));
+        assert!(s.refs.lost(5, 50.0, s.now));
         assert_eq!(s.frame(false), (11, false, Some(2)));
         assert!(!s.refs.slots[0].unwrap().valid);
         assert_eq!(s.frame(false), (12, false, Some(11)));
         // 恢复帧在路上，重复的请求不再编；过了一阵还要，就再恢复
-        assert!(!s.refs.lost(5, 50.0, s.now, true));
-        assert!(s.refs.lost(5, 50.0, s.now + recover_wait(50.0), true));
+        assert!(!s.refs.lost(5, 50.0, s.now));
+        assert!(s.refs.lost(5, 50.0, s.now + recover_wait(50.0)));
         // 0 号槽位又标了第 12 帧（比 5 新）：还是第 2 帧
         assert_eq!(s.frame(false), (13, false, Some(2)));
     }
@@ -479,11 +457,11 @@ mod tests {
         s.frame(false);
         s.frame(false);
         // 第 1 帧（关键帧）刚发出去不久时控制端说什么都没解到：关键帧还在路上
-        assert!(!s.refs.lost(0, 50.0, s.now, true));
+        assert!(!s.refs.lost(0, 50.0, s.now));
         // 过了一阵还要：只能编关键帧，第二次报告来了才编
         let later = s.now + recover_wait(50.0);
-        assert!(!s.refs.lost(0, 50.0, later, true));
-        assert!(s.refs.lost(0, 50.0, later + KEY_REPEAT_MIN, true));
+        assert!(!s.refs.lost(0, 50.0, later));
+        assert!(s.refs.lost(0, 50.0, later + KEY_REPEAT_MIN));
         assert_eq!(s.frame(false), (4, true, None));
         assert_eq!(
             s.refs.slots[0],
@@ -494,7 +472,7 @@ mod tests {
         );
         assert_eq!(s.frame(false), (5, false, Some(4)));
         // 控制端还没收到关键帧时又报了（解到的还是 0）：关键帧解得了、还在路上，不再编
-        assert!(!s.refs.lost(0, 50.0, s.now, true));
+        assert!(!s.refs.lost(0, 50.0, s.now));
     }
 
     /// 编码器没照做（恢复帧还参考了别的槽位）：不能说它参考了哪一帧，之后都编关键帧
@@ -512,7 +490,7 @@ mod tests {
         r.encoded(1, true, Plan::default(), mark(0), now);
         r.encoded(2, false, Plan::default(), mark(1), now);
         r.encoded(3, false, Plan::default(), Some(LtrReport::default()), now);
-        assert!(r.lost(2, 50.0, now, true));
+        assert!(r.lost(2, 50.0, now));
         let plan = r.plan(2, now);
         assert_eq!(plan.recover, Some(1));
         let bad = Some(LtrReport {
@@ -555,7 +533,7 @@ mod tests {
         r.encoded(u32::MAX, false, Plan::default(), mark(1), now);
         r.encoded(0, false, Plan::default(), Some(LtrReport::default()), now);
         r.encoded(1, false, Plan::default(), Some(LtrReport::default()), now);
-        assert!(r.lost(0, 50.0, now, true));
+        assert!(r.lost(0, 50.0, now));
         assert_eq!(r.plan(2, now).recover, Some(1));
     }
 }

@@ -330,14 +330,6 @@ impl Broker {
         let session_id = h.session_id;
         let frame = h.is_frame();
         let file = h.lane == SessionLane::File.number();
-        if frame && h.lane == SessionLane::Control.number() {
-            reject(recv);
-            bail!("a frame stream on the control lane");
-        }
-        if file && !frame {
-            reject(recv);
-            bail!("a file stream must be a frame stream");
-        }
         // 文件流的上限（会话头之后的字节，见模块说明）：上限是 0 的服务器不转文件
         let file_budget = file.then(|| self.cfg.file_limit.map(files::wire_size));
         if file && self.cfg.file_limit == Some(0) {

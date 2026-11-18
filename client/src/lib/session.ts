@@ -64,8 +64,6 @@ export interface Stats {
   decodeMs: number;
   /** 画面是从直连来的（不经过服务器） */
   direct: boolean;
-  /** 画面正在用前向纠错（增量帧走数据报，见 QualitySettings.transport） */
-  fec: boolean;
 }
 
 export interface EncoderState {
@@ -128,7 +126,7 @@ export class RemoteSession {
   /** 对方支持的系统操作（手机的返回、主页……）；电脑为空 */
   hostActions: SystemAction[] = [];
   encoder: EncoderState | null = null;
-  stats: Stats = { fps: 0, kbps: 0, rttMs: null, width: 0, height: 0, decodeMs: 0, direct: false, fec: false };
+  stats: Stats = { fps: 0, kbps: 0, rttMs: null, width: 0, height: 0, decodeMs: 0, direct: false };
   /** 画面上方的提示（显示时才变成文字，见 messages.ts） */
   notice: SessionNotice | null = null;
   /** 被控端为什么采集不到声音（英文技术信息）；正常、或者没开声音时为 null */
@@ -584,7 +582,6 @@ export class RemoteSession {
           height: ev.height,
           decodeMs: this.decodeMs,
           direct: ev.direct,
-          fec: ev.fec,
         };
         this.syncStats = this.videoSync;
         break;
@@ -1302,6 +1299,5 @@ function sameView(a: StreamView[], b: StreamView[]): boolean {
 function sameQuality(a: QualitySettings, b: QualitySettings): boolean {
   return a.fps === b.fps && a.bitrateKbps === b.bitrateKbps && a.maxShort === b.maxShort
     && a.adaptive === b.adaptive && a.codec === b.codec
-    && (a.transport ?? "auto") === (b.transport ?? "auto")
     && !!a.drawCursor === !!b.drawCursor;
 }
