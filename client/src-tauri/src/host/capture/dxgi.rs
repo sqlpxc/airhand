@@ -4,11 +4,13 @@
 //! * 显卡支持视频处理器时（几乎都支持），画面复制进自己的纹理，留在显卡上（[`GpuFrame`]）：硬件编码器在同一个
 //!   设备上缩放、转换颜色、编码（见 `encoder/mf.rs`），需要像素时才读回内存（[`GpuFrame::read_pixels`]）。
 //!   不支持时每帧复制到 staging 纹理、读回内存；
-//! * 优先使用 `DuplicateOutput1`（支持 HDR 桌面自动转换为 BGRA8）；
+//! * `DuplicateOutput1` 可直接交付 BGRA8 或 FP16 桌面纹理。FP16 在显卡上转成下游共用的 SDR BGRA8；
 //! * 打开前先切到当前的输入桌面（见 [`crate::host::desktop`]）：UAC 确认框、锁屏出现时桌面复制会中断
 //!   （`DXGI_ERROR_ACCESS_LOST`），重新打开时就跟着切过去了；
 //! * 旋转了的显示器（竖屏）：桌面复制给出的是没有旋转的画面，复制时转成用户看到的方向（见 [`Rotation`]），
 //!   画面的宽高、方向与 [`DisplayInfo`]（桌面坐标）一致，控制端的鼠标坐标才能对上。
+
+mod hdr;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,8 +30,9 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Multithread, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
-    DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_MODE_ROTATION,
+    DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -384,10 +387,14 @@ pub fn displays() -> Result<Vec<DisplayInfo>> {
         .collect())
 }
 
+const DESKTOP_FORMATS: [DXGI_FORMAT; 2] =
+    [DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT];
+
 pub struct DxgiCapturer {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
+    pixels: hdr::DesktopPixels,
     /// 画面留在显卡上（显卡支持视频处理器时）；`None` 时每帧读回内存
     gpu: Option<Arc<D3dSource>>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
@@ -466,7 +473,7 @@ impl DxgiCapturer {
         };
         unsafe {
             let dup = match o.output.cast::<IDXGIOutput5>() {
-                Ok(o5) => match o5.DuplicateOutput1(&device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]) {
+                Ok(o5) => match o5.DuplicateOutput1(&device, 0, &DESKTOP_FORMATS) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::debug!(
@@ -484,7 +491,7 @@ impl DxgiCapturer {
                     .context("DuplicateOutput")?,
             };
             let desc = dup.GetDesc();
-            if desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            if !DESKTOP_FORMATS.contains(&desc.ModeDesc.Format) {
                 let format = desc.ModeDesc.Format;
                 bail!("unsupported desktop pixel format: {format:?}");
             }
@@ -496,6 +503,7 @@ impl DxgiCapturer {
                 device,
                 ctx,
                 dup,
+                pixels: hdr::DesktopPixels::new(o.desc.DeviceName),
                 gpu,
                 staging: None,
                 first: true,
@@ -530,7 +538,8 @@ impl DxgiCapturer {
         let (w, h) = (desc.Width, desc.Height);
         let Some(source) = &self.gpu else {
             let staging = self.staging(w, h)?;
-            unsafe { self.ctx.CopyResource(&staging, tex) };
+            self.pixels
+                .copy(&self.device, &self.ctx, tex, &desc, &staging, true)?;
             return Ok(Copied::Staging(staging, w, h));
         };
         let (fw, fh) = self.rotation.rotated_size(w, h);
@@ -541,11 +550,10 @@ impl DxgiCapturer {
         }
         let g = f.gpu.as_mut().expect("just set");
         g.rotation = self.rotation;
-        unsafe {
-            self.ctx.CopyResource(&g.texture, tex);
-            // 马上交给显卡去复制，不等用的一方提交
-            self.ctx.Flush();
-        }
+        self.pixels
+            .copy(&self.device, &self.ctx, tex, &desc, &g.texture, false)?;
+        // 马上交给显卡去复制，不等用的一方提交
+        unsafe { self.ctx.Flush() };
         Ok(Copied::Gpu(frame))
     }
 }
