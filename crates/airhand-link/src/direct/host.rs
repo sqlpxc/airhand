@@ -192,7 +192,7 @@ pub(crate) async fn run(mut s: Session) {
     loop {
         round += 1;
         let hub = s.link.hub.clone();
-        let ours = candidates(&hub.endpoint, &hub.relay, s.link.observed);
+        let ours = candidates(&hub.endpoint, &hub.relay, s.link.observed, round).await;
         debug!(
             session_id = s.session_id,
             round,

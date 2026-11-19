@@ -19,6 +19,7 @@
 
 pub mod controller;
 pub mod host;
+mod interfaces;
 pub mod select;
 mod socket;
 pub(crate) mod tls;
@@ -41,13 +42,13 @@ const PUBLIC_V6: SocketAddr = SocketAddr::new(
     53,
 );
 
-/// 本端的候选地址（端口都是连中转的那个）：服务器看到的公网地址（`observed`），往中转去时用的地址（中转在局域网里
-/// 的话是局域网地址），和往公网去时用的 IPv4（多半是局域网地址）、IPv6 地址（多半就是公网地址，没有 NAT）。
-/// socket 只能说 IPv4 时不给 IPv6 的
-pub(crate) fn candidates(
+/// 每轮交换的候选地址包含中转看到的地址、系统选出的出口地址，以及其他活动网卡上的地址。
+/// 中转观察到的保留 NAT 映射端口，所有本地地址用同一个 QUIC socket 的端口。
+pub(crate) async fn candidates(
     endpoint: &Endpoint,
     relay: &Connection,
     observed: SocketAddr,
+    round: u32,
 ) -> Vec<SocketAddr> {
     let mut out = vec![canonical(observed)];
     let Ok(local) = endpoint.local_addr() else {
@@ -65,6 +66,7 @@ pub(crate) fn candidates(
         }
     }
     out.truncate(MAX_DIRECT_ADDRS);
+    interfaces::add(&mut out, local, round).await;
     out
 }
 
@@ -78,11 +80,15 @@ fn route_ip(to: SocketAddr) -> Option<IpAddr> {
     let s = std::net::UdpSocket::bind(bind).ok()?;
     s.connect(to).ok()?;
     let ip = s.local_addr().ok()?.ip();
-    let usable = match ip {
-        IpAddr::V4(ip) => !ip.is_unspecified(),
-        IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_unicast_link_local()),
-    };
-    usable.then_some(ip)
+    usable_ip(ip).then_some(ip)
+}
+
+/// 可用的单播地址。IPv6 链路本地地址需要接收端自己的网卡作用域，不能直接交换。
+fn usable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()),
+        IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local()),
+    }
 }
 
 /// IPv4 映射的 IPv6 地址（双栈的 socket 看到的 IPv4 对端）写成 IPv4
@@ -101,10 +107,7 @@ pub(crate) fn usable(theirs: &[SocketAddr], endpoint: &Endpoint) -> Vec<SocketAd
         .take(MAX_DIRECT_ADDRS)
         .map(|a| canonical(*a))
         .filter(|a| (a.is_ipv4() || local.is_ipv6()) && a.port() != 0)
-        .filter(|a| match a.ip() {
-            IpAddr::V4(ip) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()),
-            IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_multicast()),
-        })
+        .filter(|a| usable_ip(a.ip()))
         .collect();
     out.dedup();
     out

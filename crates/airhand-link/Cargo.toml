@@ -17,6 +17,7 @@ client = [
     "dep:anyhow",
     "dep:bytes",
     "dep:curve25519-dalek",
+    "dep:if-addrs",
     "dep:libc",
     "dep:quinn",
     "dep:rand",
@@ -52,6 +53,8 @@ anyhow = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 curve25519-dalek = { version = "4", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+# 直连时枚举活动网卡。两台只靠网线互连的电脑可能用 169.254/16。
+if-addrs = { version = "0.15", features = ["link-local"], optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rand = { version = "0.9", optional = true }
 # 被控端接受直连时用的自签名证书（每次运行生成一张；对面是谁由会话密钥证明，见 src/direct/tls.rs）

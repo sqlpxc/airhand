@@ -67,7 +67,7 @@ pub(crate) async fn run(s: Session) {
                 None => return,
             },
         };
-        let ours = candidates(&endpoint, paths.relay(), observed);
+        let ours = candidates(&endpoint, paths.relay(), observed, offer.round).await;
         debug!(session_id, round = offer.round, ?ours, theirs = ?offer.addrs, "the host offers a direct path");
         answer(DirectOffer {
             round: offer.round,
