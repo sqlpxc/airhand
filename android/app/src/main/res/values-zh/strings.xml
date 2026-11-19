@@ -231,6 +231,8 @@
     <string name="menu_clipboard">剪贴板</string>
     <string name="menu_displays">显示器</string>
     <string name="menu_fit">适应屏幕</string>
+    <string name="menu_landscape">横屏</string>
+    <string name="menu_portrait">竖屏</string>
     <string name="menu_help">手势说明</string>
     <string name="hide_keyboard">收起键盘</string>
     <string name="display_n">显示器 %1$d</string>

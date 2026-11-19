@@ -60,14 +60,17 @@
             </intent-filter>
         </activity>
 
-        <!-- 远程画面（手机和电视共用，界面不同）：旋转、弹出键盘时不重建，解码器和画面保持不动 -->
+        <!-- 远程画面（手机和电视共用，界面不同）：进来先横屏，之后跟着对方画面的方向走、菜单里也能换（见 SessionActivity），
+             旋转、弹出键盘时不重建，解码器和画面保持不动 -->
         <activity
             android:name=".ui.session.SessionActivity"
             android:exported="false"
             android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
             android:windowSoftInputMode="adjustResize|stateHidden"
-            android:theme="@style/Theme.Airhand.Session" />
+            android:theme="@style/Theme.Airhand.Session"
+            tools:ignore="DiscouragedApi" />
 
         <!-- 剪贴板里的文件：系统分享菜单里的"发给对方"（见 core/ClipFiles.kt） -->
         <activity

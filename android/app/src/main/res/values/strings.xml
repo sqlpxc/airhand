@@ -236,6 +236,8 @@
     <string name="menu_clipboard">Clipboard</string>
     <string name="menu_displays">Displays</string>
     <string name="menu_fit">Fit screen</string>
+    <string name="menu_landscape">Landscape</string>
+    <string name="menu_portrait">Portrait</string>
     <string name="menu_help">Gestures</string>
     <string name="hide_keyboard">Hide keyboard</string>
     <string name="display_n">Display %1$d</string>

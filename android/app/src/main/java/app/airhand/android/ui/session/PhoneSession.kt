@@ -51,6 +51,8 @@ import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.StayCurrentLandscape
+import androidx.compose.material.icons.outlined.StayCurrentPortrait
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.automirrored.outlined.VolumeOff
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
@@ -138,6 +140,7 @@ private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, HELP }
  * 画面占满屏幕，只有一个可以拖动的小圆钮（点开是菜单），尽量不挡画面。
  * 打开键盘时上面多一排特殊键（Esc、Tab、Ctrl、方向键……），画面缩到键盘上面，始终能看到全貌。
  * 控制手机时底部有返回 / 主页 / 最近任务三个键。第一次使用某种操作方式时先说明手势。
+ * 横屏还是竖屏跟着对方画面走，菜单里可以换（[landscape] 是现在的方向，[onRotate] 换到另一个方向）。
  */
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -146,6 +149,8 @@ fun PhoneSession(
     view: RemoteView,
     kb: KeyboardController,
     keyboardOpen: MutableState<Boolean>,
+    landscape: Boolean,
+    onRotate: () -> Unit,
     onExit: () -> Unit,
 ) {
     val app = AirhandApp.instance
@@ -296,8 +301,12 @@ fun PhoneSession(
             ) {
                 when (page) {
                     Page.MAIN -> MainMenu(
-                        session, view, name, os, mode,
+                        session, view, name, os, mode, landscape,
                         onMode = { mode = it },
+                        onRotate = {
+                            menu = false
+                            onRotate()
+                        },
                         onKeyboard = {
                             menu = false
                             keyboardOpen.value = true
@@ -422,7 +431,9 @@ private fun MainMenu(
     name: String,
     os: OsKind,
     mode: UiMode,
+    landscape: Boolean,
     onMode: (UiMode) -> Unit,
+    onRotate: () -> Unit,
     onKeyboard: () -> Unit,
     onPage: (Page) -> Unit,
     onClose: () -> Unit,
@@ -512,10 +523,17 @@ private fun MainMenu(
             view.fit()
             onClose()
         }
+        // 横屏 / 竖屏：显示现在的方向，点一下换到另一个
+        Action(
+            if (landscape) Icons.Outlined.StayCurrentLandscape else Icons.Outlined.StayCurrentPortrait,
+            stringResource(if (landscape) R.string.menu_landscape else R.string.menu_portrait),
+            cell,
+            onClick = onRotate,
+        )
         Action(Icons.AutoMirrored.Outlined.HelpOutline, stringResource(R.string.menu_help), cell) { onPage(Page.HELP) }
         Action(Icons.Outlined.LinkOff, stringResource(R.string.disconnect), cell, danger = true, onClick = onDisconnect)
         // 补齐最后一行，保持格子宽度一致
-        val items = 9 + (if (displays.size > 1) 1 else 0) + (if (lockable) 1 else 0)
+        val items = 10 + (if (displays.size > 1) 1 else 0) + (if (lockable) 1 else 0)
         repeat((4 - items % 4) % 4) { Spacer(cell) }
     }
 }
