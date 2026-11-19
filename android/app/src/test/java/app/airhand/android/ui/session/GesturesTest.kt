@@ -334,6 +334,72 @@ class GesturesTest {
         assertTrue(buttons().isEmpty())
     }
 
+    // ───────────── 开着游戏按键：空白处拖动转视角 ─────────────
+
+    @Test
+    fun gameKeysTouchDragTurnsTheViewWithoutTheLeftButton() {
+        g.mode = Gestures.Mode.TOUCH
+        g.relative = true
+        g.lookGain = 2f
+        g.down(p(500f, 250f), 0)
+        g.move(listOf(p(540f, 250f)), 50)
+        g.move(listOf(p(590f, 275f)), 100)
+        g.up(p(590f, 275f), 150)
+        // 不按左键（拖一下视角不该开枪），移动量乘上灵敏度；松手也不算点击
+        assertEquals(listOf("delta 0.080 0.000", "delta 0.100 0.100"), log)
+        assertFalse(g.pressing)
+    }
+
+    @Test
+    fun gameKeysTapStillClicks() {
+        g.mode = Gestures.Mode.TOUCH
+        g.relative = true
+        g.lookGain = 1f
+        g.down(p(500f, 250f), 0)
+        g.up(p(500f, 250f), 80)
+        assertEquals(listOf("left down", "left up"), log)
+    }
+
+    @Test
+    fun gameKeysRestingThumbNeitherRightClicksNorClicks() {
+        // 转视角时拇指常常搭在屏幕上不动：不能因此开镜（右键）或者松手时开枪（左键）
+        for (m in listOf(Gestures.Mode.TOUCH, Gestures.Mode.TRACKPAD)) {
+            log.clear()
+            g.mode = m
+            g.relative = true
+            g.lookGain = 1f
+            val t0 = timers.now
+            g.down(p(500f, 250f), t0)
+            timers.advance(Gestures.LONG_PRESS_MS + 500)
+            g.up(p(500f, 250f), timers.now)
+            assertTrue("$m: $log", buttons().isEmpty())
+        }
+    }
+
+    @Test
+    fun gameKeysTrackpadLookHasNoAcceleration() {
+        g.mode = Gestures.Mode.TRACKPAD
+        g.relative = true
+        g.lookGain = 1f
+        g.down(p(100f, 100f), 0)
+        g.move(listOf(p(120f, 100f)), 10)
+        // 很快地划：平时会加速，转视角时不加速
+        g.move(listOf(p(320f, 100f)), 20)
+        g.up(p(320f, 100f), 30)
+        assertEquals(listOf("delta 0.020 0.000", "delta 0.200 0.000"), log)
+    }
+
+    @Test
+    fun gameKeysLeaveTheVisibleCursorAlone() {
+        // 被控端显示着光标（游戏菜单）：和平时一样，拖动 = 按着左键拖
+        g.mode = Gestures.Mode.TOUCH
+        g.lookGain = 1f
+        g.down(p(500f, 250f), 0)
+        g.move(listOf(p(540f, 250f)), 50)
+        g.up(p(540f, 250f), 100)
+        assertEquals(listOf("left down", "left up"), buttons())
+    }
+
     @Test
     fun accelerationIsBounded() {
         assertEquals(0.7f, Gestures.accel(0f), 0.001f)

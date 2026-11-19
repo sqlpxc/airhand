@@ -34,6 +34,11 @@ import kotlin.math.min
  * **相对移动**（[relative]：被控端的光标隐藏了，例如游戏里拖动转视角；或者打开了锁定鼠标）：
  * 触控板的移动、触屏的拖动发"移动了多少"（[Out.delta]），不再发位置；点击也不先把光标挪到哪里。
  * 游戏这时自己把光标拉回原位、只看移动量，发位置会和它打架（视角乱跳、拖到画面边上就转不动了）。
+ *
+ * **转视角**（[lookGain]：画面上开着游戏按键）：相对移动时单指拖动只转视角——触屏方式不再按着左键拖
+ * （开火由按钮负责，拖一下视角不该开枪），触控板方式不加速（瞄准要手感一致），都乘上方案里的灵敏度。
+ * 快速点一下照样是左键；手指停着不动不算长按、慢慢松开也不算点击（转视角时拇指常常搭在屏幕上不动，
+ * 不能因此开镜或者开枪）。被控端显示着光标时（游戏菜单）和平时一样操作
  */
 class Gestures(private val out: Out, private val timers: Timers, private val slop: Float) {
 
@@ -78,6 +83,9 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
     /** 发相对移动（见类的说明）。只对触控板和触屏方式有用：直通、多点触摸是控制手机，没有光标 */
     var relative = false
 
+    /** 转视角的灵敏度（见类的说明）；null 表示没开游戏按键 */
+    var lookGain: Float? = null
+
     /** 按着左键拖动着（触屏拖动、触控板的"点一下再按住拖动"） */
     val pressing: Boolean
         get() = dragging
@@ -107,6 +115,9 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
     private var moved = false
     private var longFired = false
     private var dragging = false
+
+    /** 触屏方式下拖动在转视角（没按着左键） */
+    private var looking = false
     private var doubleTapDrag = false
     private var longTimer: Any? = null
 
@@ -159,6 +170,7 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
         moved = false
         longFired = false
         dragging = false
+        looking = false
         doubleTapDrag = false
         when (mode) {
             // 多点触摸方式在函数开头已经处理完了
@@ -197,9 +209,12 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
         }
     }
 
+    /** 正在转视角（开着游戏按键、被控端隐藏了光标） */
+    private val turning: Boolean get() = relative && lookGain != null
+
     private fun onLongPress() {
         longTimer = null
-        if (kind != Kind.ONE || moved) return
+        if (kind != Kind.ONE || moved || turning) return
         longFired = true
         out.haptic()
         when (mode) {
@@ -288,10 +303,14 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
                     dragging = true
                 }
                 Mode.TOUCH -> if (!longFired) {
-                    // 从按下的位置开始拖
-                    if (!relative) out.toRemote(startX, startY)?.let { out.move(it.first, it.second) }
-                    out.button(LEFT, true)
-                    dragging = true
+                    if (relative && lookGain != null) {
+                        looking = true
+                    } else {
+                        // 从按下的位置开始拖
+                        if (!relative) out.toRemote(startX, startY)?.let { out.move(it.first, it.second) }
+                        out.button(LEFT, true)
+                        dragging = true
+                    }
                 }
                 Mode.PASSTHROUGH -> if (pendingDown) {
                     // 单指已经滑开了，不会是双指缩放：马上按下
@@ -311,20 +330,22 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
                 val speed = hypot(dx, dy) / dt // 像素 / 毫秒
                 val gain = accel(speed)
                 if (relative) {
-                    // 被控端的光标隐藏着：只发移动了多少，本机画的指针不动
-                    out.delta(dx / w * gain, dy / h * gain)
+                    // 被控端的光标隐藏着：只发移动了多少，本机画的指针不动（转视角时不加速）
+                    val g = lookGain ?: gain
+                    out.delta(dx / w * g, dy / h * g)
                     return
                 }
                 setCursor(cursorX + dx / w * gain, cursorY + dy / h * gain)
                 out.move(cursorX, cursorY)
                 out.follow()
             }
-            Mode.TOUCH -> if (dragging) {
+            Mode.TOUCH -> if (dragging || looking) {
                 if (relative) {
                     // 游戏里拖动转视角：手指在画面上移动了多少，就发多少
                     val (w, h) = out.contentSize()
-                    if (w > 0 && h > 0) out.delta(dx / w, dy / h)
-                } else {
+                    val g = lookGain ?: 1f
+                    if (w > 0 && h > 0) out.delta(dx / w * g, dy / h * g)
+                } else if (dragging) {
                     out.toRemote(p.x, p.y)?.let {
                         setCursor(it.first, it.second)
                         out.move(cursorX, cursorY)
@@ -434,7 +455,7 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
                 Mode.TOUCH -> {
                     if (dragging) {
                         out.button(LEFT, false)
-                    } else if (!longFired) {
+                    } else if (!longFired && !looking && !(turning && t - startT >= TAP_MS)) {
                         out.ripple(startX, startY)
                         click(LEFT)
                     }
@@ -457,10 +478,12 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
             }
         }
         dragging = false
+        looking = false
         kind = Kind.NONE
     }
 
     fun cancel() {
+        looking = false
         for (id in touchIds.keys.toList()) touchUp(P(id, touchPos[id]?.first ?: 0f, touchPos[id]?.second ?: 0f), CANCEL)
         timers.cancel(longTimer)
         timers.cancel(downTimer)

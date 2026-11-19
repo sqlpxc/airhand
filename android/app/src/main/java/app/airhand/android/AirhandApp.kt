@@ -14,6 +14,7 @@ import app.airhand.android.controller.ControllerClient
 import app.airhand.android.controller.RemoteSession
 import app.airhand.android.core.Native
 import app.airhand.android.data.DeviceStore
+import app.airhand.android.data.GameStore
 import app.airhand.android.data.HostCodeStore
 import app.airhand.android.data.PairingStore
 import app.airhand.android.data.Settings
@@ -31,6 +32,10 @@ class AirhandApp : Application() {
     lateinit var hostCodes: HostCodeStore
         private set
     lateinit var pairing: PairingStore
+        private set
+
+    /** 游戏按键的方案（控制电脑时叠在画面上的按钮） */
+    lateinit var games: GameStore
         private set
     lateinit var controller: ControllerClient
         private set
@@ -50,6 +55,7 @@ class AirhandApp : Application() {
         devices = DeviceStore(this)
         hostCodes = HostCodeStore(this)
         pairing = PairingStore(this)
+        games = GameStore(this)
         controller = ControllerClient(settings)
         clipboard = Clipboard(this)
 

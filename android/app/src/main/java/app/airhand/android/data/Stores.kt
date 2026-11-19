@@ -18,7 +18,7 @@ import java.io.File
  * 应用的全部数据：都是 JSON 文件，放在应用自己的数据目录（`filesDir`）里。
  * 没有别的地方存东西：卸载时系统把这个目录整个删掉；清单里也关掉了备份和设备迁移。
  */
-private object JsonFile {
+internal object JsonFile {
     fun read(file: File): String? = try {
         if (file.exists()) String(AtomicFile(file).readFully(), Charsets.UTF_8) else null
     } catch (e: Exception) {

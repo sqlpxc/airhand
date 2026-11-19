@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.os.Build
@@ -26,10 +27,13 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import app.airhand.android.controller.CursorState
 import app.airhand.android.controller.Input
+import app.airhand.android.data.GameLayout
+import app.airhand.android.data.GameStick
 import app.airhand.android.data.ScaleMode
 import kotlin.math.abs
 import kotlin.math.max
@@ -43,7 +47,10 @@ import kotlin.math.min
  * * 被控端的光标隐藏了（游戏里转视角等）或者打开了锁定鼠标：发相对移动（[relative]）。
  *   外接鼠标这时被抓住（Android 8+ 的 pointer capture：系统指针隐藏、不会碰到屏幕边停下），
  *   发鼠标的原始移动量；触摸按画面大小换算成被控端的像素；
- * * 软键盘的输入经 [RemoteInputConnection] 交给 [KeyboardController]。
+ * * 软键盘的输入经 [RemoteInputConnection] 交给 [KeyboardController]；
+ * * 开着游戏按键（[setGame]）时，落在按钮上的手指归 [GameControls]，其余的手指照常交给 [Gestures]
+ *   （[split]：左手按着摇杆、右手在空白处转视角，对 Gestures 来说只有一个手指）；编辑方案时（[editor]）
+ *   触摸都交给 [LayoutEditor]，不发给对方。
  */
 @SuppressLint("ViewConstructor")
 class RemoteView(context: Context, private val host: Host) : FrameLayout(context), TextureView.SurfaceTextureListener {
@@ -60,6 +67,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
     private val texture = TextureView(context)
     private val overlay = Overlay(context)
+    private val gameLayer = GameLayer(context, this)
     private var surface: Surface? = null
 
     private var videoW = 0
@@ -121,11 +129,56 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             host.onInput(listOf(Input.touch(id, phase, nx, ny)), phase != Gestures.MOVE)
     }, timers, ViewConfiguration.get(context).scaledTouchSlop.toFloat())
 
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+
+    /** 游戏按钮可以放的地方：视图去掉刘海，留一点边（[updateGameArea]） */
+    private val gameGeo = GameGeometry(density)
+
+    /** 游戏按键发出去的输入：按键、点击马上发；转视角和别的相对移动一样换算、合并 */
+    val game: GameControls = GameControls(object : GameControls.Out {
+        override fun key(code: String, down: Boolean) = host.onInput(listOf(Input.key(code, down)), true)
+        override fun button(button: String, down: Boolean) = host.onInput(listOf(Input.button(button, down)), true)
+        override fun wheel(dy: Int) = host.onInput(listOf(Input.wheel(0, dy)), true)
+        override fun look(dx: Float, dy: Float) = lookBy(dx, dy)
+        override fun haptic() {
+            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        }
+
+        override fun changed() {
+            gameLayer.invalidate()
+            // 按着鼠标键的按钮（开火、右键转视角）和按着外接鼠标的键一样算（updateRelative）
+            if (gameMouse != game.holdsMouse) {
+                gameMouse = game.holdsMouse
+                updateRelative()
+            }
+        }
+    }, timers, gameGeo, touchSlop)
+
+    private var gameMouse = false
+
+    /** 转视角的灵敏度（方案里的） */
+    private var lookGain = 1f
+
+    /** 正在编辑的方案：触摸都交给它，不发给对方 */
+    var editor: LayoutEditor? = null
+        set(v) {
+            if (field === v) return
+            field = v
+            if (v != null) {
+                game.releaseAll()
+                gestures.cancel()
+                freeIds.clear()
+            }
+            updateCapture()
+            gameLayer.invalidate()
+        }
+
     init {
         setBackgroundColor(Color.BLACK)
         texture.surfaceTextureListener = this
         addView(texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(overlay, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(gameLayer, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         isFocusable = true
         isFocusableInTouchMode = true
     }
@@ -195,6 +248,11 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
     private fun fitScale(): Float =
         if (videoW == 0 || videoH == 0 || width == 0) 0f else min(width.toFloat() / videoW, height.toFloat() / videoH)
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        updateGameArea()
+    }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
@@ -335,7 +393,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
     /** 发相对移动：被控端的光标隐藏了（按着键时见 [hiddenWhilePressed]），或者打开了锁定鼠标。按键变了也要调用 */
     private fun updateRelative() {
-        val pressed = mouseButtons != 0 || gestures.pressing
+        val pressed = mouseButtons != 0 || gestures.pressing || game.holdsMouse
         val held = pressed && (hiddenWhilePressed || !cursor.visible)
         if (held != hiddenWhilePressed) {
             hiddenWhilePressed = held
@@ -361,13 +419,20 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         host.onInput(listOf(Input.delta(ix, iy)), false)
     }
 
+    /** 游戏按键转视角：手指移动了多少像素，和触屏拖动一样按画面大小换算，再乘上灵敏度 */
+    private fun lookBy(dx: Float, dy: Float) {
+        if (content.width() <= 0f || content.height() <= 0f) return
+        val (w, h) = remoteSize ?: (videoW to videoH)
+        sendDelta(dx / content.width() * w * lookGain, dy / content.height() * h * lookGain)
+    }
+
     /** 用过外接鼠标（才去抓鼠标：只用触摸屏时没必要） */
     private var mouseSeen = false
 
     /** 相对移动时抓住外接鼠标：系统指针隐藏，鼠标事件都交给 [onCapturedPointerEvent]（原始移动量） */
     private fun updateCapture() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val want = gestures.relative && mouseSeen && hasWindowFocus()
+        val want = gestures.relative && mouseSeen && hasWindowFocus() && editor == null
         if (want && !hasPointerCapture()) {
             requestPointerCapture()
         } else if (!want && hasPointerCapture()) {
@@ -463,8 +528,18 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (!interactive) return false
+        editor?.let {
+            edit(it, e)
+            return true
+        }
         if (e.isFromSource(InputDevice.SOURCE_MOUSE)) return mouse(e)
         val wasPressing = gestures.pressing
+        if (game.layout != null) split(e) else touch(e)
+        if (gestures.pressing != wasPressing) updateRelative()
+        return true
+    }
+
+    private fun touch(e: MotionEvent) {
         val t = e.eventTime
         fun pt(i: Int) = Gestures.P(e.getPointerId(i), e.getX(i), e.getY(i))
         fun pts() = (0 until e.pointerCount).map { pt(it) }
@@ -479,12 +554,127 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             MotionEvent.ACTION_UP -> gestures.up(pt(e.actionIndex), t)
             MotionEvent.ACTION_CANCEL -> gestures.cancel()
         }
-        if (gestures.pressing != wasPressing) updateRelative()
-        return true
+    }
+
+    /** 交给 [gestures] 的手指（没有落在游戏按钮上的），按落下的先后 */
+    private val freeIds = ArrayList<Int>()
+
+    /**
+     * 开着游戏按键时分手指：落在按钮上的从按下到抬起都归 [game]，其余的交给 [gestures]。
+     * Gestures 只看得到它自己的手指：第一个是 `down`，之后的是 `pointerDown`，最后一个抬起是 `up`
+     */
+    private fun split(e: MotionEvent) {
+        val t = e.eventTime
+        fun pt(i: Int) = Gestures.P(e.getPointerId(i), e.getX(i), e.getY(i))
+        fun free() = (0 until e.pointerCount).map(::pt).filter { it.id in freeIds }
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+                    // 新的一次触摸：上一次漏掉的抬起（不应该发生）不再算
+                    game.lift()
+                    freeIds.clear()
+                }
+                val p = pt(e.actionIndex)
+                if (game.down(p.id, p.x, p.y)) return
+                freeIds += p.id
+                val ps = free()
+                if (ps.size == 1) {
+                    gestures.down(p, t)
+                    overlay.invalidate()
+                } else {
+                    gestures.pointerDown(p, ps, t)
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                for (i in 0 until e.pointerCount) {
+                    val id = e.getPointerId(i)
+                    if (game.owns(id)) game.move(id, e.getX(i), e.getY(i))
+                }
+                val ps = free()
+                if (ps.isNotEmpty()) gestures.move(ps, t)
+            }
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> {
+                val p = pt(e.actionIndex)
+                if (game.up(p.id)) return
+                if (freeIds.remove(p.id)) {
+                    if (freeIds.isEmpty()) gestures.up(p, t) else gestures.pointerUp(p, freeIds.size, t)
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                game.lift()
+                if (freeIds.isNotEmpty()) gestures.cancel()
+                freeIds.clear()
+            }
+        }
+    }
+
+    /** 编辑方案：手指（和外接鼠标）都用来摆放按钮 */
+    private fun edit(ed: LayoutEditor, e: MotionEvent) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
+                ed.down(e.getPointerId(e.actionIndex), e.getX(e.actionIndex), e.getY(e.actionIndex))
+            MotionEvent.ACTION_MOVE -> for (i in 0 until e.pointerCount) ed.move(e.getPointerId(i), e.getX(i), e.getY(i))
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> ed.up(e.getPointerId(e.actionIndex))
+            MotionEvent.ACTION_CANCEL -> ed.cancel()
+        }
+    }
+
+    // ───────────────────────────── 游戏按键 ─────────────────────────────
+
+    /**
+     * 显示游戏按键用的方案；null 收起。换了、收起都先把按着的松开；开 / 关之间正在进行的手势作废
+     * （手指不会一半算按钮、一半算手势）
+     */
+    fun setGame(layout: GameLayout?) {
+        if ((layout == null) != (game.layout == null)) {
+            gestures.cancel()
+            freeIds.clear()
+        }
+        game.layout = layout
+        lookGain = layout?.look ?: 1f
+        gestures.lookGain = layout?.look
+        updateGestureExclusion()
+    }
+
+    /**
+     * 摇杆、贴着屏幕边的按钮不让系统的返回手势抢走（Android 10+ 的手势导航：从左右边缘滑入是返回，
+     * 拇指推摇杆时很容易碰到）。系统每条边最多让出 200dp，从下往上算，摇杆一般在下面
+     */
+    private fun updateGestureExclusion() {
+        val l = game.layout
+        val rects = if (l == null || !gameGeo.ready) emptyList() else l.controls.map { c ->
+            val r = gameGeo.radius(c) * (if (c is GameStick) 1.3f else 1.15f)
+            val x = gameGeo.cx(c)
+            val y = gameGeo.cy(c)
+            Rect((x - r).toInt(), (y - r).toInt(), (x + r).toInt(), (y + r).toInt())
+        }
+        ViewCompat.setSystemGestureExclusionRects(this, rects)
+    }
+
+    /** 开始编辑一个方案（设到 [editor] 才生效） */
+    fun newEditor(layout: GameLayout): LayoutEditor =
+        LayoutEditor(layout, gameGeo, touchSlop, redraw = { gameLayer.invalidate() }, tick = {
+            performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        })
+
+    /** 按钮可以放的地方：去掉刘海（画面铺到了刘海里），再留 6dp 的边 */
+    private fun updateGameArea() {
+        val cut = ViewCompat.getRootWindowInsets(this)?.getInsets(WindowInsetsCompat.Type.displayCutout())
+        val m = 6 * density
+        gameGeo.set(
+            (cut?.left ?: 0) + m,
+            (cut?.top ?: 0) + m,
+            width - (cut?.right ?: 0) - m,
+            height - (cut?.bottom ?: 0) - m,
+        )
+        updateGestureExclusion()
+        gameLayer.invalidate()
     }
 
     override fun onGenericMotionEvent(e: MotionEvent): Boolean {
         if (!interactive || !e.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) return super.onGenericMotionEvent(e)
+        // 编辑方案时不操作对方
+        if (editor != null) return true
         when (e.actionMasked) {
             MotionEvent.ACTION_HOVER_MOVE -> {
                 moveMouse(e)
@@ -581,6 +771,9 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         }
         // 拿到焦点才能抓住鼠标（失去焦点时系统自己会放开）
         updateCapture()
+        // 菜单、通知栏、切到后台：游戏按键按着的都松开（手指的抬起不一定会送到这里），切换着的也松开，
+        // 不然角色会一直走下去
+        if (!hasWindowFocus) game.releaseAll()
     }
 
     fun hideKeyboard() {
