@@ -27,6 +27,7 @@
 
 ## macOS
 
+- When recording from **Airhand Microphone** in Safari on the Mac, turn off **echo cancellation in the website’s microphone settings**. On Safari 27.2, the voice-processing audio unit fails to open this virtual input. Web apps can request the selected `deviceId` with `echoCancellation: { exact: false }` in `getUserMedia`.
 - The host needs the Screen & System Audio Recording and Accessibility permissions, which only the local user can grant in System Settings; since macOS 15 the system also asks again from time to time whether to keep allowing screen recording
 - The login window and the lock screen can't be captured or controlled
 - The host doesn't offer AV1 (current Apple chips can only decode it in hardware), so AV1 shows as unavailable in the console and HEVC is used instead
