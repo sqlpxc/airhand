@@ -67,14 +67,22 @@ pub(crate) async fn run(s: Session) {
                 None => return,
             },
         };
+        let addrs = usable(&offer.addrs, &endpoint);
         let ours = candidates(&endpoint, paths.relay(), observed);
+        #[cfg(target_os = "macos")]
+        let ours = {
+            let mut ours = ours;
+            if let Ok(local) = endpoint.local_addr() {
+                add_lan_candidates(&mut ours, local.port(), &addrs, super::route_ip);
+            }
+            ours
+        };
         debug!(session_id, round = offer.round, ?ours, theirs = ?offer.addrs, "the host offers a direct path");
         answer(DirectOffer {
             round: offer.round,
             addrs: ours,
             cert: cert.fingerprint,
         });
-        let addrs = usable(&offer.addrs, &endpoint);
         let conn = tokio::select! {
             c = connect(&endpoint, &cert, offer.cert, &addrs) => c,
             // 被控端已经开始下一轮了
@@ -114,6 +122,50 @@ pub(crate) async fn run(s: Session) {
         if next.is_none() && offers.is_closed() {
             return;
         }
+    }
+}
+
+/// 中转和公网走 TUN 时，对端的内网地址仍可能走物理网卡。用这条路由的源地址回答打洞。
+#[cfg(any(target_os = "macos", test))]
+fn add_lan_candidates(
+    ours: &mut Vec<SocketAddr>,
+    port: u16,
+    peers: &[SocketAddr],
+    route: impl Fn(SocketAddr) -> Option<std::net::IpAddr>,
+) {
+    for &peer in peers {
+        if ours.len() >= airhand_proto::session::MAX_DIRECT_ADDRS {
+            break;
+        }
+        let lan = match peer.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_private(),
+            std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+        };
+        if lan && let Some(ip) = route(peer) {
+            let candidate = SocketAddr::new(ip, port);
+            if !ip.is_loopback() && !ours.contains(&candidate) {
+                ours.push(candidate);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn includes_lan_source_with_quic_port_when_relay_uses_tun() {
+        let tun = "198.18.0.9:41000".parse().unwrap();
+        let lan = "192.168.42.10:41000".parse().unwrap();
+        let peer = "192.168.42.20:42000".parse().unwrap();
+        let public = "203.0.113.10:12345".parse().unwrap();
+        let mut ours = vec![tun];
+        add_lan_candidates(&mut ours, 41000, &[public, peer, peer], |addr| {
+            assert_eq!(addr, peer);
+            Some(SocketAddr::ip(&lan))
+        });
+        assert_eq!(ours, [tun, lan]);
     }
 }
 
