@@ -76,6 +76,7 @@ The output is under `client/src-tauri/target/release/`:
 - For just the .app use `npm run tauri build -- --bundles app`; it is built for the machine's own architecture (arm64 on Apple silicon)
 - The app is only ad-hoc signed, not notarized: the first time you open a copy on another Mac, right-click it in Finder → Open (or run `xattr -dr com.apple.quarantine Airhand.app`)
 - macOS remembers granted permissions by code signature, and an ad-hoc signature changes with every build: after rebuilding, remove Airhand in System Settings → Privacy & Security and grant the permissions again. For long-term use, put your own Developer ID in `signingIdentity` in `client/src-tauri/tauri.macos.conf.json`
+- Bundles are signed with the Hardened Runtime, using the entitlements in `client/src-tauri/Entitlements.plist`. Without `com.apple.security.device.audio-input`, macOS denies the microphone silently, without asking
 
 ## Android (APK)
 

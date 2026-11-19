@@ -76,6 +76,7 @@ npm run tauri build
 - 只要 .app 时用 `npm run tauri build -- --bundles app`；构建的是本机的架构（Apple 芯片是 arm64）
 - 程序只做了临时签名（ad-hoc），没有经过 Apple 公证：拷到别的 Mac 上第一次打开时，在访达里右键 → 打开（或者 `xattr -dr com.apple.quarantine Airhand.app`）
 - 系统按签名记住授予的权限，而临时签名每次构建都会变：重新构建后要在“系统设置 → 隐私与安全性”里把 Airhand 删掉再重新授权。长期使用的话，在 `client/src-tauri/tauri.macos.conf.json` 里把 `signingIdentity` 换成自己的开发者证书
+- 打包时默认开启 Hardened Runtime，权利（entitlements）写在 `client/src-tauri/Entitlements.plist` 里。少了 `com.apple.security.device.audio-input` 的话，系统会直接拒绝麦克风，也不弹授权框
 
 ## Android（APK）
 

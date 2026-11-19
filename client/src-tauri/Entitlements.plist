@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS：打包签名时用的权利（entitlements）。Tauri 默认开 Hardened Runtime，
+     没有声明的权利系统会直接拒绝，而且不弹授权框。 -->
+<plist version="1.0">
+<dict>
+	<!-- 控制端：网页里的 getUserMedia 读本机麦克风；被控端：AVAudioEngine / Core Audio tap。
+	     缺了它 tccd 会静默拒绝 kTCCServiceMicrophone（Info.plist 里的 NSMicrophoneUsageDescription 不够）。 -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>
