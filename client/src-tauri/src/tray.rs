@@ -113,6 +113,14 @@ pub fn remove(app: &AppHandle) {
     drop(app.remove_tray_by_id(TRAY_ID));
 }
 
+/// 菜单栏程序没有前台窗口，把选目录面板、提示和卸载确认带到用户面前。
+#[cfg(target_os = "macos")]
+pub fn front_panel(mtm: objc2::MainThreadMarker, window: &objc2_app_kit::NSWindow) {
+    #[allow(deprecated)]
+    objc2_app_kit::NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    window.setLevel(objc2_app_kit::NSModalPanelWindowLevel);
+}
+
 fn label(app: &AppHandle, text: impl AsRef<str>) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::new(app, text, false, None::<&str>)
 }
@@ -170,6 +178,11 @@ fn build_menu(app: &AppHandle, st: &AppStatus) -> tauri::Result<Menu<Wry>> {
                 menu.append(&login_item_entry(app, s)?)?;
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (id, title, enabled) = crate::clipfiles::macos::menu_item();
+        menu.append(&MenuItem::with_id(app, id, title, enabled, None::<&str>)?)?;
     }
     menu.append(&language_menu(app)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;

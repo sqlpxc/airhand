@@ -33,7 +33,7 @@
 - The host doesn't offer AV1 (current Apple chips can only decode it in hardware), so AV1 shows as unavailable in the console and HEVC is used instead
 - The controller (WKWebView) can't lock the keyboard: in fullscreen, Command+Tab, Command+Space and the like are still handled locally, so use "Send shortcut" in the toolbar
 - WKWebView on older macOS versions may lack Opus decoding, in which case the console says remote audio can't be played
-- Clipboard files only go out from a Mac: files copied on the other side can't be put on the Mac's clipboard yet (only text is synced)
+- On a Mac, use **Airhand → Receive files to…** in the menu bar to receive files and folders copied on the other device. Paste in Finder uses the Mac’s own clipboard.
 
 ## Linux
 

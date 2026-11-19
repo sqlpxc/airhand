@@ -395,6 +395,13 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
             app.state::<AppState>().hub.send_modify(|_| {});
         }
         #[cfg(target_os = "macos")]
+        "receive_files" => {
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || clipfiles::macos::choose(&handle));
+        }
+        #[cfg(target_os = "macos")]
+        "cancel_receive" => clipfiles::macos::cancel(),
+        #[cfg(target_os = "macos")]
         "uninstall" => {
             // 对话框是模态的：等这次菜单事件处理完，再在主线程上弹出来
             let handle = app.clone();
@@ -598,6 +605,8 @@ pub fn run() {
     ephemeral::isolate_caches();
 
     let hub = status::new_hub();
+    #[cfg(target_os = "macos")]
+    clipfiles::macos::init(&hub);
     let app = tauri::Builder::default()
         .manage(AppState {
             hub: hub.clone(),
@@ -709,6 +718,10 @@ pub fn run() {
             let dirs: Vec<PathBuf> = std::mem::take(&mut *state.webview_dirs.lock().unwrap());
             for d in dirs {
                 ephemeral::remove_with_retry(&d, Duration::from_secs(3));
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(e) = clipfiles::macos::shutdown() {
+                warn!("cleaning up received files: {e}");
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Err(e) = host::mic::shutdown() {

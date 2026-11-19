@@ -159,7 +159,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | 声音采集 | WASAPI 环回 | ScreenCaptureKit（系统混音） | PulseAudio / PipeWire 的输出监视器 | AudioPlaybackCapture（Android 10+） |
 | 控制端的麦克风 | Steam Streaming Microphone（WASAPI，见[麦克风](#麦克风)） | 公开的 Core Audio tap 和聚合设备（14.2+） | 会话期间的 PipeWire 录音源 | 还不支持 |
 | 剪贴板 | 剪贴板序号检测变化 | NSPasteboard 变化计数 | XFIXES 选择所有者变化通知 | 只能写入（控制端 → 手机） |
-| 剪贴板里的文件（见[剪贴板里的文件](#剪贴板里的文件)） | OLE 虚拟文件（托盘放、托盘读） | 只能发出 | FUSE + X11 剪贴板 | content URI；手机的文件用分享菜单发 |
+| 剪贴板里的文件（见[剪贴板里的文件](#剪贴板里的文件)） | OLE 虚拟文件（托盘放、托盘读） | 菜单栏接收，本地复制发出 | FUSE + X11 剪贴板 | content URI；手机的文件用分享菜单发 |
 | 控制台界面 | WebView2 | WKWebView | WebKitGTK（WebCodecs 由 GStreamer 解码） | Jetpack Compose（MediaCodec 解码） |
 
 ## Windows 服务
@@ -278,7 +278,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 |---|---|
 | Windows | OLE 虚拟文件（`FileGroupDescriptorW` + `FileContents`，和远程桌面一样，`client/src-tauri/src/clipfiles/windows.rs`）：资源管理器粘贴时才要整棵树和每个文件的内容，`IStream::Read` 读多少取多少，进度条和取消都是资源管理器自己的。不提供 `CF_HDROP`，本机的剪贴板同步也就不会把它当成本机复制了文件、又公告回去。退出时不调 `OleFlushClipboard`（那会把所有格式都要一遍）。被控端在系统服务里时由托盘放，见 [Windows 服务](#windows-服务) |
 | Linux | 只读的 FUSE 文件系统（`fuser`），挂在 `$XDG_RUNTIME_DIR/airhand-clip/<进程号>`，每个公告一个子目录；X11 剪贴板里放 `text/uri-list`、`x-special/gnome-copied-files` 和路径文本。文件管理器列哪个目录才向对方列，读到哪里才取到哪里。上次没退干净留下的挂载点启动后卸掉。没有 FUSE 时不放，只同步文本 |
-| macOS | 还不支持（要先在 Mac 上验证“按需提供 + 占位文件”的做法）。不放，对方照样等得到 `Ready` |
+| macOS | 在内存中保留最新公告后回复 `Ready`。用户在菜单栏选“接收文件到…”并确认目标目录后，才列目录、分块取文件。每个顶层项目先写入同卷的私有临时目录，完整后以独占改名发布。临时目录的恢复记录和清理见[卸载](usage.zh-CN.md#macos)。 |
 | Android | `ClipFilesProvider` 提供 content URI（`content://<包名>.clipfiles/...`），别的应用读的时候才取。Android 8 起是代理文件描述符（`StorageManager.openProxyFileDescriptor`，可以跳着读），之前是管道。剪贴板里只放文件，文件夹只能在通知里“保存到下载”（Android 10 起经 MediaStore，之前存在应用自己的目录） |
 | 网页控制台 | 不进本机剪贴板（网页写不了文件）：提示“对方复制了 N 项”，点“下载”才取。Chrome / Edge 存进用户选的文件夹 / 文件，边取边写；别的浏览器在内存里拼好（几个文件、文件夹打成不压缩的 ZIP），最多 1 GiB |
 
@@ -287,7 +287,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 ## 磁盘上的文件
 
 - Airhand 要保存的东西（设置、本机的控制码、我的设备）都在一个 `config.toml` 里（见[配置文件](usage.zh-CN.md#配置文件)）。日志从不写文件：写到 stderr，Windows 服务写到 `OutputDebugString`
-- 被控端模式**不创建 WebView**，Airhand 自己不会产生任何文件（macOS 的系统框架以 Airhand 的名义建的目录见下）
+- 被控端模式**不创建 WebView**。在 Mac 上主动接收文件时，临时目录和恢复记录只用于未完成的传输
 - 单实例锁用的是内核对象而不是锁文件：Windows 是命名互斥量，Linux 是抽象命名空间的 Unix 套接字，macOS 是登记在 bootstrap 服务里的 Mach 端口名
 - 控制台的 WebView 需要数据目录：放在临时目录下的随机子目录，开启隐私模式（不保存 Cookie 和缓存），关闭窗口或退出程序时删除；进程被强制结束时，下次启动会清理残留。macOS 的 WKWebView 不需要数据目录，隐私模式下不保存网页数据
 - macOS 上还有几样东西不在 Airhand 的目录里，是系统记着的、或者系统框架以 Airhand 的名义建的：登录时自动启动（系统的登录项）、“屏幕与系统录音”“辅助功能”等权限记录、WebKit 和 Metal 在系统临时 / 缓存目录里建的几个目录（大多是空的）、用户挪动或关掉菜单栏图标时系统记下的设置（`~/Library/Preferences/app.airhand.client.plist`，Airhand 自己不用）。完整的清单和卸载时怎么一起清掉见[卸载 → macOS](usage.zh-CN.md#macos)

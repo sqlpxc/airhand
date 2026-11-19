@@ -78,6 +78,7 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
 
 | Item | Where | Notes |
 |---|---|---|
+| Incomplete file transfer | `.airhand-receive-<random ID>` in the selected folder, referenced by `pending-receive-<random ID>` in the configuration directory | Cancelling, quitting or uninstalling cleans up partial transfers and keeps completed items. After a forced quit, cleanup runs at the next launch. Reconnect any drive removed during a transfer first. |
 | Airhand Microphone | Core Audio input device and its tap | Removed on quit. Startup and the uninstall menu also remove this user’s objects after a forced quit. |
 | Open at login | System Settings → General → Login Items ("Login Items & Extensions" on some versions of macOS), under both "Open at Login" and "App Background Activity" | Has to be unregistered by Airhand itself: if you delete the app first, a dead Airhand entry stays in both places |
 | Permissions | System Settings → Privacy & Security: Screen & System Audio Recording, Accessibility and so on | Can only be cleared while the app is still there; once it's deleted macOS can't find it any more |
@@ -98,7 +99,8 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
    ```
 
    It should say `Successfully reset All approval status for app.airhand.client`. If it says `No such bundle identifier`, the app is already gone, see "Already deleted the app" below.
-3. Delete the rest and the program:
+3. If the app was force-quit during a transfer, reopen it once to clean up and then quit. For manual cleanup, `find "$HOME/Library/Application Support/app.airhand.client" -maxdepth 1 -type l -name 'pending-receive-*' -exec readlink {} \;` shows the hidden folder for that transfer. You can remove that folder in Finder. Keep the completed files alongside it.
+4. Delete the rest and the program:
 
    ```bash
    rm -rf ~/Library/Application\ Support/app.airhand.client
@@ -118,7 +120,7 @@ find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxde
 find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' 2>/dev/null
 ```
 
-**Already deleted the app** (without steps 1 and 2 first): put Airhand.app back where it was (for example drag it from the downloaded `.dmg` into the Applications folder again), open it, and start again from step 1. macOS still remembers the login item, and turning it off in the menu removes both entries, under "Open at Login" and "App Background Activity". If you'd rather not install it again, remove them by hand: select Airhand under "Open at Login" in Login Items and click "−", do the same in Privacy & Security → Screen & System Audio Recording / Accessibility, then do step 3.
+**Already deleted the app** (without steps 1 and 2 first): put Airhand.app back where it was (for example drag it from the downloaded `.dmg` into the Applications folder again), open it, and start again from step 1. macOS still remembers the login item, and turning it off in the menu removes both entries, under "Open at Login" and "App Background Activity". If you'd rather not install it again, remove them by hand: select Airhand under "Open at Login" in Login Items and click "−", do the same in Privacy & Security → Screen & System Audio Recording / Accessibility, then follow steps 3 and 4.
 
 **What Airhand can't remove**: the system protects these two.
 
@@ -214,7 +216,7 @@ While clipboard sync is on (the clipboard button in the toolbar, on by default),
 - Shortcuts and symbolic links inside a folder don't bring along what they point to
 - **Web console**: press Ctrl+V (⌘V on a Mac) on the remote screen to paste files copied locally, or drop files and folders on it. When the other side copies files a banner appears above the picture: click **Download** to fetch them (Chrome / Edge let you pick a folder to save into)
 - **Android**: files copied on the other side go on the phone's clipboard, so you can paste them in other apps, and the notification can **Save to Downloads** (the only way for folders). To send files from the phone, use **Share → Send to the other device** in a file manager or the gallery, then paste on the other side
-- Files can't be pasted onto a Mac yet (files copied on a Mac can be pasted on the other side)
+- **Receiving on a Mac**: copy files or folders on Windows or another connected device, then open **Airhand → Receive files to…** in the Mac menu bar. Pick a folder and click **Receive**. You can cancel from the same menu. Each top-level item appears once complete. Name conflicts get a numbered suffix. Files copied on the Mac can still be pasted in the other device’s file manager.
 
 See [Known limitations](limitations.md) for the details.
 

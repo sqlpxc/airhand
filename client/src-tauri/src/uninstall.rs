@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSModalPanelWindowLevel};
+use objc2_app_kit::{NSAlert, NSAlertStyle};
 use objc2_foundation::{NSFileManager, NSString, NSURL};
 use tracing::{info, warn};
 
@@ -42,8 +42,8 @@ pub fn confirm(mtm: MainThreadMarker) -> bool {
         "Uninstall Airhand?"
     )));
     alert.setInformativeText(&NSString::from_str(&tr!(
-        "会移除 Airhand 虚拟麦克风，关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存、记下的菜单栏图标设置，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。",
-        "This removes Airhand Microphone, turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches and menu bar icon settings macOS keeps for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected."
+        "会移除 Airhand 虚拟麦克风，关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存、记下的菜单栏图标设置，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。已接收的文件会保留。",
+        "This removes Airhand Microphone, turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches and menu bar icon settings macOS keeps for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected. Files you have received will be kept."
     )));
     // 第一个按钮是默认按钮（回车）：默认是"取消"，不会一按回车就卸载了
     alert.addButtonWithTitle(&NSString::from_str(&tr!("取消", "Cancel")));
@@ -89,9 +89,7 @@ fn show(mtm: MainThreadMarker, alert: &NSAlert) -> objc2_app_kit::NSModalRespons
     // 平时只有菜单栏图标（没有窗口、不在程序坞里）：先把自己带到前面。macOS 14 起"激活"是协商式的，
     // 系统可能不让（例如用户刚才没有点过本程序），所以再把对话框放到模态面板那一层，
     // 不会躲在别的程序的窗口后面（实测：只靠激活的话，对话框可能被挡在后面，看起来像没反应）
-    #[allow(deprecated)]
-    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
-    alert.window().setLevel(NSModalPanelWindowLevel);
+    crate::tray::front_panel(mtm, &alert.window());
     alert.runModal()
 }
 
@@ -104,6 +102,14 @@ pub fn run(plan: &Plan) -> Vec<String> {
             problems.push(what);
         }
     };
+    // Stop file writes before resetting access to the chosen folder or deleting the recovery link.
+    if let Err(e) = crate::clipfiles::macos::shutdown() {
+        let what = tr!(
+            "清理未完成的文件接收（{e}）",
+            "Clean up the incomplete file transfer ({e})"
+        );
+        step(what, Err(e.to_string()));
+    }
     // Join the publisher before resetting permissions or deleting the bundle, including when
     // a controller still holds its microphone lease. Also sweeps objects left by a forced quit.
     step(

@@ -4,90 +4,110 @@
 //! |---|---|
 //! | Windows | "虚拟文件"（`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`，和远程桌面一样）：资源管理器粘贴时才要每个文件的内容，读多少取多少，进度和取消都是资源管理器自己的（`windows`） |
 //! | Linux | 一个 FUSE 文件系统，剪贴板里放它里面的路径：文件管理器读到哪里才取到哪里（`linux`）；没有 FUSE 时不放 |
-//! | macOS | 还不支持（要先在 Mac 上验证"按需提供加占位文件"的做法）：不放，对方照样等得到"放好了" |
+//! | macOS | 菜单栏保留最新的清单；选“接收文件到…”并选定文件夹后才传（`macos`） |
 //!
 //! 对方的名字在本机不一定合法（Linux 上可以有 `:`、`?`，Windows 不区分大小写……）：放进剪贴板之前按本机的规矩改
 //! （[`local_names`]），改不了的（路径太长）跳过；链接本机表示不了的也跳过（见 `airhand_proto::files` 的"链接"）。
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(windows)]
 pub mod windows;
 
-use std::sync::Arc;
+use airhand_link::files::RemoteOffer;
+use airhand_proto::files::{FileEntry, FileKind};
 
-use airhand_link::files::{RemoteFile, RemoteOffer};
-use airhand_proto::files::{FileEntry, FileError, FileKind};
+#[cfg(any(windows, target_os = "linux"))]
+pub use blocking::{Source, SourceFile, apply_source};
 
-/// 对方复制的文件从哪里取：一般就是会话里的 [`RemoteOffer`]；Windows 服务里的被控端（SYSTEM）把它交给托盘
-/// （登录的用户）放进剪贴板，托盘经管道向被控端取（见 `winsvc::clip`）。方法都是阻塞的
-pub trait Source: Send + Sync + 'static {
-    /// 用户在对方那里选中的那几项
-    fn items(&self) -> Vec<FileEntry>;
-    /// 列出目录（见 [`RemoteOffer::list`]）
-    fn list(&self, path: &[String], recursive: bool) -> Result<Vec<FileEntry>, FileError>;
-    /// 打开文件（读的时候才去取）
-    fn open(&self, path: Vec<String>, size: u64, mtime: Option<u64>) -> Box<dyn SourceFile>;
-    /// 放进剪贴板了（放不了也要说）
-    fn ready(&self);
-    /// 同一个公告（拿掉时认它）
-    fn key(&self) -> u64;
-}
+// Windows and FUSE supply files through blocking callbacks. The Mac menu owns an async RemoteOffer.
+#[cfg(any(windows, target_os = "linux"))]
+mod blocking {
+    use super::*;
+    use airhand_link::files::RemoteFile;
+    use airhand_proto::files::FileError;
+    use std::sync::Arc;
 
-/// 对方的一个文件（见 [`RemoteFile`]）。方法都是阻塞的
-#[cfg_attr(not(windows), allow(dead_code))]
-pub trait SourceFile: Send {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError>;
-    fn seek(&mut self, pos: u64);
-    fn position(&self) -> u64;
-    fn size(&self) -> u64;
-    fn name(&self) -> String;
-}
-
-/// 会话里的公告：直接向对方取
-struct Offer(RemoteOffer);
-
-impl Source for Offer {
-    fn items(&self) -> Vec<FileEntry> {
-        self.0.items().to_vec()
+    /// 对方复制的文件从哪里取：一般就是会话里的 [`RemoteOffer`]；Windows 服务里的被控端（SYSTEM）把它交给托盘
+    /// （登录的用户）放进剪贴板，托盘经管道向被控端取（见 `winsvc::clip`）。方法都是阻塞的
+    pub trait Source: Send + Sync + 'static {
+        /// 用户在对方那里选中的那几项
+        fn items(&self) -> Vec<FileEntry>;
+        /// 列出目录（见 [`RemoteOffer::list`]）
+        fn list(&self, path: &[String], recursive: bool) -> Result<Vec<FileEntry>, FileError>;
+        /// 打开文件（读的时候才去取）
+        fn open(&self, path: Vec<String>, size: u64, mtime: Option<u64>) -> Box<dyn SourceFile>;
+        /// 放进剪贴板了（放不了也要说）
+        fn ready(&self);
+        /// 同一个公告（拿掉时认它）
+        fn key(&self) -> u64;
     }
 
-    fn list(&self, path: &[String], recursive: bool) -> Result<Vec<FileEntry>, FileError> {
-        self.0.list_blocking(path, recursive)
+    /// 对方的一个文件（见 [`RemoteFile`]）。方法都是阻塞的
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub trait SourceFile: Send {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError>;
+        fn seek(&mut self, pos: u64);
+        fn position(&self) -> u64;
+        fn size(&self) -> u64;
+        fn name(&self) -> String;
     }
 
-    fn open(&self, path: Vec<String>, size: u64, mtime: Option<u64>) -> Box<dyn SourceFile> {
-        Box::new(self.0.open(path, size, mtime))
+    /// 会话里的公告：直接向对方取
+    pub(super) struct Offer(pub(super) RemoteOffer);
+
+    impl Source for Offer {
+        fn items(&self) -> Vec<FileEntry> {
+            self.0.items().to_vec()
+        }
+
+        fn list(&self, path: &[String], recursive: bool) -> Result<Vec<FileEntry>, FileError> {
+            self.0.list_blocking(path, recursive)
+        }
+
+        fn open(&self, path: Vec<String>, size: u64, mtime: Option<u64>) -> Box<dyn SourceFile> {
+            Box::new(self.0.open(path, size, mtime))
+        }
+
+        fn ready(&self) {
+            self.0.ready();
+        }
+
+        fn key(&self) -> u64 {
+            offer_key(&self.0)
+        }
     }
 
-    fn ready(&self) {
-        self.0.ready();
+    impl SourceFile for RemoteFile {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
+            self.read_blocking(buf)
+        }
+
+        fn seek(&mut self, pos: u64) {
+            RemoteFile::seek(self, pos);
+        }
+
+        fn position(&self) -> u64 {
+            RemoteFile::position(self)
+        }
+
+        fn size(&self) -> u64 {
+            RemoteFile::size(self)
+        }
+
+        fn name(&self) -> String {
+            RemoteFile::name(self).to_string()
+        }
     }
 
-    fn key(&self) -> u64 {
-        offer_key(&self.0)
-    }
-}
-
-impl SourceFile for RemoteFile {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
-        self.read_blocking(buf)
-    }
-
-    fn seek(&mut self, pos: u64) {
-        RemoteFile::seek(self, pos);
-    }
-
-    fn position(&self) -> u64 {
-        RemoteFile::position(self)
-    }
-
-    fn size(&self) -> u64 {
-        RemoteFile::size(self)
-    }
-
-    fn name(&self) -> String {
-        RemoteFile::name(self).to_string()
+    /// 同 [`apply`]，从任意的 [`Source`] 取
+    pub fn apply_source(source: Arc<dyn Source>) {
+        #[cfg(windows)]
+        windows::apply(source);
+        #[cfg(target_os = "linux")]
+        linux::apply(source);
     }
 }
 
@@ -99,21 +119,16 @@ pub fn offer_key(offer: &RemoteOffer) -> u64 {
 /// 对方复制了文件：放进本机剪贴板（之前放的随之作废）。放好了（放不了也一样）告诉对方。
 /// Windows 服务里的被控端是 SYSTEM：资源管理器（登录的用户）调不了它的数据对象，交给托盘放（见 `winsvc::clip`）
 pub fn apply(offer: RemoteOffer) {
+    #[cfg(target_os = "macos")]
+    macos::apply(offer);
     #[cfg(windows)]
     if crate::winsvc::is_agent() {
         return crate::winsvc::clip::place(offer);
     }
-    apply_source(Arc::new(Offer(offer)));
-}
-
-/// 同 [`apply`]，从任意的 [`Source`] 取
-pub fn apply_source(source: Arc<dyn Source>) {
-    #[cfg(windows)]
-    windows::apply(source);
-    #[cfg(target_os = "linux")]
-    linux::apply(source);
-    #[cfg(not(any(windows, target_os = "linux")))]
-    source.ready();
+    #[cfg(any(windows, target_os = "linux"))]
+    apply_source(std::sync::Arc::new(blocking::Offer(offer)));
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    offer.ready();
 }
 
 /// 会话结束了：本机剪贴板里还是它的文件的话拿掉（之后再粘贴也取不到了）
@@ -125,13 +140,15 @@ pub fn withdraw(offer: &RemoteOffer) {
     withdraw_key(offer_key(offer));
 }
 
-/// 同 [`withdraw`]，按 [`Source::key`]
+/// 同 [`withdraw`]，按公告编号
 pub fn withdraw_key(key: u64) {
     #[cfg(windows)]
     windows::withdraw(key);
     #[cfg(target_os = "linux")]
     linux::withdraw(key);
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    macos::withdraw(key);
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let _ = key;
 }
 

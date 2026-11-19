@@ -78,6 +78,7 @@ macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身。除
 
 | 项目 | 位置 | 说明 |
 |---|---|---|
+| 未完成的文件接收 | 所选文件夹下的 `.airhand-receive-<随机编号>`，配置目录里对应的 `pending-receive-<随机编号>` 指向它 | 取消、退出或卸载会清理临时内容，保留已接收的项目。强制退出后下次启动会重试。若接收时拔掉了外置盘，请先重新接上。 |
 | Airhand Microphone | Core Audio 录音设备和对应的音频 tap | 退出时移除；若曾强制退出，下次启动或从菜单卸载时会清理当前用户的残留 |
 | 登录时自动启动 | “系统设置 → 通用 → 登录项”（有的系统版本叫“登录项与扩展”）里“登录时打开”和“后台 App 活动”两处 | 要由 Airhand 自己注销：先删掉 App 的话，两处都会留下一个失效的 Airhand |
 | 权限记录 | “系统设置 → 隐私与安全性”里的“屏幕与系统录音”“辅助功能”等 | 要在 App 还在的时候清除，App 删掉之后系统就找不到它了 |
@@ -98,7 +99,8 @@ macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身。除
    ```
 
    看到 `Successfully reset All approval status for app.airhand.client` 就好了。如果提示 `No such bundle identifier`，说明 App 已经删掉了，见下面的“已经直接删掉了 App”。
-3. 删除其余几样和程序：
+3. 若上次接收文件时强制退出，先打开 Airhand 一次让它清理未完成的传输，再退出。手动清理时可用 `find "$HOME/Library/Application Support/app.airhand.client" -maxdepth 1 -type l -name 'pending-receive-*' -exec readlink {} \;` 查看此次传输的隐藏临时目录，可在访达里前往并删除该临时目录。保留同级的已接收文件。
+4. 删除其余几样和程序：
 
    ```bash
    rm -rf ~/Library/Application\ Support/app.airhand.client
@@ -118,7 +120,7 @@ find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxde
 find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' 2>/dev/null
 ```
 
-**已经直接删掉了 App**（没有先做第 1、2 步）：把 Airhand.app 重新放回原来的位置（例如从下载的 `.dmg` 里再拖进“应用程序”文件夹），打开它，再从第 1 步做起。系统还记着原来的登录项，在菜单里关掉就会把“登录时打开”和“后台 App 活动”里的两处一起删掉。不想再装一次的话也可以手动删：“登录项”里在“登录时打开”中选中 Airhand 点“−”，“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里选中 Airhand 点“−”，然后做第 3 步。
+**已经直接删掉了 App**（没有先做第 1、2 步）：把 Airhand.app 重新放回原来的位置（例如从下载的 `.dmg` 里再拖进“应用程序”文件夹），打开它，再从第 1 步做起。系统还记着原来的登录项，在菜单里关掉就会把“登录时打开”和“后台 App 活动”里的两处一起删掉。不想再装一次的话也可以手动删：“登录项”里在“登录时打开”中选中 Airhand 点“−”，“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里选中 Airhand 点“−”，然后做第 3、4 步。
 
 **Airhand 删不掉的**：下面两样受系统保护。
 
@@ -214,7 +216,7 @@ rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/airhand"  # 删除当前用户的配�
 - 文件夹里的快捷方式、符号链接不会把它指向的东西带过去
 - **网页控制台**：在远程画面上按 Ctrl+V（Mac 上 ⌘V）把本机复制的文件粘贴过去，也可以把文件、文件夹拖到画面上；对方复制了文件时画面上方出现提示，点**下载**取下来（Chrome / Edge 可以选存到哪个文件夹）
 - **Android**：对方复制的文件进手机的剪贴板，可以在别的应用里粘贴；通知里可以**保存到下载**（文件夹只能这样）。手机上的文件在文件管理器、相册里**分享 → 发给对方**，再到对方那里粘贴
-- 对方是 Mac 时还不能把文件粘贴到 Mac 上（Mac 上复制的文件可以粘贴到对方那里）
+- **Mac 接收文件**：连接期间在 Windows 等对端复制文件或文件夹，在 Mac 屏幕顶部点 **Airhand → 接收文件到…**，选好目标文件夹再点**接收**。传输期间可在同一菜单取消。每个顶层项目完整接收后才显示，同名项目自动编号。Mac 上复制的文件仍可到对方的文件管理器粘贴。
 
 具体的限制见[已知限制](limitations.zh-CN.md)。
 

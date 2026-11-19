@@ -128,7 +128,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 # NSAlert 等：卸载时的确认对话框（src/uninstall.rs），NSApplication、NSButton 这些 Tauri 本来就打开了
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "std", "NSAlert", "NSApplication", "NSButton", "NSColor", "NSControl", "NSCursor", "NSGraphics", "NSGraphicsContext",
-  "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation",
+  "NSImage", "NSImageRep", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSResponder", "NSSavePanel", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation",
   "objc2-core-graphics",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
@@ -160,6 +160,9 @@ objc2-video-toolbox = { version = "0.3", default-features = false, features = [
   "std", "VTBase", "VTCompressionProperties", "VTCompressionSession", "VTErrors", "VTSession",
   "VTVideoEncoderList", "objc2-core-media", "objc2-core-video",
 ] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

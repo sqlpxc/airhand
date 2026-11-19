@@ -313,6 +313,10 @@ impl ClipSync {
         if text.len() > MAX_CLIPBOARD_TEXT {
             return;
         }
+        #[cfg(target_os = "macos")]
+        if let Some(offer) = self.applied.lock().unwrap().take() {
+            crate::clipfiles::withdraw(&offer);
+        }
         let writer = writer();
         if !writer.busy() && self.synced.load(Ordering::Acquire) == hash(&text) {
             return;
