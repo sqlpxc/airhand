@@ -1109,6 +1109,29 @@ kbd {
 .display-menu {
   width: 340px;
 }
+/* 显示器菜单的一行：选它 + 右边放到单独窗口里 / 放回来的按钮 */
+.dd-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.dd-row > .dd-item {
+  flex: 1;
+  min-width: 0;
+}
+.dd-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--text-2);
+}
+.dd-icon:hover {
+  color: var(--text);
+  background: var(--hover-2);
+}
 .dd-main {
   min-width: 0;
   display: flex;
@@ -1971,6 +1994,88 @@ kbd {
 }
 .session-view.immersive .toolbar.revealed,
 .session-view.immersive:has(.popover) .toolbar {
+  transform: translate(-50%, 0);
+}
+
+/* ───────── 弹出窗口（对方的一个显示器放在单独的窗口里，见 lib/popout.ts、components/PopoutView.tsx） ─────────
+ * 画面铺满窗口（平时让出顶上的工具栏），工具栏和提示在上面一层（.popout-ui，不挡画面上的鼠标）。
+ * 全屏时和主窗口一样：工具栏悬浮在顶端，鼠标碰到顶端时出现 */
+.popout {
+  --popout-bar-h: 40px;
+  position: fixed;
+  inset: 0;
+  background: #05060a;
+}
+.popout.immersive {
+  background: #000;
+}
+.popout-stage {
+  position: absolute;
+  inset: var(--popout-bar-h) 0 0 0;
+}
+.popout.immersive .popout-stage {
+  top: 0;
+}
+.popout-ui {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+.popout-ui > :not(.lock-hint) {
+  pointer-events: auto;
+}
+.popout:not(.immersive) .popout-ui .stage-overlay {
+  top: var(--popout-bar-h);
+}
+.popout-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--popout-bar-h);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 6px 0 14px;
+  background: rgba(12, 14, 22, 0.92);
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  z-index: 5;
+}
+.popout-title {
+  flex: 0 1 auto;
+  font-weight: 600;
+}
+.popout-stats {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+.popout.immersive .popout-bar {
+  top: 8px;
+  left: 50%;
+  right: auto;
+  width: min(620px, calc(100% - 40px));
+  height: 44px;
+  border: 1px solid var(--edge-2);
+  border-radius: 14px;
+  background: var(--pop);
+  -webkit-backdrop-filter: var(--blur);
+  backdrop-filter: var(--blur);
+  box-shadow:
+    var(--shadow),
+    var(--sheen);
+  transform: translate(-50%, calc(-100% - 16px));
+  transition: transform 0.2s ease;
+}
+.popout.immersive .popout-bar.revealed {
   transform: translate(-50%, 0);
 }
 

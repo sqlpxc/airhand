@@ -337,6 +337,15 @@ export type Command =
   | { cmd: "ack"; sid: number; seq: number; stream?: number }
   | { cmd: "disconnect"; sid: number };
 
+/** 桌面版的弹出窗口（Tauri 窗口，按 label 找到它，见 src-tauri/src/popout.rs） */
+export interface PopoutFrames {
+  setFullscreen(label: string, on: boolean): Promise<void>;
+  isFullscreen(label: string): Promise<boolean>;
+  /** 把窗口拿到前面（最小化了的先还原） */
+  focus(label: string): Promise<void>;
+  close(label: string): Promise<void>;
+}
+
 /** 控制台与控制端服务之间的通道。会话的部分两种运行方式共用（console.ts 的 ConsoleLink） */
 export interface Backend {
   /** desktop = 桌面版（Tauri 窗口）；web = 网页版（浏览器） */
@@ -374,6 +383,11 @@ export interface Backend {
   setWindowFullscreen(on: boolean): Promise<void>;
   /** 窗口退出了全屏（例如按了系统快捷键） */
   onWindowFullscreenExit(cb: () => void): () => void;
+  /**
+   * 弹出窗口（把对方的一个显示器放到单独的窗口里，见 popout.ts）的全屏、关闭：桌面版按窗口的 label 由 Rust 处理
+   * （网页全屏不会让 WebView2 的窗口变大，window.close 在 macOS、Linux 上关不掉窗口）；网页版没有，用浏览器自己的
+   */
+  readonly popouts?: PopoutFrames;
   /** 我的设备（桌面版：config.toml 里的）。返回 null 表示不能保存（网页版：只在本页面的内存里） */
   loadDevices(): Promise<SavedDevice[] | null>;
   /** 保存整个列表 */

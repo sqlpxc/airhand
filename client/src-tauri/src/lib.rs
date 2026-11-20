@@ -25,6 +25,7 @@ mod fullscreen;
 pub mod host;
 #[cfg(target_os = "macos")]
 mod login_item;
+mod popout;
 mod single_instance;
 pub mod status;
 mod sysinfo;
@@ -223,8 +224,11 @@ fn open_console(app: &AppHandle) {
     let app = app.clone();
     // Windows 上在主线程同步创建 WebView2 可能死锁，放到异步任务中创建
     tauri::async_runtime::spawn(async move {
+        let handle = app.clone();
         let builder =
-            WebviewWindowBuilder::new(&app, CONSOLE, WebviewUrl::App("index.html".into()));
+            WebviewWindowBuilder::new(&app, CONSOLE, WebviewUrl::App("index.html".into()))
+                // 把对方的一个显示器放到单独的窗口里（见 popout）
+                .on_new_window(move |url, features| popout::on_new_window(&handle, url, features));
         // WebView2 / WebKitGTK 需要一个数据目录（放在临时目录里，用完删除，见 ephemeral）；
         // macOS 的 WKWebView 没有这个概念，隐私模式下不保存网页数据（WebKit 自己在系统临时目录里建的目录见 ephemeral）
         #[cfg(not(target_os = "macos"))]
@@ -314,6 +318,8 @@ fn on_console_destroyed(app: &AppHandle) {
     if !EXITING.load(Ordering::Acquire) {
         switch_services(app, Mode::Host);
     }
+    // 弹出窗口里的画面是控制台画的，控制台没了它们也就没用了
+    popout::close_all(app);
     #[cfg(target_os = "macos")]
     {
         // 全屏中被关掉时菜单栏和程序坞还藏着
@@ -556,6 +562,43 @@ fn window_fullscreen(window: tauri::WebviewWindow) -> Result<bool, Problem> {
     fullscreen::is_on(&window).map_err(Problem::failed)
 }
 
+/// 弹出窗口进入 / 退出全屏（控制台调用，按 label 找窗口，见 [`popout`]）
+#[tauri::command]
+fn popout_set_fullscreen(app: AppHandle, label: String, on: bool) -> Result<(), Problem> {
+    match popout::window(&app, &label) {
+        Some(w) => w.set_fullscreen(on).map_err(Problem::failed),
+        None => Ok(()),
+    }
+}
+
+/// 弹出窗口是不是全屏（已经关掉了的算不是）
+#[tauri::command]
+fn popout_fullscreen(app: AppHandle, label: String) -> Result<bool, Problem> {
+    match popout::window(&app, &label) {
+        Some(w) => w.is_fullscreen().map_err(Problem::failed),
+        None => Ok(false),
+    }
+}
+
+/// 把弹出窗口拿到前面（最小化了的先还原）
+#[tauri::command]
+fn popout_focus(app: AppHandle, label: String) -> Result<(), Problem> {
+    if let Some(w) = popout::window(&app, &label) {
+        let _ = w.unminimize();
+        w.set_focus().map_err(Problem::failed)?;
+    }
+    Ok(())
+}
+
+/// 关掉弹出窗口
+#[tauri::command]
+fn popout_close(app: AppHandle, label: String) -> Result<(), Problem> {
+    match popout::window(&app, &label) {
+        Some(w) => w.destroy().map_err(Problem::failed),
+        None => Ok(()),
+    }
+}
+
 #[tauri::command]
 async fn switch_to_host(app: AppHandle) -> Result<(), Problem> {
     let a = app.clone();
@@ -628,6 +671,10 @@ pub fn run() {
             clipboard_text,
             set_fullscreen,
             window_fullscreen,
+            popout_set_fullscreen,
+            popout_fullscreen,
+            popout_focus,
+            popout_close,
             switch_to_host,
             devices_load,
             devices_save,
@@ -712,6 +759,7 @@ pub fn run() {
                 sv.host = None;
                 sv.controller = None;
             }
+            popout::close_all(app);
             if let Some(w) = app.get_webview_window(CONSOLE) {
                 let _ = w.destroy();
             }

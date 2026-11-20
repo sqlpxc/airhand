@@ -6,7 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { Backend, SavedDevice, WindowFrame } from "../api";
+import type { Backend, PopoutFrames, SavedDevice, WindowFrame } from "../api";
 import { ConsoleLink } from "../console";
 import type { Lang } from "../i18n";
 
@@ -36,9 +36,18 @@ function windowFrame(): WindowFrame {
   };
 }
 
+/** 弹出窗口（见 lib/popout.ts、src-tauri/src/popout.rs） */
+const popoutFrames: PopoutFrames = {
+  setFullscreen: (label, on) => invoke<void>("popout_set_fullscreen", { label, on }),
+  isFullscreen: (label) => invoke<boolean>("popout_fullscreen", { label }),
+  focus: (label) => invoke<void>("popout_focus", { label }),
+  close: (label) => invoke<void>("popout_close", { label }),
+};
+
 class DesktopConsole extends ConsoleLink implements Backend {
   readonly kind = "desktop" as const;
   readonly frame = windowFrame();
+  readonly popouts = popoutFrames;
 
   constructor() {
     super(() => invoke<string>("console_url"));

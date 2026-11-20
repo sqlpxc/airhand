@@ -39,6 +39,9 @@
 //
 // 同时看对方的好几个显示器（多屏）时，画面是几个 canvas 拼在一起的：事件挂在包着它们的元素上，绝对坐标是指针所在
 // （落在缝里时是最近）的那一路画面上的位置，带着第几路（见 screens.ts 的 hitTest）。
+//
+// 画面可能在主窗口打开的弹出窗口里（一个显示器单独一个窗口，见 popout.ts）：那里的画面另有一个 RemoteInput。
+// 指针锁定、设备像素比例都按画面所在的窗口算（element.ownerDocument），不是主窗口的。
 import type { InputEvent, MouseButton, MouseMode } from "./api";
 import { isPasteKey } from "./files.ts";
 
@@ -93,6 +96,8 @@ export type Locate = (clientX: number, clientY: number) => { x: number; y: numbe
 export class RemoteInput {
   /** 画面（几路画面拼在一起时是包着它们的元素）：事件挂在它上面，锁定指针也是它 */
   private canvas: HTMLElement;
+  /** 画面所在的网页（主窗口的，或者弹出窗口的）：指针锁定在它上面；测试里没有时为 null */
+  private readonly doc: Document | null;
   private locate: Locate | null;
   private send: (events: InputEvent[]) => void;
   private connected: () => boolean;
@@ -161,6 +166,7 @@ export class RemoteInput {
   constructor(canvas: HTMLElement, connected: () => boolean, send: (events: InputEvent[]) => void, locate?: Locate) {
     this.canvas = canvas; this.connected = connected; this.send = send;
     this.locate = locate ?? null;
+    this.doc = canvas.ownerDocument ?? (typeof document !== "undefined" ? document : null);
     this.bind();
   }
 
@@ -208,7 +214,7 @@ export class RemoteInput {
 
   /** 本机指针锁定在画面上了 */
   get locked(): boolean {
-    return typeof document !== "undefined" && document.pointerLockElement === this.canvas;
+    return this.doc?.pointerLockElement === this.canvas;
   }
 
   /** 鼠标现在发相对移动 */
@@ -376,7 +382,7 @@ export class RemoteInput {
   private unlock() {
     if (!this.locked) return;
     this.unlocking = true;
-    document.exitPointerLock();
+    this.doc?.exitPointerLock();
   }
 
   private onLockChange() {
@@ -392,8 +398,9 @@ export class RemoteInput {
 
   /** 相对移动：鼠标移动了多少 */
   private moveBy(e: PointerEvent) {
-    // 锁定时拿到的是原始计数；否则是 CSS 像素，换算成设备像素（约等于被控端的像素）
-    const scale = this.locked && this.raw ? 1 : (typeof devicePixelRatio === "number" ? devicePixelRatio : 1) || 1;
+    // 锁定时拿到的是原始计数；否则是 CSS 像素，换算成设备像素（约等于被控端的像素；按画面所在的窗口算）
+    const dpr = this.doc?.defaultView?.devicePixelRatio ?? (typeof devicePixelRatio === "number" ? devicePixelRatio : 1);
+    const scale = this.locked && this.raw ? 1 : dpr || 1;
     this.frac.x += e.movementX * scale;
     this.frac.y += e.movementY * scale;
     const dx = Math.trunc(this.frac.x), dy = Math.trunc(this.frac.y);
@@ -469,9 +476,10 @@ export class RemoteInput {
     const signal = this.abort.signal;
     const on = <K extends keyof HTMLElementEventMap>(name: K, fn: (e: HTMLElementEventMap[K]) => void, opts?: AddEventListenerOptions) =>
       c.addEventListener(name, fn as EventListener, { ...opts, signal });
-    if (typeof document !== "undefined") {
-      document.addEventListener("pointerlockchange", () => this.onLockChange(), { signal });
-      document.addEventListener("pointerlockerror", () => {
+    const doc = this.doc;
+    if (doc) {
+      doc.addEventListener("pointerlockchange", () => this.onLockChange(), { signal });
+      doc.addEventListener("pointerlockerror", () => {
         this.lockPending = false;
         this.lockRetryAt = performance.now() + LOCK_RETRY_MS;
         this.onModeChange?.();

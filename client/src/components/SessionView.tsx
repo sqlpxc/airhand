@@ -20,6 +20,8 @@ import {
   IconMonitor,
   IconMouse,
   IconPointer,
+  IconPopIn,
+  IconPopOut,
   IconPower,
   IconRefresh,
   IconShrink,
@@ -109,9 +111,10 @@ const KEEP_NEAR = 32;
 
 /**
  * 全屏时悬浮工具栏的显示 / 收起。不用 CSS :hover：macOS 的系统菜单栏盖住顶端时网页就不算悬停了，
- * 工具栏会马上收起。这里只在鼠标明确离开（在网页里移到了工具栏附近以外）时才收起
+ * 工具栏会马上收起。这里只在鼠标明确离开（在网页里移到了工具栏附近以外）时才收起。
+ * `win`：工具栏在哪个窗口里（弹出窗口的工具栏也用它，见 PopoutView）
  */
-function useToolbarReveal(active: boolean, toolbar: RefObject<HTMLElement | null>) {
+export function useToolbarReveal(active: boolean, toolbar: RefObject<HTMLElement | null>, win: Window = window) {
   // 全屏中切换到别的连接时会重新挂载，这时鼠标还在工具栏上：先显示
   const [revealed, setRevealed] = useState(active);
   const shown = useRef(active);
@@ -137,15 +140,16 @@ function useToolbarReveal(active: boolean, toolbar: RefObject<HTMLElement | null
       if (e.relatedTarget) return; // 还在网页里
       set(e.clientY <= LEAVE_TOP && e.buttons === 0);
     };
-    window.addEventListener("pointermove", onPointer);
-    window.addEventListener("pointerdown", onPointer);
-    document.addEventListener("mouseout", onLeave);
+    const doc = win.document;
+    win.addEventListener("pointermove", onPointer);
+    win.addEventListener("pointerdown", onPointer);
+    doc.addEventListener("mouseout", onLeave);
     return () => {
-      window.removeEventListener("pointermove", onPointer);
-      window.removeEventListener("pointerdown", onPointer);
-      document.removeEventListener("mouseout", onLeave);
+      win.removeEventListener("pointermove", onPointer);
+      win.removeEventListener("pointerdown", onPointer);
+      doc.removeEventListener("mouseout", onLeave);
     };
-  }, [active, toolbar]);
+  }, [active, toolbar, win]);
   return revealed;
 }
 
@@ -300,26 +304,54 @@ export function SessionView({ s }: { s: RemoteSession }) {
               </button>
               {menu === "display" && (
                 <Dropdown onClose={closeMenu} className="display-menu">
-                  {s.displays.map((d) => (
-                    <button
-                      key={d.index}
-                      className={`dd-item ${(showingAll ? s.shown.includes(d.index) : d.index === s.currentDisplay) ? "active" : ""}`}
-                      onClick={() => {
-                        // 点一个显示器：只看它
-                        s.selectDisplay(d.index);
-                        closeMenu();
-                        s.focus();
-                      }}
-                    >
-                      <span>
-                        {t("session.display", { n: d.index + 1 })}
-                        {d.primary ? t("session.primary") : ""}
-                      </span>
-                      <span className="muted small">
-                        {d.width}×{d.height}
-                      </span>
-                    </button>
-                  ))}
+                  {s.displays.map((d) => {
+                    const popped = s.isPopped(d.index);
+                    const canPop = s.canPopOut(d.index);
+                    return (
+                      <div key={d.index} className="dd-row">
+                        <button
+                          className={`dd-item ${(showingAll ? s.shown.includes(d.index) : d.index === s.currentDisplay) ? "active" : ""}`}
+                          onClick={() => {
+                            // 点一个显示器：只看它；它在单独的窗口里时切到那个窗口
+                            if (popped) {
+                              setMenu(null);
+                              s.focusPopout(d.index);
+                              return;
+                            }
+                            s.selectDisplay(d.index);
+                            closeMenu();
+                          }}
+                        >
+                          <span>
+                            {t("session.display", { n: d.index + 1 })}
+                            {d.primary ? t("session.primary") : ""}
+                            {popped && <span className="muted small block">{t("session.inWindow")}</span>}
+                          </span>
+                          <span className="muted small">
+                            {d.width}×{d.height}
+                          </span>
+                        </button>
+                        {(popped || canPop) && (
+                          // 放到单独的窗口里 / 放回来（要在点击里开窗口：浏览器只在用户操作里让开）
+                          <button
+                            className="dd-icon"
+                            title={popped ? t("session.popIn") : t("session.popOut")}
+                            onClick={() => {
+                              if (popped) {
+                                s.dockDisplay(d.index);
+                                closeMenu();
+                              } else {
+                                setMenu(null);
+                                if (!s.popOut(d.index)) setToast(t("session.popOutFailed"));
+                              }
+                            }}
+                          >
+                            {popped ? <IconPopIn size={16} /> : <IconPopOut size={16} />}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                   {s.canShowAll && (
                     <>
                       <div className="dd-sep" />
@@ -341,6 +373,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
                           }}
                         />
                       </label>
+                      <div className="dd-foot muted small">{t("session.popOutHint")}</div>
                     </>
                   )}
                 </Dropdown>

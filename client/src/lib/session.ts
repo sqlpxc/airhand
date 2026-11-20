@@ -11,6 +11,8 @@
 // * 画面只缩放一次：按画面在窗口里显示的大小请求分辨率，收到后按 1:1 显示（见 fit.ts）；
 // * 多屏（可选，默认只看一个显示器）：同时看对方的好几个显示器，每个显示器一路画面、一个 canvas，
 //   按它们在对方桌面上的位置拼在一起（见 screens.ts），鼠标在哪一块上就操作哪个显示器；
+// * 弹出窗口（可选）：多屏时可以把其中一个显示器放到单独的窗口里（本机也有好几个显示器时一个窗口放一个，各自全屏，
+//   见 popout.ts）。那一路画面的 canvas 换到那个窗口里，还是同一个 Worker 画；主窗口里拼的是剩下的几路，至少留一路；
 // * 画面增强（可选）：要放大时在 Worker 里用显卡放大、锐化，canvas 就是显示的大小（见 enhance.ts）；
 // * 只有当前正在查看的会话播放声音，其余会话通知被控端停止采集声音；
 // * 本机麦克风（可选，默认关）：也只发给当前正在查看的会话，被控端放进它的虚拟麦克风（见 mic.ts）；
@@ -50,6 +52,7 @@ import { store } from "./store";
 import { fitSize, viewMaxShort } from "./fit";
 import { renderPlan, type Area, type EnhanceLevel } from "./enhance";
 import { hitTest, layoutTiles, placeDisplays, type Rect } from "./screens";
+import { Popout } from "./popout";
 
 /** waiting = 对方掉线了，等它重新上线（服务器会通知，见 hostOnline） */
 export type SessionState = "connecting" | "live" | "reconnecting" | "waiting" | "closed";
@@ -77,6 +80,8 @@ export interface EncoderState {
 const BACKGROUND_FPS = 5;
 /** 一个会话最多同时看几个显示器（airhand_proto::MAX_STREAMS） */
 const MAX_STREAMS = 4;
+/** 一个光标形状按几种比例生成的 CSS 留着（主窗口和弹出窗口里的比例可能不一样） */
+const MADE_CURSORS = 4;
 /** 显示区域的大小停下来这么久才按新大小请求分辨率（拖动窗口边框时不要每一下都让对方重建编码器） */
 const VIEW_LIMIT_DELAY_MS = 400;
 const MAX_RETRIES = 30;
@@ -173,6 +178,11 @@ export class RemoteSession {
   private readonly view: MediaView;
   /** 每一路画面的 canvas（第 i 项是第 i 路，要看哪一路之前建好、交给 Worker） */
   private readonly canvases: HTMLCanvasElement[] = [];
+  /** 每一路画面的 canvas 在哪个窗口里（第 i 项是第 i 路；null = 主窗口，见 placeCanvases） */
+  private readonly canvasHome: (Popout | null)[] = [];
+  /** 放到单独窗口里的显示器（按名字：对方插拔显示器时序号可能变）。正在打开、还没准备好的在 opening 里 */
+  private readonly popouts = new Map<string, Detached>();
+  private readonly opening = new Map<string, Popout>();
   /** 每一路画面的大小（像素） */
   private frames: { w: number; h: number }[] = [{ w: 16, h: 9 }];
   /**
@@ -243,7 +253,8 @@ export class RemoteSession {
   private cursorVisible = true;
   /** 被控端的光标已经画在画面里了（软件光标）：鼠标照常用绝对坐标，本地光标显不显示看设置（store 的 localCursor） */
   private cursorInFrame = false;
-  private cursorCss = "default";
+  /** 每个画面（主窗口的、弹出窗口的）现在的 CSS cursor */
+  private cursorCss = new WeakMap<object, string>();
 
   /**
    * `saved`：我的设备里记着的这台电脑。带着上次的重连凭证连，对方不在线时等它上线（见 [`open`]），
@@ -268,7 +279,9 @@ export class RemoteSession {
     this.screen = document.createElement("div");
     this.screen.className = "remote-screen";
     this.screen.tabIndex = 0;
-    const first = this.newCanvas();
+    const first = this.newCanvas(null);
+    this.canvases.push(first);
+    this.canvasHome.push(null);
     this.view = api.view(first, {
       size: (stream, w, h) => {
         this.frames[stream] = { w, h };
@@ -284,36 +297,10 @@ export class RemoteSession {
         this.videoSync = sync;
       },
     });
-    this.input = new RemoteInput(
-      this.screen,
-      () => this.sid !== null && !this.disposed,
-      (events) => {
-        if (this.sid !== null) this.command({ cmd: "input", sid: this.sid, events });
-      },
-      (x, y) => this.locate(x, y),
-    );
-    // 鼠标切换了绝对 / 相对、锁定了 / 解除了：本机指针显示与否、工具栏的状态跟着变
-    this.input.onModeChange = () => {
-      this.applyCursor();
-      this.emit();
-    };
+    this.input = this.newInput(this.screen, (x, y) => this.locate(x, y));
     this.swapCtrlCommand = saved?.swapCtrlCommand ?? false;
-    this.input.shouldSwapCtrlCommand = () => this.hostPlatform === "mac" && this.swapCtrlCommand;
     // 这台电脑上次用的鼠标模式（不算换：不用告诉谁）。之后用户换了（菜单、快捷键）：告诉对方画不画光标、记下来
     this.input.setMode(saved?.mouse ?? "auto", false);
-    this.input.onMouseMode = () => {
-      this.pushSettings();
-      this.emit();
-      this.onInputSettingsChange?.(this);
-    };
-    // 网页版：在画面上按粘贴键时，浏览器给的剪贴板里有这里复制的文件就先公告给对方（见 files.ts），粘贴键随后才发。
-    // 桌面版的本机剪贴板由 Rust 端自己同步
-    if (api.kind === "web") {
-      this.input.onPaste = (e) => {
-        const files = LocalFiles.fromDataTransfer(e.clipboardData);
-        if (files && this.offerFiles(files)) e.preventDefault();
-      };
-    }
     this.audio.onClock = (hostUs, localMs, appliedMs) => this.view.audioClock(hostUs, localMs, appliedMs);
     this.audio.onUnsupported = () => {
       this.notice = { kind: "noOpus" };
@@ -321,6 +308,47 @@ export class RemoteSession {
     };
     // 本机的麦克风没了（拔掉了）：关掉，再打开时重新找
     this.mic.onEnded = () => this.micFailed("noDevice");
+  }
+
+  /**
+   * 一个画面（主窗口的，或者弹出窗口的，见 popout.ts）上的鼠标键盘。`locate`：指针在第几路画面上的哪里。
+   * 几个画面的鼠标模式是同一个：在哪个画面上换了（快捷键），别的也跟着换
+   */
+  private newInput(screen: HTMLElement, locate: (x: number, y: number) => { x: number; y: number; stream: number }) {
+    const input = new RemoteInput(
+      screen,
+      () => this.sid !== null && !this.disposed,
+      (events) => {
+        if (this.sid !== null) this.command({ cmd: "input", sid: this.sid, events });
+      },
+      locate,
+    );
+    // 鼠标切换了绝对 / 相对、锁定了 / 解除了：本机指针显示与否、工具栏的状态跟着变
+    input.onModeChange = () => {
+      this.applyCursor();
+      this.emit();
+    };
+    input.shouldSwapCtrlCommand = () => this.hostPlatform === "mac" && this.swapCtrlCommand;
+    input.onMouseMode = (mode) => {
+      for (const other of this.inputs) if (other !== input && other.mode !== mode) other.setMode(mode, false);
+      this.pushSettings();
+      this.emit();
+      this.onInputSettingsChange?.(this);
+    };
+    // 网页版：在画面上按粘贴键时，浏览器给的剪贴板里有这里复制的文件就先公告给对方（见 files.ts），粘贴键随后才发。
+    // 桌面版的本机剪贴板由 Rust 端自己同步
+    if (api.kind === "web") {
+      input.onPaste = (e) => {
+        const files = LocalFiles.fromDataTransfer(e.clipboardData);
+        if (files && this.offerFiles(files)) e.preventDefault();
+      };
+    }
+    return input;
+  }
+
+  /** 所有画面上的鼠标键盘：主窗口的和每个弹出窗口的 */
+  private get inputs(): RemoteInput[] {
+    return [this.input, ...[...this.popouts.values()].map((d) => d.input)];
   }
 
   // ───────────────────────── 订阅 ─────────────────────────
@@ -332,6 +360,9 @@ export class RemoteSession {
   getVersion = () => this.version;
 
   private emit() {
+    // 弹出窗口里的画面：连着的时候就能操作（主窗口的由 CanvasHost 管，见 setInteractive）
+    const live = this.state === "live" && !this.disposed;
+    for (const d of this.popouts.values()) if (d.input.interactive !== live) d.input.interactive = live;
     this.version++;
     for (const l of this.listeners) l();
   }
@@ -362,7 +393,7 @@ export class RemoteSession {
     const sent = this.effectiveSettings();
     const audio = this.audioEnabled && this.foreground;
     const view = this.wantedView();
-    this.ensureCanvases(view.length);
+    this.placeCanvases(view.map((v) => v.display));
     this.sentView = null;
     try {
       info = await api.connect(
@@ -541,6 +572,9 @@ export class RemoteSession {
     this.audio.disable();
     this.syncMic();
     this.detach();
+    for (const name of [...this.popouts.keys()]) this.dropPopout(name);
+    for (const p of this.opening.values()) p.close();
+    this.opening.clear();
     this.emit();
   }
 
@@ -555,7 +589,7 @@ export class RemoteSession {
         this.hostPlatform = ev.platform;
         // 手机点的是触屏，没有鼠标模式（工具栏也不显示）：一律按自动
         if (ev.platform === "android" && this.input.mode !== "auto") {
-          this.input.setMode("auto", false);
+          for (const input of this.inputs) input.setMode("auto", false);
           this.pushSettings();
         }
         this.hostActions = ev.actions;
@@ -626,7 +660,7 @@ export class RemoteSession {
         if (this.disposed) return;
         this.attempt.invalidate();
         clearTimeout(this.retryTimer);
-        this.input.reset();
+        for (const input of this.inputs) input.reset();
         if (ev.retry) {
           this.scheduleRetry(ev.reason);
         } else {
@@ -708,44 +742,34 @@ export class RemoteSession {
       this.cursorRaw = this.cursorSlots.get(c.slot) ?? this.cursorRaw;
     }
     // 被控端的光标隐藏了：鼠标改发相对移动（会回调 onModeChange 刷新指针）
-    this.input.setRemoteCursorHidden(!c.visible);
+    for (const input of this.inputs) input.setRemoteCursorHidden(!c.visible);
     this.applyCursor();
   }
 
-  /** 按当前显示比例缩放远端光标，生成 CSS cursor */
+  /** 按每个画面（主窗口的、弹出窗口的）的显示比例缩放远端光标，生成它们的 CSS cursor */
   private applyCursor() {
+    this.setCursor(this.screen, this.cursorFor(this.input, () => this.streamScale(this.mainStreams[0] ?? 0)));
+    for (const d of this.popouts.values()) {
+      const i = this.canvasHome.indexOf(d.popout);
+      this.setCursor(d.popout.screen, this.cursorFor(d.input, () => this.streamScale(Math.max(0, i))));
+    }
+  }
+
+  /** 一个画面上的本机指针：`input` 是这个画面上的鼠标，`scaleOf` 量出对方的一个物理像素在这里是几个 CSS 像素 */
+  private cursorFor(input: RemoteInput, scaleOf: () => number): string {
     // 游戏模式：光标在画面里（对方画的），本机指针锁定着不显示；没锁定时显示一个普通的指针，好去点画面、点工具栏
-    if (this.input.mode === "game") {
-      this.setCursor(this.input.relative ? "none" : "default");
-      return;
-    }
-    if (!this.cursorVisible || this.input.relative) {
-      // 发相对移动时本机指针的位置没有意义，不显示；用户按 Esc 解除了锁定、桌面模式下对方隐藏了光标，就显示一个普通的指针
-      this.setCursor(this.input.relative ? "none" : "default");
-      return;
-    }
+    if (input.mode === "game") return input.relative ? "none" : "default";
+    // 发相对移动时本机指针的位置没有意义，不显示；用户按 Esc 解除了锁定、桌面模式下对方隐藏了光标，就显示一个普通的指针
+    if (!this.cursorVisible || input.relative) return input.relative ? "none" : "default";
     // 画面里已经有光标了（例如对方正在拖动、缩放窗口）：默认照样显示本机的（跟手）；设置里关掉了就只看画面里的，不会有两个
-    if (this.cursorInFrame && !store.get().localCursor) {
-      this.setCursor("none");
-      return;
-    }
+    if (this.cursorInFrame && !store.get().localCursor) return "none";
     const c = this.cursorRaw;
-    if (!c) {
-      this.setCursor("default");
-      return;
-    }
-    // 几路画面是按同一个比例缩放的（见 screens.ts）：按第 0 路算
-    const display = this.displays[this.currentDisplay];
-    const srcWidth = display?.width || this.frames[0].w;
-    const cssWidth = this.canvases[0].getBoundingClientRect().width || this.frames[0].w;
+    if (!c) return "default";
     // 远端物理像素 → 本地 CSS 像素；限制在 Chromium 支持的 128px 以内
-    let scale = cssWidth / srcWidth;
-    scale = Math.min(Math.max(scale, 0.35), 2, 128 / Math.max(c.w, c.h));
-    // 这个形状按差不多的比例生成过（动画光标循环回来）：直接用，不再生成一次 PNG
-    if (c.css !== undefined && c.scale !== undefined && Math.abs(scale - c.scale) < 0.02) {
-      if (this.cursorCss !== c.css) this.setCursor(c.css);
-      return;
-    }
+    const scale = Math.min(Math.max(scaleOf(), 0.35), 2, 128 / Math.max(c.w, c.h));
+    // 这个形状按差不多的比例生成过（动画光标循环回来、几个窗口里差不多大）：直接用，不再生成一次 PNG
+    const made = c.made?.find((m) => Math.abs(scale - m.scale) < 0.02);
+    if (made) return made.css;
     const src = new OffscreenCanvas(c.w, c.h);
     src.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(c.rgba), c.w, c.h), 0, 0);
     const w = Math.max(1, Math.round(c.w * scale));
@@ -758,14 +782,27 @@ export class RemoteSession {
     octx.drawImage(src, 0, 0, w, h);
     const hx = Math.min(w - 1, Math.round(c.hx * scale));
     const hy = Math.min(h - 1, Math.round(c.hy * scale));
-    c.css = `url(${out.toDataURL("image/png")}) ${hx} ${hy}, default`;
-    c.scale = scale;
-    this.setCursor(c.css);
+    const css = `url(${out.toDataURL("image/png")}) ${hx} ${hy}, default`;
+    c.made = [{ scale, css }, ...(c.made ?? [])].slice(0, MADE_CURSORS);
+    return css;
   }
 
-  private setCursor(css: string) {
-    this.cursorCss = css;
-    this.screen.style.cursor = css;
+  /**
+   * 第 i 路画面上，对方的一个物理像素显示成几个 CSS 像素。主窗口里的几路是按同一个比例缩放的（见 screens.ts）：
+   * 按主窗口里的第一路算就行
+   */
+  private streamScale(i: number): number {
+    const display = this.displays[this.shown[i]] ?? this.displays[this.currentDisplay];
+    const frame = this.frames[i] ?? this.frames[0];
+    const srcWidth = display?.width || frame.w;
+    const cssWidth = this.canvases[i]?.getBoundingClientRect().width || frame.w;
+    return cssWidth / srcWidth;
+  }
+
+  private setCursor(screen: HTMLElement, css: string) {
+    if (this.cursorCss.get(screen) === css) return;
+    this.cursorCss.set(screen, css);
+    screen.style.cursor = css;
   }
 
   // ───────────────────────── 布局 ─────────────────────────
@@ -808,54 +845,66 @@ export class RemoteSession {
   }
 
   /**
-   * 摆好每一路画面：只有一路时和以前一样，画面在显示区域里 1:1 或等比缩放；好几路时按对方的显示器在桌面上的位置
-   * 拼在一起、整体缩放到显示区域里（screens.ts），每一路在自己那一块里再 1:1 或等比缩放
+   * 摆好每一路画面。主窗口：只有一路时和以前一样，画面在显示区域里 1:1 或等比缩放；好几路时按对方的显示器在桌面上的位置
+   * 拼在一起、整体缩放到显示区域里（screens.ts），每一路在自己那一块里再 1:1 或等比缩放。
+   * 放在弹出窗口里的各自在自己的窗口里摆（layoutPopout）
    */
   private layout() {
+    const main = this.layoutMain();
+    for (const d of this.popouts.values()) this.layoutPopout(d);
+    if (!main && !this.popouts.size) return;
+    this.applyCursor();
+    this.updateView();
+  }
+
+  /** 摆好主窗口里的那几路画面。画面不在页面上（例如切到了别的标签）时什么也不做，返回 false */
+  private layoutMain(): boolean {
     const host = this.hostEl;
-    if (!host) return;
+    if (!host) return false;
     const dpr = devicePixelRatio || 1;
     const r = host.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) this.viewport = { w: Math.floor(r.width * dpr), h: Math.floor(r.height * dpr) };
     // 画面的显示区域（设备像素；原始大小显示时不按窗口缩放）
     const area = this.nativeScale ? null : this.viewport;
     const enhance = this.enhanceLevel;
-    const n = this.streamCount;
-    // 每一路画面占的那一块（设备像素，相对整个画面的左上角）、整个画面的大小，以及要不要对齐到设备像素
-    let tiles: Rect[];
-    let box: { w: number; h: number };
-    let snap: boolean;
-    if (n === 1) {
-      const { w: fw, h: fh } = this.frames[0];
+    // 在主窗口里的是第几路；每一路占的那一块（设备像素，相对整个画面的左上角）、整个画面的大小，以及要不要对齐到设备像素
+    const main = this.mainStreams;
+    let tiles: Rect[] = [];
+    let box = { w: 0, h: 0 };
+    // 好几路时每一块都在整数设备像素上：整个画面对齐了，1:1 显示的那几路就不会发虚
+    let snap = true;
+    if (main.length === 1) {
+      const m = main[0];
+      const { w: fw, h: fh } = this.frameSize(m);
       const size = area ? fitSize(fw, fh, area.w, area.h) : { w: fw, h: fh, exact: true };
       tiles = [{ x: 0, y: 0, w: size.w, h: size.h }];
       box = size;
       // 1:1 显示，或者画面增强时 canvas 就是显示的大小（Worker 按同样的算法放大好了）：不能再让浏览器插值
       snap = size.exact || renderPlan(fw, fh, area, enhance).enhance;
-      this.sendLayout(0, area, enhance);
-    } else {
-      const placed = layoutTiles(placeDisplays(this.shown.map((i) => this.displays[i])), area);
+      this.sendLayout(m, area, enhance);
+    } else if (main.length > 1) {
+      const placed = layoutTiles(placeDisplays(main.map((i) => this.displays[this.shown[i]])), area);
       tiles = placed.tiles;
       box = placed;
-      // 每一块都在整数设备像素上：整个画面对齐了，1:1 显示的那几路就不会发虚
-      snap = true;
     }
     const ss = this.screen.style;
     ss.width = `${box.w / dpr}px`;
     ss.height = `${box.h / dpr}px`;
     this.canvases.forEach((c, i) => {
+      // 在弹出窗口里：在那边摆
+      if (this.canvasHome[i]) return;
       const st = c.style;
-      const tile = tiles[i];
-      if (i >= n || !tile) {
+      const k = main.indexOf(i);
+      const tile = tiles[k];
+      if (k < 0 || !tile) {
         st.display = "none";
         return;
       }
       st.display = "";
       let size = { w: tile.w, h: tile.h };
-      if (n > 1) {
+      if (main.length > 1) {
         // 这一路的画面还没到：先按它的显示器的宽高比
-        const d = this.displays[this.shown[i]];
-        const { w: fw, h: fh } = this.frames[i] ?? { w: d.width, h: d.height };
+        const { w: fw, h: fh } = this.frameSize(i);
         size = fitSize(fw, fh, tile.w, tile.h);
         this.sendLayout(i, area ? { w: tile.w, h: tile.h } : null, enhance);
       }
@@ -872,8 +921,48 @@ export class RemoteSession {
       ss.left = `${align(c.left)}px`;
       ss.top = `${align(c.top)}px`;
     }
-    this.applyCursor();
-    this.updateView();
+    return true;
+  }
+
+  /**
+   * 摆好一个弹出窗口里的画面：和主窗口只有一路时一样，在窗口里 1:1 或等比缩放（弹出窗口总是按窗口大小显示）。
+   * 窗口可能在另一个显示器上，设备像素比例按它的算
+   */
+  private layoutPopout(d: Detached) {
+    const p = d.popout;
+    const i = this.canvasHome.indexOf(p);
+    const c = this.canvases[i];
+    const area = p.viewport;
+    if (!c || !area) return;
+    const dpr = p.dpr;
+    const enhance = store.get().enhance;
+    const display = this.displays.find((x) => x.name === d.name);
+    const { w: fw, h: fh } = this.frames[i] ?? (display ? { w: display.width, h: display.height } : this.frameSize(i));
+    const size = fitSize(fw, fh, area.w, area.h);
+    this.sendLayout(i, area, enhance);
+    const ss = p.screen.style;
+    ss.width = `${size.w / dpr}px`;
+    ss.height = `${size.h / dpr}px`;
+    const st = c.style;
+    st.display = "";
+    st.left = st.top = "0px";
+    st.width = ss.width;
+    st.height = ss.height;
+    ss.left = ss.top = "";
+    if (size.exact || renderPlan(fw, fh, area, enhance).enhance) {
+      const r = p.screen.getBoundingClientRect();
+      const align = (v: number) => (Math.round(v * dpr) - v * dpr) / dpr;
+      ss.left = `${align(r.left)}px`;
+      ss.top = `${align(r.top)}px`;
+    }
+  }
+
+  /** 第 i 路画面的大小（像素）：画面还没到时按它的显示器（还不知道是哪个时是 16:9） */
+  private frameSize(i: number): { w: number; h: number } {
+    const f = this.frames[i];
+    if (f) return f;
+    const d = this.displays[this.shown[i]];
+    return d ? { w: d.width, h: d.height } : { w: 16, h: 9 };
   }
 
   /** 告诉 Worker 第 stream 路画面怎么显示（变了才发）。不增强时显示区域用不上，不发：拖动窗口边框时不用每一下都重画 */
@@ -904,62 +993,116 @@ export class RemoteSession {
     this.shown = shown?.length ? shown : [current];
     // 第一次：只看一个显示器时就看对方开始时给的那个（主显示器）
     if (this.wantName === null) this.wantName = displays[current]?.name ?? null;
-    this.ensureCanvases(this.shown.length);
+    // 弹出去的显示器没了（对方拔掉了）、对方不能同时发好几路了：关掉它的窗口
+    for (const name of [...this.popouts.keys()]) {
+      if (this.maxStreams < 2 || (displays.length > 0 && !displays.some((d) => d.name === name))) this.dropPopout(name);
+    }
+    this.placeCanvases(this.shown);
   }
 
-  /** 新的一路画面的 canvas（放进画面里，还没交给 Worker） */
-  private newCanvas(): HTMLCanvasElement {
-    const c = document.createElement("canvas");
+  /** 一路画面的新 canvas，放进 `home`（null = 主窗口）的画面里，还没交给 Worker */
+  private newCanvas(home: Popout | null): HTMLCanvasElement {
+    const c = (home?.doc ?? document).createElement("canvas");
     c.className = "remote-canvas";
     c.width = 16;
     c.height = 9;
-    this.screen.appendChild(c);
-    this.canvases.push(c);
+    (home?.screen ?? this.screen).appendChild(c);
     return c;
   }
 
-  /** 要看 n 路画面：还没有 canvas 的那几路建好、交给 Worker（在对方发这一路之前） */
-  private ensureCanvases(n: number) {
-    while (this.canvases.length < Math.min(n, MAX_STREAMS)) {
-      const c = this.newCanvas();
-      this.view.addCanvas(this.canvases.length - 1, c);
+  /**
+   * 每一路画面的 canvas 放进它的显示器所在的窗口（`displays` 的第 i 项是第 i 路要显示的显示器），要在对方发这一路之前做好：
+   * 还没有 canvas 的路新建；显示器换了窗口（弹出去了、放回来了）的路换一个新的 canvas 交给 Worker
+   * （交出去的 canvas 不能挪到别的窗口里，Worker 换上新的解码器，自己要关键帧）。
+   * 主窗口里至少留一路：都在弹出窗口里了（例如主窗口看的那个显示器拔掉了）就把第 0 路的放回来
+   */
+  private placeCanvases(displays: number[]) {
+    const n = Math.min(displays.length, MAX_STREAMS);
+    if (n > 0 && displays.slice(0, n).every((d) => this.homeOf(d))) this.dropPopout(this.displays[displays[0]].name);
+    for (let i = 0; i < n; i++) {
+      const home = this.homeOf(displays[i]);
+      if (this.canvases[i] && this.canvasHome[i] === home) continue;
+      this.canvases[i]?.remove();
+      const c = this.newCanvas(home);
+      this.canvases[i] = c;
+      this.canvasHome[i] = home;
+      // Worker 里是新的解码器：怎么显示要重新告诉它
+      this.sentLayouts[i] = "";
+      this.view.addCanvas(i, c);
     }
   }
 
-  /** 指针（屏幕坐标）在第几路画面上的哪里：落在缝里、外面时是最近的那一路的边上 */
-  private locate(x: number, y: number): { x: number; y: number; stream: number } {
-    const rects = this.canvases.slice(0, this.streamCount).map((c) => c.getBoundingClientRect());
-    const hit = hitTest(rects, x, y);
-    return hit ? { x: hit.x, y: hit.y, stream: hit.index } : { x: 0, y: 0, stream: 0 };
+  /** 第 display 个显示器在哪个窗口里：弹出去了的是它的弹出窗口，否则是主窗口（null） */
+  private homeOf(display: number): Popout | null {
+    const name = this.displays[display]?.name;
+    return (name !== undefined && this.popouts.get(name)?.popout) || null;
   }
 
-  /** 想看的显示器（第 i 项是第 i 路）：只看一个时是选的那个；都看时它在第 0 路（切换时这一路不用重建），接着是别的 */
+  /** 在主窗口里显示的是第几路（别的在弹出窗口里） */
+  private get mainStreams(): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < this.streamCount; i++) if (!this.canvasHome[i]) out.push(i);
+    return out;
+  }
+
+  /** 指针（屏幕坐标）在主窗口里的第几路画面上的哪里：落在缝里、外面时是最近的那一路的边上 */
+  private locate(x: number, y: number): { x: number; y: number; stream: number } {
+    const main = this.mainStreams;
+    const hit = hitTest(main.map((i) => this.canvases[i].getBoundingClientRect()), x, y);
+    return hit ? { x: hit.x, y: hit.y, stream: main[hit.index] } : { x: 0, y: 0, stream: main[0] ?? 0 };
+  }
+
+  /** 指针（弹出窗口里的坐标）在那个窗口的画面上的哪里 */
+  private locatePopout(popout: Popout, x: number, y: number): { x: number; y: number; stream: number } {
+    const i = this.canvasHome.indexOf(popout);
+    const c = this.canvases[i];
+    const hit = c ? hitTest([c.getBoundingClientRect()], x, y) : null;
+    return hit ? { x: hit.x, y: hit.y, stream: i } : { x: 0, y: 0, stream: Math.max(0, i) };
+  }
+
+  /**
+   * 想看的显示器（第 i 项是第 i 路）：只看一个时是选的那个，再加上弹出去的；都看时它在第 0 路（切换时这一路不用重建），
+   * 接着是别的。对方的路数不够时先保证选的那个和弹出去的
+   */
   private wanted(): number[] {
     const n = this.displays.length;
     if (!n) return [];
     let first = this.displays.findIndex((d) => d.name === this.wantName);
     if (first < 0) first = this.currentDisplay < n ? this.currentDisplay : 0;
-    if (!this.allDisplays || this.maxStreams < 2) return [first];
-    const rest = this.displays.map((_, i) => i).filter((i) => i !== first);
-    return [first, ...rest].slice(0, Math.min(this.maxStreams, MAX_STREAMS));
+    const limit = Math.min(this.maxStreams, MAX_STREAMS);
+    if (limit < 2) return [first];
+    const popped = (i: number) => this.popouts.has(this.displays[i].name);
+    const rest = this.displays.map((_, i) => i).filter((i) => i !== first && (this.allDisplays || popped(i)));
+    const order = [first, ...rest];
+    if (order.length <= limit) return order;
+    const keep = new Set(order.filter((i) => i === first || popped(i)).slice(0, limit));
+    for (const i of order) if (keep.size < limit) keep.add(i);
+    return order.filter((i) => keep.has(i));
   }
 
   /**
    * 想看的显示器，带着每一路按它在显示区域里的大小要的短边上限（见 fit.ts；不用缩小、原始大小显示、
-   * 还不知道显示区域时是 0：不限）。对方和画质设置里的上限取较严的
+   * 还不知道显示区域时是 0：不限）。主窗口里的按主窗口算，弹出去的按它的窗口算。对方和画质设置里的上限取较严的
    */
   private wantedView(): StreamView[] {
     const ds = this.wanted();
-    const infos = ds.map((i) => this.displays[i]);
+    const limits = ds.map(() => 0);
     const vp = this.viewport;
-    let limits = ds.map(() => 0);
+    // 在主窗口里的是第几项
+    const main = ds.map((_, k) => k).filter((k) => !this.homeOf(ds[k]));
+    const infos = main.map((k) => this.displays[ds[k]]);
     if (vp && !this.nativeScale && infos.length === 1) {
-      limits = [viewMaxShort(infos[0].width, infos[0].height, vp.w, vp.h)];
+      limits[main[0]] = viewMaxShort(infos[0].width, infos[0].height, vp.w, vp.h);
     } else if (vp && !this.nativeScale && infos.length > 1) {
       const { tiles } = layoutTiles(placeDisplays(infos), vp);
-      limits = infos.map((d, i) => viewMaxShort(d.width, d.height, tiles[i].w, tiles[i].h));
+      infos.forEach((d, j) => (limits[main[j]] = viewMaxShort(d.width, d.height, tiles[j].w, tiles[j].h)));
     }
-    return ds.map((display, i) => ({ display, maxShort: limits[i] }));
+    ds.forEach((display, k) => {
+      const area = this.homeOf(display)?.viewport;
+      const d = this.displays[display];
+      if (area) limits[k] = viewMaxShort(d.width, d.height, area.w, area.h);
+    });
+    return ds.map((display, k) => ({ display, maxShort: limits[k] }));
   }
 
   /**
@@ -978,8 +1121,8 @@ export class RemoteSession {
     const apply = () => {
       this.viewTimer = undefined;
       if (this.sid === null) return;
-      // 对方开始发这几路之前，Worker 里就要有画它们的 canvas
-      this.ensureCanvases(want.length);
+      // 对方开始发这几路之前，Worker 里就要有画它们的 canvas（放在各自的窗口里）
+      this.placeCanvases(want.map((v) => v.display));
       this.sentView = want;
       this.command({ cmd: "view", sid: this.sid, streams: want });
     };
@@ -1119,7 +1262,7 @@ export class RemoteSession {
   }
 
   /**
-   * 实际发给被控端的画质：不可见时降帧率。分辨率不超过画面的显示区域另外按每一路说（view 命令，见 updateView），
+   * 实际发给被控端的画质：不可见时降帧率（有弹出窗口时不算不可见：那里还看着）。分辨率不超过画面的显示区域另外按每一路说（view 命令，见 updateView），
    * 对方和这里的短边上限取较严的
    */
   private effectiveSettings(): QualitySettings {
@@ -1128,7 +1271,7 @@ export class RemoteSession {
     // 不算画质：保存的画质里就算带着也不用
     delete s.drawCursor;
     if (this.input.mode === "game") s.drawCursor = true;
-    if (!this.visible) s.fps = Math.min(s.fps, BACKGROUND_FPS);
+    if (!this.visible && !this.popouts.size) s.fps = Math.min(s.fps, BACKGROUND_FPS);
     return s;
   }
 
@@ -1137,9 +1280,10 @@ export class RemoteSession {
     this.command({ cmd: "settings", sid: this.sid, settings: this.effectiveSettings() });
   }
 
-  /** 只看对方的第 index 个显示器 */
+  /** 只看对方的第 index 个显示器（它在单独的窗口里的话先放回来） */
   selectDisplay(index: number) {
     const d = this.displays[index];
+    if (d && this.isPopped(index)) this.dockDisplay(index);
     if (!d || (!this.allDisplays && this.wantName === d.name && this.currentDisplay === index)) return;
     this.releaseAll();
     this.allDisplays = false;
@@ -1160,6 +1304,121 @@ export class RemoteSession {
     this.allDisplays = on;
     this.updateView(true);
     this.emit();
+  }
+
+  // ───────────────────────── 弹出窗口（见 popout.ts） ─────────────────────────
+
+  /** 放在单独窗口里的显示器（第几个）和它们的窗口：界面在这些窗口里画工具栏（PopoutView） */
+  get popoutWindows(): { display: number; popout: Popout; gamePaused: boolean }[] {
+    const out: { display: number; popout: Popout; gamePaused: boolean }[] = [];
+    for (const d of this.popouts.values()) {
+      const display = this.displays.findIndex((x) => x.name === d.name);
+      if (display >= 0) out.push({ display, popout: d.popout, gamePaused: d.input.gamePaused });
+    }
+    return out;
+  }
+
+  /** 第 index 个显示器放在单独的窗口里了（或者正在打开） */
+  isPopped(index: number): boolean {
+    const name = this.displays[index]?.name;
+    return name !== undefined && (this.popouts.has(name) || this.opening.has(name));
+  }
+
+  /**
+   * 能把第 index 个显示器放到单独的窗口里：连着、对方能同时发好几路画面；正在看着的（同时看所有的显示器时）
+   * 放出去之后主窗口里还要留下至少一个，没在看的要对方还能多发一路
+   */
+  canPopOut(index: number): boolean {
+    if (!this.displays[index] || this.state !== "live" || this.maxStreams < 2 || this.isPopped(index)) return false;
+    const want = this.wanted();
+    if (want.includes(index)) return want.filter((i) => !this.isPopped(i)).length > 1;
+    const pending = [...this.opening.keys()].filter((name) => !want.some((i) => this.displays[i].name === name));
+    return want.length + pending.length < Math.min(this.maxStreams, MAX_STREAMS);
+  }
+
+  /**
+   * 把第 index 个显示器放到单独的窗口里（要在点击里调用：浏览器只在用户操作里让开新窗口）。
+   * 窗口准备好了才把画面换过去；打不开（例如浏览器拦住了）时返回 false
+   */
+  popOut(index: number): boolean {
+    if (!this.canPopOut(index)) return false;
+    const name = this.displays[index].name;
+    const popout = Popout.open(this.hostName || this.code);
+    if (!popout) return false;
+    this.opening.set(name, popout);
+    popout.onClosed = () => {
+      if (this.opening.get(name) === popout) this.opening.delete(name);
+      this.emit();
+    };
+    popout.onReady = () => {
+      this.opening.delete(name);
+      if (this.disposed || this.popouts.has(name) || !this.displays.some((d) => d.name === name)) popout.close();
+      else this.attachPopout(name, popout);
+    };
+    this.emit();
+    return true;
+  }
+
+  /** 弹出窗口准备好了：这个显示器的画面换过去，挂上鼠标键盘 */
+  private attachPopout(name: string, popout: Popout) {
+    const input = this.newInput(popout.screen, (x, y) => this.locatePopout(popout, x, y));
+    input.setMode(this.input.mode, false);
+    input.setRemoteCursorHidden(!this.cursorVisible);
+    const d: Detached = { name, popout, input };
+    this.popouts.set(name, d);
+    // 用户关掉了窗口：放回主窗口
+    popout.onClosed = () => {
+      if (this.popouts.get(name) !== d) return;
+      this.dropPopout(name);
+      this.popoutsChanged();
+    };
+    popout.onResize = () => this.layout();
+    popout.onChange = () => this.emit();
+    // 主窗口里按着的键、鼠标键先放开
+    this.releaseAll();
+    this.popoutsChanged();
+    popout.focus();
+  }
+
+  /** 关掉 name 的弹出窗口（不重新摆画面，调用的地方接着摆）。在那边按着的键、鼠标键让对方都放开 */
+  private dropPopout(name: string) {
+    const d = this.popouts.get(name);
+    if (!d) return;
+    this.popouts.delete(name);
+    d.input.dispose();
+    d.popout.onClosed = null;
+    d.popout.close();
+    this.releaseAll();
+  }
+
+  /** 弹出 / 放回了显示器：重新摆好画面，马上告诉对方看哪几个、每一路要多大 */
+  private popoutsChanged() {
+    this.placeCanvases(this.wanted());
+    this.layout();
+    this.updateView(true);
+    // 不在前台时：有没有弹出窗口决定降不降帧率
+    if (!this.visible) this.pushSettings();
+    this.emit();
+  }
+
+  /** 把第 index 个显示器放回主窗口（关掉它的窗口） */
+  dockDisplay(index: number) {
+    const name = this.displays[index]?.name;
+    if (name === undefined) return;
+    const opening = this.opening.get(name);
+    if (opening) {
+      this.opening.delete(name);
+      opening.close();
+    }
+    if (!this.popouts.has(name)) return this.emit();
+    this.dropPopout(name);
+    this.popoutsChanged();
+  }
+
+  /** 切到第 index 个显示器的弹出窗口 */
+  focusPopout(index: number) {
+    const name = this.displays[index]?.name;
+    if (name !== undefined) this.popouts.get(name)?.popout.focus();
   }
 
   setClipboardSync(v: boolean) {
@@ -1280,6 +1539,15 @@ export class RemoteSession {
   private enqueue(events: InputEvent[], urgent: boolean) { this.input.enqueue(events, urgent); }
 }
 
+/** 放在单独窗口里的一个显示器（见 popout.ts） */
+interface Detached {
+  /** 显示器的名字 */
+  name: string;
+  popout: Popout;
+  /** 那个窗口里的画面上的鼠标键盘 */
+  input: RemoteInput;
+}
+
 /** 光标的一个形状（RGBA，非预乘） */
 interface CursorImage {
   w: number;
@@ -1287,9 +1555,8 @@ interface CursorImage {
   hx: number;
   hy: number;
   rgba: Uint8ClampedArray;
-  /** 按 scale 缩放、生成好的 CSS cursor */
-  css?: string;
-  scale?: number;
+  /** 按几种比例缩放、生成好的 CSS cursor（最近用的在前面） */
+  made?: { scale: number; css: string }[];
 }
 
 function sameView(a: StreamView[], b: StreamView[]): boolean {

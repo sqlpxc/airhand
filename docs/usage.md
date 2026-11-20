@@ -206,6 +206,13 @@ When the remote computer has more than one display, the toolbar has a display bu
 - Plugging displays in and out on the remote computer is followed: a display that goes away disappears, and a new one is added while showing all displays
 - Fullscreen, actual size (1:1, scrollable) and the overview thumbnails all work as usual; Enhance processes each display separately
 
+**Separate windows**: when you have several screens too, you can put the remote displays in windows of their own, one window per local screen, each in full screen. Click the button next to a display in the display menu and it moves to a new window (the desktop app puts it on a screen the console isn't on); the main window shows the rest. The new window has buttons for full screen and for moving the display back to the main window at the top; in full screen the toolbar appears when the mouse touches the top edge, as in the main window. Closing the window also moves the display back.
+
+- No extra connection: it's the same connection, that display's stream is just drawn in another window, so the bandwidth is the same as showing several displays at once
+- With a single display shown you can still put another one in its own window (that adds a stream); at least one display stays in the main window
+- The mouse and keyboard control the display in whichever window they're in; quality, sound, shortcuts and so on are in the main window's toolbar
+- In a browser, allow pop-ups for the site
+
 ### Copying and pasting files
 
 While clipboard sync is on (the clipboard button in the toolbar, on by default), files and folders can be copied and pasted too, in both directions: copy them on this computer and paste in the remote file manager, or copy them over there and paste here.

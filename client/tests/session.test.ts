@@ -8,6 +8,7 @@ import { renderPlan } from "../src/lib/enhance.ts";
 import { fitSize, stricter, viewMaxShort } from "../src/lib/fit.ts";
 import * as media from "../src/lib/media.ts";
 import { hitTest, layoutTiles, placeDisplays } from "../src/lib/screens.ts";
+import { RemoteInput } from "../src/lib/input.ts";
 
 /** 沙箱里建的对象原型不同，按 JSON 比较 */
 const plain = (v: unknown) => JSON.parse(JSON.stringify(v));
@@ -18,8 +19,25 @@ function fakeCanvas() {
   const px = (v: string | undefined) => parseFloat(v ?? "0") || 0;
   return {
     style,
+    removed: false,
+    remove() { this.removed = true; },
     getBoundingClientRect: () => ({ left: px(style.left), top: px(style.top), width: px(style.width), height: px(style.height) }),
   };
+}
+
+/** 假的弹出窗口（见 popout.ts）：显示区域固定，关掉时和真的一样调用 onClosed */
+function fakePopout(w: number, h: number) {
+  const p: any = {
+    screen: { style: {}, addEventListener() {}, focus() {}, getBoundingClientRect: () => ({ left: 0, top: 0 }) },
+    viewport: { w, h }, dpr: 1, closed: false, onClosed: null, onResize: null, onChange: null,
+    focus() {},
+    close() {
+      if (p.closed) return;
+      p.closed = true;
+      p.onClosed?.();
+    },
+  };
+  return p;
 }
 
 // Load the actual session class with browser/backend dependencies replaced by
@@ -34,7 +52,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   const timers: (() => void)[] = [];
   const storeState: any = { enhance: "off", decoders: ["h264"] };
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
-    fitSize, stricter, viewMaxShort, renderPlan, media, hitTest, layoutTiles, placeDisplays, devicePixelRatio: 1,
+    fitSize, stricter, viewMaxShort, renderPlan, media, hitTest, layoutTiles, placeDisplays, RemoteInput, devicePixelRatio: 1,
     codecUsable: () => true, bestCodec: () => "h264",
     store: { get: () => storeState },
     toProblem: (e: any) => e,
@@ -61,9 +79,10 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
     attempt: new ConnectionAttempt(), disposed: false, sid: null, state: "connecting", settings: {}, visible: true,
     sentView: null, viewAt: -Infinity, viewport: null, displays: [], currentDisplay: 0,
     shown: [0], maxStreams: 1, allDisplays: false, wantName: null, sentLayouts: [],
-    // 第 0 路的 canvas（构造函数里建的）；之后要的假的 canvas 由 newCanvas 建
-    canvases: [fakeCanvas()], screen: { style: {}, getBoundingClientRect: () => ({ left: 0, top: 0 }) },
-    newCanvas() { const c = fakeCanvas(); this.canvases.push(c); return c; },
+    // 第 0 路的 canvas（构造函数里建的）；之后要的假的 canvas 由 newCanvas 建（记着它在哪个窗口里）
+    canvases: [fakeCanvas()], canvasHome: [null], screen: { style: {}, getBoundingClientRect: () => ({ left: 0, top: 0 }) },
+    newCanvas(home: any) { const c: any = fakeCanvas(); c.home = home; return c; },
+    popouts: new Map(), opening: new Map(), cursorCss: new WeakMap(),
     view: { setSync() {}, setAudio() {}, setLayout() {}, dispose() {}, addCanvas() {} }, frames: [{ w: 16, h: 9 }],
     input: { reset() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
@@ -177,6 +196,71 @@ test("多屏：同时看所有显示器时每一路按它在拼好的画面里�
   const sent = views().length;
   s.onEvent({ type: "displays", displays: [displays[1], displays[0]], current: 1, shown: [1] });
   assert.equal(views().length, sent, "没变不重发");
+});
+
+test("弹出窗口：一个显示器放到单独的窗口里，主窗口拼剩下的；每一路按各自的窗口要分辨率；关掉窗口就放回来", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  const displays = [
+    { index: 0, name: "A", x: 0, y: 0, width: 3840, height: 2160, primary: true },
+    { index: 1, name: "B", x: 3840, y: 1080, width: 1920, height: 1080, primary: false },
+  ];
+  const added: any[] = [];
+  Object.assign(s, {
+    sid: 7, scaleMode: "fit", interactive: true, viewport: { w: 2880, h: 1080 }, emit() {},
+    hostEl: { getBoundingClientRect: () => ({ width: 2880, height: 1080 }) },
+    input: { mode: "auto", releaseAll() {}, reset() {}, setRemoteCursorHidden() {} },
+    applyCursor() {}, cursorVisible: true,
+  });
+  s.view = { ...s.view, addCanvas: (i: number, c: any) => added.push([i, c.home ?? null]) };
+  s.onEvent({ type: "hello", hostname: "pc", os: "Windows", version: "1", displays, current: 0, shown: [0], maxStreams: 4,
+    codecs: ["h264"], platform: "windows", touch: false, actions: [] });
+  s.state = "live";
+  const views = () => h.calls.filter((c) => c[0] === "view").map((c) => c[2]);
+
+  // 只看 A 的时候：A 是主窗口里仅有的一个，不能弹出去；B 可以（多要一路）
+  assert.equal(s.canPopOut(0), false);
+  assert.equal(s.canPopOut(1), true);
+  // 同时看两个：哪个都能弹出去，但主窗口里要留一个
+  s.setAllDisplays(true);
+  s.onEvent({ type: "displays", displays, current: 0, shown: [0, 1] });
+  s.frames = [{ w: 1920, h: 1080 }, { w: 960, h: 540 }];
+  assert.equal(s.canPopOut(0), true);
+  assert.equal(s.canPopOut(1), true);
+
+  const p = fakePopout(1920, 1080);
+  s.attachPopout("B", p);
+  assert.equal(s.isPopped(1), true);
+  assert.equal(s.canPopOut(0), false, "主窗口里只剩 A 了");
+  // B 的那一路换了一个在弹出窗口里的 canvas 交给 Worker
+  assert.deepEqual(added.at(-1), [1, p]);
+  assert.equal(s.canvases[1].home, p);
+  // A 在主窗口里独占整个显示区域，B 按弹出窗口的大小（1:1，不限）
+  assert.deepEqual(views().at(-1), [{ display: 0, maxShort: 1080 }, { display: 1, maxShort: 0 }]);
+  assert.equal(s.screen.style.width, "1920px");
+  assert.equal(p.screen.style.width, "1920px", "画面还是旧的大小：小于窗口，等比放大到放得下");
+  // 主窗口里的鼠标只会落在 A 上；弹出窗口里的是 B 那一路
+  assert.deepEqual(plain(s.locate(1900, 1000)), { x: 1900 / 1920, y: 1000 / 1080, stream: 0 });
+  assert.equal(s.locatePopout(p, 10, 10).stream, 1);
+
+  // 用户关掉了弹出窗口：B 放回主窗口（又换一个 canvas），和之前一样拼在一起
+  p.close();
+  assert.equal(s.isPopped(1), false);
+  assert.deepEqual(added.at(-1), [1, null]);
+  assert.deepEqual(views().at(-1), [{ display: 0, maxShort: 1080 }, { display: 1, maxShort: 540 }]);
+  assert.equal(s.screen.style.width, "2880px");
+
+  // 只看 A 的时候弹出 B：多要一路给它，弹出窗口里的 canvas 在对方发之前就建好
+  s.setAllDisplays(false);
+  s.onEvent({ type: "displays", displays, current: 0, shown: [0] });
+  const q = fakePopout(1280, 720);
+  s.attachPopout("B", q);
+  assert.deepEqual(views().at(-1), [{ display: 0, maxShort: 1080 }, { display: 1, maxShort: 720 }]);
+  assert.equal(s.canvases[1].home, q);
+  // 对方把 B 拔掉了：关掉它的窗口
+  s.onEvent({ type: "displays", displays: [displays[0]], current: 0, shown: [0] });
+  assert.equal(q.closed, true);
+  assert.equal(s.popoutWindows.length, 0);
 });
 
 test("画面增强：只给正在操作的会话，关着时不发显示区域；增强时和 1:1 一样对齐到设备像素", () => {

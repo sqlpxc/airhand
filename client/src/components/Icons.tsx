@@ -63,6 +63,12 @@ export const IconMonitor = (p: P) =>
     </>,
   );
 export const IconClose = (p: P) => base(p, <path d="M6 6l12 12M18 6L6 18" />);
+/** 放到单独的窗口里（弹出窗口） */
+export const IconPopOut = (p: P) =>
+  base(p, <path d="M13.5 4.5h6v6M19.5 4.5L11 13M17.5 14v4a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 18V8A1.5 1.5 0 0 1 6 6.5h4" />);
+/** 放回主窗口 */
+export const IconPopIn = (p: P) =>
+  base(p, <path d="M19.5 4.5L12 12M12 7v5h5M17.5 14v4a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 18V8A1.5 1.5 0 0 1 6 6.5h4" />);
 export const IconSliders = (p: P) =>
   base(
     p,
