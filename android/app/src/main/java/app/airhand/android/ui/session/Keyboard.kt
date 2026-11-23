@@ -107,9 +107,6 @@ class KeyboardController(
         return true
     }
 
-    /** 这个键的按下已经发出去了（还没发抬起） */
-    fun holds(keyCode: Int): Boolean = KeyMap.code(keyCode)?.let { it in held || it in tapped } == true
-
     /** 外接键盘按下一个键。`metaState`：按键事件说这时按着哪些修饰键 */
     internal fun keyDown(code: String, metaState: Int = 0) {
         if (code in MODIFIER_CODES) {
@@ -173,6 +170,29 @@ class KeyboardController(
             "ControlRight" to "MetaRight", "MetaRight" to "ControlRight",
         )
     }
+}
+
+/**
+ * 外接键盘的哪些按键在输入法之前发（见 RemoteView.onKeyPreIme）。
+ *
+ * 按下：Ctrl / ⌘ 本身和带着它们的组合键，不然输入法会自己处理掉（Ctrl+C 之类，发不到对方）；别的键照样先给输入法（打拼音）。
+ * 抬起跟着按下走：按下是在输入法之前发的，抬起也在之前发（Ctrl+C 先松开 Ctrl 时，C 的抬起已经不带 Ctrl 了）；
+ * 按下给了输入法的，抬起也给它。输入法只看到按下、看不到抬起会乱，例如单按 Shift 切换中英文是按下时放过去、抬起时才切换
+ */
+internal class ImeBypass {
+    /** 按下在输入法之前发了、还没抬起的键（Android 的按键码） */
+    private val keys = HashSet<Int>()
+
+    /** 这个按键要不要在输入法之前发。`shortcut`：按着 Ctrl / ⌘，或者它就是 Ctrl / ⌘ */
+    fun early(keyCode: Int, down: Boolean, shortcut: Boolean): Boolean = if (down) shortcut else keys.remove(keyCode)
+
+    /** 在输入法之前发了一个按下。按住时的自动重复不算：第一次按下给了输入法的，抬起也给它 */
+    fun sent(keyCode: Int, repeatCount: Int) {
+        if (repeatCount == 0) keys += keyCode
+    }
+
+    /** 窗口失去焦点：按着的键都已经松开了（KeyboardController.releaseKeys） */
+    fun clear() = keys.clear()
 }
 
 /**

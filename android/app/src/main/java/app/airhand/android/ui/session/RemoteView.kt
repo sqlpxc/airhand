@@ -795,6 +795,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         if (!hasWindowFocus) {
             game.releaseAll()
             host.keyboard.releaseKeys()
+            imeBypass.clear()
         }
     }
 
@@ -815,14 +816,19 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         return host.keyboard.key(e)
     }
 
-    /**
-     * 输入法之前：Ctrl / ⌘ 的组合键先发，不然输入法会自己处理掉（Ctrl+C 之类，发不到对方）。按下已经发了的键，
-     * 抬起也在这里发：输入法可能拿走它，对方那边就一直按着
-     */
+    /** 外接键盘在输入法之前发的按键 */
+    private val imeBypass = ImeBypass()
+
+    /** 输入法之前：Ctrl / ⌘ 的组合键先发，抬起跟着按下走（见 [ImeBypass]） */
     override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
-        val beforeIme = event.isCtrlPressed || event.isMetaPressed || keyCode in SHORTCUT_MODIFIERS ||
-            (event.action == KeyEvent.ACTION_UP && host.keyboard.holds(keyCode))
-        return (beforeIme && hardwareKey(event)) || super.onKeyPreIme(keyCode, event)
+        val down = event.action == KeyEvent.ACTION_DOWN
+        if (!down && event.action != KeyEvent.ACTION_UP) return super.onKeyPreIme(keyCode, event)
+        val shortcut = event.isCtrlPressed || event.isMetaPressed || keyCode in SHORTCUT_MODIFIERS
+        if (imeBypass.early(keyCode, down, shortcut) && hardwareKey(event)) {
+            if (down) imeBypass.sent(keyCode, event.repeatCount)
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
     }
 
     /** 外接键盘（连上之前、断线时）和软键盘发来的按键：原样发过去（返回、音量键留给本机） */

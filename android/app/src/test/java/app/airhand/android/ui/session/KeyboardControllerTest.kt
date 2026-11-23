@@ -3,8 +3,6 @@ package app.airhand.android.ui.session
 import android.view.KeyEvent
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** 软键盘的文字、粘滞修饰键、外接键盘的按键变成什么输入事件 */
@@ -150,11 +148,9 @@ class KeyboardControllerTest {
         swap = true
         kb.keyDown("ControlLeft", KeyEvent.META_CTRL_ON)
         kb.keyDown("KeyW", KeyEvent.META_CTRL_ON)
-        assertTrue(kb.holds(KeyEvent.KEYCODE_W))
         kb.releaseKeys()
         kb.keyUp("KeyW")
         kb.keyUp("ControlLeft")
         assertEquals(listOf("MetaLeft↓", "KeyW↓", "KeyW↑", "MetaLeft↑"), sent)
-        assertFalse(kb.holds(KeyEvent.KEYCODE_W))
     }
 }
