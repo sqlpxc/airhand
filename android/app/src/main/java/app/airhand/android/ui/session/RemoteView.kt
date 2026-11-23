@@ -700,10 +700,17 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         return super.onGenericMotionEvent(e)
     }
 
+    /** 外接鼠标的滚轮（方向和速度看设置，[setWheel]） */
+    private val wheel = MouseWheel()
+
+    fun setWheel(reverse: Boolean, percent: Int) {
+        wheel.reverse = reverse
+        wheel.percent = percent
+    }
+
     private fun scroll(e: MotionEvent) {
-        val dy = (e.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120).toInt()
-        val dx = (e.getAxisValue(MotionEvent.AXIS_HSCROLL) * 120).toInt()
-        if (dx != 0 || dy != 0) host.onInput(listOf(Input.wheel(dx, dy)), true)
+        val (dx, dy) = wheel.steps(e.getAxisValue(MotionEvent.AXIS_HSCROLL), e.getAxisValue(MotionEvent.AXIS_VSCROLL)) ?: return
+        host.onInput(listOf(Input.wheel(dx, dy)), true)
     }
 
     private fun moveMouse(e: MotionEvent) {
@@ -849,4 +856,30 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT, KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT,
         )
     }
+}
+
+/**
+ * 外接鼠标的滚轮 → 发给对方的滚轮量（120 = 一格，向右 / 向上为正）。高精度滚轮、触控板一次只滚零点几格，
+ * 不够 1 的余量留到下一次，换方向时丢掉（和 macOS 被控端一样）。[reverse]、[percent]：设置里的方向和速度
+ */
+internal class MouseWheel {
+    var reverse = false
+    var percent = 100
+    private var restX = 0f
+    private var restY = 0f
+
+    /** `h` / `v`：AXIS_HSCROLL / AXIS_VSCROLL（一格是 1，向右 / 向上为正）。两个方向都不够 1 时是 null */
+    fun steps(h: Float, v: Float): Pair<Int, Int>? {
+        val k = 120f * percent / 100f * (if (reverse) -1 else 1)
+        restX = add(restX, h * k)
+        restY = add(restY, v * k)
+        val dx = restX.toInt()
+        val dy = restY.toInt()
+        if (dx == 0 && dy == 0) return null
+        restX -= dx
+        restY -= dy
+        return dx to dy
+    }
+
+    private fun add(rest: Float, d: Float) = if (rest * d < 0f) d else rest + d
 }

@@ -85,6 +85,10 @@ data class Settings(
      * 关掉时只看画面里的（见 [app.airhand.android.ui.session.RemoteView]）
      */
     val localCursor: Boolean = true,
+    /** 外接鼠标的滚轮反过来滚（屏幕上的双指滑动不变） */
+    val reverseWheel: Boolean = false,
+    /** 外接鼠标滚轮的速度：百分比，[WHEEL_SPEEDS] 里的一个 */
+    val wheelSpeed: Int = 100,
     /** 已经看过的手势说明（trackpad / touch / tv） */
     val tipsSeen: Set<String> = emptySet(),
     /**
@@ -114,10 +118,14 @@ data class Settings(
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
         .put("localCursor", localCursor)
+        .put("reverseWheel", reverseWheel)
+        .put("wheelSpeed", wheelSpeed)
         .put("tipsSeen", JSONArray(tipsSeen.toList()))
         .put("identity", identity)
 
     companion object {
+        val WHEEL_SPEEDS = listOf(50, 75, 100, 150, 200)
+
         fun parse(o: JSONObject): Settings {
             val d = Settings()
             val tips = o.optJSONArray("tipsSeen")
@@ -135,6 +143,8 @@ data class Settings(
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),
                 localCursor = o.optBoolean("localCursor", d.localCursor),
+                reverseWheel = o.optBoolean("reverseWheel", d.reverseWheel),
+                wheelSpeed = o.optInt("wheelSpeed", d.wheelSpeed).takeIf { it in WHEEL_SPEEDS } ?: d.wheelSpeed,
                 tipsSeen = if (tips == null) emptySet() else (0 until tips.length()).map { tips.getString(it) }.toSet(),
                 identity = o.optString("identity", ""),
             )

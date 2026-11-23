@@ -182,6 +182,9 @@
     <string name="nav_keys_desc">在画面下方显示返回、主页、最近任务</string>
     <string name="local_cursor">拖动窗口时显示本地光标</string>
     <string name="local_cursor_desc">对方拖动、缩放窗口时会把光标画进画面里。打开时照样画本机的光标，跟手不延迟；关闭时只看画面里的那个</string>
+    <string name="reverse_wheel">反转鼠标滚轮</string>
+    <string name="reverse_wheel_desc">外接鼠标的滚轮往反方向滚，屏幕上的双指滑动不变</string>
+    <string name="wheel_speed">鼠标滚轮速度</string>
     <string name="settings_data">数据</string>
     <string name="clear_devices">清除已保存的设备</string>
     <string name="clear_devices_desc">共 %1$d 台</string>

@@ -19,6 +19,8 @@ import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Navigation
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Smartphone
+import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
@@ -50,6 +52,7 @@ import app.airhand.android.R
 import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Preset
+import app.airhand.android.data.Settings
 import app.airhand.android.data.TouchMode
 import app.airhand.android.host.HostService
 import app.airhand.android.host.HostState
@@ -136,6 +139,10 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
         Toggle(Icons.Outlined.Mouse, stringResource(R.string.local_cursor), stringResource(R.string.local_cursor_desc), s.localCursor) { v ->
             app.updateSettings { it.copy(localCursor = v) }
         }
+        Toggle(Icons.Outlined.SwapVert, stringResource(R.string.reverse_wheel), stringResource(R.string.reverse_wheel_desc), s.reverseWheel) { v ->
+            app.updateSettings { it.copy(reverseWheel = v) }
+        }
+        Item(Icons.Outlined.Speed, stringResource(R.string.wheel_speed), stringResource(R.string.percent, s.wheelSpeed)) { dialog = "wheelSpeed" }
 
         SectionTitle(stringResource(R.string.settings_data))
         Item(
@@ -255,6 +262,17 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
             onSelect = { m ->
                 dialog = null
                 app.updateSettings { it.copy(touchMode = m) }
+            },
+        )
+        "wheelSpeed" -> ChoiceDialog(
+            title = stringResource(R.string.wheel_speed),
+            options = Settings.WHEEL_SPEEDS,
+            selected = s.wheelSpeed,
+            label = { p -> Text(stringResource(R.string.percent, p)) },
+            onDismiss = { dialog = null },
+            onSelect = { p ->
+                dialog = null
+                app.updateSettings { it.copy(wheelSpeed = p) }
             },
         )
         "clear" -> ConfirmDialog(

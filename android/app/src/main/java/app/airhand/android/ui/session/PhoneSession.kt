@@ -199,6 +199,7 @@ fun PhoneSession(
     LaunchedEffect(cursor) { view.setCursor(cursor) }
     LaunchedEffect(mouseLock) { view.mouseLock = mouseLock }
     LaunchedEffect(settings.localCursor) { view.localCursor = settings.localCursor }
+    LaunchedEffect(settings.reverseWheel, settings.wheelSpeed) { view.setWheel(settings.reverseWheel, settings.wheelSpeed) }
     // 相对移动按对方屏幕的像素换算
     LaunchedEffect(displays, currentDisplay) {
         displays.firstOrNull { it.index == currentDisplay }?.let { view.setRemoteSize(it.width, it.height) }
