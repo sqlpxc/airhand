@@ -19,6 +19,7 @@ import android.view.HapticFeedbackConstants
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -438,6 +439,17 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         } else if (!want && hasPointerCapture()) {
             releasePointerCapture()
         }
+    }
+
+    /**
+     * 外接鼠标在画面上时不显示系统指针：对方的光标本机已经画了（[Overlay]，或者画在画面里），再叠一个系统的就有两个。
+     * 直通（控制手机）不画光标，系统指针照常显示；抓住鼠标时系统自己会隐藏
+     */
+    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? {
+        if (interactive && showCursor && editor == null && content.contains(event.getX(pointerIndex), event.getY(pointerIndex))) {
+            return PointerIcon.getSystemIcon(context, PointerIcon.TYPE_NULL)
+        }
+        return super.onResolvePointerIcon(event, pointerIndex)
     }
 
     override fun onCapturedPointerEvent(e: MotionEvent): Boolean {
