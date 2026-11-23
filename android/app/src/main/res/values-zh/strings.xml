@@ -223,6 +223,8 @@
     <string name="audio_playback_failed">无法播放声音：%1$s</string>
     <string name="menu_keyboard">键盘</string>
     <string name="menu_shortcuts">快捷键</string>
+    <string name="swap_ctrl_command">互换 Ctrl 和 ⌘ Command</string>
+    <string name="swap_ctrl_command_desc">外接键盘的 Ctrl 当 ⌘ 用，Win 键当 Ctrl 用；键盘上方的特殊键和下面的快捷键不变。这台电脑会记住</string>
     <string name="menu_sound_on">声音：开</string>
     <string name="menu_sound_off">声音：关</string>
     <string name="menu_mouse_lock_on">锁定鼠标：开</string>

@@ -214,6 +214,8 @@ data class SavedDevice(
     val lastUsed: Long = 0,
     /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
     val hostKey: String? = null,
+    /** 控制这台 Mac 时互换外接键盘的 Ctrl 和 ⌘（会话菜单的快捷键页里开关，和桌面控制台一样按设备记住） */
+    val swapCtrlCommand: Boolean = false,
 ) {
     fun title(): String = alias?.takeIf { it.isNotBlank() } ?: hostName.takeIf { it.isNotBlank() } ?: ""
 
@@ -225,6 +227,7 @@ data class SavedDevice(
         .put("resume", resume ?: JSONObject.NULL)
         .put("lastUsed", lastUsed)
         .put("hostKey", hostKey ?: JSONObject.NULL)
+        .put("swapCtrlCommand", swapCtrlCommand)
 
     companion object {
         fun parse(o: JSONObject) = SavedDevice(
@@ -235,6 +238,7 @@ data class SavedDevice(
             resume = o.optStringOrNull("resume"),
             lastUsed = o.optLong("lastUsed"),
             hostKey = o.optStringOrNull("hostKey"),
+            swapCtrlCommand = o.optBoolean("swapCtrlCommand"),
         )
     }
 }
@@ -278,6 +282,11 @@ class DeviceStore(context: Context) {
     @Synchronized
     fun rename(code: String, alias: String?) {
         set(_flow.value.map { if (it.code == code) it.copy(alias = alias?.trim()?.ifEmpty { null }) else it })
+    }
+
+    @Synchronized
+    fun setSwapCtrlCommand(code: String, on: Boolean) {
+        set(_flow.value.map { if (it.code == code) it.copy(swapCtrlCommand = on) else it })
     }
 
     @Synchronized

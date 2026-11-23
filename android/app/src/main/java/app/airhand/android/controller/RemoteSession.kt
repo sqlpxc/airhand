@@ -106,6 +106,14 @@ class RemoteSession(
     /** 锁定鼠标：鼠标一直只发移动了多少、不发位置（被控端隐藏光标时会自动这样，这是手动打开的） */
     val mouseLock = MutableStateFlow(false)
 
+    /** 控制 Mac 时互换外接键盘的 Ctrl 和 ⌘（见 KeyboardController）：按设备记住，默认关闭 */
+    val swapCtrlCommand = MutableStateFlow(saved?.swapCtrlCommand == true)
+
+    fun setSwapCtrlCommand(on: Boolean) {
+        swapCtrlCommand.value = on
+        app.devices.setSwapCtrlCommand(code, on)
+    }
+
     /** 本机播放声音出错 */
     val audioError = MutableStateFlow<String?>(null)
     val quality = MutableStateFlow(

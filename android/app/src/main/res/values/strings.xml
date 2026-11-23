@@ -228,6 +228,8 @@
     <string name="audio_playback_failed">Can\'t play the sound: %1$s</string>
     <string name="menu_keyboard">Keyboard</string>
     <string name="menu_shortcuts">Shortcuts</string>
+    <string name="swap_ctrl_command">Swap Ctrl and ⌘ Command</string>
+    <string name="swap_ctrl_command_desc">On a connected keyboard Ctrl works as ⌘ and the Win key as Control. The extra keys row and the shortcuts below don\'t change. Remembered for this computer</string>
     <string name="menu_sound_on">Sound on</string>
     <string name="menu_sound_off">Sound off</string>
     <string name="menu_mouse_lock_on">Mouse lock on</string>

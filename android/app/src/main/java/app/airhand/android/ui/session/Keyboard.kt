@@ -16,12 +16,35 @@ import app.airhand.android.controller.KeyMap
  *
  * 修饰键（Ctrl / Alt / Shift / Win）在快捷键栏上是"粘滞"的：点一下只对下一个键有效（[Sticky.ONCE]），
  * 再点一下锁定（[Sticky.LOCK]），再点取消。比如点 Ctrl 再在软键盘上打 c，发出去的就是 Ctrl+C。
+ *
+ * 外接键盘（和输入法发来的按键事件）按物理键发（[key]）：
+ * * 修饰键的按下可能被输入法或者系统拿走了，只能从后面那个键的 `metaState` 看出按着：这时把它和那个键一起按一下；
+ * * 控制 Mac、这台电脑打开了互换 Ctrl 和 ⌘ 时（[swapCtrlCommand]），键盘上的 Ctrl 发成 ⌘，⌘（Win 键）发成 Ctrl。
+ *   快捷键栏和快捷键菜单不换，按钮上写的是什么就发什么（和桌面控制台一样）；
+ * * 按着的键都记着（[held]）：松开时发按下时发的那个键（中途改了开关也不会卡住），窗口失去焦点时一起松开（[releaseKeys]）。
  */
-class KeyboardController(private val send: (List<Any>) -> Unit) {
-    enum class Mod(val code: String) { CTRL("ControlLeft"), ALT("AltLeft"), SHIFT("ShiftLeft"), META("MetaLeft") }
+class KeyboardController(
+    /** 外接键盘的 Ctrl 和 ⌘ 互换（控制 Mac、这台电脑打开了这个开关时） */
+    private val swapCtrlCommand: () -> Boolean = { false },
+    private val send: (List<Any>) -> Unit,
+) {
+    /** `flag`：按键事件的 `metaState` 里表示这个修饰键按着的位 */
+    enum class Mod(val code: String, val flag: Int) {
+        CTRL("ControlLeft", KeyEvent.META_CTRL_ON),
+        ALT("AltLeft", KeyEvent.META_ALT_ON),
+        SHIFT("ShiftLeft", KeyEvent.META_SHIFT_ON),
+        META("MetaLeft", KeyEvent.META_META_ON),
+    }
+
     enum class Sticky { OFF, ONCE, LOCK }
 
     val mods = mutableStateMapOf<Mod, Sticky>()
+
+    /** 外接键盘按着的键 → 按下时发出去的键（Ctrl / ⌘ 互换时不一样），按按下的顺序 */
+    private val held = LinkedHashMap<String, String>()
+
+    /** 按下时和补上的修饰键一起按完了的键（见 [keyDown]）：它的抬起不用再发 */
+    private val tapped = HashSet<String>()
 
     /** 输入法正在组字（例如拼音）的内容，还没有发出去，界面上显示出来 */
     var composing by mutableStateOf("")
@@ -73,35 +96,81 @@ class KeyboardController(private val send: (List<Any>) -> Unit) {
         }
     }
 
-    /** 外接键盘 / 软键盘发来的按键事件。返回是否处理了 */
+    /** 外接键盘 / 输入法发来的按键事件。返回是否处理了 */
     fun key(e: KeyEvent): Boolean {
         val code = KeyMap.code(e.keyCode) ?: return false
         when (e.action) {
-            KeyEvent.ACTION_DOWN -> {
-                if (code in MODIFIER_CODES) {
-                    send(listOf(Input.key(code, true)))
-                } else {
-                    val mods = active().map { it.code }.filter { m -> m !in pressedHardware(e) }
-                    send(mods.map { Input.key(it, true) } + Input.key(code, true))
-                    if (mods.isNotEmpty()) send(listOf(Input.key(code, false)) + mods.reversed().map { Input.key(it, false) })
-                    consumeOnce()
-                }
-            }
-            KeyEvent.ACTION_UP -> send(listOf(Input.key(code, false)))
+            KeyEvent.ACTION_DOWN -> keyDown(code, e.metaState)
+            KeyEvent.ACTION_UP -> keyUp(code)
+            else -> return false
         }
         return true
     }
 
-    private fun pressedHardware(e: KeyEvent): Set<String> = buildSet {
-        if (e.isCtrlPressed) add(Mod.CTRL.code)
-        if (e.isAltPressed) add(Mod.ALT.code)
-        if (e.isShiftPressed) add(Mod.SHIFT.code)
-        if (e.isMetaPressed) add(Mod.META.code)
+    /** 这个键的按下已经发出去了（还没发抬起） */
+    fun holds(keyCode: Int): Boolean = KeyMap.code(keyCode)?.let { it in held || it in tapped } == true
+
+    /** 外接键盘按下一个键。`metaState`：按键事件说这时按着哪些修饰键 */
+    internal fun keyDown(code: String, metaState: Int = 0) {
+        if (code in MODIFIER_CODES) {
+            // 按住时的自动重复照样发，用第一次按下时的映射
+            send(listOf(Input.key(held.getOrPut(code) { mapped(code) }, true)))
+            return
+        }
+        // 要和这个键一起按的修饰键：快捷键栏上点了的（写的是什么就发什么），按键事件说按着、却没见到它按下的。
+        // 对方那边已经按着的（不分左右）不用再按
+        val physical = heldModifiers(held.keys)
+        val extra = LinkedHashSet<String>()
+        for (m in Mod.entries) {
+            if (state(m) != Sticky.OFF) extra += m.code
+            if (metaState and m.flag != 0 && side(m.code) !in physical) extra += mapped(m.code)
+        }
+        val remote = heldModifiers(held.values)
+        extra.removeAll { side(it) in remote }
+        if (extra.isEmpty()) {
+            held[code] = code
+            tapped -= code
+            send(listOf(Input.key(code, true)))
+        } else {
+            // 一下按完：修饰键按下，这个键按下、松开，修饰键松开。它自己的抬起之后不再发
+            held -= code
+            tapped += code
+            send(Input.chord(extra.toList() + code))
+        }
+        consumeOnce()
     }
+
+    /** 外接键盘松开一个键：发按下时发的那个。没见到按下的（那时窗口没有焦点、或者已经一起松开了）不发 */
+    internal fun keyUp(code: String) {
+        if (tapped.remove(code)) return
+        val sent = held.remove(code) ?: return
+        send(listOf(Input.key(sent, false)))
+    }
+
+    /** 松开外接键盘按着的所有键，后按下的先松开。窗口失去焦点时：之后的抬起不一定送得到这里，对方那边会一直按着 */
+    fun releaseKeys() {
+        tapped.clear()
+        if (held.isEmpty()) return
+        val ups = held.values.toList().asReversed().map { Input.key(it, false) }
+        held.clear()
+        send(ups)
+    }
+
+    /** 外接键盘上的这个键发给对方时是哪个键：只有 Ctrl 和 ⌘ 可能互换 */
+    private fun mapped(code: String): String = if (swapCtrlCommand()) CTRL_COMMAND_SWAP[code] ?: code else code
+
+    /** 不分左右的修饰键（ControlLeft、ControlRight → Control） */
+    private fun side(code: String): String = code.removeSuffix("Left").removeSuffix("Right")
+
+    private fun heldModifiers(codes: Collection<String>): Set<String> = codes.filter { it in MODIFIER_CODES }.mapTo(HashSet(), ::side)
 
     companion object {
         private val MODIFIER_CODES = setOf(
             "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight",
+        )
+        private val CTRL_COMMAND_SWAP = mapOf(
+            "ControlLeft" to "MetaLeft", "MetaLeft" to "ControlLeft",
+            "ControlRight" to "MetaRight", "MetaRight" to "ControlRight",
         )
     }
 }

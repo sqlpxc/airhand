@@ -772,8 +772,11 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         // 拿到焦点才能抓住鼠标（失去焦点时系统自己会放开）
         updateCapture()
         // 菜单、通知栏、切到后台：游戏按键按着的都松开（手指的抬起不一定会送到这里），切换着的也松开，
-        // 不然角色会一直走下去
-        if (!hasWindowFocus) game.releaseAll()
+        // 不然角色会一直走下去；外接键盘按着的键也一样
+        if (!hasWindowFocus) {
+            game.releaseAll()
+            host.keyboard.releaseKeys()
+        }
     }
 
     fun hideKeyboard() {
@@ -783,7 +786,27 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         keyboardWanted = false
     }
 
-    /** 外接键盘：按键原样发过去（返回、音量键留给本机） */
+    /**
+     * 外接键盘的按键（[SessionActivity.dispatchKeyEvent] 把窗口收到的都先交给这里）：焦点不在画面上也发给对方。
+     * 返回、音量键等留给本机；电视上、编辑游戏按键时不发。返回是否发了
+     */
+    fun hardwareKey(e: KeyEvent): Boolean {
+        if (!interactive || editor != null || !hasWindowFocus() || e.keyCode in LOCAL_KEYS) return false
+        if (e.device?.isVirtual != false) return false
+        return host.keyboard.key(e)
+    }
+
+    /**
+     * 输入法之前：Ctrl / ⌘ 的组合键先发，不然输入法会自己处理掉（Ctrl+C 之类，发不到对方）。按下已经发了的键，
+     * 抬起也在这里发：输入法可能拿走它，对方那边就一直按着
+     */
+    override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+        val beforeIme = event.isCtrlPressed || event.isMetaPressed || keyCode in SHORTCUT_MODIFIERS ||
+            (event.action == KeyEvent.ACTION_UP && host.keyboard.holds(keyCode))
+        return (beforeIme && hardwareKey(event)) || super.onKeyPreIme(keyCode, event)
+    }
+
+    /** 外接键盘（连上之前、断线时）和软键盘发来的按键：原样发过去（返回、音量键留给本机） */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
         if (interactive && passKey(event)) host.keyboard.key(event) else super.onKeyDown(keyCode, event)
 
@@ -807,6 +830,11 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         private val LOCAL_KEYS = setOf(
             KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_MUTE,
             KeyEvent.KEYCODE_POWER, KeyEvent.KEYCODE_HOME, KeyEvent.KEYCODE_APP_SWITCH,
+        )
+
+        /** 在输入法之前发的修饰键（见 [onKeyPreIme]） */
+        private val SHORTCUT_MODIFIERS = setOf(
+            KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT, KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT,
         )
     }
 }

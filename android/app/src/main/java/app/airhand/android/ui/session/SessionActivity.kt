@@ -1,9 +1,11 @@
 package app.airhand.android.ui.session
 
+import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.Surface
 import android.view.WindowManager
 import android.widget.Toast
@@ -56,6 +58,7 @@ import app.airhand.android.R
 import app.airhand.android.controller.RemoteSession
 import app.airhand.android.core.Code
 import app.airhand.android.core.DisplayInfo
+import app.airhand.android.core.OsKind
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.theme.AirhandTheme
 import kotlinx.coroutines.flow.combine
@@ -78,7 +81,9 @@ class SessionActivity : ComponentActivity(), RemoteView.Host {
     private val orientation = ScreenOrientation()
     private val landscape = mutableStateOf(true)
 
-    override val keyboard = KeyboardController { events -> session?.input(events, true) }
+    override val keyboard = KeyboardController(
+        swapCtrlCommand = { session?.let { it.os == OsKind.MAC && it.swapCtrlCommand.value } == true },
+    ) { events -> session?.input(events, true) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -166,6 +171,19 @@ class SessionActivity : ComponentActivity(), RemoteView.Host {
     override fun onStop() {
         super.onStop()
         session?.setBackground(true)
+    }
+
+    /**
+     * 外接键盘：连上了就发给对方，不管焦点在哪个视图上（[RemoteView.hardwareKey]）。这里已经在输入法之后：
+     * 输入法要的键（打拼音）照样给它，Ctrl / ⌘ 的组合键在它之前就发了（[RemoteView.onKeyPreIme]）。
+     * 连接中、断线时不拦：盖在画面上的按钮还能用键盘操作。
+     *
+     * RestrictedApi：androidx 的 ComponentActivity 把它重写的这个方法标成了库内部的，其实是 Activity 的公开方法，重写、调用 super 都没问题
+     */
+    @SuppressLint("RestrictedApi")
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (::view.isInitialized && session?.phase?.value == RemoteSession.Phase.Live && view.hardwareKey(event)) return true
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onSurface(surface: Surface?) {
