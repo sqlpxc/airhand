@@ -8,6 +8,9 @@ use airhand_proto::session::{Codec, QualitySettings};
 use std::time::{Duration, Instant};
 
 fn main() {
+    // 和正式的被控端一样：双显卡电脑上桌面复制要找对显卡，在用到 DXGI 之前
+    #[cfg(windows)]
+    capture::ignore_gpu_preference();
     for (codec, hw, max_short) in [
         (Codec::H264, false, 1080),
         (Codec::H264, true, 1080),

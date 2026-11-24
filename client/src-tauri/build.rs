@@ -4,6 +4,9 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("windows-msvc") {
         println!("cargo:rustc-link-arg=/DELAYLOAD:mfplat.dll");
+        // 链接参数对这个包的所有目标生效：没有用到 Media Foundation 的（airhand.exe 的单元测试程序）链接器会报
+        // LNK4199（没有来自 mfplat.dll 的导入，忽略 /DELAYLOAD）。本来就是无事可做，不算问题
+        println!("cargo:rustc-link-arg=/IGNORE:4199");
         println!("cargo:rustc-link-lib=delayimp");
     }
     let mic = "src/host/mic";
