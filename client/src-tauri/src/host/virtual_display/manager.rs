@@ -21,6 +21,8 @@ const WATCH: Duration = Duration::from_secs(1);
 const IDLE: Duration = Duration::from_secs(30);
 /// 启用之后这么久虚拟显示器还没出来，防窥就算失败
 const APPEAR: Duration = Duration::from_secs(15);
+/// 查不到显示设置时，先这么多次每 [`BUSY`] 再看一次，之后每 5 秒
+const LOOK_TRIES: u32 = 10;
 /// 连着这么多轮都要"只留虚拟显示器"（改不成，或者改完了又被放回去），防窥就算失败
 const MAX_FAILURES: u32 = 4;
 
@@ -45,6 +47,8 @@ fn run() {
     let mut blocker: Option<Blocker> = None;
     let mut enabled_at: Option<Instant> = None;
     let mut failures = 0u32;
+    // 连着几次查不到显示设置了
+    let mut look_failures = 0u32;
     // 最近看到的本机主显示器的分辨率：虚拟显示器用一样的
     let mut mode = Mode::default();
     // 这次启用之后已经把虚拟显示器换成了 `mode`
@@ -69,14 +73,26 @@ fn run() {
         desktop::follow();
         let facts = device::enabled().and_then(topology::facts);
         let facts = match facts {
-            Ok(f) => f,
+            Ok(f) => {
+                look_failures = 0;
+                f
+            }
             Err(e) => {
-                warn!("can't look at the displays: {e:#}");
+                look_failures += 1;
+                if look_failures == 1 || look_failures.is_multiple_of(LOOK_TRIES) {
+                    warn!("can't look at the displays: {e:#}");
+                }
                 // 设备没了（例如刚在卸载时删掉了）：不再管了，下一个会话加入时重新看能不能用
                 if stopping || !device::usable() {
                     break;
                 }
-                wait(Duration::from_secs(5));
+                // 插拔显示器的那一下常常查不到（实测拔掉 HDMI 时 `ERROR_GEN_FAILURE`），马上就好：很快再看，
+                // 不然补屏要晚好几秒。一直查不到就慢下来
+                wait(if look_failures < LOOK_TRIES {
+                    BUSY
+                } else {
+                    Duration::from_secs(5)
+                });
                 continue;
             }
         };
@@ -136,9 +152,14 @@ fn run() {
                         enabled_at = None;
                         bump();
                     }
-                    Err(e) => warn!("{e:#}"),
+                    Err(e) => {
+                        warn!("{e:#}, trying again in a moment");
+                        plan.disable_failed(Instant::now());
+                    }
                 }
             }
+            // 停用刚失败过：等着再试（要退出了也等：不然虚拟显示器就留在桌面上了）
+            Step::Backoff => {}
             Step::Isolate => {
                 info!("privacy mode: only the virtual display stays on the desktop");
                 // 先记下来：改到一半进程没了，下次启动按它恢复
@@ -164,6 +185,19 @@ fn run() {
                         Err(e) => crate::host::capture::wire_detail(&e),
                         Ok(()) => "Windows keeps putting the local displays back".into(),
                     });
+                }
+            }
+            Step::Prune => {
+                // 不记进注册表（不是防窥）：进程意外退出之后停用虚拟显示器就够了，Windows 记着的设置没动过
+                info!(
+                    "the local display was unplugged but is still on the desktop, leaving only the virtual display"
+                );
+                match topology::isolate() {
+                    Ok(()) => {
+                        mode_set = false;
+                        bump();
+                    }
+                    Err(e) => warn!("{e:#}"),
                 }
             }
             Step::Restore => {

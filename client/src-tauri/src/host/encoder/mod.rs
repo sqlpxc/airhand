@@ -253,6 +253,7 @@ impl Encoder {
         allow_hw: bool,
         allow_gpu: bool,
     ) -> Result<Self> {
+        let started = std::time::Instant::now();
         let (src_w, src_h) = (frame.width, frame.height);
         let (w, h) = target_size(src_w, src_h, s.max_short);
         let gpu = frame.gpu.as_ref().filter(|_| allow_gpu);
@@ -289,7 +290,8 @@ impl Encoder {
         };
         let gpu = gpu.is_some() && inner.takes_gpu();
         let i = inner.info();
-        info!(encoder = %i.name, hw = i.hardware, gpu, codec = ?i.codec, src_w, src_h, w, h, kbps, "encoder created");
+        let took_ms = started.elapsed().as_millis() as u64;
+        info!(encoder = %i.name, hw = i.hardware, gpu, codec = ?i.codec, src_w, src_h, w, h, kbps, took_ms, "encoder created");
         Ok(Self {
             inner,
             resizers: (0..resize_threads()).map(|_| fir::Resizer::new()).collect(),

@@ -172,6 +172,19 @@ fn send_msg_cancellable(out: &Outbox, stop: &AtomicBool, msg: &HostMsg) -> bool 
     }
 }
 
+/// 关掉编码器。卡住了的硬件编码器关掉时可能要等一会儿（这期间这一路画面停着）：太久的记一笔
+fn drop_encoder(enc: &mut Option<Encoder>) {
+    let started = Instant::now();
+    *enc = None;
+    let took = started.elapsed();
+    if took > Duration::from_millis(500) {
+        warn!(
+            took_ms = took.as_millis() as u64,
+            "closing the encoder took long"
+        );
+    }
+}
+
 fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
@@ -348,7 +361,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
             .as_ref()
             .is_some_and(|e| e.compatible(&frame, &settings))
         {
-            enc = None;
+            drop_encoder(&mut enc);
             match Encoder::new(
                 &frame,
                 &settings,
@@ -463,7 +476,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
                 } else if e.info().hardware {
                     hw_failures += 1;
                 }
-                enc = None;
+                drop_encoder(&mut enc);
                 ctrl.force_key.store(true, Ordering::Release);
             }
         }

@@ -11,6 +11,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
+};
 use windows::Win32::Devices::Display::*;
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LUID, POINTL};
 use windows::Win32::Graphics::Gdi::{
@@ -126,10 +129,55 @@ fn source_mode(cfg: &Config, p: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFI
     Some(unsafe { m.Anonymous.sourceMode })
 }
 
-/// 现在的样子（`enabled`：设备启用着没有，见 `super::device::enabled`）
+/// 接在这个输出上的显示器的设备节点还在不在（看不出来时为 `None`）。
+///
+/// 拔掉最后一个显示器时 Windows 可能什么都不改（实测：合着盖的笔记本拔掉接在 NVIDIA 上的 HDMI）：那条路径照样
+/// 在桌面上，`targetAvailable` 照样是真的，名字也照样查得到，DXGI 也还列着它，只是再也没有新画面。这时显示器的
+/// 设备节点没了（Kernel-PnP 1010：surprise removed），查到的 `monitorDevicePath` 是空的（实测如此）；
+/// 不是空的也再看一眼设备节点在不在
+fn monitor_present(adapter: LUID, id: u32) -> Option<bool> {
+    let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    name.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+    name.header.adapterId = adapter;
+    name.header.id = id;
+    if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } != 0 {
+        return None;
+    }
+    let path = wide_str(&name.monitorDevicePath);
+    if path.is_empty() {
+        return Some(false);
+    }
+    let instance = monitor_instance(&path)?;
+    let mut node = 0u32;
+    let r = unsafe {
+        CM_Locate_DevNodeW(
+            &mut node,
+            &HSTRING::from(instance),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    match r {
+        CR_SUCCESS => Some(true),
+        CR_NO_SUCH_DEVNODE => Some(false),
+        _ => None,
+    }
+}
+
+/// 显示器的设备接口路径 → 设备实例 ID：`\\?\DISPLAY#XMI27B3#5&17d37f5&0&UID4355#{e6f07b5f-…}` →
+/// `DISPLAY\XMI27B3\5&17d37f5&0&UID4355`
+fn monitor_instance(path: &str) -> Option<String> {
+    let (id, _) = path.strip_prefix(r"\\?\")?.rsplit_once("#{")?;
+    (!id.is_empty()).then(|| id.replace('#', "\\"))
+}
+
+/// 现在的样子（`enabled`：设备启用着没有，见 `super::device::enabled`）。本机的显示器接着、设备节点也在
+/// （见 [`monitor_present`]，看不出来的算在）才算接着；拔掉了还在桌面上的是 `physical_stale`
 pub(super) fn facts(enabled: bool) -> Result<Facts> {
     let cfg = query(QDC_ALL_PATHS)?;
     let mut adapters = Adapters::default();
+    // 同一个输出在好几条路径上（每个源配每个输出），每个只看一次
+    let mut present: HashMap<Target, bool> = HashMap::new();
     let mut f = Facts {
         enabled,
         ..Facts::default()
@@ -139,11 +187,24 @@ pub(super) fn facts(enabled: bool) -> Result<Facts> {
         if adapters.is_virtual(p.targetInfo.adapterId) {
             f.virtual_connected |= available;
             f.virtual_active |= active(p);
-        } else {
-            f.physical_active |= active(p);
-            if available {
-                f.physical_connected.push(target(p));
+            continue;
+        }
+        if !available && !active(p) {
+            continue;
+        }
+        let live = available
+            && *present.entry(target(p)).or_insert_with(|| {
+                monitor_present(p.targetInfo.adapterId, p.targetInfo.id).unwrap_or(true)
+            });
+        if active(p) {
+            if live {
+                f.physical_active = true;
+            } else {
+                f.physical_stale = true;
             }
+        }
+        if live {
+            f.physical_connected.push(target(p));
         }
     }
     f.physical_connected.sort_unstable();
@@ -286,6 +347,11 @@ fn virtual_source() -> Option<(String, u32, u32)> {
     })
 }
 
+/// 桌面上的第一个虚拟显示器的名字，和 `DisplayInfo::name` 一样（`DISPLAY19`，没有前面的 `\\.\`）
+pub(super) fn virtual_name() -> Option<String> {
+    virtual_source().map(|(name, ..)| name.trim_start_matches(r"\\.\").to_string())
+}
+
 /// 桌面上的虚拟显示器换成 `mode`（大小不一样的话）。只改这一次（不存进注册表）：下次启用时驱动的首选就是它
 /// （见 `super::device::write_settings`），这里只是防 Windows 套用以前记着的分辨率。
 /// 返回有没有虚拟显示器在桌面上（没有就是还不用改）
@@ -330,5 +396,20 @@ mod tests {
         let f = super::facts(false).unwrap();
         println!("{f:#?}");
         println!("primary: {:?}", super::primary_mode());
+    }
+
+    /// 显示器的设备接口路径 → 设备实例 ID；看不懂的不猜
+    #[test]
+    fn monitor_instance_from_its_interface_path() {
+        assert_eq!(
+            super::monitor_instance(
+                r"\\?\DISPLAY#XMI27B3#5&17d37f5&0&UID4355#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+            )
+            .as_deref(),
+            Some(r"DISPLAY\XMI27B3\5&17d37f5&0&UID4355")
+        );
+        assert_eq!(super::monitor_instance(""), None);
+        assert_eq!(super::monitor_instance(r"DISPLAY\XMI27B3\1"), None);
+        assert_eq!(super::monitor_instance(r"\\?\#{guid}"), None);
     }
 }

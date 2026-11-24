@@ -364,6 +364,23 @@ pub fn cover_generation() -> u64 {
     curtain::cover_generation()
 }
 
+/// 补屏的虚拟显示器在桌面上的名字（和 `DisplayInfo::name` 一样，例如 `DISPLAY19`）；没在补屏（没有它、开着防窥）时
+/// 为 `None`。本机的显示器回到桌面上之后它马上就要停用：会话不再跟着它（见 `host::session`）。要查显示设置，
+/// 放在不挡异步任务的线程上调用
+pub fn filling_in() -> Option<String> {
+    #[cfg(windows)]
+    {
+        if HUB.wants.lock().unwrap().privacy(Instant::now()) {
+            return None;
+        }
+        topology::virtual_name()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// 进程启动时（还没有会话）、卸载时：上次意外退出没恢复的恢复掉（见模块说明）
 pub fn recover() {
     #[cfg(windows)]

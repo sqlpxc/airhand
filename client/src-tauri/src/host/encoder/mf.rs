@@ -664,13 +664,17 @@ impl MfEncoder {
                         recover: None,
                     },
                 );
-                let used = probe(
-                    &mut enc,
-                    LtrControl {
-                        mark: None,
-                        recover: Some(slot),
-                    },
-                );
+                // 标的那一帧就没编出来（例如编码器卡住了，每次都要等到超时）：不用再试一次
+                let used = match &marked {
+                    Ok(_) => probe(
+                        &mut enc,
+                        LtrControl {
+                            mark: None,
+                            recover: Some(slot),
+                        },
+                    ),
+                    Err(_) => Ok(None),
+                };
                 let ok = matches!(marked, Ok(Some(r)) if r.marked == Some(slot))
                     && matches!(used, Ok(Some(r)) if r.used == 1 << slot);
                 if !ok {

@@ -61,15 +61,34 @@ const WAKE_WAIT: Duration = Duration::from_secs(3);
 
 /// 显示器列表变了之后，每一路画面看的显示器在新列表里的序号：按名字找（插拔别的显示器时序号可能变），
 /// 找不到（被拔掉了）的那一路不要了；一路都不剩就改看主显示器（新列表的第一个，见 [`resolve_view`]）。
-fn follow_view(old: &[DisplayInfo], view: &[StreamView], new: &[DisplayInfo]) -> Vec<StreamView> {
+///
+/// `fill_in`：补屏的虚拟显示器（见 [`virtual_display::filling_in`]）。本机的显示器回到桌面上了，它马上就要停用：
+/// 看着它的那一路也不要了，一路都不剩时改看本机的显示器（主显示器排在前面）。不然先跟着它，它停用时再换一次，
+/// 控制端的画面多跳一下
+fn follow_view(
+    old: &[DisplayInfo],
+    view: &[StreamView],
+    new: &[DisplayInfo],
+    fill_in: Option<&str>,
+) -> Vec<StreamView> {
+    let leaving = fill_in.filter(|v| new.iter().any(|d| d.name != *v));
     let followed: Vec<StreamView> = view
         .iter()
         .filter_map(|v| {
             let name = &old.get(v.display as usize)?.name;
+            if leaving == Some(name.as_str()) {
+                return None;
+            }
             let display = new.iter().position(|n| &n.name == name)? as u8;
             Some(StreamView { display, ..*v })
         })
         .collect();
+    if followed.is_empty()
+        && let Some(v) = leaving
+        && let Some(i) = new.iter().position(|d| d.name != v)
+    {
+        return vec![StreamView::display(i as u8)];
+    }
     resolve_view(&followed, new.len(), MAX_STREAMS)
 }
 
@@ -693,12 +712,14 @@ impl Platform for Desktop {
             // （例如把显示器转成竖屏后宽高对调）。更新列表并告诉控制端；采集线程自己会重新打开。
             // 正在看的显示器换了序号就跟着它走，被拔掉了就改看主显示器
             Tick::Displays => {
-                let now = tokio::task::spawn_blocking(capture::displays)
-                    .await
-                    .unwrap_or_default();
+                let (now, fill_in) = tokio::task::spawn_blocking(|| {
+                    (capture::displays(), virtual_display::filling_in())
+                })
+                .await
+                .unwrap_or_default();
                 // 列不出来（例如切换显示模式的瞬间）时保留原来的列表
                 if !now.is_empty() && now != self.displays {
-                    let next = follow_view(&self.displays, &self.view, &now);
+                    let next = follow_view(&self.displays, &self.view, &now, fill_in.as_deref());
                     info!(session_id, ?now, view = ?next, "displays changed");
                     self.displays = now;
                     // 序号没变的那几路接着编：采集线程自己会重新打开（旋转、改分辨率……）
@@ -777,15 +798,18 @@ mod tests {
             d(0, "DISPLAY1", 0, 1920, 1080),
             d(1, "DISPLAY2", 1920, 1080, 1920),
         ];
-        assert_eq!(follow_view(&old, &view(&[1]), &rotated), view(&[1]));
+        assert_eq!(follow_view(&old, &view(&[1]), &rotated, None), view(&[1]));
         // 在左边插了一个显示器，正在看的那个排到了后面；两个都在看时两路各跟各的
         let plugged = [
             d(0, "DISPLAY1", 0, 1920, 1080),
             d(1, "DISPLAY3", 1920, 1280, 1024),
             d(2, "DISPLAY2", 3200, 1920, 1080),
         ];
-        assert_eq!(follow_view(&old, &view(&[1]), &plugged), view(&[2]));
-        assert_eq!(follow_view(&old, &view(&[0, 1]), &plugged), view(&[0, 2]));
+        assert_eq!(follow_view(&old, &view(&[1]), &plugged, None), view(&[2]));
+        assert_eq!(
+            follow_view(&old, &view(&[0, 1]), &plugged, None),
+            view(&[0, 2])
+        );
         // 每一路的大小跟着它走
         let sized = [
             StreamView::display(0),
@@ -795,7 +819,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            follow_view(&old, &sized, &plugged),
+            follow_view(&old, &sized, &plugged, None),
             [
                 StreamView::display(0),
                 StreamView {
@@ -805,9 +829,43 @@ mod tests {
             ]
         );
         // 正在看的被拔掉了：只看它的时候改看主显示器，还看着别的显示器就不要这一路了
-        assert_eq!(follow_view(&old, &view(&[1]), &old[..1]), view(&[0]));
-        assert_eq!(follow_view(&old, &view(&[1, 0]), &old[..1]), view(&[0]));
+        assert_eq!(follow_view(&old, &view(&[1]), &old[..1], None), view(&[0]));
+        assert_eq!(
+            follow_view(&old, &view(&[1, 0]), &old[..1], None),
+            view(&[0])
+        );
         // 序号本来就不对
-        assert_eq!(follow_view(&old, &view(&[7]), &old), view(&[0]));
+        assert_eq!(follow_view(&old, &view(&[7]), &old, None), view(&[0]));
+    }
+
+    /// 补屏的时候本机的显示器回到了桌面上：不再跟着马上就要停用的虚拟显示器，改看本机的（不管谁排在前面）；
+    /// 只剩虚拟显示器的时候照常跟着它
+    #[test]
+    fn leaves_the_fill_in_display_when_a_monitor_is_back() {
+        let filling = [d(0, "DISPLAY19", 0, 3840, 2160)];
+        let back = [
+            d(0, "DISPLAY1", 0, 3840, 2160),
+            d(1, "DISPLAY19", 3840, 1920, 1080),
+        ];
+        assert_eq!(
+            follow_view(&filling, &view(&[0]), &back, Some("DISPLAY19")),
+            view(&[0])
+        );
+        let back_behind = [
+            d(0, "DISPLAY19", 0, 1920, 1080),
+            d(1, "DISPLAY1", 1920, 3840, 2160),
+        ];
+        assert_eq!(
+            follow_view(&filling, &view(&[0]), &back_behind, Some("DISPLAY19")),
+            view(&[1])
+        );
+        // 不知道哪个是补屏的：和以前一样跟着名字走
+        assert_eq!(follow_view(&filling, &view(&[0]), &back, None), view(&[1]));
+        // 分辨率变了，还是只有它
+        let resized = [d(0, "DISPLAY19", 0, 1920, 1080)];
+        assert_eq!(
+            follow_view(&filling, &view(&[0]), &resized, Some("DISPLAY19")),
+            view(&[0])
+        );
     }
 }
