@@ -15,7 +15,9 @@
 //!   `HIDSystemState` 的：键盘、鼠标、触控板，媒体键、手势也是），放过被控端自己注入的（事件源带着
 //!   [`INJECTED`] 记号）和别的程序合成的；松开按键、鼠标键的放过去，开启之前本机按着的不会一直按着。要"辅助功能"
 //!   权限（注入输入本来就要它，没有就开不了：[`usable`]）。系统停用了监听（回调超时、本机输入太多）马上重新启用。
-//!   挡不住的：密码框有焦点时（"安全输入"）键盘事件不经过事件监听，本机的人还能往里面打字；电源键、合盖；
+//!   挡不住的：密码框有焦点时（"安全输入"）键盘事件不经过事件监听，本机的人还能往里面打字；电源键、合盖。
+//!   挡下了本机的人按键、点鼠标、滚动（移动鼠标不算）时告诉 `host::ending`：本机有人要用电脑，断线的控制端不再等它
+//!   重连（见 `ending::local_input`；回调里只记一下，监听的线程每 [`TICK`] 看一眼）；
 //! * 补屏的虚拟显示器（见 [`super::mac`]）不用调黑、不用盖：本机的人看不到它。
 //!
 //! 两个线程：事件监听在 `airhand-privacy-input` 的 run loop 上，这个线程不做别的（注入的输入也要经过监听，
@@ -60,6 +62,9 @@ const GAMMA_TRIES: u32 = 10;
 const GAMMA_RETRY: Duration = Duration::from_secs(10);
 /// 黑窗口最多几个（`curtain.m` 的 `MAX_COVERS`）
 const MAX_COVERS: usize = 32;
+
+/// 挡下了本机的人按键、点鼠标、滚动（见模块说明）：回调里只记一下，监听的线程再告诉 `ending`
+static PRESSED: AtomicBool = AtomicBool::new(false);
 
 /// 挡的事件：键盘、鼠标、触控板。`CGEventType` 里有的，加上只有 `NSEvent` 才有名字的几种
 const KINDS: [u32; 26] = [
@@ -225,9 +230,14 @@ fn block_input(stop: &AtomicBool, started: mpsc::Sender<Result<()>>) {
     };
     let _ = started.send(Ok(()));
     info!("privacy mode: the local keyboard and mouse are blocked");
+    // 上一次防窥留下的不算
+    PRESSED.store(false, Ordering::Relaxed);
     while !stop.load(Ordering::Acquire) {
         tap.keep_enabled();
         CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, TICK.as_secs_f64(), false);
+        if PRESSED.swap(false, Ordering::Relaxed) {
+            crate::host::ending::local_input();
+        }
     }
     drop(tap);
     info!("privacy mode: the local keyboard and mouse work again");
@@ -373,6 +383,18 @@ fn blocks(e: &Seen) -> bool {
     e.local && !e.ours && !releases(e)
 }
 
+/// 本机的人想用电脑：按键、按下鼠标键、滚动（挡下了才算，见模块说明）。移动鼠标不算：桌子被碰一下也会动
+fn presses(e: &Seen) -> bool {
+    matches!(
+        CGEventType(e.kind),
+        CGEventType::KeyDown
+            | CGEventType::LeftMouseDown
+            | CGEventType::RightMouseDown
+            | CGEventType::OtherMouseDown
+            | CGEventType::ScrollWheel
+    )
+}
+
 /// 松开：按键、鼠标键、手势结束、修饰键松开（它的那一位清掉了）
 fn releases(e: &Seen) -> bool {
     match CGEventType(e.kind) {
@@ -476,7 +498,13 @@ unsafe extern "C-unwind" fn filter(
         keycode: field(CGEventField::KeyboardEventKeycode) as u16,
         flags: CGEvent::flags(Some(ev)).0,
     };
-    if blocks(&seen) { null_mut() } else { pass }
+    if !blocks(&seen) {
+        return pass;
+    }
+    if presses(&seen) {
+        PRESSED.store(true, Ordering::Relaxed);
+    }
+    null_mut()
 }
 
 #[cfg(test)]
@@ -523,6 +551,29 @@ mod tests {
             CGEventType(END_GESTURE),
         ] {
             assert!(!blocks(&local(kind)), "松开 {kind:?}");
+        }
+    }
+
+    /// 按键、按下鼠标键、滚动算本机有人想用电脑；移动、拖动、松开不算
+    #[test]
+    fn presses_are_someone_at_the_computer() {
+        for kind in [
+            CGEventType::KeyDown,
+            CGEventType::LeftMouseDown,
+            CGEventType::RightMouseDown,
+            CGEventType::OtherMouseDown,
+            CGEventType::ScrollWheel,
+        ] {
+            assert!(presses(&local(kind)), "{kind:?}");
+        }
+        for kind in [
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDragged,
+            CGEventType::KeyUp,
+            CGEventType::LeftMouseUp,
+            CGEventType::FlagsChanged,
+        ] {
+            assert!(!presses(&local(kind)), "{kind:?}");
         }
     }
 

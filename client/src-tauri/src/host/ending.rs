@@ -5,7 +5,11 @@
 //!
 //! * **正常结束**（控制端断开：断开按钮、关掉标签页 / 窗口；本机断开所有控制端、更换控制码）：马上算；
 //! * **断线**（失联、连接出错，被控端和服务器的连接断了，被控端的任务被中止）：控制端多半在重连，
-//!   再等 [`RECONNECT`]，没人回来才算。期间又断了一个就从那时重新等；正常结束了一个就不等了。
+//!   再等 [`RECONNECT`]，没人回来才算。期间又断了一个就从那时重新等；正常结束了一个就不等了；
+//! * **本机有人要用电脑**：防窥挡着本机的键盘鼠标时有人按了键、点了鼠标（[`local_input`]）。断线了在等的不再等，
+//!   马上算；还连着的不管，不过之后 [`PRESENT`] 里断线了也不等。控制端的应用被杀掉（手机上划掉后台）时
+//!   发不出断开，中转要过 10 秒左右才发现它不在了，再等重连的话本机的人要对着黑屏等快一分钟。
+//!   远程控制结束时照样先锁屏，本机的人看到的只是锁屏界面；控制端重连上来时防窥照样打开（握手里带着）。
 //!
 //! 结束的时候：
 //!
@@ -25,7 +29,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::info;
 
@@ -33,6 +37,9 @@ use super::virtual_display;
 
 /// 断线的控制端：等它重连这么久
 pub const RECONNECT: Duration = Duration::from_secs(30);
+/// 本机的人按了键、点了鼠标（[`local_input`]）之后这么久里断线的控制端不等它重连：控制端的应用被杀掉时，
+/// 中转大约 10 秒后（QUIC 的空闲超时）才发现它不在了，这之前按的也算
+const PRESENT: Duration = Duration::from_secs(30);
 
 /// 远程控制在不在、断线的在不在等（见模块说明）。纯逻辑，执行在 [`run`]
 #[derive(Debug, Default)]
@@ -45,6 +52,8 @@ struct State {
     epoch: u64,
     /// 被控端要停下来了（[`shutdown`] 之后什么也不做）
     stopping: bool,
+    /// 本机的人上一次按键、点鼠标（防窥挡着的时候，见 [`local_input`]）；用过一次就清掉
+    local: Option<Instant>,
 }
 
 /// 要做什么
@@ -66,10 +75,21 @@ impl State {
 
     /// 会话结束了：`clean` 是正常结束（见模块说明）
     fn leave(&mut self, session_id: u64, clean: bool) -> Action {
+        self.leave_at(session_id, clean, Instant::now())
+    }
+
+    fn leave_at(&mut self, session_id: u64, clean: bool, now: Instant) -> Action {
         if !self.live.remove(&session_id) || self.stopping {
             return Action::Nothing;
         }
         if !clean {
+            if self.someone_here(now) {
+                info!(
+                    session_id,
+                    "someone at the computer wants to use it, not waiting for the controller"
+                );
+                return self.stop_waiting();
+            }
             self.epoch += 1;
             self.waiting = true;
             return Action::Wait(self.epoch);
@@ -85,6 +105,7 @@ impl State {
         // 最后一个正常结束了：不用再等断线的了
         self.epoch += 1;
         self.waiting = false;
+        self.local = None;
         Action::End
     }
 
@@ -94,6 +115,37 @@ impl State {
             return Action::Nothing;
         }
         self.waiting = false;
+        if self.live.is_empty() {
+            self.local = None;
+            Action::End
+        } else {
+            Action::Release
+        }
+    }
+
+    /// 防窥挡住了本机的人按键、点鼠标（见 [`local_input`]）
+    fn local_input(&mut self, now: Instant) -> Action {
+        if self.stopping {
+            return Action::Nothing;
+        }
+        if self.waiting {
+            return self.stop_waiting();
+        }
+        self.local = Some(now);
+        Action::Nothing
+    }
+
+    /// 本机的人刚按过键、点过鼠标（见 [`PRESENT`]）
+    fn someone_here(&self, now: Instant) -> bool {
+        self.local
+            .is_some_and(|t| now.saturating_duration_since(t) < PRESENT)
+    }
+
+    /// 不再等断线的控制端重连：一个会话都不剩了就结束，不然只退出防窥（和等待到期一样）
+    fn stop_waiting(&mut self) -> Action {
+        self.epoch += 1;
+        self.waiting = false;
+        self.local = None;
         if self.live.is_empty() {
             Action::End
         } else {
@@ -169,6 +221,20 @@ impl Slot {
 fn leave(session_id: u64, clean: bool) {
     let action = state().leave(session_id, clean);
     run(action);
+}
+
+/// 防窥模式挡住了本机的人按键、点鼠标、滚滚轮（Windows 的低级钩子、macOS 的事件监听在自己的线程上调用，
+/// 见 `virtual_display`）：本机有人要用电脑。断线了在等重连的控制端不再等：一个会话都不剩了就锁屏、
+/// 退出防窥；还连着的控制端不管（见模块说明）
+pub fn local_input() {
+    let action = state().local_input(Instant::now());
+    if action != Action::Nothing {
+        info!(
+            "someone at the computer wants to use it, not waiting for the controller to reconnect"
+        );
+        // 挡输入的线程要马上回到它的消息循环 / run loop：退出防窥要拿别的锁，放在自己的线程上
+        spawn(move || run(action));
+    }
 }
 
 /// 做 `action`：要等的、要锁屏的（锁屏之后要等锁屏界面出来）放在自己的线程上，不挡会话的任务
@@ -435,5 +501,59 @@ mod tests {
         };
         assert!(s.stop());
         assert_eq!(s.expire(e), Action::Nothing);
+    }
+
+    /// 断线了在等重连时本机有人按键：不等了，马上结束；那一轮等待到期时什么也不做
+    #[test]
+    fn someone_at_the_computer_stops_the_wait() {
+        let t0 = Instant::now();
+        let mut s = State::default();
+        s.join(1);
+        let Action::Wait(e) = s.leave_at(1, false, t0) else {
+            panic!()
+        };
+        assert_eq!(s.local_input(t0), Action::End);
+        assert_eq!(s.expire(e), Action::Nothing);
+        // 用过了：下一次断线照样等
+        s.join(2);
+        assert!(matches!(s.leave_at(2, false, t0), Action::Wait(_)));
+    }
+
+    /// 还连着时按的键不打断它；之后不久它断线了（控制端的应用被杀掉，中转过一会儿才发现）就不等它重连
+    #[test]
+    fn a_recent_press_skips_the_wait() {
+        let t0 = Instant::now();
+        let mut s = State::default();
+        s.join(1);
+        assert_eq!(s.local_input(t0), Action::Nothing);
+        assert_eq!(
+            s.leave_at(1, false, t0 + Duration::from_secs(10)),
+            Action::End
+        );
+
+        // 很久以前按的不算
+        let mut s = State::default();
+        s.join(1);
+        s.local_input(t0);
+        assert!(matches!(
+            s.leave_at(1, false, t0 + PRESENT),
+            Action::Wait(_)
+        ));
+    }
+
+    /// 还有别的控制端连着：本机有人按键也不锁屏，只是不等断线的重连（它打开的防窥退出）；没在等的时候什么也不做
+    #[test]
+    fn others_still_connected() {
+        let t0 = Instant::now();
+        let mut s = State::default();
+        s.join(1);
+        s.join(2);
+        let Action::Wait(e) = s.leave_at(1, false, t0) else {
+            panic!()
+        };
+        assert_eq!(s.local_input(t0), Action::Release);
+        assert_eq!(s.expire(e), Action::Nothing);
+        assert_eq!(s.local_input(t0), Action::Nothing);
+        assert_eq!(s.leave_at(2, true, t0), Action::End);
     }
 }

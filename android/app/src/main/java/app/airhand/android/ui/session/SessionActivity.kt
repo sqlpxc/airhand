@@ -174,6 +174,21 @@ class SessionActivity : ComponentActivity(), RemoteView.Host {
     }
 
     /**
+     * 不是从界面上离开的（[exit]）却要结束了：在最近任务里把应用划掉了，而进程还活着（例如本机正在被控，前台服务撑着进程）。
+     * 这时没人看得到画面、也没处点断开，会话不能留在后台一直连着（对方开着防窥的话一直黑屏、本机的人用不了）：
+     * 正常断开，对方马上锁屏、退出防窥。进程直接被杀掉时走不到这里，对方等它断线（见被控端的 ending）。
+     * 转屏等配置变化重建界面时不算
+     */
+    override fun onDestroy() {
+        val s = session
+        if (s != null && isFinishing && !isChangingConfigurations && app.session.value === s) {
+            android.util.Log.i("airhand", "the session screen went away (task removed), disconnecting")
+            app.endSession(s)
+        }
+        super.onDestroy()
+    }
+
+    /**
      * 外接键盘：连上了就发给对方，不管焦点在哪个视图上（[RemoteView.hardwareKey]）。这里已经在输入法之后：
      * 输入法要的键（打拼音）照样给它，Ctrl / ⌘ 的组合键在它之前就发了（[RemoteView.onKeyPreIme]）。
      * 连接中、断线时不拦：盖在画面上的按钮还能用键盘操作。

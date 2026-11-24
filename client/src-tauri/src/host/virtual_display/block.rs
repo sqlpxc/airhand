@@ -6,7 +6,10 @@
 //!   （线程上有钩子时不能切换桌面，见 `host::desktop`）。被控端以 SYSTEM 身份运行，安全桌面上也装得上；
 //! * 松开按键、松开鼠标键的事件放过去：开启之前本机按着的键不会一直按着（别的程序看到的就是按着的）；
 //! * 拦不住 Ctrl+Alt+Del（系统的安全注意序列，不经过钩子）。按了也只是切到安全桌面，本机的显示器都撤下了，看不到；
-//! * 钩子的回调在这个线程的消息循环里调用：回调很快就返回，系统也就不会因为超时把钩子摘掉。
+//! * 挡下了本机的人按键、点鼠标、滚滚轮（移动鼠标不算：桌子被碰一下也会动）时告诉 `host::ending`：本机有人要用电脑，
+//!   断线的控制端不再等它重连（见 `ending::local_input`）；
+//! * 钩子的回调在这个线程的消息循环里调用：回调很快就返回（只记一下有没有人按过，消息循环里再告诉 `ending`），
+//!   系统也就不会因为超时把钩子摘掉。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -21,11 +24,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
     PostThreadMessageW, QS_ALLINPUT, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYUP, WM_LBUTTONUP, WM_MBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SYSKEYUP,
-    WM_XBUTTONUP,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_NULL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::host::input::INJECTED;
+
+/// 挡下了本机的人按键、点鼠标、滚滚轮：钩子里只记一下，消息循环里再告诉 `ending`（见模块说明）
+static PRESSED: AtomicBool = AtomicBool::new(false);
 
 /// 本机的输入被挡住了（[`Blocker`] 开着期间）。Drop 时放开
 pub(super) struct Blocker {
@@ -103,6 +110,8 @@ impl Drop for Hooks {
 
 fn run(stop: &AtomicBool, thread_id: &AtomicU32) {
     thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    // 上一次防窥留下的不算
+    PRESSED.store(false, Ordering::Relaxed);
     let mut hooks: Option<Hooks> = None;
     while !stop.load(Ordering::Acquire) {
         if !crate::host::desktop::on_input_desktop() {
@@ -127,6 +136,9 @@ fn run(stop: &AtomicBool, thread_id: &AtomicU32) {
                 unsafe { DispatchMessageW(&msg) };
             }
         }
+        if PRESSED.swap(false, Ordering::Relaxed) {
+            crate::host::ending::local_input();
+        }
     }
     drop(hooks);
 }
@@ -138,6 +150,9 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         let ours = k.flags.contains(LLKHF_INJECTED) && k.dwExtraInfo == INJECTED;
         let release = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
         if !ours && !release {
+            if matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                PRESSED.store(true, Ordering::Relaxed);
+            }
             return LRESULT(1);
         }
     }
@@ -153,6 +168,17 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
             WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP
         );
         if !ours && !release {
+            if matches!(
+                wparam.0 as u32,
+                WM_LBUTTONDOWN
+                    | WM_RBUTTONDOWN
+                    | WM_MBUTTONDOWN
+                    | WM_XBUTTONDOWN
+                    | WM_MOUSEWHEEL
+                    | WM_MOUSEHWHEEL
+            ) {
+                PRESSED.store(true, Ordering::Relaxed);
+            }
             return LRESULT(1);
         }
     }
