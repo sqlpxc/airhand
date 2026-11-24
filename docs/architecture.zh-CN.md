@@ -184,7 +184,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 
 - 桌面复制和 `SendInput` 只对调用线程所在的桌面有效。UAC 确认框、锁屏和登录界面在安全桌面 `Winlogon` 上，只有 SYSTEM 能打开；采集线程和注入线程在用之前先切到当前接收输入的桌面上（`client/src-tauri/src/host/desktop.rs`）
 - 托盘和被控端之间是每个会话一个的命名管道（`\\.\pipe\airhand-host-<会话>`），每行一条 JSON 消息。只有交互登录的用户能连接，不能再开一个同名管道实例冒充被控端，托盘还会核对管道属于 SYSTEM
-- 剪贴板里的文件交给托盘（`client/src-tauri/src/winsvc/clip.rs`，管道 `\\.\pipe\airhand-clip-<会话>`，安全设置同上）：SYSTEM 进程放进剪贴板的数据对象资源管理器调不了，所以对方复制的文件由托盘放、托盘粘贴时经管道向被控端取；本机复制的文件由托盘以登录的用户的身份读，不然控制端能借 SYSTEM 读到这个用户读不了的文件。没有托盘时只同步文本
+- 剪贴板里的文件交给托盘（`client/src-tauri/src/winsvc/clip.rs`，管道 `\\.\pipe\airhand-clip-<会话>`，安全设置同上）：SYSTEM 进程放进剪贴板的数据对象资源管理器调不了，所以对方复制的文件由托盘放、托盘粘贴时经管道向被控端取；本机复制的文件由托盘以登录的用户的身份读，不然控制端能借 SYSTEM 读到这个用户读不了的文件；剪贴板里复制了哪些文件也由托盘读：资源管理器复制的文件 SYSTEM 进程在剪贴板里看不到（文字看得到）。没有托盘时只同步文本
 - 服务和被控端没有控制台：日志用 `OutputDebugString` 输出（见开发文档的[调试 Windows 服务](development.zh-CN.md#调试-windows-服务)）
 
 ### 虚拟显示器、防窥模式、不熄屏

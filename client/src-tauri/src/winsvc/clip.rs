@@ -3,7 +3,9 @@
 //! * 控制端复制的文件要放进剪贴板，成为资源管理器（登录的用户）粘贴得了的虚拟文件：SYSTEM 进程里的数据对象
 //!   资源管理器调不了，所以由托盘放（[`place`]），托盘粘贴时经管道向被控端列目录、读文件（被控端再向控制端取）；
 //! * 本机复制的文件要以登录的用户的身份读（不然控制端能借 SYSTEM 读到这个用户读不了的文件）：被控端公告给控制端的
-//!   是 [`TrayFs`]，控制端来取时经管道请托盘读（[`provider`]）。
+//!   是 [`TrayFs`]，控制端来取时经管道请托盘读（[`provider`]）；
+//! * 剪贴板里复制了哪些文件也请托盘读（[`copied_files`]）：资源管理器复制的文件 SYSTEM 进程在剪贴板里看不到
+//!   （文字看得到，`CF_HDROP` 这些格式看不到），自己读的话本机复制的文件永远公告不出去。
 //!
 //! 管道 `\\.\pipe\airhand-clip-<会话>`，安全设置和 [`super::ipc`] 的一样（只有交互登录的用户能连、不能冒充被控端，
 //! 托盘核对管道的所有者）。被控端是服务端，同一时刻只认最近连上的那个托盘。每条消息是
@@ -36,6 +38,8 @@ const READ_CHUNK: usize = 1 << 20;
 const LIST_WAIT: Duration = Duration::from_secs(120);
 /// 等一块数据最多这么久
 const READ_WAIT: Duration = Duration::from_secs(120);
+/// 等托盘说剪贴板里复制了哪些文件最多这么久（比读剪贴板的超时短，见 `crate::clipboard`）
+const COPIED_WAIT: Duration = Duration::from_secs(3);
 /// 最多记着这么多个放进剪贴板的公告
 const KEEP_OFFERS: usize = 4;
 
@@ -88,6 +92,10 @@ enum Msg {
     LocalDrop {
         id: u64,
     },
+    /// 本机剪贴板里复制了哪些文件（托盘读，见模块说明），回答 `Copied`
+    ReadCopied {
+        req: u64,
+    },
 
     // ── 托盘 → 被控端 ──
     /// 放进剪贴板了（放不了也说）
@@ -97,6 +105,12 @@ enum Msg {
     Items {
         req: u64,
         items: Vec<FileEntry>,
+    },
+    /// 剪贴板里复制的文件（没有、是自己放的对方的文件：空的）；`error`：读不了（例如别的程序正开着剪贴板）
+    Copied {
+        req: u64,
+        paths: Vec<PathBuf>,
+        error: Option<String>,
     },
     Opened {
         req: u64,
@@ -143,6 +157,7 @@ impl Msg {
     fn reply_to(&self) -> Option<u64> {
         match self {
             Msg::Items { req, .. }
+            | Msg::Copied { req, .. }
             | Msg::Opened { req, .. }
             | Msg::Listed { req, .. }
             | Msg::Data { req, .. } => Some(*req),
@@ -325,9 +340,30 @@ pub fn withdraw(key: u64) {
     agent().offers.lock().unwrap().retain(|(k, _)| *k != key);
 }
 
+/// 本机剪贴板里复制的文件：请托盘以登录的用户的身份读（见模块说明）。阻塞的。没有托盘时是 `None`
+/// （调用的一方自己读；本机复制的文件也要托盘读，反正公告不了）。托盘没有及时回答当作没有复制文件
+pub fn copied_files() -> Option<Result<Option<Vec<PathBuf>>, arboard::Error>> {
+    let conn = tray()?;
+    let Some(f) = conn.call(|req| Msg::ReadCopied { req }, COPIED_WAIT) else {
+        warn!("the tray didn't tell which files are on the clipboard");
+        return Some(Ok(None));
+    };
+    Some(match f.msg {
+        Msg::Copied {
+            error: Some(description),
+            ..
+        } => Err(arboard::Error::Unknown { description }),
+        Msg::Copied { paths, .. } => Ok((!paths.is_empty()).then_some(paths)),
+        _ => Ok(None),
+    })
+}
+
 /// 本机复制的这些路径：交给托盘读（见模块说明）。没有托盘、一个都不在了时是 `None`（不公告）
 pub async fn provider(paths: Vec<PathBuf>) -> Option<Arc<dyn Provider>> {
-    let conn = tray()?;
+    let Some(conn) = tray() else {
+        info!("no tray to read the copied files, not offering them");
+        return None;
+    };
     tokio::task::spawn_blocking(move || {
         let id = conn.id();
         let f = conn.call(|req| Msg::Local { req, id, paths }, LIST_WAIT)?;
@@ -654,6 +690,24 @@ fn from_agent(conn: &Arc<Conn>, side: &Arc<TraySide>, f: Frame) {
             items,
         })),
         Msg::Withdraw { key } => clipfiles::withdraw_key(key),
+        Msg::ReadCopied { req } => {
+            let conn = conn.clone();
+            tokio::task::spawn_blocking(move || {
+                let (paths, error) = match crate::clipboard::copied_files() {
+                    // 管道上是 JSON：不是 Unicode 的路径发不了（LocalFs 也不要名字不是 Unicode 的）
+                    Ok(paths) => (
+                        paths
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|p| p.to_str().is_some())
+                            .collect(),
+                        None,
+                    ),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                };
+                conn.send(Msg::Copied { req, paths, error }, Vec::new())
+            });
+        }
         Msg::Local { req, id, paths } => {
             let (conn, side) = (conn.clone(), side.clone());
             tokio::task::spawn_blocking(move || {
@@ -965,5 +1019,41 @@ mod tests {
         .await
         .unwrap();
         assert!(got == data[10..]);
+    }
+
+    /// 被控端请托盘读剪贴板里复制的文件（经过管道，这里是内存里的一对）：复制了文件时是那些路径，复制的是文字时没有。
+    /// 动的是本机真的剪贴板：手动运行（`cargo test --lib winsvc::clip -- --ignored`）
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn the_tray_tells_the_host_which_files_are_copied() {
+        let dir = std::env::temp_dir().join(format!("airhand-copied-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("复制的.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let (host_end, tray_end) = tokio::io::duplex(1 << 20);
+        let (htx, hrx) = mpsc::unbounded_channel();
+        let host = Conn::new(htx);
+        let (ttx, trx) = mpsc::unbounded_channel();
+        let tray = Conn::new(ttx);
+        let side = Arc::new(TraySide::default());
+        let t = tray.clone();
+        tokio::spawn(pump(tray_end, tray, trx, move |f| from_agent(&t, &side, f)));
+        tokio::spawn(pump(host_end, host.clone(), hrx, |_| {}));
+        *agent().conn.lock().unwrap() = Some(host);
+
+        arboard::Clipboard::new()
+            .unwrap()
+            .set()
+            .file_list(std::slice::from_ref(&file))
+            .unwrap();
+        let got = tokio::task::spawn_blocking(copied_files).await.unwrap();
+        assert_eq!(got.unwrap().unwrap(), Some(vec![file.clone()]));
+
+        crate::clipboard::set_text("not files").unwrap();
+        let got = tokio::task::spawn_blocking(copied_files).await.unwrap();
+        assert_eq!(got.unwrap().unwrap(), None);
+
+        *agent().conn.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

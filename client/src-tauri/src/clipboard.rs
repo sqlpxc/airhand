@@ -3,7 +3,9 @@
 //! * 检测到变化后才读取内容：Windows 用 `GetClipboardSequenceNumber`，Linux 用 XFIXES 的
 //!   选择所有者变化通知，macOS 用 `NSPasteboard.changeCount`（都不需要读取内容，几乎零开销）；
 //! * 记录"双方已一致"的内容哈希，抑制回声（A 写入 B → B 检测到变化 → 又发回 A）；
-//! * 对方复制的文件由 [`crate::clipfiles`] 放进本机剪贴板；本机剪贴板里是自己放的那些时不算本机复制了文件。
+//! * 对方复制的文件由 [`crate::clipfiles`] 放进本机剪贴板；本机剪贴板里是自己放的那些时不算本机复制了文件；
+//! * Windows 服务里的被控端（SYSTEM）看不到资源管理器复制的文件（剪贴板里只看得到文字），复制了哪些文件请托盘读
+//!   （见 `winsvc::clip`）。
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -86,8 +88,29 @@ fn hash_clip(c: &Clip) -> u64 {
     }
 }
 
-/// 剪贴板里复制的文件（没有时为 `None`）
+/// 剪贴板里复制的文件（没有时为 `None`）。Windows 服务里的被控端请托盘以登录的用户的身份读（见模块说明）；
+/// 没有托盘时自己读（多半读不到，反正也公告不了：本机的文件也要托盘读）
 fn get_files() -> Result<Option<Vec<std::path::PathBuf>>, arboard::Error> {
+    #[cfg(windows)]
+    if crate::winsvc::is_agent()
+        && let Some(files) = crate::winsvc::clip::copied_files()
+    {
+        return files;
+    }
+    local_files()
+}
+
+/// 托盘替服务里的被控端读：本机剪贴板里复制的文件，自己放进去的对方的文件不算（见模块说明）
+#[cfg(windows)]
+pub fn copied_files() -> Result<Option<Vec<std::path::PathBuf>>, arboard::Error> {
+    if crate::clipfiles::is_ours() {
+        return Ok(None);
+    }
+    local_files()
+}
+
+/// 本进程读剪贴板里复制的文件
+fn local_files() -> Result<Option<Vec<std::path::PathBuf>>, arboard::Error> {
     match with_clipboard(|c| c.get().file_list()) {
         // 自己放进去的对方的文件（Linux：本程序挂的文件系统里的）不算本机复制的
         Ok(files)
