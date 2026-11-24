@@ -41,7 +41,7 @@ use tracing::{info, warn};
 use super::pace::Pacer;
 
 #[cfg(windows)]
-pub use dxgi::{D3dSource, GpuFrame};
+pub use dxgi::{D3dSource, GpuFrame, ignore_gpu_preference};
 #[cfg(all(windows, test))]
 pub(crate) use dxgi::{Rotation, create_device};
 #[cfg(target_os = "macos")]

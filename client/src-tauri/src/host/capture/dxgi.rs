@@ -8,9 +8,14 @@
 //! * 打开前先切到当前的输入桌面（见 [`crate::host::desktop`]）：UAC 确认框、锁屏出现时桌面复制会中断
 //!   （`DXGI_ERROR_ACCESS_LOST`），重新打开时就跟着切过去了；
 //! * 旋转了的显示器（竖屏）：桌面复制给出的是没有旋转的画面，复制时转成用户看到的方向（见 [`Rotation`]），
-//!   画面的宽高、方向与 [`DisplayInfo`]（桌面坐标）一致，控制端的鼠标坐标才能对上。
+//!   画面的宽高、方向与 [`DisplayInfo`]（桌面坐标）一致，控制端的鼠标坐标才能对上；
+//! * 双显卡电脑：DXGI 不管本进程的显卡偏好（[`ignore_gpu_preference`]），每块显示器留在真正接着它的显卡下面，
+//!   在那块显卡上建设备复制它。
 
 mod hdr;
+mod hybrid;
+
+pub use hybrid::ignore_gpu_preference;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -317,6 +322,8 @@ struct Output {
 }
 
 fn outputs() -> Result<Vec<Output>> {
+    // 被控端一启动就已经换掉了（见调用处），这里是保险：DXGI 按显卡偏好搬过的显示器复制不了
+    ignore_gpu_preference();
     let mut list = Vec::new();
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;

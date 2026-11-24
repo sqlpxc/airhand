@@ -183,6 +183,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 仅为当前用户安装时没有系统服务（`client/src-tauri/src/winsvc/user.rs`）：被控端和 macOS、Linux 一样在托盘进程里运行，所以下面说的安全桌面、命名管道都用不上，锁屏、登录界面和 UAC 确认框不能控制。一台电脑上只该有一份 Airhand 运行被控端：安装程序按已有的安装升级（`client/src-tauri/windows/hooks.nsh`），别的用户为所有用户安装之后，仅为当前用户安装的那份让开。托盘在命名事件 `Local\Airhand.Quit` 上等着被叫退出，安装程序也看它在不在，决定升级后要不要重新打开托盘。
 
 - 桌面复制和 `SendInput` 只对调用线程所在的桌面有效。UAC 确认框、锁屏和登录界面在安全桌面 `Winlogon` 上，只有 SYSTEM 能打开；采集线程和注入线程在用之前先切到当前接收输入的桌面上（`client/src-tauri/src/host/desktop.rs`）
+- 双显卡电脑（核显 + 独显的笔记本）：进程有显卡偏好（设置 → 图形里按程序选的、电源设置、显卡驱动的切换配置）时，DXGI 把接在另一块显卡上的显示器“搬”到偏好的显卡下面，放一个虚拟输出；对它桌面复制一定是 `DXGI_ERROR_UNSUPPORTED`（0x887A0004）。只选一种偏好也不行：显示器分别接在两块显卡上时总有一块被搬走，SYSTEM 身份的被控端也不受用户的按程序设置管。所以被控端进程（服务里的 `--agent`，或者托盘里的被控端）一启动、用到 DXGI 之前，就把本进程里的 `win32u!NtGdiDdDDIGetCachedHybridQueryValue` 换成总是回答“没有偏好”的函数（和 Sunshine 的做法一样）：DXGI 不再搬显示器，每块显示器在真正接着它的显卡上复制（`client/src-tauri/src/host/capture/dxgi/hybrid.rs`）。这是没有公开的系统接口：函数开头不是预期的系统调用代码时不动它，只记一条警告。实测（RTX 4080 Laptop + Intel 核显，屏幕接在独显上）：给程序选“省电”时以前报 0x887A0004，现在三种偏好都能采集
 - 托盘和被控端之间是每个会话一个的命名管道（`\\.\pipe\airhand-host-<会话>`），每行一条 JSON 消息。只有交互登录的用户能连接，不能再开一个同名管道实例冒充被控端，托盘还会核对管道属于 SYSTEM
 - 剪贴板里的文件交给托盘（`client/src-tauri/src/winsvc/clip.rs`，管道 `\\.\pipe\airhand-clip-<会话>`，安全设置同上）：SYSTEM 进程放进剪贴板的数据对象资源管理器调不了，所以对方复制的文件由托盘放、托盘粘贴时经管道向被控端取；本机复制的文件由托盘以登录的用户的身份读，不然控制端能借 SYSTEM 读到这个用户读不了的文件；剪贴板里复制了哪些文件也由托盘读：资源管理器复制的文件 SYSTEM 进程在剪贴板里看不到（文字看得到）。没有托盘时只同步文本
 - 服务和被控端没有控制台：日志用 `OutputDebugString` 输出（见开发文档的[调试 Windows 服务](development.zh-CN.md#调试-windows-服务)）

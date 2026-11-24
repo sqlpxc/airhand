@@ -28,6 +28,8 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 pub fn run(args: &[String]) -> i32 {
     super::init_debug_logging();
     crate::enable_dpi_awareness();
+    // 双显卡电脑上桌面复制要找对显卡：在用到 DXGI 之前
+    crate::host::capture::ignore_gpu_preference();
 
     // 同一时刻只能有一个被控端（服务保证这一点；这里防止手动运行的 --agent 和服务里的同时注册）
     let _single = unsafe {

@@ -709,6 +709,11 @@ pub fn run() {
         winsvc::user::step_aside();
         return;
     }
+    // 被控端在本进程里运行：双显卡电脑上桌面复制要找对显卡，在用到 DXGI 之前（见 host::capture::ignore_gpu_preference）
+    #[cfg(windows)]
+    if !service_mode {
+        host::capture::ignore_gpu_preference();
+    }
     #[cfg(not(windows))]
     let service_mode = false;
     let Some(instance) = single_instance::acquire() else {
