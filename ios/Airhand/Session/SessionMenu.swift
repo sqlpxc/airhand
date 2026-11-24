@@ -146,6 +146,13 @@ struct SessionMenu: View {
                 Divider().overlay(Theme.stroke).padding(.leading, 50)
                 NavigationLink { DisplaysPage(session: session) } label: { row("display.2", L.t("menu_displays")) }
             }
+            // 防窥模式：对方（Windows、Mac）说了它的状态才有；点开是开关和说明（开不了时写着为什么）
+            if let p = session.privacyState, !session.viewOnly {
+                Divider().overlay(Theme.stroke).padding(.leading, 50)
+                NavigationLink { PrivacyPage(session: session) } label: {
+                    row(p.active ? "lock.shield.fill" : "lock.shield", L.t("privacy_toggle"), value: L.t(p.active ? "on" : "off"))
+                }
+            }
             if computer && !session.viewOnly {
                 Divider().overlay(Theme.stroke).padding(.leading, 50)
                 NavigationLink { GamePage(app: app, session: session, edit: actions.editGame) } label: {
@@ -367,6 +374,52 @@ struct DisplaysPage: View {
         .navigationTitle(L.t("menu_displays"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
+    }
+}
+
+// ───────────────────────────── 防窥模式 ─────────────────────────────
+
+/// 防窥模式：对方所有的显示器黑屏、键盘鼠标不起作用，只有控制端看得到、操作得了（和桌面版工具栏的盾牌菜单一样）。
+/// 开关下面写着现在怎么样：正在打开、开着、没能打开的原因、开不了的原因
+struct PrivacyPage: View {
+    let session: RemoteSession
+
+    var body: some View {
+        List {
+            if let s = session.privacyState {
+                Section {
+                    Toggle(isOn: Binding(get: { session.privacyState?.active ?? false }, set: { session.setPrivacy($0) })) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(L.t("privacy_toggle"))
+                            Text(hint(s)).font(.caption).foregroundStyle(s == .failed ? Theme.bad : Theme.sub)
+                        }
+                    }
+                    .disabled(!s.usable)
+                } footer: {
+                    if s.usable { Text(L.t("privacy_note")) }
+                }
+            } else {
+                // 会话断了：对方还没重新说（重连上了接着显示，要不要开着已经在握手里告诉它了）
+                Text(L.t("session_reconnecting")).foregroundStyle(Theme.sub)
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(Theme.bg)
+        .navigationTitle(L.t("privacy_toggle"))
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+    }
+
+    private func hint(_ s: PrivacyState) -> String {
+        let mac = session.os == .mac
+        switch s {
+        case .unavailable: return L.t(mac ? "privacy_unavailable_mac" : "privacy_unavailable")
+        case .notAllowed: return L.t("privacy_not_allowed")
+        case .starting: return L.t(mac ? "privacy_starting_mac" : "privacy_starting")
+        case .on: return L.t("privacy_on")
+        case .failed: return L.t("privacy_failed", session.privacyDetail ?? "—")
+        case .off: return L.t(mac ? "privacy_off_mac" : "privacy_off")
+        }
     }
 }
 

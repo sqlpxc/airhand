@@ -197,6 +197,37 @@ enum class OsKind(val wire: String) {
     }
 }
 
+/**
+ * 被控端的防窥模式（会话事件 `privacy` 的 `state`），与 Rust 的 `airhand_proto::session::PrivacyState` 对应。
+ * 对方是装了虚拟显示器驱动的 Windows、允许了"辅助功能"的 Mac 时才会说；不支持的被控端不说，界面也就没有这个开关
+ */
+enum class PrivacyState(val wire: String) {
+    /** 这台被控端开不了：Windows 没装虚拟显示器驱动 / 不是为所有用户安装的；Mac 没允许"辅助功能" */
+    UNAVAILABLE("unavailable"),
+
+    /** 被控端的设置不允许（config.toml 的 privacy_mode） */
+    NOT_ALLOWED("notAllowed"),
+    OFF("off"),
+
+    /** 正在打开（Windows 换成虚拟显示器要几秒钟） */
+    STARTING("starting"),
+    ON("on"),
+
+    /** 刚才没能打开（对方已经恢复原样），detail 是原因 */
+    FAILED("failed");
+
+    /** 开关是开着的：开着或者正在打开 */
+    val active get() = this == ON || this == STARTING
+
+    /** 这台被控端能开（开关可以点） */
+    val usable get() = this != UNAVAILABLE && this != NOT_ALLOWED
+
+    companion object {
+        /** 不认识的（对方版本新增的；Rust 那边已经报成 unavailable，这里再保险一次）当作开不了 */
+        fun fromWire(s: String?): PrivacyState = entries.firstOrNull { it.wire == s } ?: UNAVAILABLE
+    }
+}
+
 object Code {
     /** 用户输入的控制码 → 6 位数字（允许空格 / 短横线），不合法返回 null。规则与 `airhand_proto::parse_code` 相同 */
     fun parse(input: String): String? {

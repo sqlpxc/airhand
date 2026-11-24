@@ -51,6 +51,8 @@ import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.RemoveModerator
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SportsEsports
 import androidx.compose.material.icons.outlined.StayCurrentLandscape
 import androidx.compose.material.icons.outlined.StayCurrentPortrait
@@ -110,6 +112,7 @@ import app.airhand.android.core.Code
 import app.airhand.android.core.Codec
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
+import app.airhand.android.core.PrivacyState
 import app.airhand.android.core.SystemAction
 import app.airhand.android.data.TouchMode
 import app.airhand.android.ui.ConfirmDialog
@@ -137,7 +140,7 @@ private fun initialMode(setting: TouchMode, os: OsKind) = when (setting) {
     TouchMode.AUTO -> if (os == OsKind.ANDROID || os == OsKind.IOS) UiMode.TOUCH else UiMode.TRACKPAD
 }
 
-private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, GAME, HELP }
+private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, PRIVACY, GAME, HELP }
 
 /**
  * 手机上的远程画面。
@@ -169,6 +172,8 @@ fun PhoneSession(
     val name by session.hostName.collectAsState()
     val notices by session.notices.collectAsState()
     val audioError by session.audioError.collectAsState()
+    val privacy by session.privacyState.collectAsState()
+    val privacyDetail by session.privacyDetail.collectAsState()
     val phase by session.phase.collectAsState()
     // 连上之后以对方报告的平台为准
     val os = hello?.platform?.takeIf { it != OsKind.UNKNOWN } ?: OsKind.of(hostOs)
@@ -180,6 +185,8 @@ fun PhoneSession(
     var page by remember { mutableStateOf(Page.MAIN) }
     var confirmExit by remember { mutableStateOf(false) }
     var dismissed by remember { mutableStateOf(setOf<String>()) }
+    // 防窥模式没能打开：菜单关着时也要让用户知道（关掉提示之后再失败一次时重新显示）
+    LaunchedEffect(privacy) { if (privacy != PrivacyState.FAILED) dismissed = dismissed - PRIVACY_NOTICE }
     val gm = gestureMode(mode, os, touch)
     val tipKey = gm.name.lowercase()
     val showTips = phase == RemoteSession.Phase.Live && video != null && tipKey !in settings.tipsSeen
@@ -243,7 +250,10 @@ fun PhoneSession(
 
         // 被控端的提示（采集失败、不能操作……）和本机的问题
         val messages = notices.entries.filter { it.key !in dismissed }.map { it.key to Messages.notice(ctx, it.value, os) } +
-            listOfNotNull(audioError?.let { "localAudio" to ctx.getString(R.string.audio_playback_failed, it) }).filter { it.first !in dismissed }
+            listOfNotNull(
+                audioError?.let { "localAudio" to ctx.getString(R.string.audio_playback_failed, it) },
+                (PRIVACY_NOTICE to ctx.getString(R.string.privacy_failed, privacyDetail ?: "—")).takeIf { privacy == PrivacyState.FAILED },
+            ).filter { it.first !in dismissed }
         if (editor == null) {
             Column(
                 Modifier
@@ -380,6 +390,9 @@ fun PhoneSession(
                     Page.CLIPBOARD -> SubPage(stringResource(R.string.menu_clipboard), { page = Page.MAIN }) {
                         ClipboardActions(session) { menu = false }
                     }
+                    Page.PRIVACY -> SubPage(stringResource(R.string.privacy_toggle), { page = Page.MAIN }) {
+                        Privacy(session, os)
+                    }
                     Page.GAME -> SubPage(stringResource(R.string.menu_game), { page = Page.MAIN }) {
                         GamePage(
                             session.code,
@@ -417,6 +430,9 @@ fun PhoneSession(
 
 /** 看过游戏按键的说明（Settings.tipsSeen） */
 private const val GAME_TIPS = "game"
+
+/** 画面上方“防窥模式没能打开”的提示（关掉了就记在 dismissed 里） */
+private const val PRIVACY_NOTICE = "privacy"
 
 // ───────────────────────────── 浮动圆钮 ─────────────────────────────
 
@@ -502,6 +518,7 @@ private fun MainMenu(
     val mouseLock by session.mouseLock.collectAsState()
     val hostOs by session.hostOs.collectAsState()
     val safety by session.safety.collectAsState()
+    val privacy by session.privacyState.collectAsState()
 
     Row(Modifier.padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         OsAvatar(hostOs, 40.dp)
@@ -567,6 +584,15 @@ private fun MainMenu(
         if (displays.size > 1) {
             Action(Icons.Outlined.Monitor, stringResource(R.string.menu_displays), cell) { onPage(Page.DISPLAYS) }
         }
+        // 防窥模式：对方（Windows、Mac）说了它的状态才有；点开是开关和说明（开不了时写着为什么）
+        privacy?.let { p ->
+            Action(
+                if (p.active) Icons.Outlined.Shield else Icons.Outlined.RemoveModerator,
+                stringResource(if (p.active) R.string.menu_privacy_on else R.string.menu_privacy_off),
+                cell,
+                active = p.active,
+            ) { onPage(Page.PRIVACY) }
+        }
         // 锁定鼠标（控制电脑时）：鼠标一直只发移动了多少，游戏里转视角用；游戏按键：画面上的按钮和摇杆
         val lockable = os != OsKind.ANDROID && os != OsKind.IOS
         if (lockable) {
@@ -589,7 +615,7 @@ private fun MainMenu(
         Action(Icons.AutoMirrored.Outlined.HelpOutline, stringResource(R.string.menu_help), cell) { onPage(Page.HELP) }
         Action(Icons.Outlined.LinkOff, stringResource(R.string.disconnect), cell, danger = true, onClick = onDisconnect)
         // 补齐最后一行，保持格子宽度一致
-        val items = 10 + (if (displays.size > 1) 1 else 0) + (if (lockable) 2 else 0)
+        val items = 10 + (if (displays.size > 1) 1 else 0) + (if (privacy != null) 1 else 0) + (if (lockable) 2 else 0)
         repeat((4 - items % 4) % 4) { Spacer(cell) }
     }
 }
@@ -853,6 +879,56 @@ private fun ClipboardActions(session: RemoteSession, onDone: () -> Unit) {
     }
     MenuRow(stringResource(R.string.clipboard_type), stringResource(R.string.clipboard_type_desc)) {
         withText { session.typeText(it) }
+    }
+}
+
+/**
+ * 防窥模式：对方所有的显示器黑屏、键盘鼠标不起作用，只有控制端看得到、操作得了（和桌面版工具栏的盾牌菜单一样）。
+ * 开关下面写着现在怎么样：正在打开、开着、没能打开的原因、开不了的原因
+ */
+@Composable
+private fun Privacy(session: RemoteSession, os: OsKind) {
+    val state by session.privacyState.collectAsState()
+    val detail by session.privacyDetail.collectAsState()
+    // 会话断了：对方还没重新说（重连上了接着显示，要不要开着已经在握手里告诉它了）
+    val s = state ?: run {
+        Text(
+            stringResource(R.string.session_reconnecting),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+        )
+        return
+    }
+    val mac = os == OsKind.MAC
+    val hint = when (s) {
+        PrivacyState.UNAVAILABLE -> stringResource(if (mac) R.string.privacy_unavailable_mac else R.string.privacy_unavailable)
+        PrivacyState.NOT_ALLOWED -> stringResource(R.string.privacy_not_allowed)
+        PrivacyState.STARTING -> stringResource(if (mac) R.string.privacy_starting_mac else R.string.privacy_starting)
+        PrivacyState.ON -> stringResource(R.string.privacy_on)
+        PrivacyState.FAILED -> stringResource(R.string.privacy_failed, detail ?: "—")
+        PrivacyState.OFF -> stringResource(if (mac) R.string.privacy_off_mac else R.string.privacy_off)
+    }
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.privacy_toggle)) },
+        supportingContent = {
+            Text(hint, color = if (s == PrivacyState.FAILED) MaterialTheme.colorScheme.error else Color.Unspecified)
+        },
+        trailingContent = { Switch(checked = s.active, onCheckedChange = session::setPrivacy, enabled = s.usable) },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = s.usable) { session.setPrivacy(!s.active) }
+            .padding(horizontal = 8.dp),
+    )
+    if (s.usable) {
+        HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
+        Text(
+            stringResource(R.string.privacy_note),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+        )
     }
 }
 

@@ -292,7 +292,7 @@ Send this computer's microphone to the remote computer: programs there (meetings
 
 ### Privacy mode
 
-Keeps the people at the remote computer from seeing what you do: all of its monitors go blank and its keyboard and mouse stop working, so only you can see and control it. Toolbar shield button → **Privacy mode**.
+Keeps the people at the remote computer from seeing what you do: all of its monitors go blank and its keyboard and mouse stop working, so only you can see and control it. Toolbar shield button → **Privacy mode**; on a phone (Android, iPhone / iPad) it's the round button on the edge of the picture → **Privacy mode**, with the current state under the switch.
 
 - Windows hosts have to be installed for all users with the [virtual display](#virtual-display) driver; Mac hosts have to allow Airhand Accessibility (which controlling their keyboard and mouse needs anyway). Otherwise the switch is greyed out and the menu says why. There's no such button for Linux and phones
 - **Windows**: turning it on switches the remote computer to a virtual display (at the resolution of its main monitor), the only display left on its desktop, with its own monitors taken off (no signal); this takes a few seconds. You see and control that virtual display. The Start menu, UAC prompts, the lock screen and the mouse pointer are all on it too, nothing shows on the remote monitors. The remote keyboard and mouse are blocked, except Ctrl+Alt+Del (Windows' secure attention sequence): it only switches to the secure desktop, which doesn't show on the remote monitors either

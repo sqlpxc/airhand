@@ -93,6 +93,7 @@ export const contract = {
     "audio": true,
     "hostKey": "abababababababababababababababababababababababababababababababab",
     "pairing": "482913",
+    "privacy": true,
     "resume": [
       1,
       2,

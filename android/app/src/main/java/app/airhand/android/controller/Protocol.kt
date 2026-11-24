@@ -108,7 +108,8 @@ object Commands {
      * 控制码加上连接选项（Rust 的 `airhand_link::controller::ConnectOptions`，和桌面版、网页版一样）：
      * `resume`：之前连上时得到的重连凭证（十六进制，见 [Resume]）；`hostKey`：之前记下的对方公钥（只认它）；
      * `pairing`：配对码（对方要求配对时用户输入的）；`settings` / `audio`：开始时的画质和要不要声音（在端到端握手里
-     * 交给对方，它一开始就按这个建编码器）
+     * 交给对方，它一开始就按这个建编码器）；`privacy`：要不要防窥模式（重连时带上现在的开关，对方一开始就保持着，
+     * 它的屏幕不会在重连的间隙露出来）
      */
     fun connect(
         code: String,
@@ -117,22 +118,27 @@ object Commands {
         hostKey: String? = null,
         pairing: String? = null,
         audio: Boolean = false,
-    ): JSONObject = options(resume, settings, hostKey, pairing, audio).put("cmd", "connect").put("code", code)
+        privacy: Boolean = false,
+    ): JSONObject = options(resume, settings, hostKey, pairing, audio, privacy).put("cmd", "connect").put("code", code)
 
     /** 连接选项（`ConnectOptions`） */
-    fun options(resume: String?, settings: Quality, hostKey: String?, pairing: String?, audio: Boolean): JSONObject =
+    fun options(resume: String?, settings: Quality, hostKey: String?, pairing: String?, audio: Boolean, privacy: Boolean): JSONObject =
         JSONObject()
             .put("resume", Resume.toJson(resume))
             .put("hostKey", hostKey ?: JSONObject.NULL)
             .put("pairing", pairing ?: JSONObject.NULL)
             .put("settings", settings.toJson())
             .put("audio", audio)
+            .put("privacy", privacy)
 
     fun input(sid: Int, events: JSONArray): JSONObject = cmd("input", sid).put("events", events)
     fun settings(sid: Int, q: Quality): JSONObject = cmd("settings", sid).put("settings", q.toJson())
     fun keyframe(sid: Int): JSONObject = cmd("keyframe", sid)
     fun display(sid: Int, index: Int): JSONObject = cmd("display", sid).put("index", index)
     fun audio(sid: Int, enabled: Boolean): JSONObject = cmd("audio", sid).put("enabled", enabled)
+
+    /** 打开 / 关闭对方的防窥模式（对方说过它的状态之后才有用，见 [RemoteSession.setPrivacy]） */
+    fun privacy(sid: Int, on: Boolean): JSONObject = cmd("privacy", sid).put("on", on)
     fun clipboard(sid: Int, text: String): JSONObject = cmd("clipboard", sid).put("text", text)
     fun disconnect(sid: Int): JSONObject = cmd("disconnect", sid)
 }

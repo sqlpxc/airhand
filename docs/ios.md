@@ -18,7 +18,7 @@ The UI follows the system language (Chinese / English), dark theme.
 - **Pairing code**: the first connection to a device asks for the 6-digit pairing code it shows; afterwards it remembers this iPhone / iPad. If its identity changed (reinstalled, or impersonated) you pair again
 - **My devices**: devices you connected to are saved — one tap to connect. Offline devices show “Offline · connects when it's back” and open automatically when they come online. Long-press to rename, copy the code, or delete (with undo)
 - **Links**: `airhand://connect/123456?pairing=654321` connects with one tap (`pairing` is optional)
-- The remote screen is full-screen with a single **draggable round button** (snaps to the left / right edge). It opens the menu: the remote's name, codec, frame rate, latency, bitrate, direct or relayed path and safety code at the top; then keyboard, sound, microphone, input mode, lock mouse, fit screen, rotate (iPhone), send files, gestures, home, disconnect; and pages for shortcuts, quality (presets, codec, A/V sync), clipboard, displays (multi-monitor) and game controls
+- The remote screen is full-screen with a single **draggable round button** (snaps to the left / right edge). It opens the menu: the remote's name, codec, frame rate, latency, bitrate, direct or relayed path and safety code at the top; then keyboard, sound, microphone, input mode, lock mouse, fit screen, rotate (iPhone), send files, gestures, home, disconnect; and pages for shortcuts, quality (presets, codec, A/V sync), clipboard, displays (multi-monitor), privacy mode (when the remote is Windows or a Mac) and game controls
 - On iPhone the screen follows the remote's orientation (landscape for computers), and the menu can rotate it; iPad rotates freely
 
 ### Gestures
@@ -45,6 +45,7 @@ After zooming in, Airhand asks the remote for a sharper picture once your finger
 - **Clipboard**: text copied on the remote lands in this device's clipboard; the menu can send this device's text to the remote clipboard or type it (iOS asks once to allow pasting)
 - **Files**: files copied on the remote show a prompt; “Save to Files” transfers them into Files › On My iPhone › Airhand. “Send files” puts files from this device on the remote clipboard to paste there (only a list is sent until pasted)
 - **Sound** with adaptive jitter buffer; **A/V sync** for videos; **microphone** forwarding to Windows, macOS 14.2+ and Linux hosts, with system echo cancellation
+- **Privacy mode** (Windows and Mac hosts): blanks all of the remote monitors and disables its keyboard and mouse, so only you can see and control it. The page shows the current state (turning on, on, why it isn't available), and a failure also pops up a message. It turns off by itself after you disconnect and stays on while reconnecting. See [Usage → Privacy mode](usage.md#privacy-mode)
 - A quick trip to another app keeps the session; after a longer time in the background iOS suspends the app and the session reconnects when you return (with its resume token — no pairing code needed). On the home page the picture drops to 5 fps; the card at the top returns to it
 
 ### Game controls

@@ -1,6 +1,7 @@
 package app.airhand.android.controller
 
 import app.airhand.android.core.Codec
+import app.airhand.android.core.PrivacyState
 import app.airhand.android.core.Quality
 import app.airhand.android.core.SystemAction
 import org.json.JSONArray
@@ -111,13 +112,30 @@ class ProtocolTest {
         assertSame(want["display"], Commands.display(3, 1))
         assertSame(want["audio"], Commands.audio(3, true))
         assertSame(want["clipboard"], Commands.clipboard(3, "hi"))
+        assertSame(want["privacy"], Commands.privacy(3, true))
         assertSame(want["disconnect"], Commands.disconnect(3))
         // Android 不用的：画面确认走 Native.ctlAck，剪贴板由自己同步，还不能把手机的麦克风交给对方，
-        // 只看对方的一个显示器（同时看几个是 view），手机的剪贴板换成文字时不用撤回分享的文件（分享不是复制），
-        // 还没有防窥模式的开关（privacy）
+        // 只看对方的一个显示器（同时看几个是 view），手机的剪贴板换成文字时不用撤回分享的文件（分享不是复制）
         assertEquals(
-            setOf("ack", "clipboardSync", "clipboardCleared", "mic", "view", "privacy"),
-            want.keys - setOf("input", "settings", "keyframe", "display", "audio", "clipboard", "disconnect"),
+            setOf("ack", "clipboardSync", "clipboardCleared", "mic", "view"),
+            want.keys - setOf("input", "settings", "keyframe", "display", "audio", "clipboard", "privacy", "disconnect"),
+        )
+    }
+
+    /** 会话事件 `privacy` 的状态（Rust 的 `PrivacyState`，camelCase）；不认识的当作开不了 */
+    @Test
+    fun privacyStatesMatchRust() {
+        assertEquals(
+            listOf("unavailable", "notAllowed", "off", "starting", "on", "failed"),
+            PrivacyState.entries.map { it.wire },
+        )
+        for (s in PrivacyState.entries) assertEquals(s, PrivacyState.fromWire(s.wire))
+        assertEquals(PrivacyState.UNAVAILABLE, PrivacyState.fromWire("somethingNew"))
+        assertEquals(PrivacyState.UNAVAILABLE, PrivacyState.fromWire(null))
+        assertEquals(listOf(PrivacyState.STARTING, PrivacyState.ON), PrivacyState.entries.filter { it.active })
+        assertEquals(
+            listOf(PrivacyState.OFF, PrivacyState.STARTING, PrivacyState.ON, PrivacyState.FAILED),
+            PrivacyState.entries.filter { it.usable },
         )
     }
 
@@ -126,9 +144,9 @@ class ProtocolTest {
     fun connectOptionsMatchRust() {
         val want = fixture.getJSONObject("connectOptions")
         val resume = Resume.fromJson(want.getJSONArray("resume"))
-        val have = Commands.options(resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", true)
+        val have = Commands.options(resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", audio = true, privacy = true)
         assertSame(want, have)
-        val cmd = Commands.connect("123 456", resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", true)
+        val cmd = Commands.connect("123 456", resume, Quality(60, 8000, 1080, true, Codec.H265), "ab".repeat(32), "482913", audio = true, privacy = true)
         assertEquals("connect", cmd.getString("cmd"))
         assertEquals("123 456", cmd.getString("code"))
         assertSame(want, JSONObject(cmd.toString()).apply { remove("cmd"); remove("code") })

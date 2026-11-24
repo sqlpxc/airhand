@@ -97,6 +97,17 @@ final class ProtocolTests: XCTestCase {
         XCTAssertTrue(same(Commands.audio(3, true), find("audio")))
         XCTAssertTrue(same(Commands.mic(3, true), find("mic")))
         XCTAssertTrue(same(Commands.clipboard(3, "hi"), find("clipboard")))
+        XCTAssertTrue(same(Commands.privacy(3, true), find("privacy")))
+    }
+
+    /// 会话事件 `privacy` 的状态（Rust 的 `PrivacyState`，camelCase）；不认识的当作开不了
+    func testPrivacyStates() {
+        XCTAssertEqual(PrivacyState.allCases.map(\.rawValue), ["unavailable", "notAllowed", "off", "starting", "on", "failed"])
+        XCTAssertEqual(PrivacyState.fromWire("notAllowed"), .notAllowed)
+        XCTAssertEqual(PrivacyState.fromWire("somethingNew"), .unavailable)
+        XCTAssertEqual(PrivacyState.fromWire(nil), .unavailable)
+        XCTAssertEqual(PrivacyState.allCases.filter(\.active), [.starting, .on])
+        XCTAssertEqual(PrivacyState.allCases.filter(\.usable), [.off, .starting, .on, .failed])
     }
 
     func testConnectOptions() {
@@ -106,7 +117,9 @@ final class ProtocolTests: XCTestCase {
                         codec: Codec.fromWire(s.str("codec"))!)
         let resume = Resume.fromJson(o.arr("resume"))
         XCTAssertNotNil(resume)
-        var c = Commands.connect(code: "123456", resume: resume, settings: q, hostKey: o.str("hostKey"), pairing: o.str("pairing"), audio: o.bool("audio"))
+        var c = Commands.connect(code: "123456", resume: resume, settings: q, hostKey: o.str("hostKey"), pairing: o.str("pairing"), audio: o.bool("audio"),
+                                 privacy: o.bool("privacy"))
+        XCTAssertTrue(o.bool("privacy"))
         c["cmd"] = nil
         c["code"] = nil
         XCTAssertTrue(same(c, o), "\(c) != \(o)")

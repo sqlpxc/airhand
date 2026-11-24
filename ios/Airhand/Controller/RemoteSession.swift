@@ -55,6 +55,11 @@ final class RemoteSession {
     /// 被控端能不能接本机的麦克风（ready / busy / noDevice ...），nil：不支持
     private(set) var micState: String?
     private(set) var micOn = false
+    /// 对方的防窥模式（Hello 之后对方会说，之后有变化再说）。对方不支持（Linux、手机、旧版本）、还没说、
+    /// 重连的间隙里为 nil：不显示这个开关。整台被控端一个状态，别的控制端打开 / 关掉了这里也跟着变
+    private(set) var privacyState: PrivacyState?
+    /// 没能打开防窥的原因（英文技术信息，对方给的）
+    private(set) var privacyDetail: String?
     /// 远端光标（UIKit 的画面直接观察，不经过 SwiftUI）
     @ObservationIgnored var onCursor: ((CursorState) -> Void)?
     @ObservationIgnored var onPhase: ((Phase) -> Void)?
@@ -94,6 +99,8 @@ final class RemoteSession {
     @ObservationIgnored private var sender: InputSender!
     @ObservationIgnored private var sentSettings: Quality?
     @ObservationIgnored private var sentAudio = false
+    /// 要防窥模式（开关）：重连时在连接选项里带上，对方就一直保持着。跟着对方说的状态变。只在主线程上用
+    @ObservationIgnored private var privacyWanted = false
     @ObservationIgnored private var zoomShown: CGSize?
     @ObservationIgnored private var zoomWanted: CGSize?
     @ObservationIgnored private var zoomWork: DispatchWorkItem?
@@ -180,12 +187,14 @@ final class RemoteSession {
             }
             if closed { break }
             let h = client.handle
-            // 画质、显示器这些状态都在主线程上改：在主线程上读
-            let settings = DispatchQueue.main.sync { currentSettings() }
+            // 画质、显示器、防窥这些状态都在主线程上改：在主线程上读
+            let (settings, privacy) = DispatchQueue.main.sync { (currentSettings(), privacyWanted) }
             sentSettings = settings
             let withAudio = audioOn && !background
             sentAudio = withAudio
-            let cmd = Commands.connect(code: code, resume: resume, settings: settings, hostKey: hostKey, pairing: pairing, audio: withAudio)
+            // 防窥模式也在握手里就说：断线重连时对方一直保持着，它的屏幕不会在重连的间隙露出来
+            let cmd = Commands.connect(code: code, resume: resume, settings: settings, hostKey: hostKey, pairing: pairing, audio: withAudio,
+                                       privacy: privacy)
             let r = Json.parse(Native.ctlCall(h, Json.string(cmd))) ?? ["err": ["kind": "failed", "detail": "bad reply"]]
             if closed {
                 if let ok = r.obj("ok"), let s = ok.int("sid") { _ = Native.ctlCall(h, Json.string(Commands.disconnect(UInt32(s)))) }
@@ -196,6 +205,11 @@ final class RemoteSession {
                 onConnected(h, ok, UInt32(s))
                 guard let end = pump(h, UInt32(s)) else { break }
                 sid = -1
+                // 对方还没重新说它的防窥模式（要不要开着留着，重连时告诉它）
+                main {
+                    self.privacyState = nil
+                    self.privacyDetail = nil
+                }
                 decoder.resetStream()
                 stopAudio()
                 stopMic()
@@ -269,6 +283,9 @@ final class RemoteSession {
             if !self.grantOs.isEmpty { self.hostOs = self.grantOs }
             self.micState = nil
             self.micOn = false
+            // 防窥模式：对方在 Hello 之后重新说（要不要开着已经在握手里告诉它了）
+            self.privacyState = nil
+            self.privacyDetail = nil
         }
         if audioOn && !background { startAudio(tell: !sentAudio) } else if sentAudio { command { Commands.audio($0, false) } }
         if background { applyBackground() }
@@ -429,6 +446,18 @@ final class RemoteSession {
             main {
                 self.micState = state
                 if state != "ready" && state != "preparing" && self.micOn { self.setMic(false) }
+            }
+        case "privacy":
+            let state = PrivacyState.fromWire(e.str("state"))
+            let detail = e.str("detail")
+            main {
+                let was = self.privacyState
+                // 开关跟着对方说的变：别的控制端打开 / 关掉了、没能打开，都以对方的为准
+                self.privacyWanted = state.active
+                self.privacyState = state
+                self.privacyDetail = detail
+                // 没能打开（Windows 换虚拟显示器要几秒，用户可能已经关了菜单）：提示一下
+                if state == .failed, was != .failed { self.app?.show(L.t("privacy_failed", detail ?? "—")) }
             }
         default: break
         }
@@ -626,6 +655,20 @@ final class RemoteSession {
         m?.stop()
         if micOn || m != nil { command { Commands.mic($0, false) } }
         main { self.micOn = false }
+    }
+
+    // ── 防窥模式 ──
+
+    /// 打开 / 关闭对方的防窥模式：对方所有的显示器黑屏、键盘鼠标不起作用，只有控制端看得到、操作得了。
+    /// 先显示成正在打开 / 已关闭，对方换好了再说（Windows 换成虚拟显示器要几秒）。对方还没说它的状态时只记下来
+    func setPrivacy(_ on: Bool) {
+        guard !viewOnly else { return }
+        if let s = privacyState, !s.usable { return }
+        privacyWanted = on
+        guard privacyState != nil, handle != 0, sid >= 0, !closed else { return }
+        command { Commands.privacy($0, on) }
+        privacyDetail = nil
+        privacyState = on ? .starting : .off
     }
 
     // ── 其他 ──

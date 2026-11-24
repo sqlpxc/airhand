@@ -248,6 +248,21 @@
     <string name="clipboard_type">作为键盘输入发送</string>
     <string name="clipboard_type_desc">直接把本机复制的文字打到对方当前的输入框里</string>
 
+    <!-- 防窥模式（Windows、Mac 被控端）：对方的显示器黑屏、键盘鼠标不起作用，只有你看得到、操作得了 -->
+    <string name="menu_privacy_on">防窥模式：开</string>
+    <string name="menu_privacy_off">防窥模式：关</string>
+    <string name="privacy_toggle">防窥模式</string>
+    <string name="privacy_off">打开后，对方电脑的显示器全部黑屏、键盘鼠标不起作用，只有你看得到、操作得了（画面换成一块虚拟显示器）。断开连接后自动恢复</string>
+    <string name="privacy_off_mac">打开后，对方 Mac 的显示器全部黑屏、键盘鼠标和触控板不起作用，只有你看得到、操作得了。断开连接后自动恢复</string>
+    <string name="privacy_starting">正在打开：对方电脑正在换成虚拟显示器，要几秒钟</string>
+    <string name="privacy_starting_mac">正在打开</string>
+    <string name="privacy_on">已打开：对方的显示器全部黑屏、键盘鼠标不起作用。断开连接后自动恢复；断线时等你重连 30 秒，期间重连会接着保持</string>
+    <string name="privacy_failed">防窥模式没能打开（%1$s），对方的屏幕已经恢复。可以再试一次</string>
+    <string name="privacy_unavailable">对方电脑用不了：需要为所有用户安装 Airhand，并在安装时装上虚拟显示器驱动</string>
+    <string name="privacy_unavailable_mac">对方 Mac 用不了：要先在那台 Mac 的“系统设置 → 隐私与安全性 → 辅助功能”里允许 Airhand（挡住它的键盘鼠标要用到）</string>
+    <string name="privacy_not_allowed">对方电脑的设置不允许防窥模式（config.toml 里的 privacy_mode）</string>
+    <string name="privacy_note">对方电脑前的人可以断开它的网络或者重启它来结束防窥模式</string>
+
     <!-- 游戏按键：控制电脑时叠在画面上的按钮和摇杆 -->
     <string name="menu_game">游戏按键</string>
     <string name="game_show">在画面上显示</string>

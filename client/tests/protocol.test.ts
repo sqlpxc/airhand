@@ -97,6 +97,6 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
   // 连接选项：字段和 ConnectOptions 一样
   const opts = contract.connectOptions;
   assert.deepEqual(opts, fixture.connectOptions);
-  assert.deepEqual(Object.keys(opts).sort(), ["audio", "hostKey", "pairing", "resume", "settings"]);
+  assert.deepEqual(Object.keys(opts).sort(), ["audio", "hostKey", "pairing", "privacy", "resume", "settings"]);
   assert.equal(opts.settings.codec, "h265");
 });

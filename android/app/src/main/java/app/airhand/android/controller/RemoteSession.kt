@@ -15,6 +15,7 @@ import app.airhand.android.core.Native
 import app.airhand.android.core.Notice
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
+import app.airhand.android.core.PrivacyState
 import app.airhand.android.core.Problem
 import app.airhand.android.core.Quality
 import app.airhand.android.core.ServerState
@@ -116,6 +117,19 @@ class RemoteSession(
 
     /** 本机播放声音出错 */
     val audioError = MutableStateFlow<String?>(null)
+
+    /**
+     * 对方的防窥模式（Hello 之后对方会说，之后有变化再说）。对方不支持（Linux、手机、旧版本）、还没说、
+     * 重连的间隙里为 null：不显示这个开关。整台被控端一个状态，别的控制端打开 / 关掉了这里也跟着变
+     */
+    val privacyState = MutableStateFlow<PrivacyState?>(null)
+
+    /** 没能打开防窥的原因（英文技术信息，对方给的） */
+    val privacyDetail = MutableStateFlow<String?>(null)
+
+    /** 要防窥模式（开关）：重连时在连接选项里带上，对方就一直保持着。跟着对方说的状态变 */
+    @Volatile
+    private var privacyWanted = false
     val quality = MutableStateFlow(
         Preset.of(app.settings.value.preset).quality(
             VideoDecoder.decodable.firstOrNull { it in Codec.PRIORITY } ?: Codec.H264,
@@ -239,7 +253,8 @@ class RemoteSession(
                 // 开始时的画质和要不要声音在端到端握手里就告诉对方：它一开始就按这个建编码器
                 val withAudio = audioOn.value && !background
                 sentAudio = withAudio
-                val cmd = Commands.connect(code, resume, settings, hostKey, pairing, withAudio)
+                // 防窥模式也在握手里就说：断线重连时对方一直保持着，它的屏幕不会在重连的间隙露出来
+                val cmd = Commands.connect(code, resume, settings, hostKey, pairing, withAudio, privacyWanted)
                 val r = runCatching { JSONObject(Native.ctlCall(h, cmd.toString())) }
                     .getOrElse { JSONObject().put("err", JSONObject().put("kind", "failed").put("detail", it.toString())) }
                 if (closed) {
@@ -252,6 +267,7 @@ class RemoteSession(
                     onConnected(h, ok)
                     val end = pump(h, ok.getInt("sid")) ?: break
                     sid = -1
+                    resetPrivacy()
                     decoder.resetStream()
                     stopAudio()
                     if (closed) break
@@ -335,6 +351,8 @@ class RemoteSession(
         sid = ok.getInt("sid")
         // 光标的槽位是被控端为一个会话分配的：新的会话从头开始
         cursorSlots.clear()
+        // 防窥模式：对方在 Hello 之后重新说（要不要开着已经在握手里告诉它了）
+        resetPrivacy()
         resume = Resume.fromJson(ok.optJSONArray("resume")) ?: resume
         // 端到端握手确认过的对方公钥：之后重连只认它；配对码用过了
         ok.optString("hostKey").takeIf { it.isNotBlank() }?.let { hostKey = it }
@@ -514,7 +532,20 @@ class RemoteSession(
                 }
             }
             "fileError" -> Log.w(TAG, "a clipboard file couldn't be transferred: ${e.optString("name")} (${e.optString("error")})")
+            "privacy" -> {
+                val s = PrivacyState.fromWire(e.optStringOrNull("state"))
+                // 开关跟着对方说的变：别的控制端打开 / 关掉了、没能打开，都以对方的为准
+                privacyWanted = s.active
+                privacyDetail.value = e.optStringOrNull("detail")
+                privacyState.value = s
+            }
         }
+    }
+
+    /** 新的会话、会话断了：对方还没说它的防窥模式（不显示开关）。要不要开着（[privacyWanted]）留着，重连时告诉对方 */
+    private fun resetPrivacy() {
+        privacyState.value = null
+        privacyDetail.value = null
     }
 
     /** 现在能不能把手机上的文件放进对方的剪贴板（连着） */
@@ -644,6 +675,21 @@ class RemoteSession(
     fun setAudio(on: Boolean) {
         audioOn.value = on
         if (on) startAudio() else stopAudio()
+    }
+
+    /**
+     * 打开 / 关闭对方的防窥模式：对方所有的显示器黑屏、键盘鼠标不起作用，只有控制端看得到、操作得了。
+     * 先显示成正在打开 / 已关闭，对方换好了再说（Windows 换成虚拟显示器要几秒）。对方还没说它的状态时只记下来
+     */
+    fun setPrivacy(on: Boolean) {
+        if (viewOnly) return
+        val s = privacyState.value
+        if (s != null && !s.usable) return
+        privacyWanted = on
+        if (s == null || handle == 0L || sid < 0 || closed) return
+        command { Commands.privacy(it, on) }
+        privacyDetail.value = null
+        privacyState.value = if (on) PrivacyState.STARTING else PrivacyState.OFF
     }
 
     @Synchronized

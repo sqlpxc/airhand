@@ -124,7 +124,7 @@ fn commands() -> Vec<(Value, Command)> {
                 enabled: true,
             },
         ),
-        // 防窥模式（只有装了虚拟显示器驱动的 Windows 被控端支持）
+        // 防窥模式（装了虚拟显示器驱动的 Windows 被控端、允许了辅助功能的 macOS 被控端支持）
         (
             json!({ "cmd": "privacy", "sid": 3, "on": true }),
             Command::Privacy { sid: 3, on: true },
@@ -170,7 +170,9 @@ fn connect_options() -> (Value, ConnectOptions) {
             "hostKey": "ab".repeat(32),
             "pairing": "482913",
             "settings": { "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "h265" },
-            "audio": true
+            "audio": true,
+            // 重连时接着保持防窥模式（四种界面都带）
+            "privacy": true
         }),
         ConnectOptions {
             resume: Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
@@ -179,7 +181,7 @@ fn connect_options() -> (Value, ConnectOptions) {
             settings: settings(),
             audio: true,
             view: Vec::new(),
-            privacy: false,
+            privacy: true,
         },
     )
 }
