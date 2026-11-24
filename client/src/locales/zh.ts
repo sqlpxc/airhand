@@ -275,6 +275,10 @@ export default {
   "privacy.unavailable": "对方电脑用不了：需要为所有用户安装 Airhand，并在安装时装上虚拟显示器驱动",
   "privacy.notAllowed": "对方电脑的设置不允许防窥模式（config.toml 里的 privacy_mode）",
   "privacy.note": "对方电脑前的人可以断开它的网络或者重启它来结束防窥模式",
+  // 对方是 Mac：显示器调黑、盖上黑窗口，不换虚拟显示器（见 client/src-tauri/src/host/virtual_display/curtain.rs）
+  "privacy.offMac": "打开后，对方 Mac 的显示器全部黑屏、键盘鼠标和触控板不起作用，只有你看得到、操作得了。断开连接后自动恢复",
+  "privacy.startingMac": "正在打开",
+  "privacy.unavailableMac": "对方 Mac 用不了：要先在那台 Mac 的“系统设置 → 隐私与安全性 → 辅助功能”里允许 Airhand（挡住它的键盘鼠标要用到）",
 
   // 快捷键
   "combo.winStart": "Win 开始菜单",

@@ -33,6 +33,9 @@ cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture
 cargo test --lib native_mic_cleanup -- --ignored --nocapture
 # Windows：列出现在的显示器、哪些是虚拟显示器、本机主显示器的分辨率（只读，不改显示设置）
 cargo test --lib list_displays -- --ignored --nocapture
+# macOS 防窥：主显示器调黑 1 秒，读回来是黑的、恢复之后不是；调黑时采集到的画面不变（需要屏幕录制权限）。本机屏幕会黑一下
+cargo test --lib blanks_and_restores -- --ignored --nocapture
+cargo test --lib gamma_is_not_captured -- --ignored --nocapture
 
 # 手机核心（Android 和 iOS 共用，crates/airhand-mobile：在途控制、关键帧、声音分发、命令格式）在仓库根目录的 cargo test 里
 # ios/：Swift 单元测试（协议样例、Annex-B、AV1、Opus、抖动缓冲、手势），以及模拟器里的端到端测试，见 docs/ios.zh-CN.md 的“测试”

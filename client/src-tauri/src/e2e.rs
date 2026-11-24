@@ -432,7 +432,7 @@ async fn e2e_roundtrip() {
                 println!("麦克风: {state:?} {detail:?}");
                 rep.mic = Some(state);
             }
-            // 防窥模式（只有装了虚拟显示器驱动的 Windows 被控端能开）：这个测试不开
+            // 防窥模式（装了虚拟显示器驱动的 Windows、有辅助功能权限的 macOS 被控端能开）：这个测试不开
             HostMsg::Privacy { state, detail } => println!("防窥模式: {state:?} {detail:?}"),
             HostMsg::Notice(notice) => {
                 println!("提示: {notice:?}");

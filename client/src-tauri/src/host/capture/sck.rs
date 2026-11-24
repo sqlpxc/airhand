@@ -9,7 +9,9 @@
 //!   （或者列不出来）就叫醒它（[`power::wake_display`]）、报错，采集线程过一会儿再来打开；采集期间显示器睡着了
 //!   也报错重来。亮着的锁屏界面照常采集。合着笔记本的盖子时不叫（只会在盖子后面亮 10 秒，画面每 10 秒断一次）：
 //!   补屏的虚拟显示器顶上，采集它（见 `virtual_display`）；
-//! * 锁屏、解锁时重建采集器：一直开着的流在这前后可能停在上一个画面上，等不来新的画面。
+//! * 锁屏、解锁时重建采集器：一直开着的流在这前后可能停在上一个画面上，等不来新的画面；
+//! * 防窥模式盖在本机显示器上的黑窗口不采集（`SCContentFilter` 去掉它们，见 `virtual_display` 的 `curtain`）：
+//!   控制端看到的是下面的画面。黑窗口变了（盖上、撤掉、显示器变了）就重建采集器。
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
@@ -37,8 +39,8 @@ use objc2_screen_capture_kit::{SCFrameStatus, SCStreamConfiguration, SCStreamOut
 
 use super::{CaptureUpdate, Capturer, Frame, FramePool};
 use crate::host::macos::{self, Display};
-use crate::host::power;
 use crate::host::sck::{self, Sample};
+use crate::host::{power, virtual_display};
 
 /// 定期检查显示器分辨率 / 排列的间隔
 const LAYOUT_CHECK: Duration = Duration::from_secs(2);
@@ -137,6 +139,8 @@ pub struct SckCapturer {
     state_checked: Instant,
     /// 系统把光标画进了采集到的画面里（要带光标的画面的订阅者单独一路，见 `super` 的"带光标的画面"）
     shows_cursor: bool,
+    /// 打开时防窥的黑窗口是哪一版（见 [`virtual_display::cover_generation`]）：变了就重建采集器
+    covers: u64,
 }
 
 fn frame_interval(fps: u8) -> CMTime {
@@ -160,7 +164,9 @@ impl SckCapturer {
             }
         };
         let locked = macos::screen_locked();
-        let target = sck::shareable_display(display.id)?;
+        // 先记下是哪一版再取窗口：取完之后又变了的话，下一帧就会发现
+        let covers = virtual_display::cover_generation();
+        let target = sck::shareable_display(display.id, &virtual_display::cover_windows())?;
         let (w, h) = crate::host::encoder::target_size(display.width, display.height, max_short);
         let config = unsafe {
             let c = SCStreamConfiguration::new();
@@ -229,6 +235,7 @@ impl SckCapturer {
             locked,
             state_checked: Instant::now(),
             shows_cursor,
+            covers,
         })
     }
 
@@ -259,6 +266,10 @@ impl Capturer for SckCapturer {
         _pool: &mut FramePool,
         _draw: bool,
     ) -> Result<CaptureUpdate> {
+        // 防窥的黑窗口变了：没去掉的那几个会把控制端的画面也盖黑
+        if virtual_display::cover_generation() != self.covers {
+            bail!("the privacy mode's black windows changed");
+        }
         if self.layout_checked.elapsed() > LAYOUT_CHECK {
             self.layout_checked = Instant::now();
             if macos::display(self.index).ok().as_ref() != Some(&self.display) {
@@ -477,5 +488,55 @@ mod tests {
             assert!(pixels.iter().any(|&b| b != 0));
             cap.set_fps(10);
         }
+    }
+
+    /// 本机的主显示器调黑（gamma 表全是 0，防窥模式就是这样做的，见 `virtual_display` 的 `curtain`）时采集到的画面
+    /// 不变：gamma 表在帧缓冲后面。需要"屏幕与系统录音"权限；本机屏幕会黑 1 秒左右（测试进程崩溃了系统也会恢复）。
+    /// `cargo test --lib gamma_is_not_captured -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gamma_is_not_captured() {
+        use objc2_core_graphics::{
+            CGDisplayRestoreColorSyncSettings, CGError, CGSetDisplayTransferByTable,
+        };
+        if !sck::require_permission() {
+            return;
+        }
+        let id = macos::display(0).expect("没有显示器").id;
+        // 画面不变时 ScreenCaptureKit 不交新的帧：每次重新打开采集，取第一帧的平均亮度
+        let brightness = || {
+            let mut cap = SckCapturer::open(0, 30, 360, false).expect("打开采集");
+            let mut pool = FramePool::default();
+            let started = Instant::now();
+            let frame = loop {
+                assert!(started.elapsed() < Duration::from_secs(5), "没有收到画面");
+                if let Some(f) = cap
+                    .next(Duration::from_millis(100), &mut pool, false)
+                    .unwrap()
+                    .frame
+                {
+                    break f;
+                }
+            };
+            let px = frame.pixels().unwrap().as_chunks::<4>().0;
+            px.iter()
+                .map(|p| p[0] as f64 + p[1] as f64 + p[2] as f64)
+                .sum::<f64>()
+                / px.len() as f64
+        };
+        let before = brightness();
+        let zeros = [0.0f32; 256];
+        let r = unsafe {
+            CGSetDisplayTransferByTable(id, 256, zeros.as_ptr(), zeros.as_ptr(), zeros.as_ptr())
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let during = brightness();
+        CGDisplayRestoreColorSyncSettings();
+        println!("采集到的平均亮度：调黑前 {before:.1}，调黑时 {during:.1}");
+        assert_eq!(r, CGError::Success);
+        assert!(
+            (during - before).abs() <= before * 0.2 + 3.0,
+            "调黑之后采集到的画面变了"
+        );
     }
 }

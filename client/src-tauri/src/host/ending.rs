@@ -19,8 +19,8 @@
 //! 之后 `virtual_display::shutdown` 恢复本机的显示器（[`shutdown`]）。
 //!
 //! 锁屏：Windows 是 `LockWorkStation`（系统服务里的被控端以 SYSTEM 身份运行在用户的会话里，也锁得了；
-//! 没人登录、已经锁着时什么也不做）；macOS 是"锁定屏幕"（`SACLockScreenImmediate`）；Linux 是
-//! `loginctl lock-session`，不行再试 `xdg-screensaver lock`。
+//! 没人登录、已经锁着时什么也不做）；macOS 是"锁定屏幕"（`SACLockScreenImmediate`，等会话信息里说锁上了；
+//! 已经锁着时什么也不做）；Linux 是 `loginctl lock-session`，不行再试 `xdg-screensaver lock`。
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,10 +263,39 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use tracing::warn;
+    use std::time::{Duration, Instant};
 
-    /// 私有框架 login.framework 的 `SACLockScreenImmediate`：和菜单里的"锁定屏幕"一样，不要什么权限
+    use tracing::{info, warn};
+
+    use crate::host::macos;
+
+    /// 锁屏之后最多等锁上这么久（再退出防窥）
+    const SHOWN: Duration = Duration::from_secs(2);
+    /// 会话信息里说锁上了之后再等这么久，让锁屏界面画出来（没有量过要多久，宁可多等一会儿：防窥晚一点退出）
+    const DRAWN: Duration = Duration::from_millis(500);
+
+    /// 私有框架 login.framework 的 `SACLockScreenImmediate`：和菜单里的"锁定屏幕"一样，不要什么权限。
+    /// 它只是发起锁屏：等会话信息里说锁上了（[`macos::screen_locked`]）
     pub fn lock() {
+        if macos::screen_locked() == Some(true) {
+            return;
+        }
+        if !request() {
+            return;
+        }
+        let deadline = Instant::now() + SHOWN;
+        while macos::screen_locked() != Some(true) {
+            if Instant::now() >= deadline {
+                info!("the lock screen didn't show up in time");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(DRAWN);
+    }
+
+    /// 发起锁屏，成没成
+    fn request() -> bool {
         unsafe {
             let lib = libc::dlopen(
                 c"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login"
@@ -275,18 +304,19 @@ mod imp {
             );
             if lib.is_null() {
                 warn!("can't lock the screen: login.framework isn't there");
-                return;
+                return false;
             }
             let f = libc::dlsym(lib, c"SACLockScreenImmediate".as_ptr());
             if f.is_null() {
                 warn!("can't lock the screen: SACLockScreenImmediate isn't there");
-                return;
+                return false;
             }
             let f = std::mem::transmute::<*mut libc::c_void, extern "C" fn() -> i32>(f);
             let r = f();
             if r != 0 {
                 warn!("can't lock the screen: SACLockScreenImmediate returned {r}");
             }
+            r == 0
         }
     }
 }

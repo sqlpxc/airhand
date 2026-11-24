@@ -50,7 +50,7 @@ impl Loopback {
             .into_iter()
             .next()
             .ok_or(super::NoDisplay)?;
-        let target = sck::shareable_display(display.id)?;
+        let target = sck::shareable_display(display.id, &[])?;
         let config = unsafe {
             let c = SCStreamConfiguration::new();
             c.setCapturesAudio(true);

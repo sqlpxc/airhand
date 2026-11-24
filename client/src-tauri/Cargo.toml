@@ -140,6 +140,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
   "std", "CFArray", "CFBase", "CFCGTypes", "CFData", "CFDictionary", "CFMessagePort", "CFNumber",
   "CFString",
+  # 防窥模式挡住本机的键盘鼠标：事件监听在自己线程的 run loop 上（见 src/host/virtual_display/curtain.rs）
+  "CFDate", "CFMachPort", "CFRunLoop",
 ] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
   "std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDirectDisplay", "CGDisplayConfiguration",

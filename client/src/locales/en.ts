@@ -266,6 +266,10 @@ const en: Record<MsgKey, Msg> = {
   "privacy.unavailable": "Not available on the remote computer: Airhand has to be installed for all users, together with the virtual display driver",
   "privacy.notAllowed": "The remote computer's settings don't allow privacy mode (privacy_mode in config.toml)",
   "privacy.note": "Someone at the remote computer can end privacy mode by disconnecting it from the network or restarting it",
+  // The remote computer is a Mac: its displays are blanked and covered, no virtual display (see client/src-tauri/src/host/virtual_display/curtain.rs)
+  "privacy.offMac": "Blanks all of the remote Mac's displays and disables its keyboard, mouse and trackpad, so only you can see and control it. Turns off by itself after you disconnect",
+  "privacy.startingMac": "Turning on",
+  "privacy.unavailableMac": "Not available on the remote Mac: someone at that Mac has to allow Airhand in System Settings → Privacy & Security → Accessibility first (it's needed to block its keyboard and mouse)",
 
   "combo.winStart": "Start menu (Win)",
   "combo.altTab": "Switch windows (Alt + Tab)",

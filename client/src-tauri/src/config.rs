@@ -106,7 +106,8 @@ pub struct Settings {
     pub autostart: bool,
     /// 界面语言（`language`）：托盘菜单、控制台里选过的。`None`：没选过，跟随系统语言
     pub language: Option<Lang>,
-    /// 允许控制端打开防窥模式（`privacy_mode`，Windows 装了虚拟显示器驱动时有用，见 `host::virtual_display`）。
+    /// 允许控制端打开防窥模式（`privacy_mode`，Windows 装了虚拟显示器驱动时、macOS 有"辅助功能"权限时有用，
+    /// 见 `host::virtual_display`）。
     /// 模板里没有它：要禁止时手动写上 `privacy_mode = false`
     pub privacy_mode: bool,
     /// 远程控制结束后锁屏（`lock_on_end`，被控端，见 `host::ending`）。模板里没有它：在托盘菜单里切换时写入

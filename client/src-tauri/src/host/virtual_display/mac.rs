@@ -29,6 +29,9 @@
 //!
 //! 本进程建的虚拟显示器在本进程里读不到显示模式（`CGDisplayCopyDisplayMode` 返回空，别的进程读得到），
 //! 显示器列表里的像素大小用 [`pixels`]。
+//!
+//! 防窥模式（[`super::curtain`]）也由这里的管理线程打开、关掉：它不用虚拟显示器，但状态、什么时候开着
+//! 和 Windows 一样由 `super` 管。
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
@@ -43,6 +46,7 @@ use objc2_core_graphics::{
 use tracing::{info, warn};
 
 use super::HUB;
+use super::curtain::{self, Curtain};
 use crate::host::{macos, power};
 
 /// 有会话的时候多久看一次盖子、显示器、电源
@@ -56,6 +60,10 @@ const SETTLE: Duration = Duration::from_secs(2);
 const AC_CHECK: Duration = Duration::from_secs(5);
 /// 建不出来的话过这么久再试
 const RETRY: Duration = Duration::from_secs(10);
+/// 打开防窥之后、盖上黑窗口之前多久看一次（盖上了才算开着）
+const STARTING: Duration = Duration::from_millis(100);
+/// 打开防窥之后这么久黑窗口还没盖上（主线程没处理），就算没能打开
+const COVER_WAIT: Duration = Duration::from_secs(5);
 /// 刷新率：私有接口最高 60
 const HZ: f64 = 60.0;
 /// 虚拟显示器的身份（"AH"、"vd"）：一直一样，macOS 按它记住排列和窗口的位置
@@ -103,6 +111,11 @@ pub(super) fn usable() -> bool {
 
 /// 现在的虚拟显示器：编号、像素大小
 static CURRENT: Mutex<Option<(CGDirectDisplayID, u32, u32)>> = Mutex::new(None);
+
+/// 本进程现在的虚拟显示器（防窥时不调黑、不盖它，见 [`super::curtain`]）
+pub(super) fn current() -> Option<CGDirectDisplayID> {
+    CURRENT.lock().unwrap().map(|c| c.0)
+}
 
 /// 本进程建的虚拟显示器的像素大小（见模块说明）；不是它时为 `None`
 pub fn pixels(id: CGDirectDisplayID) -> Option<(u32, u32)> {
@@ -254,8 +267,39 @@ fn usable_displays(
         .collect()
 }
 
+/// 防窥（见 [`super::curtain`]）：要开着就打开，不要了就关掉（恢复原样）；黑窗口盖上了才算开着
+fn follow_privacy(curtain: &mut Option<(Curtain, Instant)>, wanted: bool, now: Instant) {
+    if !wanted {
+        *curtain = None;
+    } else if curtain.is_none() {
+        match Curtain::start() {
+            Ok(c) => *curtain = Some((c, now)),
+            Err(e) => super::fail(crate::host::capture::wire_detail(&e)),
+        }
+    }
+    if let Some((c, since)) = curtain
+        && !c.ready()
+        && now.duration_since(*since) > COVER_WAIT
+    {
+        *curtain = None;
+        super::fail("the black windows over the local displays didn't show up".into());
+    }
+    let on = curtain.as_ref().is_some_and(|(c, _)| c.ready());
+    let mut w = HUB.wants.lock().unwrap();
+    if w.on != on {
+        w.on = on;
+        if on {
+            info!("privacy mode is on");
+        }
+    }
+    super::publish(&w);
+}
+
 fn run() {
     info!("virtual display manager started");
+    // 这个 macOS 上建不建得了虚拟显示器（建不了的话这个线程只管防窥）
+    let can_create = usable();
+    let mut curtain: Option<(Curtain, Instant)> = None;
     let mut filling: Option<Filling> = None;
     let mut shape = Shape::default();
     // 本机能用的显示器从什么时候起一直在
@@ -268,10 +312,18 @@ fn run() {
     let mut unmirrored_since: Option<Instant> = None;
     loop {
         let now = Instant::now();
-        let (sessions, ready, stopping) = {
-            let w = HUB.wants.lock().unwrap();
-            (w.sessions(now), w.ready, w.stopping)
+        let (sessions, ready, stopping, privacy) = {
+            let mut w = HUB.wants.lock().unwrap();
+            // "辅助功能"权限可能在会话中途给了、收回了
+            let can = curtain::usable();
+            if w.curtain != can {
+                w.curtain = can;
+                super::publish(&w);
+            }
+            let privacy = w.privacy(now) && !w.stopping;
+            (w.sessions(now), w.ready, w.stopping, privacy)
         };
+        follow_privacy(&mut curtain, privacy, now);
         let ours = filling.as_ref().map(|f| f.display.id);
         let lid_state = macos::lid_state();
         let lid = lid_state == Some(true);
@@ -326,7 +378,8 @@ fn run() {
         }
         // 有会话：预备、补屏；只是开着"不自动睡眠"：预备，合上盖子之后留着系统换上去的那块（合盖之后再建的没有画面，
         // 不建）
-        let wanted = !stopping
+        let wanted = can_create
+            && !stopping
             && ((sessions && (fill || standby.is_some()))
                 || (ready && (standby.is_some() || (fill && filling.is_some()))));
         match (&filling, wanted) {
@@ -385,18 +438,28 @@ fn run() {
             },
             _ => {}
         }
-        if filling.is_none() {
+        if filling.is_none() && curtain.is_none() {
             // 没事可做了：退出（下一个会话加入、打开"不自动睡眠"时再启动）。台式机上预备不用管。
-            // 在锁里看，免得和 join、set_ready 错过
+            // 在锁里看，免得和 join、set_ready、打开防窥错过
             let mut w = HUB.wants.lock().unwrap();
-            let laptop = lid_state.is_some();
-            if w.stopping || (!w.sessions(Instant::now()) && !(w.ready && laptop)) {
+            let laptop = lid_state.is_some() && can_create;
+            let now = Instant::now();
+            if w.stopping || (!w.sessions(now) && !w.privacy(now) && !(w.ready && laptop)) {
                 w.running = false;
+                w.on = false;
+                super::publish(&w);
                 HUB.wake.notify_all();
                 break;
             }
         }
-        wait(if sessions { WATCH } else { WATCH_READY });
+        let starting = curtain.as_ref().is_some_and(|(c, _)| !c.ready());
+        wait(if starting {
+            STARTING
+        } else if sessions || curtain.is_some() {
+            WATCH
+        } else {
+            WATCH_READY
+        });
     }
     info!("virtual display manager stopped");
 }

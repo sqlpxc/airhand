@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use super::block::Blocker;
 use super::plan::{Plan, Step, Wants};
-use super::{HUB, Mode, device, topology};
+use super::{HUB, Mode, device, fail, topology};
 use crate::host::desktop;
 
 /// 有事的时候多久看一次（启用之后等它出来、改完设置之后看结果）
@@ -33,16 +33,6 @@ pub(super) fn spawn() {
         let mut w = HUB.wants.lock().unwrap();
         w.running = false;
     }
-}
-
-/// 防窥没能打开：不再要它，告诉控制端为什么
-fn fail(detail: String) {
-    warn!("privacy mode failed: {detail}");
-    let mut w = HUB.wants.lock().unwrap();
-    w.holders.clear();
-    w.linger = None;
-    w.failed = Some(detail);
-    super::publish(&w);
 }
 
 fn bump() {

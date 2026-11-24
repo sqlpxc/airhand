@@ -19,7 +19,7 @@ use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSArray, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
+    SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
 /// ScreenCaptureKit 的异步调用最多等这么久
@@ -90,8 +90,16 @@ impl StreamOutput {
     }
 }
 
-/// ScreenCaptureKit 里与某个 CoreGraphics 显示器对应的对象。
-pub fn shareable_display(id: u32) -> Result<Retained<SCDisplay>> {
+/// 要采集的显示器（ScreenCaptureKit 里的对象）和采集时要去掉的窗口
+pub struct Target {
+    display: Retained<SCDisplay>,
+    excluded: Retained<NSArray<SCWindow>>,
+}
+
+/// ScreenCaptureKit 里与某个 CoreGraphics 显示器对应的对象。`exclude`：采集时要去掉的窗口（窗口编号，
+/// 防窥模式的黑窗口），都得在 ScreenCaptureKit 列出的窗口里（这时连不在屏幕上的窗口也列出来：睡着的显示器上的
+/// 也要找得到）；还没列出来就报错，过一会儿再来
+pub fn shareable_display(id: u32, exclude: &[u32]) -> Result<Target> {
     let (tx, rx) = mpsc::channel::<Result<Handoff<Retained<SCShareableContent>>, String>>();
     let block = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
@@ -106,7 +114,9 @@ pub fn shareable_display(id: u32) -> Result<Retained<SCDisplay>> {
     );
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            false, true, &block,
+            false,
+            exclude.is_empty(),
+            &block,
         );
     }
     let content = rx
@@ -115,10 +125,28 @@ pub fn shareable_display(id: u32) -> Result<Retained<SCDisplay>> {
         .map_err(|e| anyhow!("can't list the screens (SCShareableContent: {e})"))?
         .0;
     let displays = unsafe { content.displays() };
-    (0..displays.count())
+    let display = (0..displays.count())
         .map(|i| displays.objectAtIndex(i))
         .find(|d| unsafe { d.displayID() } == id)
-        .ok_or_else(|| anyhow!("ScreenCaptureKit doesn't know display {id}"))
+        .ok_or_else(|| anyhow!("ScreenCaptureKit doesn't know display {id}"))?;
+    let mut excluded = Vec::new();
+    if !exclude.is_empty() {
+        let windows = unsafe { content.windows() };
+        excluded.extend(
+            (0..windows.count())
+                .map(|i| windows.objectAtIndex(i))
+                .filter(|w| exclude.contains(&unsafe { w.windowID() })),
+        );
+        if excluded.len() < exclude.len() {
+            return Err(anyhow!(
+                "ScreenCaptureKit doesn't list the privacy mode's black windows yet"
+            ));
+        }
+    }
+    Ok(Target {
+        display,
+        excluded: NSArray::from_retained_slice(&excluded),
+    })
 }
 
 /// 一个正在运行的采集流，Drop 时停止。
@@ -130,10 +158,10 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// 采集整个显示器（不排除任何窗口），`kinds` 里的每种样本都交给 `on_sample`（在内部的串行队列上调用）；
-    /// 流被系统停止（例如显示器拔掉、权限被收回）时调用 `on_stop`。
+    /// 采集整个显示器（去掉 `target` 说的那几个窗口），`kinds` 里的每种样本都交给 `on_sample`（在内部的串行
+    /// 队列上调用）；流被系统停止（例如显示器拔掉、权限被收回）时调用 `on_stop`。
     pub fn start(
-        display: &SCDisplay,
+        target: &Target,
         config: &SCStreamConfiguration,
         kinds: &[SCStreamOutputType],
         label: &str,
@@ -148,8 +176,8 @@ impl Stream {
         let stream = unsafe {
             let filter = SCContentFilter::initWithDisplay_excludingWindows(
                 SCContentFilter::alloc(),
-                display,
-                &NSArray::new(),
+                &target.display,
+                &target.excluded,
             );
             SCStream::initWithFilter_configuration_delegate(
                 SCStream::alloc(),

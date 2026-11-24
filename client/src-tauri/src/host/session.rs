@@ -474,10 +474,12 @@ impl Platform for Desktop {
     }
 
     async fn start(&mut self, start: Start) -> Result<()> {
-        // 不熄屏。屏幕已经熄了的话叫醒它（不然没有新画面）；要防窥的不叫：本机的显示器马上要撤下来
+        // 不熄屏。屏幕已经熄了的话叫醒它（不然没有新画面）。Windows 要防窥的不叫：本机的显示器马上要撤下来；
+        // macOS 的防窥采集的还是本机的显示器（调黑了，见 virtual_display），睡着的采集不了，照样叫
         self._awake = Some(power::keep_awake());
         self.privacy_at_start = start.privacy;
-        if !start.privacy {
+        let dark = start.privacy && cfg!(windows);
+        if !dark {
             power::wake_display();
         }
         let (mut displays, codecs, env_notice) = tokio::task::spawn_blocking(|| {
@@ -496,7 +498,7 @@ impl Platform for Desktop {
                 "no displays, waiting for the virtual display"
             );
             displays = wait_for_displays(virtual_display::APPEAR_WAIT).await;
-        } else if displays.is_empty() && cfg!(target_os = "macos") && !start.privacy {
+        } else if displays.is_empty() && cfg!(target_os = "macos") {
             // macOS：睡着的显示器可能列不出来（锁屏之后常见），上面刚叫醒它：等它亮起来，同样不先说"没有显示器"
             info!(
                 session_id = self.session_id,

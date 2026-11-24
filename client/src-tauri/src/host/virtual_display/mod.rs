@@ -1,5 +1,5 @@
-//! 虚拟显示器（Windows）：被控端的显示器关了电源也能远程控制；防窥模式。macOS 上只有补屏（合上盖子、
-//! 没接显示器时，见 [`mac`]）。
+//! 虚拟显示器（Windows）：被控端的显示器关了电源也能远程控制；防窥模式。macOS 上补屏（合上盖子、
+//! 没接显示器时，见 [`mac`]），防窥模式不用虚拟显示器（见 [`curtain`]），状态和 Windows 一样在这里管。
 //!
 //! # 显示器关了电源
 //!
@@ -12,7 +12,8 @@
 //!
 //! 控制端打开防窥模式时（见 `airhand_proto::session` 的"防窥模式"），启用虚拟显示器，只留它在桌面上、撤下本机所有的
 //! 显示器（显示器没有信号，什么也看不到：开始菜单、UAC 确认框、锁屏、鼠标指针都在虚拟显示器上），挡住本机的键盘
-//! 鼠标（[`block`]）。控制端看到、操作的是虚拟显示器。
+//! 鼠标（[`block`]）。控制端看到、操作的是虚拟显示器。macOS 上控制端看到、操作的还是本机的显示器，本机的显示器
+//! 调黑、盖上采集时去掉的黑窗口，挡住本机的键盘鼠标（见 [`curtain`]）。
 //!
 //! * 整台被控端一份：哪个控制端打开的都一样，哪一个都能关；
 //! * 打开它的控制端都走了：接着开着，远程控制结束了才关掉（[`release_privacy`]，见 `host::ending`）——
@@ -20,20 +21,24 @@
 //!   本机屏幕不会在重连的间隙里露出来）。本机的人想结束它：断开网络，过一会儿会话断了，防窥也就关了
 //!   （锁着屏）；或者重启电脑；
 //! * 关掉时停用虚拟显示器，按 Windows 记着的设置恢复本机的显示器（改设置时从不存进 Windows 的显示设置数据库，
-//!   见 [`topology`]）。进程意外退出、断电重启之后，下次启动时恢复（[`recover`]）；
+//!   见 [`topology`]）。进程意外退出、断电重启之后，下次启动时恢复（[`recover`]）。macOS 上进程退出时系统自己
+//!   恢复（gamma 表、窗口、事件监听都是这个进程的）；
 //! * 被控端的 `config.toml` 里 `privacy_mode = false` 时不允许（[`PrivacyState::NotAllowed`]）。
 //!
 //! # 驱动
 //!
 //! 用的是 MttVDD（Virtual Display Driver），随安装包带着，为所有用户安装时问用户要不要装（见 [`device`]）。
 //! 没装、或者 Airhand 不是为所有用户安装的（没有权限启用、停用设备）时都用不了：补屏不做，防窥是
-//! [`PrivacyState::Unavailable`]。macOS 用系统自带的（私有的）`CGVirtualDisplay`，不用装什么，只补屏；
-//! macOS、Linux 都没有防窥（不发防窥的状态，控制端不显示这个开关）。
+//! [`PrivacyState::Unavailable`]。macOS 用系统自带的（私有的）`CGVirtualDisplay`，不用装什么；macOS 的防窥
+//! 要"辅助功能"权限（挡住本机的键盘鼠标），没有时是 [`PrivacyState::Unavailable`]。Linux 没有防窥（不发防窥的
+//! 状态，控制端不显示这个开关）。
 //!
 //! 别的地方用的是 [`join`] 得到的 [`Lease`]：每个会话一个，会话结束时丢掉。
 
 #[cfg(windows)]
 mod block;
+#[cfg(target_os = "macos")]
+mod curtain;
 #[cfg(windows)]
 pub(crate) mod device;
 #[cfg(target_os = "macos")]
@@ -51,6 +56,9 @@ use std::time::{Duration, Instant};
 
 use airhand_proto::session::PrivacyState;
 use tokio::sync::watch;
+
+/// 这个平台有防窥模式（告诉控制端它的状态，控制端才显示这个开关）
+const HAS_PRIVACY: bool = cfg!(any(windows, target_os = "macos"));
 
 /// 打开防窥的控制端都走了之后，防窥最多再开这么久。平时不到这么久就关了（[`release_privacy`]），这是兜底：
 /// 万一没人叫它，本机的显示器也不会一直黑着、键盘鼠标一直不能用
@@ -109,10 +117,13 @@ struct Wanted {
     ready: bool,
     /// 上次没能打开防窥的原因（再打开、关掉时清掉）
     failed: Option<String>,
-    /// 防窥开着（只留着虚拟显示器，由管理线程设置）
+    /// 防窥开着（Windows：只留着虚拟显示器；macOS：调黑了、盖上了，由管理线程设置）
     on: bool,
     /// 能用虚拟显示器（每个会话加入时重新看一次：可能刚装上驱动）
     usable: bool,
+    /// macOS 能开防窥：有"辅助功能"权限（会话加入时、管理线程每一轮重新看）
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    curtain: bool,
     /// 有事了，管理线程马上看一眼
     poked: bool,
     /// 管理线程在运行
@@ -128,6 +139,15 @@ impl Wanted {
 
     fn sessions(&self, now: Instant) -> bool {
         !self.sessions.is_empty() || self.idle_since.is_some_and(|t| now < t + SESSION_LINGER)
+    }
+
+    /// 这台被控端现在能开防窥（不管设置允不允许）：Windows 要能用虚拟显示器，macOS 要有"辅助功能"权限
+    fn privacy_possible(&self) -> bool {
+        if cfg!(windows) {
+            self.usable
+        } else {
+            cfg!(target_os = "macos") && self.curtain
+        }
     }
 
     fn poke(&mut self) {
@@ -154,7 +174,7 @@ fn allowed() -> bool {
 /// 按现在想要的、管理线程报告的，更新发给控制端的状态
 fn publish(w: &Wanted) {
     let now = Instant::now();
-    let (state, detail) = if !w.usable {
+    let (state, detail) = if !w.privacy_possible() {
         (PrivacyState::Unavailable, None)
     } else if !allowed() {
         (PrivacyState::NotAllowed, None)
@@ -180,6 +200,17 @@ fn publish(w: &Wanted) {
     });
 }
 
+/// 防窥没能打开（由管理线程调用）：不再要它，告诉控制端为什么
+#[cfg(any(windows, target_os = "macos"))]
+fn fail(detail: String) {
+    tracing::warn!("privacy mode failed: {detail}");
+    let mut w = HUB.wants.lock().unwrap();
+    w.holders.clear();
+    w.linger = None;
+    w.failed = Some(detail);
+    publish(&w);
+}
+
 /// 一个会话对虚拟显示器的需要（见模块说明）。丢掉时离开
 pub struct Lease {
     session_id: u64,
@@ -193,18 +224,25 @@ pub fn join(session_id: u64) -> Lease {
     let usable = mac::usable();
     #[cfg(not(any(windows, target_os = "macos")))]
     let usable = false;
+    #[cfg(target_os = "macos")]
+    let privacy = curtain::usable();
     let mut w = HUB.wants.lock().unwrap();
     w.sessions.insert(session_id);
     w.idle_since = None;
     w.usable = usable;
+    #[cfg(target_os = "macos")]
+    {
+        w.curtain = privacy;
+    }
     #[cfg(windows)]
     if usable && !w.running {
         w.running = true;
         w.stopping = false;
         manager::spawn();
     }
+    // 补屏、防窥都在 mac 的管理线程上
     #[cfg(target_os = "macos")]
-    if usable && !w.running {
+    if (usable || privacy) && !w.running {
         w.running = true;
         w.stopping = false;
         mac::spawn();
@@ -218,8 +256,7 @@ impl Lease {
     /// 控制端打开 / 关闭防窥模式。不能用、不允许时什么也不做（状态里已经说了为什么）
     pub fn set_privacy(&self, on: bool) {
         let mut w = HUB.wants.lock().unwrap();
-        // 只有 Windows 有防窥（macOS 的虚拟显示器只用来补屏）
-        if !cfg!(windows) || !w.usable || !allowed() || !w.sessions.contains(&self.session_id) {
+        if !w.privacy_possible() || !allowed() || !w.sessions.contains(&self.session_id) {
             return;
         }
         w.failed = None;
@@ -240,7 +277,7 @@ impl Lease {
 
     /// 防窥模式的状态；这个平台没有防窥模式时为 `None`（不告诉控制端，它就不显示这个开关）
     pub fn privacy(&self) -> Option<Privacy> {
-        cfg!(windows).then(|| HUB.privacy.borrow().clone())
+        HAS_PRIVACY.then(|| HUB.privacy.borrow().clone())
     }
 
     /// 防窥模式的状态变了
@@ -312,6 +349,18 @@ pub fn pixels(id: u32) -> Option<(u32, u32)> {
     mac::pixels(id)
 }
 
+/// 防窥模式盖在本机显示器上的黑窗口（macOS，窗口编号，见 [`curtain`]）：采集时去掉它们
+#[cfg(target_os = "macos")]
+pub fn cover_windows() -> Vec<u32> {
+    curtain::cover_windows()
+}
+
+/// 黑窗口变了就加一（macOS）：在这之前打开的采集要重新打开
+#[cfg(target_os = "macos")]
+pub fn cover_generation() -> u64 {
+    curtain::cover_generation()
+}
+
 /// 进程启动时（还没有会话）、卸载时：上次意外退出没恢复的恢复掉（见模块说明）
 pub fn recover() {
     #[cfg(windows)]
@@ -348,20 +397,20 @@ fn sessions() -> std::collections::HashMap<u64, bool> {
 mod tests {
     use super::*;
 
-    /// 没有虚拟显示器（这台测试机没装、没有权限）：开关防窥什么也不做，会话进出照常记着
+    /// 开不了防窥（Windows 没装驱动、没有权限，macOS 没有"辅助功能"权限）：开关防窥什么也不做，会话进出照常记着
     #[test]
     fn without_the_driver_nothing_happens() {
         let a = join(9001);
         let b = join(9002);
-        if HUB.wants.lock().unwrap().usable {
-            // 这台电脑装了驱动、测试又有管理员权限：不在这里改显示设置
+        if HUB.wants.lock().unwrap().privacy_possible() {
+            // 这台电脑装了驱动、测试又有管理员权限（macOS：终端有辅助功能权限）：不在这里黑屏、挡住键盘鼠标
             return;
         }
         a.set_privacy(true);
         assert_eq!(sessions().get(&9001), Some(&false));
         assert_eq!(
             a.privacy().map(|p| p.state),
-            cfg!(windows).then_some(PrivacyState::Unavailable)
+            HAS_PRIVACY.then_some(PrivacyState::Unavailable)
         );
         drop(a);
         assert!(!sessions().contains_key(&9001));

@@ -3,7 +3,9 @@
 //! * 按键按**物理键码**注入，远端的键盘布局 / 输入法照常工作；修饰键的状态由我们自己维护并写进每个事件；
 //! * 按住鼠标键移动时发"拖动"事件，连续点击带上点击次数（否则双击、拖动窗口都不起作用）；
 //! * 滚轮按像素发送（触控板的平滑滚动也能还原），120 = 一格 ≈ 3 行；
-//! * 坐标：显示器内的归一化坐标 → 全局坐标（点）。
+//! * 坐标：显示器内的归一化坐标 → 全局坐标（点）；
+//! * 每个事件都带着 [`INJECTED`] 记号：防窥模式挡住本机的键盘鼠标时只放过它们（见 `virtual_display` 的
+//!   `curtain`）。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -40,6 +42,26 @@ const FLAG_OPTION: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 const FLAG_FN: u64 = 0x0080_0000;
 const FLAG_CAPS: u64 = 0x0001_0000;
+
+/// 注入的每个事件都带着的记号（事件源的 user data，事件里的 `kCGEventSourceUserData`）：防窥模式挡住本机键盘鼠标时，
+/// 只放过带着它的
+pub(crate) const INJECTED: i64 = 0x4169_7248; // "AirH"
+
+/// 修饰键 `keycode` 按着（Caps Lock：锁定）时事件标志里的那一位（设备无关的）；不是修饰键时为 `None`。
+/// 修饰键的按下、松开都是 `FlagsChanged` 事件，看这一位才知道是哪一种
+pub(crate) fn modifier_mask(keycode: u16) -> Option<u64> {
+    if keycode == 0x39 {
+        return Some(FLAG_CAPS);
+    }
+    let (m, _) = mackeys::modifier(keycode)?;
+    Some(match m {
+        Modifier::Shift => FLAG_SHIFT,
+        Modifier::Control => FLAG_CONTROL,
+        Modifier::Option => FLAG_OPTION,
+        Modifier::Command => FLAG_COMMAND,
+        Modifier::Function => FLAG_FN,
+    })
+}
 
 fn modifier_flags(m: Modifier, right: bool) -> u64 {
     match (m, right) {
@@ -172,6 +194,8 @@ impl MacInjector {
             // 默认注入之后会屏蔽本地键鼠 0.25 秒；远程控制时本地用户也可能在操作，不屏蔽
             CGEventSource::set_local_events_suppression_interval(Some(&s), 0.0);
             CGEventSource::set_pixels_per_line(Some(&s), PIXELS_PER_LINE);
+            // 用这个事件源建的事件都带着记号（防窥模式只放过它们）
+            CGEventSource::set_user_data(Some(&s), INJECTED);
             self.source = Some(Source(s));
         }
         self.source.as_ref().map(|s| s.0.clone())
@@ -492,6 +516,24 @@ mod tests {
             1,
             "离得太远"
         );
+    }
+
+    /// 修饰键在事件标志里的那一位：左右两个是同一位（设备无关的），和注入时写进去的一致
+    #[test]
+    fn modifier_masks() {
+        assert_eq!(modifier_mask(0x38), Some(FLAG_SHIFT));
+        assert_eq!(modifier_mask(0x3C), Some(FLAG_SHIFT));
+        assert_eq!(modifier_mask(0x36), Some(FLAG_COMMAND));
+        assert_eq!(modifier_mask(0x3D), Some(FLAG_OPTION));
+        assert_eq!(modifier_mask(0x3E), Some(FLAG_CONTROL));
+        assert_eq!(modifier_mask(0x3F), Some(FLAG_FN));
+        assert_eq!(modifier_mask(0x39), Some(FLAG_CAPS));
+        assert_eq!(modifier_mask(0x00), None);
+        for kc in [0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36, 0x3F] {
+            let (m, right) = mackeys::modifier(kc).unwrap();
+            let mask = modifier_mask(kc).unwrap();
+            assert_eq!(modifier_flags(m, right) & mask, mask, "{kc:#x}");
+        }
     }
 
     /// 需要"辅助功能"权限：把鼠标移到主显示器中心，然后恢复原位置。

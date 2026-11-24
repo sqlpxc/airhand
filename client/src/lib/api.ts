@@ -240,7 +240,8 @@ export type MicState = "unsupported" | "noDevice" | "ready" | "busy" | "failed" 
 
 /**
  * 被控端的防窥模式（airhand_proto::session::PrivacyState）：unavailable = 对方没装虚拟显示器驱动（或不是为所有用户安装的），
- * notAllowed = 对方的设置不允许，starting = 正在换成虚拟显示器，failed = 刚才没能打开（已恢复原样）。
+ * Mac 没有允许辅助功能，notAllowed = 对方的设置不允许，starting = 正在打开（Windows 换成虚拟显示器），
+ * failed = 刚才没能打开（已恢复原样）。
  */
 export type PrivacyState = "unavailable" | "notAllowed" | "off" | "starting" | "on" | "failed";
 
@@ -296,7 +297,7 @@ export type SessionEvent =
   | { type: "clipboard"; text: string }
   /** 被控端能不能接本机的麦克风：会话开始时一次，之后有变化再来；对方的版本旧时没有。detail：出错时的技术信息 */
   | { type: "mic"; state: MicState; detail: string | null }
-  /** 被控端的防窥模式：会话开始时一次，之后有变化再来；对方不支持（不是 Windows、版本旧）时没有。detail：没能打开的原因 */
+  /** 被控端的防窥模式：会话开始时一次，之后有变化再来；对方不支持（Linux、手机、版本旧）时没有。detail：没能打开的原因 */
   | { type: "privacy"; state: PrivacyState; detail: string | null }
   /** 被控端复制了文件（只有网页版会收到；桌面版直接放进本机剪贴板）：要内容时用 remoteList / remoteRead 取 */
   | { type: "clipboardFiles"; clip: number; items: FileEntry[] }

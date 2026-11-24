@@ -564,7 +564,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
             </div>
           )}
           {s.privacyState !== null && (
-            // 防窥模式：对方说了它的状态才显示（Windows 被控端）；开不了的也显示，在菜单里说明为什么
+            // 防窥模式：对方说了它的状态才显示（Windows、macOS 被控端）；开不了的也显示，在菜单里说明为什么
             <div className="menu-anchor">
               <button
                 className={`tb-btn icon ${menu === "privacy" || privacyActive(s) ? "on" : ""}`}
@@ -850,25 +850,27 @@ function privacyActive(s: RemoteSession): boolean {
   return s.privacyState === "on" || s.privacyState === "starting";
 }
 
-/** 对方能开防窥模式（装了虚拟显示器驱动、设置允许） */
+/** 对方能开防窥模式（Windows 装了虚拟显示器驱动、Mac 允许了辅助功能，设置也允许） */
 function privacyUsable(s: RemoteSession): boolean {
   return s.privacyState !== "unavailable" && s.privacyState !== "notAllowed";
 }
 
+/** 防窥模式现在怎么样。对方是 Mac 时不换虚拟显示器，开不了的原因也不一样 */
 function privacyHint(s: RemoteSession): string {
+  const mac = s.hostPlatform === "mac";
   switch (s.privacyState) {
     case "unavailable":
-      return t("privacy.unavailable");
+      return t(mac ? "privacy.unavailableMac" : "privacy.unavailable");
     case "notAllowed":
       return t("privacy.notAllowed");
     case "starting":
-      return t("privacy.starting");
+      return t(mac ? "privacy.startingMac" : "privacy.starting");
     case "on":
       return t("privacy.on");
     case "failed":
       return t("privacy.failed", { detail: s.privacyDetail ?? "—" });
     default:
-      return t("privacy.off");
+      return t(mac ? "privacy.offMac" : "privacy.off");
   }
 }
 

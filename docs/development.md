@@ -33,6 +33,10 @@ cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture
 cargo test --lib native_mic_cleanup -- --ignored --nocapture
 # Windows: list the current displays, which ones are virtual, and the main monitor's mode (read-only, changes nothing)
 cargo test --lib list_displays -- --ignored --nocapture
+# macOS privacy mode: blank the main display for a second, read back black and restored; the capture doesn't change
+# while it's blank (needs Screen Recording). The local screen goes black briefly
+cargo test --lib blanks_and_restores -- --ignored --nocapture
+cargo test --lib gamma_is_not_captured -- --ignored --nocapture
 
 # The phone core shared by Android and iOS (crates/airhand-mobile: in-flight control, keyframes, audio fan-out, command format) runs in the root cargo test
 # ios/: Swift unit tests (protocol fixture, Annex-B, AV1, Opus, jitter buffer, gestures); end-to-end tests in the simulator are in docs/ios.md#testing

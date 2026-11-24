@@ -35,7 +35,7 @@ See [How it works → Video](docs/architecture.md#video) for details.
 
 - **Windows system service**: the lock screen, the sign-in screen and UAC prompts can be seen and controlled, and the computer can be reached after boot, before anyone signs in
 - **Works with the monitor off** (Windows): when the host's monitor is switched off (or there's none), a virtual display fills in automatically; while a controller is connected the screen doesn't turn off and the computer doesn't sleep. On a Mac the same goes for a closed laptop lid (on a power adapter) or a Mac mini with no display
-- **Privacy mode** (Windows): with one click the remote computer's monitors all go blank and its keyboard and mouse stop working, so only you can see and control it; it ends by itself after you disconnect, with the remote screen locked first
+- **Privacy mode** (Windows, macOS): with one click the remote computer's monitors all go blank and its keyboard and mouse stop working, so only you can see and control it; it ends by itself after you disconnect, with the remote screen locked first
 - **Fixed control codes**: they survive restarts, upgrades and even server restarts until you change them yourself
 - **Console**: browser-style tabs to control several computers at once, plus a multi-screen overview to watch them all. Computers you've connected to are saved and reconnect with one click; if one is offline, it connects as soon as it comes back
 - **Web console**: the controller can also run in Docker and be used from a browser, with nothing to install on the computer you control from
