@@ -38,8 +38,9 @@ const READ_CHUNK: usize = 1 << 20;
 const LIST_WAIT: Duration = Duration::from_secs(120);
 /// 等一块数据最多这么久
 const READ_WAIT: Duration = Duration::from_secs(120);
-/// 等托盘说剪贴板里复制了哪些文件最多这么久（比读剪贴板的超时短，见 `crate::clipboard`）
-const COPIED_WAIT: Duration = Duration::from_secs(3);
+/// 等托盘说剪贴板里复制了哪些文件最多这么久：系统等复制它的程序现做数据最多 30 秒，比它长一点，
+/// 托盘总会在这之前回答（不然是托盘出了问题）。慢不要紧：剪贴板换了内容就不等它了（见 `crate::clipboard`）
+const COPIED_WAIT: Duration = Duration::from_secs(35);
 /// 最多记着这么多个放进剪贴板的公告
 const KEEP_OFFERS: usize = 4;
 
@@ -341,7 +342,7 @@ pub fn withdraw(key: u64) {
 }
 
 /// 本机剪贴板里复制的文件：请托盘以登录的用户的身份读（见模块说明）。阻塞的。没有托盘时是 `None`
-/// （调用的一方自己读；本机复制的文件也要托盘读，反正公告不了）。托盘没有及时回答当作没有复制文件
+/// （调用的一方自己读；本机复制的文件也要托盘读，反正公告不了）。托盘一直不回答（[`COPIED_WAIT`]）当作没有复制文件
 pub fn copied_files() -> Option<Result<Option<Vec<PathBuf>>, arboard::Error>> {
     let conn = tray()?;
     let Some(f) = conn.call(|req| Msg::ReadCopied { req }, COPIED_WAIT) else {

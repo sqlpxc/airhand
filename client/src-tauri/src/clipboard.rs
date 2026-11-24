@@ -220,18 +220,19 @@ fn writer() -> &'static Arc<ClipboardWriter> {
     WRITER.get_or_init(Arc::default)
 }
 
-/// 一次读取最多等这么久。剪贴板里的内容可能要复制它的程序现做（延迟渲染），那个程序不响应时
-/// 读取的系统调用一直不返回：等不到就放弃这一份内容，剪贴板换了内容再读
+/// 一次读取这么久还没返回算慢。剪贴板里的内容可能要复制它的程序现做（延迟渲染），内容大（Excel 里一大片）、
+/// 要经网络现取（远程桌面、虚拟机）时要好几秒，那个程序不响应时要等到系统放弃（Windows 最多 30 秒）。
+/// 读的还是剪贴板里现在的内容就一直等：晚到的照样同步；剪贴板已经换了内容的就不再等它，读新的
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-/// 同时在跑的读取最多这么多个，包括超时放弃了、还卡着的：卡住的线程收不回来，不能每次都开新的
+/// 同时在跑的读取最多这么多个，包括不再等的、还卡着的：卡住的线程收不回来，不能每次都开新的
 const MAX_READS: usize = 3;
 /// 连续读失败这么多次（约 3 秒）才记警告：别的程序偶尔正开着剪贴板，下一次就好了
 const FAILURES_TO_WARN: u32 = 10;
 
-/// 读取也只允许一个后台任务。所有会话共享按剪贴板序号缓存的结果；
+/// 只等一个读取的结果。所有会话共享按剪贴板序号缓存的结果；
 /// poll 只取已经完成的结果，慢的系统调用不能暂停会话或堆积阻塞任务。
-/// 一次读取 [`READ_TIMEOUT`] 还没返回就放弃那个序号的内容（不然它一直占着唯一的名额，
-/// 之后本机复制什么都不再同步）；卡着没返回的读取最多留 [`MAX_READS`] 个。
+/// 读的是剪贴板里现在的内容时一直等它（慢也不丢）；剪贴板换了内容、在等的读取 [`READ_TIMEOUT`] 还没返回，
+/// 就不再等它，读新的（不然新内容要等旧的读完才同步得出去）。卡着没返回的读取最多留 [`MAX_READS`] 个。
 #[derive(Default)]
 struct ClipboardReader(Mutex<Reads>);
 
@@ -241,7 +242,7 @@ type ReadResult = Result<Option<Arc<Clip>>, arboard::Error>;
 struct Reads {
     latest: Option<(u32, Option<Arc<Clip>>)>,
     pending: Option<Pending>,
-    /// 在跑的读取，包括超时放弃了、还没返回的
+    /// 在跑的读取，包括不再等的、还没返回的
     running: Arc<AtomicUsize>,
     /// 连续读失败的次数
     failures: u32,
@@ -254,6 +255,8 @@ struct Pending {
     seq: u32,
     started: Instant,
     rx: tokio::sync::oneshot::Receiver<ReadResult>,
+    /// 已经记过"读得慢"的日志
+    slow: bool,
 }
 
 /// 在跑的一个读取：读完（或者读取 panic）时从计数里减掉
@@ -308,18 +311,26 @@ impl ClipboardReader {
                     state.pending = None;
                 }
                 Err(TryRecvError::Empty)
-                    if now.saturating_duration_since(p.started) >= READ_TIMEOUT =>
-                {
-                    // 当作这个序号没有内容：不再为它重读（多半还会卡住），剪贴板换了内容再读
+                    if now.saturating_duration_since(p.started) < READ_TIMEOUT => {}
+                // 剪贴板已经换了内容：不再等旧的（线程收不回来，还算在 running 里），读新的
+                Err(TryRecvError::Empty) if p.seq != seq => {
                     warn!(
                         seq = p.seq,
-                        "reading the clipboard got no answer in {READ_TIMEOUT:?}, skipping this content \
-                         (the program that copied it may not be responding)"
+                        "reading the clipboard got no answer in {READ_TIMEOUT:?} and the content has \
+                         changed since, reading the new content instead"
                     );
-                    state.latest = Some((p.seq, None));
                     state.pending = None;
                 }
-                Err(TryRecvError::Empty) => {}
+                // 读的还是现在的内容：接着等，晚到的照样同步
+                Err(TryRecvError::Empty) => {
+                    if !std::mem::replace(&mut p.slow, true) {
+                        warn!(
+                            seq = p.seq,
+                            "reading the clipboard got no answer in {READ_TIMEOUT:?}, still waiting \
+                             (the program that copied it may be slow or not responding)"
+                        );
+                    }
+                }
             }
         }
         if let Some((at, clip)) = &state.latest
@@ -342,6 +353,7 @@ impl ClipboardReader {
                 seq,
                 started: now,
                 rx,
+                slow: false,
             });
             let running = Running::start(&state.running);
             tokio::task::spawn_blocking(move || {
@@ -356,7 +368,7 @@ impl ClipboardReader {
                 drop(running);
                 let took = started.elapsed();
                 if took >= READ_TIMEOUT {
-                    info!(?took, "a stuck clipboard read returned");
+                    info!(?took, "a slow clipboard read returned");
                 }
                 let _ = tx.send(clip);
             });
@@ -535,9 +547,36 @@ mod tests {
         .unwrap()
     }
 
-    /// 复制它的程序不响应、读取一直不返回：放弃这一份内容，之后剪贴板换了内容照样读得到
+    /// 复制它的程序现做得很慢（内容大、要经网络取）：剪贴板还是它时一直等，不开新的读取，晚到的照样交出来
     #[tokio::test]
-    async fn a_stuck_read_is_given_up_and_later_content_is_still_read() {
+    async fn a_slow_read_of_the_current_content_is_still_delivered() {
+        let reader = ClipboardReader::default();
+        let start = Instant::now();
+        let (release, wait) = mpsc::channel::<()>();
+        assert!(
+            reader
+                .poll(1, start, move || {
+                    let _ = wait.recv();
+                    Ok(Some(Clip::Text("late".into())))
+                })
+                .is_none()
+        );
+        for t in [READ_TIMEOUT / 2, READ_TIMEOUT, READ_TIMEOUT * 10] {
+            assert!(
+                reader
+                    .poll(1, start + t, || panic!("keep waiting for the same content"))
+                    .is_none()
+            );
+            assert!(reader.0.lock().unwrap().pending.is_some());
+        }
+        release.send(()).unwrap();
+        let got = poll_until(&reader, 1, start + READ_TIMEOUT * 10, "read again").await;
+        assert_eq!(got.as_deref(), Some(&Clip::Text("late".into())));
+    }
+
+    /// 读取一直不返回、剪贴板又换了内容：等一会儿（READ_TIMEOUT）就不再等旧的，读新的
+    #[tokio::test]
+    async fn a_stuck_read_of_replaced_content_is_left_behind() {
         let reader = ClipboardReader::default();
         let start = Instant::now();
         let (_release, wait) = mpsc::channel::<()>();
@@ -549,25 +588,15 @@ mod tests {
                 })
                 .is_none()
         );
-        // 还没到时候：接着等，不开新的读取
+        // 旧的还没等够：接着等，不开新的读取
         assert!(
             reader
-                .poll(1, start + READ_TIMEOUT / 2, || panic!("still waiting"))
+                .poll(2, start + READ_TIMEOUT / 2, || panic!("still waiting"))
                 .is_none()
         );
-        assert!(reader.0.lock().unwrap().pending.is_some());
-        // 等不到：当作这个序号没有内容，也不再为它重读
-        assert_eq!(
-            reader.poll(1, start + READ_TIMEOUT, || panic!("given up")),
-            Some(None)
-        );
-        assert_eq!(
-            reader.poll(1, start + READ_TIMEOUT * 2, || panic!("given up")),
-            Some(None)
-        );
-        assert!(reader.0.lock().unwrap().pending.is_none());
-        // 剪贴板换了内容：卡住的那个还没返回，照样读新的
-        let got = poll_until(&reader, 2, start + READ_TIMEOUT * 2, "new").await;
+        assert_eq!(reader.0.lock().unwrap().pending.as_ref().unwrap().seq, 1);
+        // 等够了：读新的（卡住的那个还没返回）
+        let got = poll_until(&reader, 2, start + READ_TIMEOUT, "new").await;
         assert_eq!(got.as_deref(), Some(&Clip::Text("new".into())));
     }
 
@@ -576,22 +605,23 @@ mod tests {
     async fn stuck_reads_are_capped() {
         let reader = ClipboardReader::default();
         let start = Instant::now();
-        let late = start + READ_TIMEOUT;
         let mut releases = Vec::new();
+        // 每次剪贴板都换了内容、之前的读取都等够了还没返回
         for seq in 0..MAX_READS as u32 {
             let (release, wait) = mpsc::channel::<()>();
             releases.push(release);
             assert!(
                 reader
-                    .poll(seq, start, move || {
+                    .poll(seq, start + READ_TIMEOUT * seq, move || {
                         let _ = wait.recv();
                         Ok(None)
                     })
                     .is_none()
             );
-            assert_eq!(reader.poll(seq, late, || panic!("given up")), Some(None));
+            assert_eq!(reader.0.lock().unwrap().pending.as_ref().unwrap().seq, seq);
         }
         let seq = MAX_READS as u32;
+        let late = start + READ_TIMEOUT * seq;
         assert!(reader.poll(seq, late, || panic!("too many")).is_none());
         assert!(reader.0.lock().unwrap().pending.is_none());
         assert!(reader.poll(seq, late, || panic!("too many")).is_none());
