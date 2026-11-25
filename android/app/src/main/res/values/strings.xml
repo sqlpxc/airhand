@@ -195,10 +195,20 @@
     <string name="clear_devices">Clear saved devices</string>
     <string name="clear_devices_desc">%1$d saved</string>
     <string name="clear_devices_confirm">All devices in My devices will be removed.</string>
-    <string name="data_note">All data (settings, saved devices, this phone\'s control code) stays in the app\'s private folder. It is never backed up elsewhere and is deleted when you uninstall the app.</string>
+    <string name="data_note">All data (settings, saved devices, this phone\'s control code, crash log) stays in the app\'s private folder. It is never backed up elsewhere and is deleted when you uninstall the app.</string>
     <string name="settings_about">About</string>
     <string name="version">Version</string>
     <string name="version_value">%1$s · protocol %2$d</string>
+    <string name="crash_log">Crash log</string>
+    <string name="crash_log_none">Nothing recorded</string>
+    <plurals name="crash_log_count">
+        <item quantity="one">%1$d record · last one %2$s</item>
+        <item quantity="other">%1$d records · last one %2$s</item>
+    </plurals>
+    <string name="crash_log_text">Recorded when Airhand crashes, stops responding or is closed by the system while you\'re using it: the app version, phone model, system version and where it went wrong, without screen content or anything you typed. Paste it into a GitHub issue to help fix the problem. It stays in the app\'s private folder and is deleted when you uninstall.</string>
+    <string name="crash_log_cleared">Crash log cleared</string>
+    <string name="crash_log_notice">Airhand closed unexpectedly. To report it, copy the crash log in Settings</string>
+    <string name="crash_log_view">View</string>
 
     <!-- Quality presets (same as the desktop console) -->
     <string name="preset_saver">Data saver</string>

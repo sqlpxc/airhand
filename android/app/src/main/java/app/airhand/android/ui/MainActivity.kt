@@ -19,8 +19,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -34,6 +36,7 @@ import androidx.compose.ui.res.stringResource
 import app.airhand.android.AirhandApp
 import app.airhand.android.R
 import app.airhand.android.controller.RemoteSession
+import app.airhand.android.core.CrashLog
 import app.airhand.android.host.HostState
 import app.airhand.android.ui.phone.ConnectTab
 import app.airhand.android.ui.phone.SettingsTab
@@ -41,6 +44,9 @@ import app.airhand.android.ui.phone.ShareTab
 import app.airhand.android.ui.session.SessionActivity
 import app.airhand.android.ui.theme.AirhandTheme
 import app.airhand.android.ui.tv.TvActivity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 
 /**
  * 手机 / 平板的主界面：三个页签
@@ -101,6 +107,19 @@ private fun PhoneHome(tab: Int, onTab: (Int) -> Unit) {
                 ctx.startActivity(Intent(ctx, SessionActivity::class.java))
             }
         }
+    }
+
+    // 之前意外退出过（闪退、无响应、正在用的时候被系统杀掉，见 CrashLog）：提示一次，可以去设置里复制崩溃日志反馈
+    LaunchedEffect(Unit) {
+        CrashLog.unseen.first { it }
+        withContext(Dispatchers.IO) { CrashLog.markSeen() }
+        val r = snackbar.showSnackbar(
+            ctx.getString(R.string.crash_log_notice),
+            ctx.getString(R.string.crash_log_view),
+            withDismissAction = true,
+            duration = SnackbarDuration.Long,
+        )
+        if (r == SnackbarResult.ActionPerformed) onTab(MainActivity.TAB_SETTINGS)
     }
 
     Scaffold(

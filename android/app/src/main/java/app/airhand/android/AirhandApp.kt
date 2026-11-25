@@ -12,6 +12,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import app.airhand.android.controller.ControllerClient
 import app.airhand.android.controller.RemoteSession
+import app.airhand.android.core.CrashLog
 import app.airhand.android.core.Native
 import app.airhand.android.data.DeviceStore
 import app.airhand.android.data.GameStore
@@ -49,6 +50,8 @@ class AirhandApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // 最先装上：之后哪里崩了（包括加载 Rust 库）都记得下来
+        CrashLog.install(this)
         instance = this
         Native.init(if (BuildConfig.DEBUG) "debug,quinn=info,rustls=info" else "info,quinn=warn")
         settings = SettingsStore(this)

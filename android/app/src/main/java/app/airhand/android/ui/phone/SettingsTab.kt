@@ -1,14 +1,19 @@
 package app.airhand.android.ui.phone
 
+import android.content.Intent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Gesture
@@ -24,17 +29,21 @@ import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -46,10 +55,12 @@ import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import app.airhand.android.AirhandApp
 import app.airhand.android.BuildConfig
 import app.airhand.android.R
 import app.airhand.android.core.Code
+import app.airhand.android.core.CrashLog
 import app.airhand.android.core.Native
 import app.airhand.android.core.Preset
 import app.airhand.android.data.Settings
@@ -62,7 +73,10 @@ import app.airhand.android.ui.EditTextDialog
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.SectionTitle
 import app.airhand.android.ui.theme.Brand
+import app.airhand.android.ui.theme.Mono
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** "设置"页。所有设置都保存在应用自己的数据目录里 */
 @Composable
@@ -160,6 +174,18 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
 
         SectionTitle(stringResource(R.string.settings_about))
         Item(Icons.Outlined.Info, stringResource(R.string.version), stringResource(R.string.version_value, BuildConfig.VERSION_NAME, Native.protocolVersion()))
+        // 闪退、无响应时记下的（见 CrashLog）：复制 / 分享给开发者
+        val crashes by CrashLog.summary.collectAsState()
+        Item(
+            Icons.Outlined.BugReport,
+            stringResource(R.string.crash_log),
+            if (crashes.count == 0) {
+                stringResource(R.string.crash_log_none)
+            } else {
+                pluralStringResource(R.plurals.crash_log_count, crashes.count, crashes.count, Messages.ago(ctx, crashes.latest))
+            },
+            enabled = crashes.count > 0,
+        ) { dialog = "crashLog" }
         Spacer(Modifier.height(8.dp))
     }
 
@@ -275,6 +301,29 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 app.updateSettings { it.copy(wheelSpeed = p) }
             },
         )
+        "crashLog" -> CrashLogDialog(
+            onDismiss = { dialog = null },
+            onCopy = { text ->
+                dialog = null
+                app.clipboard.write(text, "Airhand crash log")
+                scope.launch { snackbar.showSnackbar(ctx.getString(R.string.copied)) }
+            },
+            onShare = { text ->
+                dialog = null
+                val send = Intent(Intent.ACTION_SEND)
+                    .setType("text/plain")
+                    .putExtra(Intent.EXTRA_SUBJECT, "Airhand crash log")
+                    .putExtra(Intent.EXTRA_TEXT, text)
+                runCatching { ctx.startActivity(Intent.createChooser(send, null)) }
+            },
+            onClear = {
+                dialog = null
+                scope.launch {
+                    withContext(Dispatchers.IO) { CrashLog.clear() }
+                    snackbar.showSnackbar(ctx.getString(R.string.crash_log_cleared))
+                }
+            },
+        )
         "clear" -> ConfirmDialog(
             title = stringResource(R.string.clear_devices),
             text = stringResource(R.string.clear_devices_confirm),
@@ -288,6 +337,51 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
         )
     }
 }
+
+/**
+ * 崩溃日志：说明记了什么、内容预览（复制之前看得到里面有什么），复制 / 分享 / 清除。
+ * 复制、分享的是全部（[CrashLog.export]，不超过 GitHub 一条评论的长度）
+ */
+@Composable
+private fun CrashLogDialog(onDismiss: () -> Unit, onCopy: (String) -> Unit, onShare: (String) -> Unit, onClear: () -> Unit) {
+    val text by produceState<String?>(null) { value = withContext(Dispatchers.IO) { CrashLog.export() } }
+    val ready = !text.isNullOrEmpty()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.crash_log)) },
+        text = {
+            Column {
+                Text(stringResource(R.string.crash_log_text), style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+                Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceContainerHighest) {
+                    Text(
+                        text?.take(CRASH_PREVIEW_CHARS) ?: "…",
+                        fontFamily = Mono,
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 220.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(8.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Row {
+                TextButton(onClick = { text?.let(onShare) }, enabled = ready) { Text(stringResource(R.string.share)) }
+                TextButton(onClick = { text?.let(onCopy) }, enabled = ready) { Text(stringResource(R.string.copy)) }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onClear) { Text(stringResource(R.string.clear), color = MaterialTheme.colorScheme.error) }
+        },
+    )
+}
+
+/** 预览只显示开头这么多（长文本放进 Text 里会卡），复制、分享的是全部 */
+private const val CRASH_PREVIEW_CHARS = 8_000
 
 /** `host:port`，端口 1–65535（IPv6 写成 `[::1]:4433`） */
 fun validServer(v: String): Boolean {

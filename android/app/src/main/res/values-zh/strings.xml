@@ -189,10 +189,19 @@
     <string name="clear_devices">清除已保存的设备</string>
     <string name="clear_devices_desc">共 %1$d 台</string>
     <string name="clear_devices_confirm">“我的设备”里的所有设备都会被删除。</string>
-    <string name="data_note">所有数据（设置、保存的设备、本机控制码）只保存在本应用的私有目录里，不会备份到其他地方，卸载应用时一并删除。</string>
+    <string name="data_note">所有数据（设置、保存的设备、本机控制码、崩溃日志）只保存在本应用的私有目录里，不会备份到其他地方，卸载应用时一并删除。</string>
     <string name="settings_about">关于</string>
     <string name="version">版本</string>
     <string name="version_value">%1$s · 协议版本 %2$d</string>
+    <string name="crash_log">崩溃日志</string>
+    <string name="crash_log_none">没有记录</string>
+    <plurals name="crash_log_count">
+        <item quantity="other">%1$d 条 · 最近一次：%2$s</item>
+    </plurals>
+    <string name="crash_log_text">Airhand 闪退、无响应，或者正在用的时候被系统关掉时记下来：应用版本、手机型号、系统版本和出错的位置，没有画面和你输入的内容。贴到 GitHub 的 issue 里可以帮助修复问题。只保存在本应用的私有目录里，卸载时一并删除。</string>
+    <string name="crash_log_cleared">已清除崩溃日志</string>
+    <string name="crash_log_notice">Airhand 意外退出过。想反馈的话，可以在“设置”里复制崩溃日志</string>
+    <string name="crash_log_view">查看</string>
 
     <!-- 画质预设（与桌面控制台相同） -->
     <string name="preset_saver">省流</string>
