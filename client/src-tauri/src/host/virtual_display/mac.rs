@@ -20,7 +20,15 @@
 //! * 能用的显示器：接着的（[`macos::online_display_ids`]，睡着的也算：叫醒就行），合着盖子时内建的不算；
 //! * 虚拟显示器和最近看到的本机主显示器一样大、一样的缩放（HiDPI）和物理尺寸：镜像时内建的显示器分辨率不变，
 //!   合上盖子之后控制端看到的画面大小、窗口和文字的大小也不变。一直是同一个身份（厂商、型号、序列号），
-//!   macOS 记得窗口放在它上面的位置；
+//!   macOS 记得窗口放在它上面的位置。样子直接读显示器的显示模式（[`shape_of`]：熄着屏的也读得到，`macos::displays`
+//!   只列亮着的），记在进程里（[`SEEN`]，管理线程退出了也记着）；什么都没见过（合着盖子时才启动）就读合着的
+//!   内建显示器的，还读不到才用 1080p。预备的读不到内建显示器的样子（没见过，兜底）也照样这么建：有画面（大小
+//!   不对）总比合上盖子之后黑屏强；
+//! * 建好之后不再改它：本机改了分辨率，它还是原来的大小（合上盖子之后控制端看到的也是），下次建的时候才照着新的。
+//!   不撤掉重建：实测撤掉的那一刻系统把内建的显示器换回"只有它自己"时记着的分辨率（macOS 按接着哪些显示器分别记
+//!   分辨率，镜像着它时本机改的只记在那一套里），本机刚改的分辨率就被改回去，开着"不自动睡眠"时等于改不了。也不
+//!   原地换模式（`applySettings`）：在镜像里换过，内建的显示器会一直撕裂（实测）。同样的原因，撤掉它的时候
+//!   （会话结束、用着电池、退出）镜像着它时本机改的分辨率会被系统换回去，和以前一样；
 //! * 合上、打开盖子，主显示器换了：马上告诉会话，重新列出显示器；
 //! * 有虚拟显示器的时候要着 `PreventSystemSleep`（[`power::keep_running`]）：接着外接电源时合着盖子也不睡眠
 //!   （有会话期间本来就要着，见 `power`；这个管最后一个会话结束后等重连的那一会儿）；
@@ -40,8 +48,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayIsBuiltin, CGDisplayMirrorsDisplay, CGDisplayScreenSize,
-    CGMainDisplayID,
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsBuiltin,
+    CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayScreenSize, CGMainDisplayID,
 };
 use tracing::{info, warn};
 
@@ -112,6 +120,9 @@ pub(super) fn usable() -> bool {
 /// 现在的虚拟显示器：编号、像素大小
 static CURRENT: Mutex<Option<(CGDirectDisplayID, u32, u32)>> = Mutex::new(None);
 
+/// 最近看到的本机主显示器的样子（见模块说明）：管理线程退出了也记着，合着盖子时再启动也照着它建
+static SEEN: Mutex<Option<Shape>> = Mutex::new(None);
+
 /// 本进程现在的虚拟显示器（防窥时不调黑、不盖它，见 [`super::curtain`]）
 pub(super) fn current() -> Option<CGDirectDisplayID> {
     CURRENT.lock().unwrap().map(|c| c.0)
@@ -150,14 +161,14 @@ impl Default for Shape {
 }
 
 impl Shape {
-    /// 和 `d` 一样
-    fn of(d: &macos::Display, mm: (f64, f64)) -> Self {
+    /// 和一块显示器一样：`points` 是它的大小（点），`pixels` 是像素，`mm` 是物理尺寸
+    fn of(points: (f64, f64), pixels: (u32, u32), mm: (f64, f64)) -> Self {
         let even = |v: f64| ((v.round() as u32) & !1).max(2);
-        let hidpi = d.scale() >= 1.5;
+        let hidpi = points.0 > 0.0 && pixels.0 as f64 / points.0 >= 1.5;
         let (width, height) = if hidpi {
-            (even(d.points_w), even(d.points_h))
+            (even(points.0), even(points.1))
         } else {
-            (d.width & !1, d.height & !1)
+            (pixels.0 & !1, pixels.1 & !1)
         };
         // 读不出物理尺寸时按每英寸 110 像素（点）估
         let mm = if mm.0 > 10.0 && mm.1 > 10.0 {
@@ -179,6 +190,41 @@ impl Shape {
         let k = if self.hidpi { 2 } else { 1 };
         (self.width * k, self.height * k)
     }
+}
+
+/// 本机的显示器 `id` 现在的样子。直接读它的显示模式：熄着屏（睡着）的也读得到，[`macos::displays`] 只列亮着的。
+/// 本进程的虚拟显示器读不到（见模块说明）
+fn shape_of(id: CGDirectDisplayID) -> Option<Shape> {
+    let mode = CGDisplayCopyDisplayMode(id)?;
+    let points = (
+        CGDisplayMode::width(Some(&mode)) as f64,
+        CGDisplayMode::height(Some(&mode)) as f64,
+    );
+    let pixels = (
+        CGDisplayMode::pixel_width(Some(&mode)) as u32,
+        CGDisplayMode::pixel_height(Some(&mode)) as u32,
+    );
+    if points.0 < 1.0 || points.1 < 1.0 || pixels.0 < 2 || pixels.1 < 2 {
+        return None;
+    }
+    // 显示模式是没转过的：竖着放的显示器照它在桌面上的样子转过来
+    let b = CGDisplayBounds(id).size;
+    let portrait = if b.width > 0.0 && b.height > 0.0 {
+        b.height > b.width
+    } else {
+        points.1 > points.0
+    };
+    let mm = CGDisplayScreenSize(id);
+    Some(Shape::of(
+        orient(points, portrait),
+        orient(pixels, portrait),
+        orient((mm.width, mm.height), portrait),
+    ))
+}
+
+/// 横着、竖着和 `portrait` 一致
+fn orient<T: PartialOrd>((w, h): (T, T), portrait: bool) -> (T, T) {
+    if (h > w) != portrait { (h, w) } else { (w, h) }
 }
 
 /// 一块虚拟显示器，丢掉时系统撤掉它
@@ -301,7 +347,6 @@ fn run() {
     let can_create = usable();
     let mut curtain: Option<(Curtain, Instant)> = None;
     let mut filling: Option<Filling> = None;
-    let mut shape = Shape::default();
     // 本机能用的显示器从什么时候起一直在
     let mut usable_since: Option<Instant> = None;
     let mut retry_at: Option<Instant> = None;
@@ -360,14 +405,21 @@ fn run() {
             _ => None,
         };
         let fill = usable.is_empty();
-        // 记下本机的主显示器的样子：虚拟显示器照着它建
-        if let Some(d) = macos::displays()
+        // 本机的主显示器（不是主显示器的话随便一块能用的）的样子：虚拟显示器照着它建。都读不到（合着盖子）时照着
+        // 最近看到的；什么都没见过的话读合着的内建显示器的，还读不到才是 1080p（见模块说明）
+        let main = usable.iter().copied().find(|&id| CGDisplayIsMain(id));
+        let seen = main
             .into_iter()
-            .find(|d| usable.contains(&d.id))
-        {
-            let size = CGDisplayScreenSize(d.id);
-            shape = Shape::of(&d, (size.width, size.height));
-        }
+            .chain(usable.iter().copied())
+            .find_map(shape_of);
+        let shape = {
+            let mut last = SEEN.lock().unwrap();
+            if seen.is_some() {
+                *last = seen;
+            }
+            last.or_else(|| builtin.and_then(shape_of))
+                .unwrap_or_default()
+        };
         if fill {
             usable_since = None;
         } else {
@@ -383,6 +435,8 @@ fn run() {
             && ((sessions && (fill || standby.is_some()))
                 || (ready && (standby.is_some() || (fill && filling.is_some()))));
         match (&filling, wanted) {
+            // 照着现在看到的本机显示器建；读不到的话（没见过这样的，兜底）照着最近看到的，什么都没见过才是 1080p：
+            // 有画面总比合上盖子之后黑屏强（见模块说明）
             (None, true) if retry_at.is_none_or(|t| now >= t) => {
                 match VirtualDisplay::create(shape) {
                     // 注意：tracing 的宏里 `display` 是它自己的函数名，变量换个名字
@@ -393,6 +447,8 @@ fn run() {
                             w,
                             h,
                             hidpi = shape.hidpi,
+                            // 照着现在看到的本机显示器（不是的话是最近看到的、1080p）
+                            seen = seen.is_some(),
                             lid_closed = lid,
                             standby = standby.is_some(),
                             "virtual display created"
@@ -484,23 +540,10 @@ mod tests {
     /// 真建虚拟显示器的测试一个一个来：同一个身份同时建两块会失败
     static HARDWARE: Mutex<()> = Mutex::new(());
 
-    fn display(points: (f64, f64), pixels: (u32, u32)) -> macos::Display {
-        macos::Display {
-            id: 1,
-            x: 0.0,
-            y: 0.0,
-            points_w: points.0,
-            points_h: points.1,
-            width: pixels.0,
-            height: pixels.1,
-            primary: true,
-        }
-    }
-
     /// 照着本机的显示器：Retina 屏用 HiDPI（点），普通屏用像素；读不出物理尺寸时按 110 PPI 估
     #[test]
     fn shape_follows_the_local_display() {
-        let retina = Shape::of(&display((1440.0, 900.0), (2880, 1800)), (286.9, 179.3));
+        let retina = Shape::of((1440.0, 900.0), (2880, 1800), (286.9, 179.3));
         assert_eq!(
             retina,
             Shape {
@@ -511,16 +554,38 @@ mod tests {
             }
         );
         assert_eq!(retina.pixels(), (2880, 1800));
-        let plain = Shape::of(&display((1920.0, 1080.0), (1920, 1080)), (0.0, 0.0));
+        let plain = Shape::of((1920.0, 1080.0), (1920, 1080), (0.0, 0.0));
         assert!(!plain.hidpi);
         assert_eq!(plain.pixels(), (1920, 1080));
         assert!((plain.mm.0 - 443.3).abs() < 0.1, "{:?}", plain.mm);
         // 缩放过的 Retina 屏（"看起来像" 1470x956）
-        let scaled = Shape::of(&display((1470.0, 956.0), (2940, 1912)), (300.0, 195.0));
+        let scaled = Shape::of((1470.0, 956.0), (2940, 1912), (300.0, 195.0));
         assert_eq!(
             (scaled.width, scaled.height, scaled.hidpi),
             (1470, 956, true)
         );
+        // 竖着放的：显示模式是横着的，照桌面上的样子转过来
+        assert_eq!(orient((2560u32, 1440u32), true), (1440, 2560));
+        assert_eq!(orient((1440.0, 2560.0), true), (1440.0, 2560.0));
+        assert_eq!(orient((286.0, 179.0), false), (286.0, 179.0));
+    }
+
+    /// 直接读显示模式（熄着屏的也读得到）：亮着的显示器读出来和显示器列表里的一样
+    #[test]
+    fn reads_shapes_like_the_display_list() {
+        for d in macos::displays() {
+            // 本进程的虚拟显示器读不到显示模式；转过的显示器列表里的像素没转
+            if pixels(d.id).is_some() || objc2_core_graphics::CGDisplayRotation(d.id) != 0.0 {
+                continue;
+            }
+            let mm = CGDisplayScreenSize(d.id);
+            let listed = Shape::of(
+                (d.points_w, d.points_h),
+                (d.width, d.height),
+                (mm.width, mm.height),
+            );
+            assert_eq!(shape_of(d.id), Some(listed), "{d:?}");
+        }
     }
 
     /// 合着盖子时内建的显示器不算；补屏的虚拟显示器自己也不算
@@ -583,13 +648,8 @@ mod tests {
             return;
         };
         let before = macos::displays();
-        let d = before
-            .iter()
-            .find(|d| d.id == builtin)
-            .expect("内建的显示器");
-        let size = CGDisplayScreenSize(builtin);
-        let vd =
-            VirtualDisplay::create(Shape::of(d, (size.width, size.height))).expect("建虚拟显示器");
+        let vd = VirtualDisplay::create(shape_of(builtin).expect("内建的显示器的样子"))
+            .expect("建虚拟显示器");
         mirror(vd.id, builtin);
         std::thread::sleep(Duration::from_millis(1000));
         assert_eq!(CGDisplayMirrorsDisplay(vd.id), builtin);
