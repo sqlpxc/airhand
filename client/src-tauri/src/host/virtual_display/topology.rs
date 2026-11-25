@@ -1,8 +1,7 @@
 //! 显示设置（Windows 的 CCD：`QueryDisplayConfig` / `SetDisplayConfig`）：哪些显示器是虚拟的、哪些在桌面上，
 //! 只留虚拟显示器（防窥），按 Windows 记着的设置恢复。
 //!
-//! * 认虚拟显示器靠显卡：虚拟显示器的"显卡"就是 Airhand 建的那个设备，它的设备路径里有设备的实例 ID
-//!   （`\\?\ROOT#AIRHANDVIRTUALDISPLAY#0000#{...}`）；
+//! * 虚拟屏可能和内屏共用同一个 CCD 显卡 ID。除了独立的虚拟显卡，也按每个显示目标的 PnP 父设备识别；
 //! * 改设置一律不存进 Windows 的显示设置数据库（不带 `SDC_SAVE_TO_DATABASE`）：Windows 按"接着哪些显示器"记着
 //!   各自的设置，存进去的话，下次接着同样的显示器时它自己就会套用"本机的显示器不在桌面上"——开机就黑屏。
 //!   恢复时用的正是这个数据库（`SDC_USE_DATABASE_CURRENT`）；
@@ -12,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
+    CM_Get_Parent, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
 };
 use windows::Win32::Devices::Display::*;
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LUID, POINTL};
@@ -91,16 +90,43 @@ fn source_name(adapter: LUID, id: u32) -> Option<String> {
     (r == 0).then(|| wide_str(&name.viewGdiDeviceName))
 }
 
-/// 认得出哪些显卡是虚拟显示器的（按 LUID 记着，一次查询里不重复问）
-#[derive(Default)]
-struct Adapters(HashMap<i64, bool>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Monitor {
+    Airhand,
+    Other,
+    Missing,
+    Unknown,
+}
 
-impl Adapters {
-    fn is_virtual(&mut self, adapter: LUID) -> bool {
-        *self.0.entry(luid_key(adapter)).or_insert_with(|| {
+/// 缓存只用在一次 CCD 快照里。共享显卡上的两个目标可以分别是内屏和虚拟屏。
+struct Displays {
+    airhand_node: Option<u32>,
+    adapters: HashMap<i64, bool>,
+    monitors: HashMap<Target, Monitor>,
+}
+
+impl Displays {
+    fn new() -> Self {
+        Self {
+            airhand_node: super::device::devnode(),
+            adapters: HashMap::new(),
+            monitors: HashMap::new(),
+        }
+    }
+
+    fn monitor(&mut self, p: &DISPLAYCONFIG_PATH_INFO) -> Monitor {
+        *self.monitors.entry(target(p)).or_insert_with(|| {
+            monitor(p.targetInfo.adapterId, p.targetInfo.id, self.airhand_node)
+        })
+    }
+
+    fn is_virtual(&mut self, p: &DISPLAYCONFIG_PATH_INFO) -> bool {
+        let adapter = p.targetInfo.adapterId;
+        let dedicated = *self.adapters.entry(luid_key(adapter)).or_insert_with(|| {
             let ours = INSTANCE.replace('\\', "#");
             adapter_path(adapter).is_some_and(|p| p.to_uppercase().contains(&ours))
-        })
+        });
+        dedicated || self.monitor(p) == Monitor::Airhand
     }
 }
 
@@ -129,26 +155,28 @@ fn source_mode(cfg: &Config, p: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFI
     Some(unsafe { m.Anonymous.sourceMode })
 }
 
-/// 接在这个输出上的显示器的设备节点还在不在（看不出来时为 `None`）。
+/// 查目标显示器是否还在，以及它是否是 Airhand 设备的子节点。
 ///
 /// 拔掉最后一个显示器时 Windows 可能什么都不改（实测：合着盖的笔记本拔掉接在 NVIDIA 上的 HDMI）：那条路径照样
 /// 在桌面上，`targetAvailable` 照样是真的，名字也照样查得到，DXGI 也还列着它，只是再也没有新画面。这时显示器的
 /// 设备节点没了（Kernel-PnP 1010：surprise removed），查到的 `monitorDevicePath` 是空的（实测如此）；
 /// 不是空的也再看一眼设备节点在不在
-fn monitor_present(adapter: LUID, id: u32) -> Option<bool> {
+fn monitor(adapter: LUID, id: u32, airhand_node: Option<u32>) -> Monitor {
     let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
     name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
     name.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
     name.header.adapterId = adapter;
     name.header.id = id;
     if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } != 0 {
-        return None;
+        return Monitor::Unknown;
     }
     let path = wide_str(&name.monitorDevicePath);
     if path.is_empty() {
-        return Some(false);
+        return Monitor::Missing;
     }
-    let instance = monitor_instance(&path)?;
+    let Some(instance) = monitor_instance(&path) else {
+        return Monitor::Unknown;
+    };
     let mut node = 0u32;
     let r = unsafe {
         CM_Locate_DevNodeW(
@@ -158,9 +186,19 @@ fn monitor_present(adapter: LUID, id: u32) -> Option<bool> {
         )
     };
     match r {
-        CR_SUCCESS => Some(true),
-        CR_NO_SUCH_DEVNODE => Some(false),
-        _ => None,
+        CR_SUCCESS => {
+            let mut parent = 0;
+            if airhand_node.is_some()
+                && unsafe { CM_Get_Parent(&mut parent, node, 0) } == CR_SUCCESS
+                && Some(parent) == airhand_node
+            {
+                Monitor::Airhand
+            } else {
+                Monitor::Other
+            }
+        }
+        CR_NO_SUCH_DEVNODE => Monitor::Missing,
+        _ => Monitor::Unknown,
     }
 }
 
@@ -172,30 +210,25 @@ fn monitor_instance(path: &str) -> Option<String> {
 }
 
 /// 现在的样子（`enabled`：设备启用着没有，见 `super::device::enabled`）。本机的显示器接着、设备节点也在
-/// （见 [`monitor_present`]，看不出来的算在）才算接着；拔掉了还在桌面上的是 `physical_stale`
+/// （见 [`monitor`]，看不出来的算在）才算接着；拔掉了还在桌面上的是 `physical_stale`
 pub(super) fn facts(enabled: bool) -> Result<Facts> {
     let cfg = query(QDC_ALL_PATHS)?;
-    let mut adapters = Adapters::default();
-    // 同一个输出在好几条路径上（每个源配每个输出），每个只看一次
-    let mut present: HashMap<Target, bool> = HashMap::new();
+    let mut displays = Displays::new();
     let mut f = Facts {
         enabled,
         ..Facts::default()
     };
     for p in &cfg.paths {
         let available = p.targetInfo.targetAvailable.as_bool();
-        if adapters.is_virtual(p.targetInfo.adapterId) {
+        if !available && !active(p) {
+            continue;
+        }
+        if displays.is_virtual(p) {
             f.virtual_connected |= available;
             f.virtual_active |= active(p);
             continue;
         }
-        if !available && !active(p) {
-            continue;
-        }
-        let live = available
-            && *present.entry(target(p)).or_insert_with(|| {
-                monitor_present(p.targetInfo.adapterId, p.targetInfo.id).unwrap_or(true)
-            });
+        let live = available && displays.monitor(p) != Monitor::Missing;
         if active(p) {
             if live {
                 f.physical_active = true;
@@ -215,9 +248,9 @@ pub(super) fn facts(enabled: bool) -> Result<Facts> {
 /// 本机的主显示器现在的分辨率和刷新率（不在桌面上时为 `None`）：虚拟显示器用一样的，控制端看到的画面大小不变
 pub(super) fn primary_mode() -> Option<Mode> {
     let cfg = query(QDC_ONLY_ACTIVE_PATHS).ok()?;
-    let mut adapters = Adapters::default();
+    let mut displays = Displays::new();
     cfg.paths.iter().find_map(|p| {
-        if !active(p) || adapters.is_virtual(p.targetInfo.adapterId) {
+        if !active(p) || displays.is_virtual(p) {
             return None;
         }
         let m = source_mode(&cfg, p)?;
@@ -242,12 +275,12 @@ pub(super) fn primary_mode() -> Option<Mode> {
 /// 虚拟显示器从 (0, 0) 起往右排，第一个是主显示器。新接上的输出不指定分辨率，由 Windows 选（驱动的首选）
 pub(super) fn isolate() -> Result<()> {
     let cfg = query(QDC_ALL_PATHS)?;
-    let mut adapters = Adapters::default();
+    let mut displays = Displays::new();
     let mut chosen: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::new();
     let mut sources: HashSet<Target> = HashSet::new();
     let mut targets: HashSet<Target> = HashSet::new();
     for p in &cfg.paths {
-        if active(p) && adapters.is_virtual(p.targetInfo.adapterId) {
+        if active(p) && displays.is_virtual(p) {
             sources.insert(source(p));
             targets.insert(target(p));
             chosen.push(*p);
@@ -256,7 +289,7 @@ pub(super) fn isolate() -> Result<()> {
     for p in &cfg.paths {
         if active(p)
             || !p.targetInfo.targetAvailable.as_bool()
-            || !adapters.is_virtual(p.targetInfo.adapterId)
+            || !displays.is_virtual(p)
             || targets.contains(&target(p))
             || sources.contains(&source(p))
         {
@@ -336,9 +369,9 @@ pub(super) fn restore() -> Result<()> {
 /// 桌面上的第一个虚拟显示器：GDI 名字和现在的大小
 fn virtual_source() -> Option<(String, u32, u32)> {
     let cfg = query(QDC_ONLY_ACTIVE_PATHS).ok()?;
-    let mut adapters = Adapters::default();
+    let mut displays = Displays::new();
     cfg.paths.iter().find_map(|p| {
-        if !active(p) || !adapters.is_virtual(p.targetInfo.adapterId) {
+        if !active(p) || !displays.is_virtual(p) {
             return None;
         }
         let m = source_mode(&cfg, p)?;
@@ -389,6 +422,27 @@ pub(super) fn apply_mode(mode: Mode) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn virtual_and_physical_targets_on_the_same_gpu() {
+        use super::*;
+
+        let mut panel = DISPLAYCONFIG_PATH_INFO::default();
+        panel.targetInfo.id = 1;
+        let mut vdd = panel;
+        vdd.targetInfo.id = 2;
+        let mut displays = Displays {
+            airhand_node: None,
+            adapters: HashMap::from([(luid_key(panel.targetInfo.adapterId), false)]),
+            monitors: HashMap::from([
+                (target(&panel), Monitor::Other),
+                (target(&vdd), Monitor::Airhand),
+            ]),
+        };
+        assert!(!displays.is_virtual(&panel));
+        assert!(displays.is_virtual(&vdd));
+        assert!(!displays.is_virtual(&panel));
+    }
+
     /// 只读：列出现在的显示器、哪些是虚拟的（`cargo test --lib list_displays -- --ignored --nocapture`）
     #[test]
     #[ignore]

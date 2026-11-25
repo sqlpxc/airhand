@@ -92,7 +92,7 @@ fn recorded() -> bool {
 }
 
 /// 设备节点（不在时为 `None`）
-fn devnode() -> Option<u32> {
+pub(super) fn devnode() -> Option<u32> {
     let id = HSTRING::from(INSTANCE);
     let mut node = 0u32;
     let r = unsafe { CM_Locate_DevNodeW(&mut node, &id, CM_LOCATE_DEVNODE_NORMAL) };
