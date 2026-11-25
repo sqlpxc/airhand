@@ -108,6 +108,53 @@ void ah_vd_destroy(void *display) {
     }
 }
 
+// The current mode of `display`: its size in points and in pixels (`out`: width, height, pixel width, pixel height).
+// Returns 0 if it can't be read. The process that created a virtual display can't read (or set) its mode, other
+// processes can (see mac.rs).
+int ah_vd_mode(uint32_t display, uint32_t out[4]) {
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+    if (!mode) return 0;
+    out[0] = (uint32_t)CGDisplayModeGetWidth(mode);
+    out[1] = (uint32_t)CGDisplayModeGetHeight(mode);
+    out[2] = (uint32_t)CGDisplayModeGetPixelWidth(mode);
+    out[3] = (uint32_t)CGDisplayModeGetPixelHeight(mode);
+    CGDisplayModeRelease(mode);
+    return 1;
+}
+
+// Switch `display` to its mode of `width` x `height` points and `pixel_width` x `pixel_height` pixels (the low
+// resolution twins of HiDPI modes included), remembered by macOS: the next time this display is in the same set of
+// displays, macOS picks this mode again. Returns a CGError, kCGErrorIllegalArgument if there's no such mode.
+int ah_vd_set_mode(uint32_t display, uint32_t width, uint32_t height, uint32_t pixel_width, uint32_t pixel_height) {
+    @autoreleasepool {
+        NSDictionary *options = @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes : @YES};
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, (__bridge CFDictionaryRef)options);
+        if (!modes) return kCGErrorIllegalArgument;
+        CGDisplayModeRef wanted = NULL;
+        for (CFIndex i = 0; i < CFArrayGetCount(modes) && !wanted; i++) {
+            CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            if (CGDisplayModeGetWidth(mode) == width && CGDisplayModeGetHeight(mode) == height &&
+                CGDisplayModeGetPixelWidth(mode) == pixel_width && CGDisplayModeGetPixelHeight(mode) == pixel_height &&
+                CGDisplayModeIsUsableForDesktopGUI(mode))
+                wanted = mode;
+        }
+        CGError error = kCGErrorIllegalArgument;
+        if (wanted) {
+            CGDisplayConfigRef config;
+            error = CGBeginDisplayConfiguration(&config);
+            if (!error) {
+                error = CGConfigureDisplayWithDisplayMode(config, display, wanted, NULL);
+                if (error)
+                    CGCancelDisplayConfiguration(config);
+                else
+                    error = CGCompleteDisplayConfiguration(config, kCGConfigurePermanently);
+            }
+        }
+        CFRelease(modes);
+        return error;
+    }
+}
+
 // Put `display` into the mirror set of `of` (0: take it out of any mirror set), for this login session only.
 // Returns a CGError.
 int ah_vd_mirror(uint32_t display, uint32_t of) {

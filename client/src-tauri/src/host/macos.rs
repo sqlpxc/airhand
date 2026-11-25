@@ -205,7 +205,8 @@ pub fn displays() -> Vec<Display> {
         .filter(|&&id| CGDisplayMirrorsDisplay(id) == 0)
         .map(|&id| {
             let b = CGDisplayBounds(id);
-            // 本进程建的虚拟显示器在本进程里读不到显示模式（别的进程读得到）：用建它时定的大小
+            // 本进程建的虚拟显示器在本进程里读不到显示模式（别的进程读得到）：用管理线程给的大小（建它时定的，或者
+            // 子进程看到的，见 virtual_display::mac）
             let (pw, ph) = super::virtual_display::pixels(id)
                 .map(|(w, h)| (w as usize, h as usize))
                 .or_else(|| {

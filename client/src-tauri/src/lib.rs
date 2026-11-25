@@ -690,6 +690,11 @@ pub fn run() {
     if let Some(code) = winsvc::cli() {
         std::process::exit(code);
     }
+    // macOS：被控端起来看、换补屏的虚拟显示器的模式的子进程（见 host::virtual_display）
+    #[cfg(target_os = "macos")]
+    if let Some(code) = host::virtual_display::cli() {
+        std::process::exit(code);
+    }
     init_logging();
     // Windows：为所有用户安装的 Airhand 由系统服务运行被控端；仅为当前用户安装的（没有系统服务）和调试构建直接运行时
     // 一样，被控端在本进程里运行。发布版没有安装时不能运行，提示运行安装程序

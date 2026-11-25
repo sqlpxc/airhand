@@ -29,24 +29,33 @@
 //!   分辨率，镜像着它时本机改的只记在那一套里），本机刚改的分辨率就被改回去，开着"不自动睡眠"时等于改不了。也不
 //!   原地换模式（`applySettings`）：在镜像里换过，内建的显示器会一直撕裂（实测）。同样的原因，撤掉它的时候
 //!   （会话结束、用着电池、退出）镜像着它时本机改的分辨率会被系统换回去，和以前一样；
+//! * **自己在（合上了盖子、补着屏）的时候看着它的模式**：系统按“接着哪几块显示器”记着每块显示器用的模式，它的身份
+//!   一直不变，合上盖子时系统换上的是记着的，不是建它时说的；HiDPI 的虚拟显示器系统还给出同样点数的 1x 模式
+//!   （“低分辨率”）。记着的是 1x 的（例如以前照 1080p 非 HiDPI 建过），合上盖子之后画面就糊了：大小没变，只有一半的
+//!   清晰度（issue #40，实测：把它设成 1x 之后撤掉重建，照 HiDPI 建的照样是 1x）。所以它自己在了一会儿（[`SETTLE`]，
+//!   等系统换完）之后看一眼，不是建它时的模式就换回去，系统也记住（下次合上盖子直接就是它）；换不回去的话显示器
+//!   列表里照它现在的像素大小（照实际的采集，不放大）。合着盖子时在系统设置里给它换的分辨率，下次合上盖子也换回去；
 //! * 合上、打开盖子，主显示器换了：马上告诉会话，重新列出显示器；
 //! * 有虚拟显示器的时候要着 `PreventSystemSleep`（[`power::keep_running`]）：接着外接电源时合着盖子也不睡眠
 //!   （有会话期间本来就要着，见 `power`；这个管最后一个会话结束后等重连的那一会儿）；
 //! * 最后一个会话结束后再留一会儿（等断线重连，见 `super::SESSION_LINGER`），之后撤掉（开着“不自动睡眠”时
 //!   接着预备），没事可做时线程退出。进程退出时系统自己撤掉它，不用恢复什么。
 //!
-//! 本进程建的虚拟显示器在本进程里读不到显示模式（`CGDisplayCopyDisplayMode` 返回空，别的进程读得到），
-//! 显示器列表里的像素大小用 [`pixels`]。
+//! 本进程建的虚拟显示器在本进程里读不到、也设不了显示模式（实测只有进程里建的第一块读得到，之后建的
+//! `CGDisplayCopyDisplayMode`、`CGDisplayCopyAllDisplayModes` 都是空的，私有的 `CGSGetCurrentDisplayMode` 也一样；
+//! 别的进程读得到、设得了）：显示器列表里的像素大小用 [`pixels`]，看、换它的模式由本程序的子进程做（[`cli`]）。
 //!
 //! 防窥模式（[`super::curtain`]）也由这里的管理线程打开、关掉：它不用虚拟显示器，但状态、什么时候开着
 //! 和 Windows 一样由 `super` 管。
 
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::fmt;
+use std::process::{Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsBuiltin,
     CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayScreenSize, CGMainDisplayID,
@@ -80,6 +89,12 @@ const PRODUCT: u32 = 0x7664;
 /// 测试建的用另一个序列号：同一个身份只能有一块（本机的 Airhand 正预备着时会被拒绝），也不动
 /// macOS 给真的那块记着的排列
 const SERIAL: u32 = if cfg!(test) { 0x7e57 } else { 1 };
+/// 看、换虚拟显示器的模式的子进程最多等这么久（实测 0.4 秒左右）
+const HELPER_WAIT: Duration = Duration::from_secs(5);
+/// 子进程的命令行参数（见 [`cli`]）
+const MODE_ARG: &str = "--virtual-display-mode";
+/// 子进程报告模式的那一行的开头（见 [`report`]）
+const REPORT: &str = "airhand-virtual-display-mode";
 
 unsafe extern "C" {
     fn ah_vd_supported() -> c_int;
@@ -100,6 +115,14 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn ah_vd_destroy(display: *mut c_void);
     fn ah_vd_mirror(display: u32, of: u32) -> i32;
+    fn ah_vd_mode(display: u32, out: *mut u32) -> c_int;
+    fn ah_vd_set_mode(
+        display: u32,
+        width: u32,
+        height: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> i32;
 }
 
 /// 让 `id` 镜像 `of`（`of` 为 0：拿出镜像）。注意：tracing 的宏里 `display` 是它自己的函数名，参数不叫这个
@@ -135,6 +158,32 @@ pub fn pixels(id: CGDirectDisplayID) -> Option<(u32, u32)> {
         .unwrap()
         .filter(|c| c.0 == id)
         .map(|c| (c.1, c.2))
+}
+
+/// 虚拟显示器 `id` 现在的像素大小是 `(w, h)`（子进程看到的，见 [`follow_mode`]）；变了的话返回 `true`
+fn set_pixels(id: CGDirectDisplayID, (w, h): (u32, u32)) -> bool {
+    let mut c = CURRENT.lock().unwrap();
+    match c.as_mut() {
+        Some(c) if c.0 == id && (c.1, c.2) != (w, h) => {
+            (c.1, c.2) = (w, h);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 一个显示模式：多大（点），帧缓冲多大（像素）。HiDPI 的像素是点数的两倍，1x 的一样大
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mode {
+    points: (u32, u32),
+    pixels: (u32, u32),
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (p, px) = (self.points, self.pixels);
+        write!(f, "{}x{} ({}x{} px)", p.0, p.1, px.0, px.1)
+    }
 }
 
 /// 虚拟显示器的样子
@@ -190,6 +239,14 @@ impl Shape {
         let k = if self.hidpi { 2 } else { 1 };
         (self.width * k, self.height * k)
     }
+
+    /// 照它建的虚拟显示器该用的模式（HiDPI 的不是同样点数的 1x 那个）
+    fn mode(&self) -> Mode {
+        Mode {
+            points: (self.width, self.height),
+            pixels: self.pixels(),
+        }
+    }
 }
 
 /// 本机的显示器 `id` 现在的样子。直接读它的显示模式：熄着屏（睡着）的也读得到，[`macos::displays`] 只列亮着的。
@@ -231,6 +288,8 @@ fn orient<T: PartialOrd>((w, h): (T, T), portrait: bool) -> (T, T) {
 struct VirtualDisplay {
     handle: NonNull<c_void>,
     id: CGDirectDisplayID,
+    /// 照什么样子建的
+    shape: Shape,
 }
 
 // 只是一个 Objective-C 对象的引用，在哪个线程上释放都行
@@ -263,7 +322,7 @@ impl VirtualDisplay {
         };
         let (pw, ph) = shape.pixels();
         *CURRENT.lock().unwrap() = Some((id, pw, ph));
-        Ok(Self { handle, id })
+        Ok(Self { handle, id, shape })
     }
 }
 
@@ -277,6 +336,175 @@ impl Drop for VirtualDisplay {
             }
         }
         unsafe { ah_vd_destroy(self.handle.as_ptr()) };
+    }
+}
+
+/// `airhand --virtual-display-mode <显示器编号> <点数宽> <高> <像素宽> <高>`：被控端起的子进程（见 [`check_mode`]、
+/// 模块说明），看这块显示器现在的模式，不是这个就换成它、让系统记住，报告之前、之后的模式（[`report`]）。不是这个
+/// 命令行时为 `None`，否则是退出码
+pub(super) fn cli() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some(MODE_ARG) {
+        return None;
+    }
+    Some(helper(&args.collect::<Vec<_>>()))
+}
+
+/// 子进程做的（见 [`cli`]）。退出码：0 是现在就是要的模式，1 是没换过去，2 是读不到它的模式、参数不对
+fn helper(args: &[String]) -> i32 {
+    let numbers: Option<Vec<u32>> = args.iter().map(|a| a.parse().ok()).collect();
+    let Some(&[id, w, h, pw, ph]) = numbers.as_deref() else {
+        eprintln!("usage: {MODE_ARG} <display> <width> <height> <pixel width> <pixel height>");
+        return 2;
+    };
+    let want = Mode {
+        points: (w, h),
+        pixels: (pw, ph),
+    };
+    let Some(before) = read_mode(id) else {
+        eprintln!("can't read the mode of display {id}");
+        return 2;
+    };
+    if before != want {
+        let r = unsafe { ah_vd_set_mode(id, w, h, pw, ph) };
+        if r != 0 {
+            eprintln!("can't switch display {id} to {want}: CGError {r}");
+        }
+    }
+    let after = read_mode(id).unwrap_or(before);
+    println!("{}", report(before, after));
+    if after == want { 0 } else { 1 }
+}
+
+/// 显示器 `id` 现在的模式（本进程建的虚拟显示器读不到，见模块说明）
+fn read_mode(id: CGDirectDisplayID) -> Option<Mode> {
+    let mut m = [0u32; 4];
+    (unsafe { ah_vd_mode(id, m.as_mut_ptr()) } != 0).then_some(Mode {
+        points: (m[0], m[1]),
+        pixels: (m[2], m[3]),
+    })
+}
+
+/// 子进程报告之前、之后的模式的那一行
+fn report(before: Mode, after: Mode) -> String {
+    let n = |m: Mode| {
+        format!(
+            "{} {} {} {}",
+            m.points.0, m.points.1, m.pixels.0, m.pixels.1
+        )
+    };
+    format!("{REPORT} {} {}", n(before), n(after))
+}
+
+/// 从子进程的输出里找出 [`report`] 的那一行（测试时前后还有测试框架的输出）
+fn parse_report(out: &str) -> Option<(Mode, Mode)> {
+    out.lines().find_map(|line| {
+        let numbers: Vec<u32> = line
+            .strip_prefix(REPORT)?
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let &[a, b, c, d, e, f, g, h] = numbers.as_slice() else {
+            return None;
+        };
+        Some((
+            Mode {
+                points: (a, b),
+                pixels: (c, d),
+            },
+            Mode {
+                points: (e, f),
+                pixels: (g, h),
+            },
+        ))
+    })
+}
+
+/// 跑 [`helper`] 的子进程：本程序加上 [`MODE_ARG`]
+#[cfg(not(test))]
+fn helper_command(args: &[String]) -> Result<Command> {
+    let mut c = Command::new(std::env::current_exe()?);
+    c.arg(MODE_ARG).args(args);
+    Ok(c)
+}
+
+/// 测试时：本测试程序只跑 `tests::mode_helper`，参数在环境变量里
+#[cfg(test)]
+fn helper_command(args: &[String]) -> Result<Command> {
+    let mut c = Command::new(std::env::current_exe()?);
+    c.args([
+        "--exact",
+        "host::virtual_display::mac::tests::mode_helper",
+        "--ignored",
+        "--nocapture",
+    ])
+    .env(tests::HELPER_ARGS, args.join(" "));
+    Ok(c)
+}
+
+/// 在子进程里（见模块说明）看显示器 `id` 现在的模式，不是 `want` 就换成它、让系统记住；返回之前、之后的模式
+fn check_mode(id: CGDirectDisplayID, want: Mode) -> Result<(Mode, Mode)> {
+    let args = [
+        id,
+        want.points.0,
+        want.points.1,
+        want.pixels.0,
+        want.pixels.1,
+    ]
+    .map(|n| n.to_string());
+    let mut child = helper_command(&args)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("can't start the helper process")?;
+    // 输出只有几行，等它退出时不会把管道塞满
+    let deadline = Instant::now() + HELPER_WAIT;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("the helper process didn't finish in {HELPER_WAIT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output()?;
+    match parse_report(&String::from_utf8_lossy(&out.stdout)) {
+        Some(modes) => Ok(modes),
+        None => bail!(
+            "the helper process ({}) said: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// 虚拟显示器自己在（合上了盖子、补着屏）：系统换上的是它记着的模式，不是建它时的就换回去（见模块说明）；
+/// 换不回去的话显示器列表里照它现在的像素大小
+fn follow_mode(vd: &VirtualDisplay) {
+    let want = vd.shape.mode();
+    let (before, after) = match check_mode(vd.id, want) {
+        Ok(modes) => modes,
+        Err(e) => {
+            warn!(id = vd.id, "can't check the virtual display's mode: {e:#}");
+            return;
+        }
+    };
+    if after == want {
+        info!(id = vd.id, %before, mode = %after, "virtual display mode");
+    } else {
+        warn!(
+            id = vd.id,
+            %before,
+            mode = %after,
+            wanted = %want,
+            "the virtual display keeps a mode it wasn't created with: capturing it as it is"
+        );
+    }
+    // 显示器列表里的像素大小照现在的；模式换了，会话重新列出显示器
+    if set_pixels(vd.id, after.pixels) || before != after {
+        bump();
     }
 }
 
@@ -355,6 +583,8 @@ fn run() {
     let mut ac = (true, None::<Instant>);
     // 预备着的虚拟显示器从什么时候起没在镜像（开着盖子时）
     let mut unmirrored_since: Option<Instant> = None;
+    // 虚拟显示器自己在的时候查它的模式（见 `follow_mode`）：哪一块、什么时候查（`None`：这次查过了）
+    let mut mode_check: Option<(CGDirectDisplayID, Option<Instant>)> = None;
     loop {
         let now = Instant::now();
         let (sessions, ready, stopping, privacy) = {
@@ -494,6 +724,21 @@ fn run() {
             },
             _ => {}
         }
+        // 自己在（合上了盖子、补着屏，不在镜像里）：系统换上的是它记着的模式。等系统换完了看一眼，每次自己在的时候
+        // 一次（见模块说明）
+        let alone = filling
+            .as_ref()
+            .filter(|f| standby.is_none() && CGDisplayMirrorsDisplay(f.display.id) == 0);
+        match (alone, mode_check) {
+            (None, _) => mode_check = None,
+            (Some(f), Some((id, due))) if id == f.display.id => {
+                if due.is_some_and(|t| now >= t) {
+                    mode_check = Some((id, None));
+                    follow_mode(&f.display);
+                }
+            }
+            (Some(f), _) => mode_check = Some((f.display.id, Some(now + SETTLE))),
+        }
         if filling.is_none() && curtain.is_none() {
             // 没事可做了：退出（下一个会话加入、打开"不自动睡眠"时再启动）。台式机上预备不用管。
             // 在锁里看，免得和 join、set_ready、打开防窥错过
@@ -540,6 +785,41 @@ mod tests {
     /// 真建虚拟显示器的测试一个一个来：同一个身份同时建两块会失败
     static HARDWARE: Mutex<()> = Mutex::new(());
 
+    /// 测试时子进程（[`helper_command`]）的参数
+    pub(super) const HELPER_ARGS: &str = "AIRHAND_TEST_VIRTUAL_DISPLAY_MODE";
+
+    /// 测试时的子进程（见 [`helper_command`]）：没有参数的话什么也不做
+    #[test]
+    #[ignore = "the helper process of the tests that check modes"]
+    fn mode_helper() {
+        if let Ok(args) = std::env::var(HELPER_ARGS) {
+            let args: Vec<String> = args.split_whitespace().map(String::from).collect();
+            helper(&args);
+        }
+    }
+
+    /// 子进程报告的模式：前后有别的输出（测试框架的）也找得到；不对的不算
+    #[test]
+    fn parses_the_helper_report() {
+        let hidpi = Mode {
+            points: (1512, 982),
+            pixels: (3024, 1964),
+        };
+        let low = Mode {
+            points: (1512, 982),
+            pixels: (1512, 982),
+        };
+        let out = format!(
+            "\nrunning 1 test\n{}\ntest mode_helper ... ok\n",
+            report(low, hidpi)
+        );
+        assert_eq!(parse_report(&out), Some((low, hidpi)));
+        assert_eq!(parse_report("running 1 test\n"), None);
+        assert_eq!(parse_report(&format!("{REPORT} 1 2 3 4 5 6 7")), None);
+        assert_eq!(parse_report(&format!("{REPORT} 1 2 3 4 5 6 7 x")), None);
+        assert_eq!(low.to_string(), "1512x982 (1512x982 px)");
+    }
+
     /// 照着本机的显示器：Retina 屏用 HiDPI（点），普通屏用像素；读不出物理尺寸时按 110 PPI 估
     #[test]
     fn shape_follows_the_local_display() {
@@ -554,9 +834,18 @@ mod tests {
             }
         );
         assert_eq!(retina.pixels(), (2880, 1800));
+        // 要的是 HiDPI 的模式，不是同样点数的 1x 的
+        assert_eq!(
+            retina.mode(),
+            Mode {
+                points: (1440, 900),
+                pixels: (2880, 1800)
+            }
+        );
         let plain = Shape::of((1920.0, 1080.0), (1920, 1080), (0.0, 0.0));
         assert!(!plain.hidpi);
         assert_eq!(plain.pixels(), (1920, 1080));
+        assert_eq!(plain.mode().points, plain.mode().pixels);
         assert!((plain.mm.0 - 443.3).abs() < 0.1, "{:?}", plain.mm);
         // 缩放过的 Retina 屏（"看起来像" 1470x956）
         let scaled = Shape::of((1470.0, 956.0), (2940, 1912), (300.0, 195.0));
@@ -656,6 +945,57 @@ mod tests {
         let during = macos::displays();
         println!("{during:#?}");
         assert_eq!(during, before, "镜像时显示器列表、内建显示器的大小都不该变");
+        drop(vd);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    /// issue #40：系统记着的是 1x 的模式的话，照 HiDPI 建的虚拟显示器自己在的时候（合上盖子之后）也是 1x 的；子进程
+    /// 换回来，系统也记住了。合上盖子换成"自己在"：把它拿出镜像（系统可能照它记着的放进了镜像）。会在本机多出一块
+    /// 显示器、闪几下（10 秒左右）。
+    /// `cargo test --lib fixes_the_mode_macos_remembered -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fixes_the_mode_macos_remembered() {
+        let _one = HARDWARE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(usable(), "这个 macOS 上建不了虚拟显示器");
+        let shape = Shape {
+            width: 1280,
+            height: 800,
+            hidpi: true,
+            mm: (286.0, 179.0),
+        };
+        let want = shape.mode();
+        let low = Mode {
+            points: want.points,
+            pixels: want.points,
+        };
+        let alone = || {
+            let vd = VirtualDisplay::create(shape).expect("建虚拟显示器");
+            std::thread::sleep(Duration::from_millis(1000));
+            if CGDisplayMirrorsDisplay(vd.id) != 0 {
+                mirror(vd.id, 0);
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+            assert_eq!(CGDisplayMirrorsDisplay(vd.id), 0, "拿不出镜像");
+            vd
+        };
+        // 弄成用户那边的样子：系统记着 1x 的
+        let vd = alone();
+        assert_eq!(check_mode(vd.id, low).expect("换成 1x").1, low);
+        drop(vd);
+        std::thread::sleep(Duration::from_millis(1000));
+        // 照 HiDPI 建，系统换上的是记着的 1x；换回来
+        let vd = alone();
+        let (before, after) = check_mode(vd.id, want).expect("换回 HiDPI");
+        println!("{before} -> {after}");
+        assert_eq!(before, low, "系统没换上记着的 1x（复现不了）");
+        assert_eq!(after, want);
+        drop(vd);
+        std::thread::sleep(Duration::from_millis(1000));
+        // 系统记住了：再建直接是 HiDPI 的
+        let vd = alone();
+        let (before, _) = check_mode(vd.id, want).expect("看模式");
+        assert_eq!(before, want, "系统没记住换回来的");
         drop(vd);
         std::thread::sleep(Duration::from_millis(500));
     }
