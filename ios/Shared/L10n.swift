@@ -167,6 +167,7 @@ enum L {
         "notice_mac_no_screen_input": "对方 Mac 没有允许 Airhand 使用“屏幕与系统录音”和“辅助功能”：看不到画面、听不到声音，也不能操作",
         "notice_mac_no_input": "对方 Mac 没有允许 Airhand 使用“辅助功能”，不能操作键盘和鼠标",
         "notice_mac_no_screen": "对方 Mac 没有允许 Airhand 使用“屏幕与系统录音”，看不到画面，也听不到声音",
+        "notice_mac_awdl": "对方 Mac 在用 Wi-Fi，隔空投送、隔空播放等功能会每隔一会儿借用它的无线网卡，画面可能周期性地卡顿。给它插上网线，或者在它菜单栏的 Airhand 菜单里打开“远程控制时暂停隔空投送”",
         // 问题
         "problem_server_unreachable": "无法连接服务器：%@",
         "problem_cert_mismatch": "服务器证书与设置里的指纹（或第一次连接时记住的证书）不一致，连接可能被人拦截。服务器确实换了证书的话，在设置里重新保存一次证书指纹",
@@ -332,6 +333,7 @@ enum L {
         "notice_mac_no_screen_input": "The remote Mac hasn't allowed Airhand “Screen & System Audio Recording” and “Accessibility”: no picture, no sound, no control",
         "notice_mac_no_input": "The remote Mac hasn't allowed Airhand “Accessibility”: keyboard and mouse don't work",
         "notice_mac_no_screen": "The remote Mac hasn't allowed Airhand “Screen & System Audio Recording”: no picture or sound",
+        "notice_mac_awdl": "The remote Mac is on Wi-Fi, and AirDrop, AirPlay and similar features keep borrowing its wireless card, so the picture may stutter now and then. Plug it into Ethernet, or turn on “Pause AirDrop during remote control” in Airhand's menu bar menu on that Mac",
         "problem_server_unreachable": "Can't reach the server: %@",
         "problem_cert_mismatch": "The server certificate doesn't match the fingerprint in Settings (or the one remembered on first connection); the connection may be intercepted. If the server really changed its certificate, save the fingerprint again in Settings",
         "problem_incompatible_update_app": "Incompatible with the server: the server is newer, please update Airhand",
@@ -397,6 +399,7 @@ enum Messages {
             if n.input { return L.t("notice_mac_no_input") }
             if n.screen { return L.t("notice_mac_no_screen") }
             return nil
+        case "awdl": return n.active ? L.t("notice_mac_awdl") : nil
         default: return nil
         }
     }

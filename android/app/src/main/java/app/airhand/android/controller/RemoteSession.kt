@@ -504,7 +504,10 @@ class RemoteSession(
             )
             "notice" -> {
                 val o = e.optJSONObject("notice") ?: return
-                val n = Notice(o.optString("kind"), o.optStringOrNull("detail"), o.optBoolean("screen"), o.optBoolean("input"))
+                val n = Notice(
+                    o.optString("kind"), o.optStringOrNull("detail"), o.optBoolean("screen"), o.optBoolean("input"),
+                    o.optBoolean("active"),
+                )
                 val m = notices.value.toMutableMap()
                 when (n.kind) {
                     "captureRecovered" -> m.remove("capture")
@@ -512,6 +515,8 @@ class RemoteSession(
                     "captureFailed" -> m["capture"] = n
                     "audioFailed" -> m["audio"] = n
                     "missingPermissions" -> if (!n.screen && !n.input) m.remove("permissions") else m["permissions"] = n
+                    // 对方 Mac 走 Wi-Fi、AWDL 开着：插上网线、暂停了 AWDL 时撤下
+                    "awdl" -> if (n.active) m["awdl"] = n else m.remove("awdl")
                     else -> m[n.kind] = n
                 }
                 notices.value = m

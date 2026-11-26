@@ -38,6 +38,7 @@ fn main() {
                 .flag("-fblocks")
                 .file(curtain)
                 .compile("airhand_curtain");
+            awdl_helper();
             for framework in [
                 "AppKit",
                 "AVFAudio",
@@ -72,4 +73,31 @@ fn main() {
         _ => {}
     }
     tauri_build::build()
+}
+
+/// macOS：远程控制时暂停 AWDL 的助手（src/awdl/helper.c）是一个单独的可执行文件，由 launchd 以 root 身份运行。
+/// 编译到 OUT_DIR 里，再整个放进 Airhand 的可执行文件（`include_bytes!`）：安装时由管理员权限的脚本写到
+/// /Library/PrivilegedHelperTools（见 src/awdl/helper.rs），不经过普通用户写得了的临时文件。
+/// 编译器和目标架构（交叉编译 Intel 版时是 x86_64）由 cc 按 `--target` 定；连接器给 Apple 芯片的可执行文件自动签上 ad-hoc 签名
+fn awdl_helper() {
+    let src = "src/awdl/helper.c";
+    println!("cargo:rerun-if-changed={src}");
+    let out =
+        std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("airhand-awdl");
+    let compiler = cc::Build::new()
+        .std("gnu11")
+        .opt_level(2)
+        .debug(false)
+        .warnings(true)
+        .get_compiler();
+    let status = compiler
+        .to_command()
+        .arg(src)
+        .arg("-o")
+        .arg(&out)
+        // 不要调试信息、本地符号：只是一个很小的守护进程
+        .args(["-Wl,-dead_strip", "-Wl,-S", "-Wl,-x"])
+        .status()
+        .expect("run the C compiler for the AWDL helper");
+    assert!(status.success(), "compiling {src} failed");
 }

@@ -121,6 +121,7 @@ async fn connection(tcp: TcpStream, gate: Arc<Gate>, app: AppHandle) {
         info: serde_json::to_value(crate::app_info()).unwrap_or_default(),
         report: Some(status::controller_reporter(&state.hub)),
         clipboard: Some(|| Box::new(clipboard::ClipSync::new())),
+        session: session_guard(),
     };
     let socket = ws
         .with(|m| future::ready(Ok::<_, tungstenite::Error>(to_tungstenite(m))))
@@ -134,6 +135,14 @@ async fn connection(tcp: TcpStream, gate: Arc<Gate>, app: AppHandle) {
         // 切回被控端：控制端服务和它的会话马上停下
         _ = mode.wait_for(|s| s.mode != Mode::Controller) => {}
     }
+}
+
+/// 每个会话拿着的：macOS 在远程控制期间暂停 AWDL（本机控制别人也算，见 `awdl`）
+fn session_guard() -> Option<fn() -> console::SessionGuard> {
+    #[cfg(target_os = "macos")]
+    return Some(|| Box::new(crate::awdl::session()));
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// 比较令牌：花的时间和哪个字节不同无关

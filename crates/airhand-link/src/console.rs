@@ -119,7 +119,13 @@ pub struct Setup {
     /// 桌面版：本服务同步这台电脑的剪贴板，每个会话一个（[`Frontend::Desktop`]）。
     /// `None`：控制台自己同步（浏览器，[`Frontend::Browser`]）
     pub clipboard: Option<fn() -> Box<dyn ClipboardSync>>,
+    /// 每个会话从开始连接到结束（连不上、断开）一直拿着它返回的东西，例如 macOS 桌面版在远程控制期间暂停 AWDL
+    /// （客户端的 `awdl.rs`）。`None`：没有要做的
+    pub session: Option<fn() -> SessionGuard>,
 }
+
+/// 见 [`Setup::session`]：会话结束时放开（drop）
+pub type SessionGuard = Box<dyn Send + Sync>;
 
 /// 控制台发来的二进制画面确认 `1u8 | sid u32 LE | seq u32 LE | 第几路 u8` → `(sid, 第几路, seq)`。
 /// 第 0 路可以不写最后一个字节
@@ -355,6 +361,7 @@ where
         out,
         info: setup.info,
         clipboard: setup.clipboard,
+        session: setup.session,
         tasks: JoinSet::new(),
     };
 
@@ -452,6 +459,8 @@ impl Outbox {
 struct ConsoleUi {
     ch: u32,
     out: Outbox,
+    /// [`Setup::session`] 给的：会话（连接中的、连上了的）拿着界面，会话结束时界面和它一起放开
+    _guard: Option<SessionGuard>,
 }
 
 impl SessionUi for ConsoleUi {
@@ -481,6 +490,7 @@ struct Console {
     out: Outbox,
     info: Value,
     clipboard: Option<fn() -> Box<dyn ClipboardSync>>,
+    session: Option<fn() -> SessionGuard>,
     /// 进行中的 `connect`；控制台关闭时一起中止
     tasks: JoinSet<()>,
 }
@@ -650,10 +660,12 @@ impl Console {
                     None => Frontend::Browser,
                 };
                 let (svc, out) = (self.svc.clone(), self.out.clone());
+                let guard = self.session.map(|new| new());
                 self.tasks.spawn(async move {
                     let ui = Arc::new(ConsoleUi {
                         ch,
                         out: out.clone(),
+                        _guard: guard,
                     });
                     let r = svc.connect(&code, opts, ui, frontend).await;
                     out.reply(
@@ -919,7 +931,11 @@ mod tests {
     #[tokio::test]
     async fn media_envelope_reuses_the_decrypted_buffer() {
         let (out, mut rx) = outbox(1, 1024);
-        let ui = ConsoleUi { ch: 7, out };
+        let ui = ConsoleUi {
+            ch: 7,
+            out,
+            _guard: None,
+        };
         let mut packet = Vec::with_capacity(3 + airhand_proto::handshake::SEAL_OVERHEAD);
         packet.extend_from_slice(&[1, 2, 3]);
         let ptr = packet.as_ptr();
@@ -971,7 +987,6 @@ mod tests {
                 max_short: 1080,
                 adaptive: true,
                 codec: Codec::AV1,
-                transport: Default::default(),
                 draw_cursor: false,
             }
         );
@@ -1132,6 +1147,7 @@ mod tests {
             info: json!({ "version": "1" }),
             report: None,
             clipboard: None,
+            session: None,
         };
         let served = tokio::spawn(serve(pipe, setup));
         let mut next = async || match from_service.recv().await.unwrap() {
@@ -1179,6 +1195,61 @@ mod tests {
         );
         // 不带 id 的输入没有回复
         assert_eq!(replies[4], json!({ "type": "reply", "id": 5, "ok": null }));
+        to_service.send(WsMessage::Close).unwrap();
+        served.await.unwrap().unwrap();
+    }
+
+    /// [`Setup::session`]：每次 `connect` 拿一个，连不上时（这里：还没连上服务器）马上放开
+    #[tokio::test]
+    async fn session_guards_follow_connections() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        struct Held;
+        impl Drop for Held {
+            fn drop(&mut self) {
+                HELD.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        fn guard() -> SessionGuard {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            HELD.fetch_add(1, Ordering::SeqCst);
+            Box::new(Held)
+        }
+
+        let (to_console, mut from_service) = mpsc::unbounded_channel();
+        let (to_service, from_console) = mpsc::unbounded_channel();
+        let pipe = Pipe {
+            rx: from_console,
+            tx: to_console,
+        };
+        let link = Arc::new(LinkConfig::new("127.0.0.1:9", "", "test", "test").unwrap());
+        let setup = Setup {
+            link,
+            identity: Identity::generate(),
+            info: json!({}),
+            report: None,
+            clipboard: None,
+            session: Some(guard),
+        };
+        let served = tokio::spawn(serve(pipe, setup));
+        to_service
+            .send(WsMessage::Text(
+                r#"{"id":1,"cmd":"connect","code":"123456","ch":1}"#.into(),
+            ))
+            .unwrap();
+        let reply = loop {
+            let WsMessage::Text(t) = from_service.recv().await.unwrap() else {
+                continue;
+            };
+            let m: Value = serde_json::from_str(&t).unwrap();
+            if m["type"] == "reply" {
+                break m;
+            }
+        };
+        assert_eq!(reply["err"]["kind"], json!("notConnected"));
+        assert_eq!(MADE.load(Ordering::SeqCst), 1);
+        assert_eq!(HELD.load(Ordering::SeqCst), 0);
         to_service.send(WsMessage::Close).unwrap();
         served.await.unwrap().unwrap();
     }

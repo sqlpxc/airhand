@@ -75,6 +75,18 @@ pub(crate) fn missing_permissions() -> (bool, bool) {
     }
 }
 
+/// 走 Wi-Fi、AWDL 开着（只有 macOS 看，见 `crate::awdl::hint`）：告诉控制端画面可能周期性地卡顿
+pub(crate) fn awdl_hint() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::awdl::hint()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// 本机复制的文件交给谁读（公告给控制端，它粘贴时来取）：一般是本进程直接读（[`LocalFs`]）；
 /// Windows 服务里的被控端是 SYSTEM，交给托盘以登录的用户的身份读（见 `winsvc::clip`），没有托盘就不公告。
 /// 一个都不在了（剪贴板里的路径都没了）时也不公告

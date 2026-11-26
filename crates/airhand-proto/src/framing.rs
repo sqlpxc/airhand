@@ -172,6 +172,8 @@ mod tests {
                 detail: "no default audio output device".into(),
             })),
             HostMsg::Notice(Some(Notice::AudioRecovered)),
+            HostMsg::Notice(Some(Notice::Awdl { active: true })),
+            HostMsg::Notice(Some(Notice::Awdl { active: false })),
             HostMsg::Bye(ByeReason::CodeChanged),
             HostMsg::Cursor {
                 visibility: CursorVisibility::Hidden,

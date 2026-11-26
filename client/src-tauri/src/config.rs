@@ -11,7 +11,7 @@
 //! * **配置文件 `config.toml`**（见 [`Settings`]）：可以手动改服务器地址和指纹；还保存着服务器分配的控制码
 //!   （固定不变，见 `airhand_proto::signal` 的"固定控制码"）、控制台的"我的设备"（见 [`crate::devices`]），
 //!   Windows 上还有开机自动启动（macOS 上是登录时自动启动的记录，见 [`autostart_default_pending`]），
-//!   托盘菜单、控制台里选的界面语言（`language`，见 [`crate::i18n`]），托盘菜单里切换的结束远程后锁屏（`lock_on_end`）、不自动睡眠（`prevent_sleep`，macOS）。所有数据都只在这一个文件里。位置（见 [`path`]）：
+//!   托盘菜单、控制台里选的界面语言（`language`，见 [`crate::i18n`]），托盘菜单里切换的结束远程后锁屏（`lock_on_end`）、不自动睡眠（`prevent_sleep`，macOS）、远程控制时暂停隔空投送（`pause_awdl`，macOS）。所有数据都只在这一个文件里。位置（见 [`path`]）：
 //!   * Windows：程序所在目录（安装目录）。为所有用户安装时文件由系统服务里的被控端维护（见 [`crate::winsvc`]），
 //!     托盘进程没有写权限，控制台保存设备时经命名管道交给它写；仅为当前用户安装时（见 `crate::winsvc::user`）
 //!     安装目录在用户自己的目录里，由托盘进程维护；
@@ -116,6 +116,10 @@ pub struct Settings {
     /// 不自动睡眠（`prevent_sleep`，macOS 被控端，见 `host::power`）。模板里没有它：在菜单栏图标的菜单里切换时写入
     /// （[`save_prevent_sleep`]，马上生效，不用重新启动）
     pub prevent_sleep: bool,
+    /// 远程控制时暂停隔空投送（`pause_awdl`，macOS，见 `awdl`）。模板里没有它：在菜单栏图标的菜单里切换时写入
+    /// （[`save_pause_awdl`]，马上生效，不用重新启动）
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub pause_awdl: bool,
     /// 服务器分配的控制码和加密过的密钥（`[code]`），用 [`Settings::code`] 解开
     saved_code: Option<(i64, String)>,
 }
@@ -130,6 +134,7 @@ impl Default for Settings {
             privacy_mode: true,
             lock_on_end: true,
             prevent_sleep: false,
+            pause_awdl: false,
             saved_code: None,
         }
     }
@@ -245,6 +250,9 @@ fn parse(text: &str) -> Result<Settings> {
     }
     if let Some(v) = doc.get("prevent_sleep").and_then(|v| v.as_bool()) {
         s.prevent_sleep = v;
+    }
+    if let Some(v) = doc.get("pause_awdl").and_then(|v| v.as_bool()) {
+        s.pause_awdl = v;
     }
     if let Some(v) = doc.get("language").and_then(|v| v.as_str()) {
         s.language = Lang::from_code(v);
@@ -495,7 +503,7 @@ fn last() -> MutexGuard<'static, Option<String>> {
 }
 
 /// 按模板（默认配置）生成配置文件的内容。`before` 是文件被删掉之前的内容：服务器等设置回到默认，
-/// 状态接着用——开机自动启动（Windows）、选过的界面语言、结束远程后锁屏、不自动睡眠、本机的控制码、我的设备。只搬值，模板里的说明和顺序不动
+/// 状态接着用——开机自动启动（Windows）、选过的界面语言、结束远程后锁屏、不自动睡眠、远程控制时暂停隔空投送、本机的控制码、我的设备。只搬值，模板里的说明和顺序不动
 fn regenerate(before: Option<&str>) -> Result<DocumentMut> {
     let mut doc: DocumentMut = template().parse()?;
     let Some(old) = before.and_then(|t| t.parse::<DocumentMut>().ok()) else {
@@ -519,6 +527,9 @@ fn regenerate(before: Option<&str>) -> Result<DocumentMut> {
     }
     if let Some(on) = old.get("prevent_sleep").and_then(Item::as_bool) {
         put_prevent_sleep(&mut doc, on);
+    }
+    if let Some(on) = old.get("pause_awdl").and_then(Item::as_bool) {
+        put_pause_awdl(&mut doc, on);
     }
     if let (Some(from), Some(to)) = (
         old.get("code").and_then(Item::as_table_like),
@@ -807,6 +818,28 @@ fn prevent_sleep_note() -> String {
     tr!(
         "# 不自动睡眠（macOS）：Airhand 作为被控端运行、接着外接电源时，电脑不因为空闲而睡眠，一直能被连接（显示器照常熄灭）。在菜单栏图标的菜单\"不自动睡眠\"里切换时记下\n",
         "# Prevent automatic sleeping (macOS): while Airhand runs as a host on a power adapter, the computer doesn't sleep when idle, so it can always be reached (the display still turns off). Saved when you switch \"Prevent automatic sleeping\" in the menu bar icon's menu\n"
+    )
+}
+
+/// 保存"远程控制时暂停隔空投送"（菜单栏图标的菜单里切换的，macOS）
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn save_pause_awdl(on: bool) -> Result<()> {
+    edit(|doc| {
+        put_pause_awdl(doc, on);
+        Ok(())
+    })
+}
+
+/// 写入 `pause_awdl`（模板里没有：默认不暂停。加上时带一段说明）
+fn put_pause_awdl(doc: &mut DocumentMut, on: bool) {
+    put_setting(doc, "pause_awdl", toml_edit::value(on), pause_awdl_note);
+}
+
+/// `pause_awdl` 前面的说明
+fn pause_awdl_note() -> String {
+    tr!(
+        "# 远程控制时暂停隔空投送（macOS）：用 Wi-Fi 联网、被远程控制或者控制别的电脑时暂停 AWDL（隔空投送、隔空播放、随航、通用控制等用的 Wi-Fi 直连），远程控制不再周期性地卡顿，结束后恢复。要装一个小组件，在菜单栏图标的菜单\"远程控制时暂停隔空投送\"里打开、关掉时记下\n",
+        "# Pause AirDrop during remote control (macOS): while on Wi-Fi and being controlled or controlling another computer, pause AWDL (the Wi-Fi peer-to-peer link of AirDrop, AirPlay, Sidecar, Universal Control and the like) so remote control doesn't stutter now and then; it resumes afterwards. Needs a small helper; saved when you switch \"Pause AirDrop during remote control\" in the menu bar icon's menu\n"
     )
 }
 
@@ -1407,6 +1440,35 @@ mod tests {
         put_prevent_sleep(&mut doc, true);
         let again = regenerate(Some(&doc.to_string())).unwrap().to_string();
         assert!(parse(&again).unwrap().prevent_sleep);
+    }
+
+    /// 远程控制时暂停隔空投送默认关（模板里没有这一项）；在菜单里打开时记下，带一段说明，之后只改值；
+    /// 文件被删掉重新生成时接着用
+    #[test]
+    fn pause_awdl_is_saved() {
+        let tpl = template();
+        assert!(!tpl.contains("pause_awdl"));
+        assert!(!parse(&tpl).unwrap().pause_awdl);
+
+        let mut doc: DocumentMut = tpl.parse().unwrap();
+        put_pause_awdl(&mut doc, true);
+        let text = doc.to_string();
+        let note = pause_awdl_note();
+        let note = note.lines().next().unwrap();
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("missing {s:?}"));
+        assert!(at(note) < at("pause_awdl = true"));
+        assert!(at("pause_awdl = true") < at("[code]"));
+        assert!(parse(&text).unwrap().pause_awdl);
+
+        put_pause_awdl(&mut doc, false);
+        let text = doc.to_string();
+        assert_eq!(text.matches(note).count(), 1);
+        assert_eq!(text.matches("pause_awdl = ").count(), 1);
+        assert!(!parse(&text).unwrap().pause_awdl);
+
+        put_pause_awdl(&mut doc, true);
+        let again = regenerate(Some(&doc.to_string())).unwrap().to_string();
+        assert!(parse(&again).unwrap().pause_awdl);
     }
 
     fn device(code: &str) -> crate::devices::Device {

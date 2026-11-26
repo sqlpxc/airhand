@@ -91,6 +91,9 @@ node scripts/measure-avsync.mjs <控制码> [配对码]
 cargo run --release --example headless_host
 # client/src-tauri/：编码性能测试（抓真实屏幕，对比各编码器）
 cargo run --release --example encode_bench
+# macOS：远程控制时暂停隔空投送的组件（src/awdl/helper.c，以 root 运行）的日志。暂停着的时候 `ifconfig awdl0` 的 flags 里没有 UP
+# （cargo test --lib awdl 以普通用户运行编译进来的组件，只检查协议：不是 root 关不上 awdl0）
+log stream --predicate 'subsystem == "app.airhand.awdl"' --level debug
 ```
 
 测画面流畅度或音画同步时请用 release 构建：被控端回退到 CPU 缩放时，调试构建从 4K 缩到 1080p 每帧可能要约 0.5 秒。

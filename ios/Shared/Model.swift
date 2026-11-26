@@ -189,12 +189,13 @@ struct EncoderInfo: Equatable {
     var height: Int
 }
 
-/// 被控端发来的提示（`NoticeView`）
+/// 被控端发来的提示（`NoticeView`）。`active`：`awdl` 的（对方 Mac 走 Wi-Fi、AWDL 开着；false 是撤下）
 struct Notice: Equatable {
     var kind: String
     var detail: String?
     var screen = false
     var input = false
+    var active = false
 }
 
 struct Stats: Equatable {

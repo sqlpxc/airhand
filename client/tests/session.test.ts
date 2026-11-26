@@ -650,3 +650,32 @@ test("stale completion cannot finish a newer attempt", () => {
   attempt.finish(current);
   assert.equal(attempt.attempting, false);
 });
+
+test("对方 Mac 走 Wi-Fi 的提示：不盖住别的提示，撤下时只撤自己，关掉过就不再提示", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  const awdl = (active: boolean) => s.onEvent({ type: "notice", notice: { kind: "awdl", active } });
+  s.notice = null;
+  awdl(true);
+  assert.equal(s.notice?.kind, "awdl");
+  // 对方插上了网线 / 暂停了 AWDL
+  awdl(false);
+  assert.equal(s.notice, null);
+  // 正显示着别的提示：不盖住它，撤下时也不动它
+  s.onEvent({ type: "notice", notice: { kind: "missingPermissions", screen: false, input: true } });
+  awdl(true);
+  assert.equal(s.notice?.kind, "missingPermissions");
+  awdl(false);
+  assert.equal(s.notice?.kind, "missingPermissions");
+  s.dismissNotice();
+  // 关掉了它：这个标签页里不再提示（重连之后对方会再说一遍）
+  awdl(true);
+  assert.equal(s.notice?.kind, "awdl");
+  s.dismissNotice();
+  awdl(false);
+  awdl(true);
+  assert.equal(s.notice, null);
+  // 别的提示照常显示
+  s.onEvent({ type: "notice", notice: { kind: "noDisplays" } });
+  assert.equal(s.notice?.kind, "noDisplays");
+});

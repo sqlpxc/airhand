@@ -12,7 +12,7 @@ Double-click to run (on Windows install it first, see [Windows installation](#wi
 - Who is controlling this computer right now (with the **safety code** after each connection), and **Disconnect all controllers**
 - **Change control code**: the old code stops working immediately and connected controllers are disconnected; the pairing code changes too and all paired controllers are forgotten
 - **Forget paired controllers**: they'll need the pairing code again
-- Open console and **Start with Windows** (Windows; **Start when you sign in** when installed just for you) / Switch to controller (macOS, Linux) and **Open at login** (macOS) / **Lock screen when remote control ends** (see below) / **Prevent automatic sleeping** (macOS, see below) / Language / **Uninstall Airhand…** (macOS, see [Uninstalling](#uninstalling)) / Quit
+- Open console and **Start with Windows** (Windows; **Start when you sign in** when installed just for you) / Switch to controller (macOS, Linux) and **Open at login** (macOS) / **Lock screen when remote control ends** (see below) / **Prevent automatic sleeping** (macOS, see below) / **Pause AirDrop during remote control** (macOS, see below) / Language / **Uninstall Airhand…** (macOS, see [Uninstalling](#uninstalling)) / Quit
 
 After a network drop the host reconnects automatically with exponential backoff and **gets its old control code back**, even after a server restart. The code is **fixed**: it's saved in `config.toml`, and the server keeps it for this computer however long it stays offline (codes unused for 180 days are released), so it stays the same across restarts and upgrades until you change it.
 
@@ -31,6 +31,12 @@ After a network drop the host reconnects automatically with exponential backoff 
 > **Privacy mode**: when a controller turns it on (see [Privacy mode](#privacy-mode)), all of this Mac's displays go black (the backlight stays on) with a black window over each of them, and its keyboard, mouse and trackpad stop working, while the controller still sees and controls everything. Airhand needs the **Accessibility** permission for it (the host needs it to control the keyboard and mouse anyway); without it the controller's switch is greyed out. No display settings are changed: when Airhand quits (or crashes) the displays, keyboard and mouse come back right away.
 >
 > **Closing the lid during remote control** (MacBook): on a power adapter the Mac keeps running and stays under control. While a controller is connected to a MacBook on power with no external display (and, with **Prevent automatic sleeping** on, all the time Airhand runs as a host, so a controller connecting after the lid has been closed gets a picture too), Airhand keeps a virtual display ready that mirrors the built-in one ("Airhand" in System Settings → Displays; the screen may flash once when it's added and when it's removed). While it mirrors, a 120 Hz display may run at 60 Hz. You won't notice it, and the controller still sees one display. Close the lid and macOS switches to it: the windows move onto it and the controller keeps seeing and controlling the desktop, with sound. Open the lid and macOS switches back. A Mac with no display connected (a Mac mini) gets a virtual display too. Without **Prevent automatic sleeping**, the virtual display stays for 30 seconds after the last controller disconnects (in case it reconnects); after that a Mac with its lid closed goes to sleep as usual. On battery a closed lid still puts the Mac to sleep.
+
+> **Periodic stutter over Wi-Fi** (macOS): AirDrop, AirPlay, Sidecar, Universal Control and similar features use a Wi-Fi peer-to-peer link (AWDL) that shares the Mac's wireless card with Wi-Fi. While it's on, it keeps switching the card to its own channel for a moment, and meanwhile the remote control's picture and input just wait. When the Mac being controlled is on Wi-Fi with AWDL on, the controller shows a notice (click it to dismiss; it doesn't come back in that tab). There are three ways out:
+>
+> - **Use an Ethernet cable** (best): it doesn't go through the wireless card, so nothing interferes.
+> - Check **Pause AirDrop during remote control** in the menu bar icon's menu (off by default, takes effect right away, saved as `pause_awdl` in `config.toml`): while this Mac is on Wi-Fi and is being controlled or controls another computer, Airhand pauses AWDL, and resumes it 20 seconds after the last connection ends (so reconnecting doesn't flip it back and forth); on Ethernet nothing is paused. While it's paused the menu says "AirDrop is paused", and this Mac's AirDrop, AirPlay to this Mac, Sidecar, Universal Control, Continuity Camera, iPhone Mirroring and the like don't work. The first time you turn it on, Airhand explains this and then installs a small helper that does only this: it runs with system privileges, so you enter an administrator password once. macOS then notifies you that a background item was added; the helper is listed under "Allow in the Background" in System Settings → General → Login Items & Extensions, and if you turn it off there nothing can be paused (the menu says so). Turning the option off keeps the helper (it doesn't run when there's no remote control); it's removed when you uninstall Airhand (see [Uninstalling](#uninstalling)).
+> - Set the router's 5 GHz channel to **149** (or 44; 6 on 2.4 GHz): those are the channels AWDL uses anyway, and switching costs much less when Wi-Fi is on the same one. iPhones and iPads can't pause their own AWDL when they're the controller, so this helps them too.
 
 ## Windows installation
 
@@ -102,6 +108,7 @@ Everything Airhand saves is in one `config.toml` (with comments). The menu in th
 | `privacy_mode` | Windows, macOS: whether controllers may turn on [privacy mode](#privacy-mode), `true` by default. It isn't in the file by default: add `privacy_mode = false` to keep others from turning it on |
 | `lock_on_end` | Lock the screen when the remote control ends (see [Host](#host-default)): written when you switch **Lock screen when remote control ends** in the tray menu. Without it the screen is locked (`true`) |
 | `prevent_sleep` | macOS: prevent automatic sleeping (see "Lock screen and sleep" under [Host](#host-default)): written when you switch **Prevent automatic sleeping** in the menu bar icon's menu. On a power adapter the Mac then doesn't sleep when idle or with the lid closed. Without it the Mac sleeps as usual (`false`) |
+| `pause_awdl` | macOS: pause AirDrop during remote control (see "Periodic stutter over Wi-Fi" under [Host](#host-default)): written when you switch **Pause AirDrop during remote control** in the menu bar icon's menu. Without it nothing is paused (`false`). Setting it to `true` by hand doesn't install the helper; turn it on in the menu |
 | `[code]` | This computer's control code, and the secret that gets it back. Delete `code` and `secret` to get a new code |
 | `[host]` | Maintained by Airhand: this computer's end-to-end identity as a host (`key`), the pairing code and whether pairing is paused, all stored encrypted. Deleting `key` creates a new identity: controllers that connected before will warn that this computer's identity changed |
 | `[[paired]]` | Maintained by Airhand: paired controllers (public key, name, when they paired); they connect without the pairing code. Delete an entry to forget that controller |
@@ -132,6 +139,7 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
 | Item | Where | Notes |
 |---|---|---|
 | Incomplete file transfer | `.airhand-receive-<random ID>` in the selected folder, referenced by `pending-receive-<random ID>` in the configuration directory | Cancelling, quitting or uninstalling cleans up partial transfers and keeps completed items. After a forced quit, cleanup runs at the next launch. Reconnect any drive removed during a transfer first. |
+| Helper that pauses AirDrop | `/Library/PrivilegedHelperTools/app.airhand.awdl`, `/Library/LaunchDaemons/app.airhand.awdl.plist` | Only there if you turned on **Pause AirDrop during remote control**. Owned by root, so removing it needs an administrator password: uninstalling from the menu asks for it |
 | Airhand Microphone | Core Audio input device and its tap | Removed on quit. Startup and the uninstall menu also remove this user’s objects after a forced quit. |
 | Open at login | System Settings → General → Login Items ("Login Items & Extensions" on some versions of macOS), under both "Open at Login" and "App Background Activity" | Has to be unregistered by Airhand itself: if you delete the app first, a dead Airhand entry stays in both places |
 | Permissions | System Settings → Privacy & Security: Screen & System Audio Recording, Accessibility and so on | Can only be cleared while the app is still there; once it's deleted macOS can't find it any more |
@@ -163,12 +171,20 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
    rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    ```
 
-   One line per item: the configuration, the caches macOS created for it, the crash reports, the menu bar icon settings and the program. Instead of the last line you can also drag Airhand from the Applications folder to the Trash (and empty it). `find` runs into other apps' protected directories; those errors are silenced and don't affect the result. The menu bar icon settings are first deleted through the system's preferences service (`defaults delete`), which leaves an empty file behind for `rm` to delete.
+   If you turned on **Pause AirDrop during remote control**, also remove its helper (this needs an administrator password; on `bootout` it resumes AWDL if it had paused it, then exits):
+
+   ```bash
+   sudo launchctl bootout system/app.airhand.awdl
+   sudo rm -f /Library/LaunchDaemons/app.airhand.awdl.plist /Library/PrivilegedHelperTools/app.airhand.awdl
+   ```
+
+   The first block has one line per item: the configuration, the caches macOS created for it, the crash reports, the menu bar icon settings and the program. Instead of the last line you can also drag Airhand from the Applications folder to the Trash (and empty it). `find` runs into other apps' protected directories; those errors are silenced and don't affect the result. The menu bar icon settings are first deleted through the system's preferences service (`defaults delete`), which leaves an empty file behind for `rm` to delete.
 
 **Check**: if these commands print nothing except WebKit's empty directories in the temporary directory (they can't be removed, see the end), and neither System Settings → General → Login Items nor Privacy & Security → Screen & System Audio Recording / Accessibility lists Airhand, it's all gone.
 
 ```bash
 ls -d ~/Library/Application\ Support/app.airhand.client ~/Library/Preferences/app.airhand.client.plist /Applications/Airhand.app ~/Applications/Airhand.app 2>/dev/null
+ls -d /Library/PrivilegedHelperTools/app.airhand.awdl /Library/LaunchDaemons/app.airhand.awdl.plist 2>/dev/null
 find "$(getconf DARWIN_USER_CACHE_DIR)" "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name '*app.airhand.client' 2>/dev/null
 find ~/Library/Logs/DiagnosticReports ~/Library/Application\ Support/CrashReporter -maxdepth 1 -name 'airhand[-_]*' 2>/dev/null
 ```

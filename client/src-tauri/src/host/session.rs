@@ -9,6 +9,9 @@
 //! 会话期间不熄屏、不睡眠（[`power`]）；本机的显示器关了电源时补一块虚拟显示器、防窥模式都在
 //! [`virtual_display`]：它改了显示设置就告诉会话，会话马上重新列出显示器（画面跟着换到虚拟显示器上、换回来）。
 //! 会话怎么结束的（正常结束还是出了错）交给 [`ending`]：远程控制结束了就锁屏、退出防窥模式。
+//!
+//! macOS：会话期间按"远程控制时暂停隔空投送"暂停 AWDL（见 `crate::awdl`）；走 Wi-Fi、AWDL 又开着的话告诉控制端
+//! （`Notice::Awdl`），它提示插网线或者打开这一项。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,6 +61,8 @@ const DISPLAY_CHECK: Duration = Duration::from_secs(2);
 const MIC_CHECK: Duration = Duration::from_secs(5);
 /// macOS：会话开始时列不出显示器（睡着了）的话，叫醒它之后最多等这么久
 const WAKE_WAIT: Duration = Duration::from_secs(3);
+/// macOS：多久看一次是不是走 Wi-Fi、AWDL 开着（第一次在会话开始这么久之后：打开了暂停的话，先等它暂停上）
+const AWDL_CHECK: Duration = Duration::from_secs(5);
 
 /// 显示器列表变了之后，每一路画面看的显示器在新列表里的序号：按名字找（插拔别的显示器时序号可能变），
 /// 找不到（被拔掉了）的那一路不要了；一路都不剩就改看主显示器（新列表的第一个，见 [`resolve_view`]）。
@@ -96,6 +101,16 @@ fn follow_view(
 async fn audio_failure(sound: &mut Option<AudioSubscription>) -> Option<String> {
     match sound {
         Some(s) => s.failure_changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 等下一次看 AWDL 的时候；这个平台不看（不是 macOS）时一直等下去
+async fn awdl_due(tick: &mut Option<Interval>) {
+    match tick {
+        Some(t) => {
+            t.tick().await;
+        }
         None => std::future::pending().await,
     }
 }
@@ -224,6 +239,13 @@ struct Desktop {
     privacy_at_start: bool,
     /// 会话期间不熄屏、不睡眠
     _awake: Option<Awake>,
+    /// macOS：远程控制期间暂停 AWDL（见 `crate::awdl`），控制端确认了握手才拿
+    #[cfg(target_os = "macos")]
+    _wifi: Option<crate::awdl::Session>,
+    /// macOS：定时看看是不是走 Wi-Fi、AWDL 开着；别的平台没有
+    awdl_tick: Option<Interval>,
+    /// 告诉过控制端走 Wi-Fi、AWDL 开着（[`Notice::Awdl`]）
+    awdl_told: bool,
     /// 控制端确认了握手就算一次远程控制，结束后锁屏、退出防窥（见 [`ending`]）
     presence: ending::Slot,
 }
@@ -279,6 +301,8 @@ enum Tick {
     MicCheck,
     /// 防窥模式的状态变了
     Privacy,
+    /// 该看看是不是走 Wi-Fi、AWDL 开着了（macOS）
+    Awdl,
 }
 
 impl Desktop {
@@ -318,6 +342,15 @@ impl Desktop {
             privacy_sent: None,
             privacy_at_start: false,
             _awake: None,
+            #[cfg(target_os = "macos")]
+            _wifi: None,
+            awdl_tick: cfg!(target_os = "macos").then(|| {
+                let mut t =
+                    tokio::time::interval_at(tokio::time::Instant::now() + AWDL_CHECK, AWDL_CHECK);
+                t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                t
+            }),
+            awdl_told: false,
             presence,
         }
     }
@@ -582,6 +615,10 @@ impl Platform for Desktop {
         if self.privacy_at_start {
             self.screens.set_privacy(true);
         }
+        #[cfg(target_os = "macos")]
+        {
+            self._wifi = Some(crate::awdl::session());
+        }
     }
 
     async fn request(&mut self, req: Request) -> Result<()> {
@@ -662,6 +699,7 @@ impl Platform for Desktop {
             _ = self.privacy_changes.changed() => Tick::Privacy,
             // 虚拟显示器改了显示设置：马上重新列出显示器，不等定时检查
             _ = self.display_changes.changed() => Tick::Displays,
+            () = awdl_due(&mut self.awdl_tick) => Tick::Awdl,
         }
     }
 
@@ -730,6 +768,17 @@ impl Platform for Desktop {
             }
             Tick::Mic(status) => self.send_mic(status)?,
             Tick::Privacy => self.send_privacy()?,
+            // 插上 / 拔掉网线、暂停 / 恢复了 AWDL：提示控制端，或者撤下提示
+            Tick::Awdl => {
+                let active = tokio::task::spawn_blocking(super::awdl_hint)
+                    .await
+                    .unwrap_or(false);
+                if active != self.awdl_told {
+                    info!(session_id, active, "Wi-Fi shared with AWDL");
+                    self.awdl_told = active;
+                    self.out.send(&notice(Notice::Awdl { active }))?;
+                }
+            }
             // 能用了的话：控制端一直想开着就打开，不然告诉它现在能开了
             Tick::MicCheck => {
                 if self.mic.wanted {

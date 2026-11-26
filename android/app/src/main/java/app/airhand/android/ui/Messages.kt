@@ -80,14 +80,17 @@ object Messages {
             n.input -> R.string.notice_mac_no_input
             else -> R.string.notice_mac_no_screen
         }
+        "awdl" -> R.string.notice_mac_awdl
         else -> null
     }
 
     /**
      * 只看画面（电视）时要显示的提示：本来就不操作，对方没给操作权限（无障碍服务 / 辅助功能）不用提示；
-     * 同时缺屏幕录制权限的只说看不到画面。返回 null 表示不显示
+     * 同时缺屏幕录制权限的只说看不到画面。对方 Mac 走 Wi-Fi 的建议也不显示（电视上的提示关不掉，又没法去对方的菜单里改）。
+     * 返回 null 表示不显示
      */
     fun forViewer(n: Notice): Notice? = when {
+        n.kind == "awdl" -> null
         n.kind != "missingPermissions" -> n
         !n.screen -> null
         else -> n.copy(input = false)

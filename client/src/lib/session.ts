@@ -137,6 +137,8 @@ export class RemoteSession {
   stats: Stats = { fps: 0, kbps: 0, rttMs: null, width: 0, height: 0, decodeMs: 0, direct: false };
   /** 画面上方的提示（显示时才变成文字，见 messages.ts） */
   notice: SessionNotice | null = null;
+  /** 关掉过"对方 Mac 走 Wi-Fi"的提示：这个标签页里不再提示（重连之后对方会再说一遍） */
+  private awdlDismissed = false;
   /** 被控端为什么采集不到声音（英文技术信息）；正常、或者没开声音时为 null */
   audioError: string | null = null;
   settings: QualitySettings;
@@ -677,6 +679,13 @@ export class RemoteSession {
         } else if (n.kind === "missingPermissions" && this.hostPlatform === "android") {
           // 对方是手机：缺的是 Airhand 的"远程操作"（无障碍服务），不是 Mac 的系统权限
           this.notice = { kind: "androidNoInput" };
+        } else if (n.kind === "awdl") {
+          // 只是建议：不盖住正在显示的其它提示，关掉过就不再提示；对方插上网线、暂停了 AWDL 时撤下
+          if (!n.active) {
+            if (this.notice?.kind === "awdl") this.notice = null;
+          } else if (!this.notice && !this.awdlDismissed) {
+            this.notice = n;
+          }
         } else if (n.kind === "audioFailed") {
           this.audioError = n.detail;
           // 声音的问题不盖住正在显示的其它提示（例如缺少权限、Wayland），原因在声音菜单里一直能看到
@@ -1523,6 +1532,7 @@ export class RemoteSession {
   }
 
   dismissNotice() {
+    if (this.notice?.kind === "awdl") this.awdlDismissed = true;
     this.notice = null;
     this.emit();
   }

@@ -334,6 +334,11 @@ pub enum NoticeView {
         screen: bool,
         input: bool,
     },
+    /// 对方 Mac 用 Wi-Fi 联网、AWDL（隔空投送等用的 Wi-Fi 直连）开着，画面可能周期性地卡一下。
+    /// `active` 为 false 表示不再是这样了，控制台撤下之前的提示
+    Awdl {
+        active: bool,
+    },
 }
 
 impl From<Notice> for NoticeView {
@@ -348,6 +353,7 @@ impl From<Notice> for NoticeView {
             Notice::MissingPermissions { screen, input } => {
                 NoticeView::MissingPermissions { screen, input }
             }
+            Notice::Awdl { active } => NoticeView::Awdl { active },
         }
     }
 }
@@ -1102,6 +1108,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&n).unwrap(),
             json!({ "type": "notice", "notice": { "kind": "audioRecovered" } })
+        );
+        let n = SessionEvent::Notice {
+            notice: Notice::Awdl { active: true }.into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            json!({ "type": "notice", "notice": { "kind": "awdl", "active": true } })
         );
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::Kicked),

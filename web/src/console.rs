@@ -73,6 +73,7 @@ async fn run(socket: WebSocket, app: Arc<App>, peer: SocketAddr) {
         }),
         report: None,
         clipboard: None,
+        session: None,
     };
     match console::serve(socket, setup).await {
         Ok(()) => info!(%peer, "console closed"),

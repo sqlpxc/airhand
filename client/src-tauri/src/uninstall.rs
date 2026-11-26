@@ -9,6 +9,9 @@
 //!    AppKit 记下的菜单栏图标位置 / 是否显示（App 自己的偏好设置，见 [`remove_preferences`]）；
 //! 4. 把 App 移到废纸篓（放错了还能放回来，清空废纸篓就彻底删掉了）。
 //!
+//! 装过"远程控制时暂停隔空投送"的组件（见 `crate::awdl`）的话，一开始就把它拿掉：它在 /Library 里、属于 root，
+//! 要输一次管理员密码（输密码的对话框里说明了是 Airhand 要移除它）。
+//!
 //! 某一步没做成不影响后面的步骤，最后的提示里列出来，可以按使用指南手动清理。
 //! 调用之前先停掉被控端和控制端、让配置文件不再写入（见 `lib.rs` 的 `uninstall`）。
 
@@ -41,10 +44,17 @@ pub fn confirm(mtm: MainThreadMarker) -> bool {
         "卸载 Airhand？",
         "Uninstall Airhand?"
     )));
-    alert.setInformativeText(&NSString::from_str(&tr!(
+    let mut text = tr!(
         "会移除 Airhand 虚拟麦克风，关掉登录时自动启动，清除 Airhand 的“屏幕与系统录音”“辅助功能”等权限，删除配置文件（本机的控制码、“我的设备”里保存的电脑）和系统为它生成的缓存、记下的菜单栏图标设置，然后把 Airhand 移到废纸篓并退出。\n\n正在控制本机的连接会断开。已接收的文件会保留。",
         "This removes Airhand Microphone, turns off open at login, clears Airhand's permissions (Screen & System Audio Recording, Accessibility and so on), deletes the configuration file (this computer's control code and the computers saved in My devices) and the caches and menu bar icon settings macOS keeps for it, then moves Airhand to the Trash and quits.\n\nAnyone controlling this computer will be disconnected. Files you have received will be kept."
-    )));
+    );
+    if crate::awdl::present() {
+        text.push_str(&tr!(
+            "\n\n还会移除远程控制时暂停隔空投送的组件，要输入一次管理员密码。",
+            "\n\nThe helper that pauses AirDrop during remote control is removed too, which needs an administrator password."
+        ));
+    }
+    alert.setInformativeText(&NSString::from_str(&text));
     // 第一个按钮是默认按钮（回车）：默认是"取消"，不会一按回车就卸载了
     alert.addButtonWithTitle(&NSString::from_str(&tr!("取消", "Cancel")));
     let uninstall = alert.addButtonWithTitle(&NSString::from_str(&tr!("卸载", "Uninstall")));
@@ -109,6 +119,16 @@ pub fn run(plan: &Plan) -> Vec<String> {
             "Clean up the incomplete file transfer ({e})"
         );
         step(what, Err(e.to_string()));
+    }
+    // App 外面、属于 root 的组件：要输管理员密码，先做（对话框里说明了是 Airhand 要移除它）
+    if crate::awdl::present() {
+        step(
+            tr!(
+                "移除远程控制时暂停隔空投送的组件（/Library/PrivilegedHelperTools/app.airhand.awdl）",
+                "Remove the helper that pauses AirDrop during remote control (/Library/PrivilegedHelperTools/app.airhand.awdl)"
+            ),
+            crate::awdl::remove(),
+        );
     }
     // Join the publisher before resetting permissions or deleting the bundle, including when
     // a controller still holds its microphone lease. Also sweeps objects left by a forced quit.

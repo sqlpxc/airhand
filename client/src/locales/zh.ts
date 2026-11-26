@@ -314,6 +314,8 @@ export default {
       : p.input
         ? "对方 Mac 没有允许 Airhand 使用“辅助功能”，不能操作键盘和鼠标。需要那台电脑的用户在“系统设置 → 隐私与安全性 → 辅助功能”里允许 Airhand"
         : "对方 Mac 没有允许 Airhand 使用“屏幕与系统录音”，看不到画面，也听不到声音。需要那台电脑的用户在“系统设置 → 隐私与安全性 → 屏幕与系统录音”里允许 Airhand，然后重新打开 Airhand",
+  "notice.awdl":
+    "对方 Mac 在用 Wi-Fi，隔空投送、隔空播放等功能会每隔一会儿借用它的无线网卡，画面可能周期性地卡顿。给它插上网线，或者在它菜单栏的 Airhand 菜单里打开“远程控制时暂停隔空投送”",
   // 本机产生的提示
   "notice.h264Undecodable": "本机无法解码 H.264 画面",
   "notice.codecFallback": "本机无法解码 {codec} 画面，已改用 {to}",

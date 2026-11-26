@@ -84,6 +84,7 @@ test("Rust 的 Problem / NoticeView 在两种语言里都有词条", async () =>
     "audioFailed",
     "audioRecovered",
     "missingPermissions",
+    "awdl",
   ]);
   const before = getLang();
   try {

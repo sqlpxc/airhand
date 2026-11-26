@@ -1,5 +1,5 @@
 //! 系统托盘：图标 + 右键菜单（模式、服务器状态、控制码、切换模式、开机自动启动 / 登录时自动启动（macOS、
-//! Windows 仅为当前用户安装）、结束远程后锁屏、不自动睡眠（macOS）、语言、退出）。
+//! Windows 仅为当前用户安装）、结束远程后锁屏、不自动睡眠（macOS）、远程控制时暂停隔空投送（macOS）、语言、退出）。
 
 use std::sync::OnceLock;
 
@@ -236,6 +236,9 @@ fn build_menu(app: &AppHandle, st: &AppStatus) -> tauri::Result<Menu<Wry>> {
             None::<&str>,
         )?)?;
     }
+    // 远程控制时暂停隔空投送（macOS，见 crate::awdl）：本机被控制、控制别人都算，两种模式里都有
+    #[cfg(target_os = "macos")]
+    awdl_items(app, &menu)?;
     #[cfg(target_os = "macos")]
     {
         let (id, title, enabled) = crate::clipfiles::macos::menu_item();
@@ -329,6 +332,65 @@ fn login_item_entry(
         s == State::On,
         None::<&str>,
     )
+}
+
+/// macOS：远程控制时暂停隔空投送（见 [`crate::awdl`]）。打开着的话下面再说现在怎么样：暂停着，
+/// 或者没做成（助手没有了、旧了、连不上，点一下重新安装）
+#[cfg(target_os = "macos")]
+fn awdl_items(app: &AppHandle, menu: &Menu<Wry>) -> tauri::Result<()> {
+    use crate::awdl::Installed;
+    let v = crate::awdl::view();
+    menu.append(&CheckMenuItem::with_id(
+        app,
+        "pause_awdl",
+        tr!(
+            "远程控制时暂停隔空投送（Wi-Fi 更流畅）",
+            "Pause AirDrop during remote control (smoother Wi-Fi)"
+        ),
+        !v.busy,
+        v.enabled,
+        None::<&str>,
+    )?)?;
+    if v.busy {
+        menu.append(&label(
+            app,
+            tr!(
+                "    正在安装组件（在弹出的对话框里输入管理员密码）…",
+                "    Installing the helper (enter an administrator password in the dialog)…"
+            ),
+        )?)?;
+        return Ok(());
+    }
+    if !v.enabled {
+        return Ok(());
+    }
+    let repair = match (v.installed, &v.error) {
+        (Installed::No, _) => Some(tr!(
+            "⚠ 暂停隔空投送的组件不见了（点击重新安装）",
+            "⚠ The helper that pauses AirDrop is missing (click to reinstall)"
+        )),
+        (Installed::Outdated, _) => Some(tr!(
+            "⚠ 暂停隔空投送的组件要更新（点击更新）",
+            "⚠ The helper that pauses AirDrop needs an update (click to update)"
+        )),
+        (Installed::Yes, Some(_)) => Some(tr!(
+            "⚠ 没能暂停隔空投送（点击重新安装组件）",
+            "⚠ Couldn't pause AirDrop (click to reinstall the helper)"
+        )),
+        (Installed::Yes, None) => None,
+    };
+    if let Some(text) = repair {
+        menu.append(&item(app, "repair_awdl", text)?)?;
+    } else if v.paused {
+        menu.append(&label(
+            app,
+            tr!(
+                "    隔空投送已暂停，远程控制结束后恢复",
+                "    AirDrop is paused until the remote control ends"
+            ),
+        )?)?;
+    }
+    Ok(())
 }
 
 /// 被控端：服务器状态、控制码、正在控制本机的控制端

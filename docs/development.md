@@ -92,6 +92,9 @@ node scripts/measure-avsync.mjs <control-code> [pairing-code]
 cargo run --release --example headless_host
 # client/src-tauri/: encoder benchmark (captures the real screen and compares the encoders)
 cargo run --release --example encode_bench
+# macOS: log of the helper that pauses AirDrop during remote control (src/awdl/helper.c, runs as root). While it pauses, `ifconfig awdl0` shows no UP flag
+# (cargo test --lib awdl runs the embedded helper as an ordinary user and only checks the protocol: without root it can't take awdl0 down)
+log stream --predicate 'subsystem == "app.airhand.awdl"' --level debug
 ```
 
 Use release builds when judging smoothness or A/V sync: if the host falls back to CPU scaling, a debug build can take about 0.5 s per frame to shrink 4K to 1080p.

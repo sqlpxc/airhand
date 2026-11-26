@@ -303,6 +303,8 @@ const en: Record<MsgKey, Msg> = {
       : p.input
         ? "The remote Mac hasn't allowed Airhand Accessibility, so its keyboard and mouse can't be controlled. Someone at that Mac needs to allow Airhand in System Settings → Privacy & Security → Accessibility"
         : "The remote Mac hasn't allowed Airhand Screen & System Audio Recording, so there's no picture or sound. Someone at that Mac needs to allow Airhand in System Settings → Privacy & Security → Screen & System Audio Recording, then reopen Airhand",
+  "notice.awdl":
+    "The remote Mac is on Wi-Fi, and AirDrop, AirPlay and similar features keep borrowing its wireless card, so the picture may stutter now and then. Plug it into Ethernet, or turn on “Pause AirDrop during remote control” in Airhand's menu bar menu on that Mac",
   "notice.h264Undecodable": "This computer can't decode the H.264 video",
   "notice.codecFallback": "This computer can't decode {codec} video. Switched to {to}",
   "notice.noOpus": "This computer can't decode Opus, so remote sound can't be played",

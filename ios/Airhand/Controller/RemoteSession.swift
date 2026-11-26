@@ -411,7 +411,8 @@ final class RemoteSession {
             main { self.stats = st }
         case "notice":
             guard let o = e.obj("notice") else { return }
-            let n = Notice(kind: o.str("kind") ?? "", detail: o.str("detail"), screen: o.bool("screen"), input: o.bool("input"))
+            let n = Notice(kind: o.str("kind") ?? "", detail: o.str("detail"), screen: o.bool("screen"), input: o.bool("input"),
+                           active: o.bool("active"))
             main {
                 var m = self.notices
                 switch n.kind {
@@ -420,6 +421,8 @@ final class RemoteSession {
                 case "captureFailed": m["capture"] = n
                 case "audioFailed": m["audio"] = n
                 case "missingPermissions": m["permissions"] = (!n.screen && !n.input) ? nil : n
+                // 对方 Mac 走 Wi-Fi、AWDL 开着：插上网线、暂停了 AWDL 时撤下
+                case "awdl": m["awdl"] = n.active ? n : nil
                 default: m[n.kind] = n
                 }
                 self.notices = m

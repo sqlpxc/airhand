@@ -127,7 +127,9 @@ export type RemoteNotice =
   /** 声音采集恢复：撤下 audioFailed（本身不显示） */
   | { kind: "audioRecovered" }
   /** 被控端（macOS）缺少的系统权限；两项都为 false 表示已经全部授予 */
-  | { kind: "missingPermissions"; screen: boolean; input: boolean };
+  | { kind: "missingPermissions"; screen: boolean; input: boolean }
+  /** 对方 Mac 走 Wi-Fi、AWDL（隔空投送等用的 Wi-Fi 直连）开着，画面可能周期性地卡顿；active 为 false 时撤下 */
+  | { kind: "awdl"; active: boolean };
 
 export interface AppInfo {
   version: string;

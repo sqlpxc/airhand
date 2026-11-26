@@ -477,6 +477,7 @@
     <string name="notice_android_no_input">Remote control (the accessibility service) is off on the other phone: you can watch but not operate it</string>
     <string name="notice_mac_no_screen_input">The other Mac hasn\'t allowed Airhand “Screen &amp; System Audio Recording” and “Accessibility”: no picture, no sound and no control</string>
     <string name="notice_mac_no_input">The other Mac hasn\'t allowed Airhand “Accessibility”, so the keyboard and mouse can\'t be controlled</string>
+    <string name="notice_mac_awdl">The other Mac is on Wi-Fi, and AirDrop, AirPlay and similar features keep borrowing its wireless card, so the picture may stutter now and then. Plug it into Ethernet, or turn on “Pause AirDrop during remote control” in Airhand\'s menu bar menu on that Mac</string>
     <string name="notice_mac_no_screen">The other Mac hasn\'t allowed Airhand “Screen &amp; System Audio Recording”: no picture and no sound</string>
 
     <!-- Problems (types, see problem.rs in Rust) -->
