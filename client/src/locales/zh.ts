@@ -316,6 +316,8 @@ export default {
         : "对方 Mac 没有允许 Airhand 使用“屏幕与系统录音”，看不到画面，也听不到声音。需要那台电脑的用户在“系统设置 → 隐私与安全性 → 屏幕与系统录音”里允许 Airhand，然后重新打开 Airhand",
   "notice.awdl":
     "对方 Mac 在用 Wi-Fi，隔空投送、隔空播放等功能会每隔一会儿借用它的无线网卡，画面可能周期性地卡顿。给它插上网线，或者在它菜单栏的 Airhand 菜单里打开“远程控制时暂停隔空投送”",
+  "notice.windowsToGo":
+    "对方电脑的 Windows 被标记成了 Windows To Go，系统不让程序用显卡编码，画面只能软件编码：帧率低、占 CPU。它不是从 U 盘或移动硬盘启动的话（这个标记多半是装机工具、克隆系统留下的），在那台电脑上把注册表 HKLM\\SYSTEM\\CurrentControlSet\\Control 里的 PortableOperatingSystem 改成 0，然后重启",
   // 本机产生的提示
   "notice.h264Undecodable": "本机无法解码 H.264 画面",
   "notice.codecFallback": "本机无法解码 {codec} 画面，已改用 {to}",

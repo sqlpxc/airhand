@@ -399,6 +399,8 @@ fn host_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Resul
     {
         #[cfg(target_os = "macos")]
         permission_items(app, menu)?;
+        #[cfg(windows)]
+        windows_to_go_items(app, menu)?;
         if let (ServerState::Connected, Some(code)) = (&st.host.server, st.host.code) {
             let code = airhand_proto::format_code(code);
             menu.append(&label(app, tr!("控制码：{code}", "Control code: {code}"))?)?;
@@ -526,6 +528,31 @@ fn permission_items(app: &AppHandle, menu: &Menu<Wry>) -> tauri::Result<()> {
     if !p.screen || !p.input {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
+    Ok(())
+}
+
+/// Windows：本机被标记成了 Windows To Go，用不了硬件编码（见 `host::encoder::windows_to_go`，控制端也会提示）。
+/// 要改的是系统的注册表、还要重启，Airhand 不替用户改：只说明怎么办
+#[cfg(windows)]
+fn windows_to_go_items(app: &AppHandle, menu: &Menu<Wry>) -> tauri::Result<()> {
+    if !crate::host::encoder::windows_to_go() {
+        return Ok(());
+    }
+    menu.append(&label(
+        app,
+        tr!(
+            "⚠ 本机被标记成了 Windows To Go，用不了硬件编码，远程画面帧率低",
+            "⚠ Windows is marked as Windows To Go: no hardware encoding, low frame rate"
+        ),
+    )?)?;
+    menu.append(&label(
+        app,
+        tr!(
+            r"    不是从 U 盘启动的话：把注册表 HKLM\SYSTEM\CurrentControlSet\Control 的 PortableOperatingSystem 改成 0，再重启",
+            r"    Not booting from a USB drive? Set PortableOperatingSystem in HKLM\SYSTEM\CurrentControlSet\Control to 0, then restart"
+        ),
+    )?)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
     Ok(())
 }
 

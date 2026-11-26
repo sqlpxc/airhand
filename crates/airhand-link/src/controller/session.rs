@@ -339,6 +339,8 @@ pub enum NoticeView {
     Awdl {
         active: bool,
     },
+    /// 对方电脑（Windows）被标记成了 Windows To Go，系统不给用硬件编码器，画面只能软件编码
+    WindowsToGo,
 }
 
 impl From<Notice> for NoticeView {
@@ -354,6 +356,7 @@ impl From<Notice> for NoticeView {
                 NoticeView::MissingPermissions { screen, input }
             }
             Notice::Awdl { active } => NoticeView::Awdl { active },
+            Notice::WindowsToGo => NoticeView::WindowsToGo,
         }
     }
 }
@@ -1115,6 +1118,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&n).unwrap(),
             json!({ "type": "notice", "notice": { "kind": "awdl", "active": true } })
+        );
+        let n = SessionEvent::Notice {
+            notice: Notice::WindowsToGo.into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            json!({ "type": "notice", "notice": { "kind": "windowsToGo" } })
         );
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::Kicked),

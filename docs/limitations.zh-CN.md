@@ -21,6 +21,7 @@
 
 - 被控端只在控制台会话（物理屏幕）里运行：远程桌面（RDP）会话不能被控制
 - 还不能发送 `Ctrl+Alt+Del`（需要 `SendSAS`）
+- Windows 被标记成 Windows To Go（注册表 `HKLM\SYSTEM\CurrentControlSet\Control` 的 `PortableOperatingSystem` 不为 0）时，Media Foundation 一个硬件编码器也不列出来，被控端只能软件编码（OpenH264）：帧率低、占 CPU。系统只看这个值，不管是不是真的从 U 盘启动，装机工具、克隆的系统、“优化”软件有时会把它留下。控制端会提示，托盘菜单里也有警告；不是从 U 盘启动的话，把它改成 0 再重启（Airhand 不替你改）
 - 粘贴对方复制的文件夹时，从这个文件夹算起超过 259 个字符的路径（Windows 的虚拟文件的限制）和文件夹里的链接都跳过（日志里有记录，界面上没有提示）。被控端在系统服务里时，复制、粘贴文件要靠托盘（以登录的用户的身份读写）：托盘退出了就只同步文本
 - 调试构建在托盘进程里运行被控端，没有 SYSTEM 权限，采集和操作不了 UAC 确认框和锁屏（这期间控制端会显示采集失败）
 - [虚拟显示器](usage.zh-CN.md#虚拟显示器)（显示器关了电源也能控制、防窥模式）只在为所有用户安装、装了随包的虚拟显示器驱动（MttVDD）时可用。驱动的签名是 SignPath Foundation 的，不是微软的：安装时 Windows 会确认一次；Windows 11 ARM64 只认微软签名的驱动，装不上。这台电脑上已经有别的程序（例如 Sunshine）装的 Virtual Display Driver 时 Airhand 不用它

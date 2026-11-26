@@ -102,6 +102,28 @@ pub fn has_hardware(codec: Codec) -> bool {
     !enum_hardware(codec).is_empty()
 }
 
+/// Windows 被标记成了 Windows To Go：`HKLM\SYSTEM\CurrentControlSet\Control` 的 `PortableOperatingSystem` 不为 0。
+/// mfplat 这时一个硬件编码器也不列出来（`MFTEnumEx`、`MFTEnum2` 都是 0 个，注册表里的硬件 MFT 都是完整的）。
+/// 它只看这个值，不管系统是不是真的从移动硬盘启动：不是 Windows To Go 的电脑上这个值多半是装机工具、克隆系统、
+/// “优化”软件留下的，改成 0 再重启就好了（issue #43）。只读注册表，不碰 Media Foundation
+pub fn windows_to_go() -> bool {
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+    let mut value = 0u32;
+    let mut len = size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            windows::core::w!(r"SYSTEM\CurrentControlSet\Control"),
+            windows::core::w!("PortableOperatingSystem"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut len),
+        )
+    };
+    r.is_ok() && value != 0
+}
+
 fn friendly_name(a: &IMFActivate) -> String {
     unsafe {
         let mut p = PWSTR::null();

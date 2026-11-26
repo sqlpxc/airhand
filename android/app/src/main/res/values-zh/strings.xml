@@ -471,6 +471,7 @@
     <string name="notice_mac_no_screen_input">对方 Mac 没有允许 Airhand 使用“屏幕与系统录音”和“辅助功能”：看不到画面、听不到声音，也不能操作</string>
     <string name="notice_mac_no_input">对方 Mac 没有允许 Airhand 使用“辅助功能”，不能操作键盘和鼠标</string>
     <string name="notice_mac_awdl">对方 Mac 在用 Wi-Fi，隔空投送、隔空播放等功能会每隔一会儿借用它的无线网卡，画面可能周期性地卡顿。给它插上网线，或者在它菜单栏的 Airhand 菜单里打开“远程控制时暂停隔空投送”</string>
+    <string name="notice_windows_to_go">对方电脑的 Windows 被标记成了 Windows To Go，系统不让程序用显卡编码，画面只能软件编码，帧率低。它不是从 U 盘或移动硬盘启动的话（这个标记多半是装机工具、克隆系统留下的），在那台电脑上把注册表 HKLM\\SYSTEM\\CurrentControlSet\\Control 里的 PortableOperatingSystem 改成 0，然后重启</string>
     <string name="notice_mac_no_screen">对方 Mac 没有允许 Airhand 使用“屏幕与系统录音”，看不到画面，也听不到声音</string>
 
     <!-- 问题（类型，见 Rust 的 problem.rs） -->

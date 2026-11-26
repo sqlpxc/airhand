@@ -534,11 +534,12 @@ impl Platform for Desktop {
         if !dark {
             power::wake_display();
         }
-        let (mut displays, codecs, env_notice) = tokio::task::spawn_blocking(|| {
+        let (mut displays, codecs, env_notice, encoder_notice) = tokio::task::spawn_blocking(|| {
             (
                 capture::displays(),
                 super::encoder::available_codecs(),
                 capture::environment_notice(),
+                super::encoder::environment_notice(),
             )
         })
         .await
@@ -586,6 +587,10 @@ impl Platform for Desktop {
             self.out.send(&notice(Notice::NoDisplays))?;
         }
         if let Some(n) = env_notice {
+            self.out.send(&notice(n))?;
+        }
+        // Windows 被标记成了 Windows To Go：只能软件编码，告诉控制端为什么、怎么办
+        if let Some(n) = encoder_notice {
             self.out.send(&notice(n))?;
         }
         // 缺少系统权限（macOS）：告诉控制端为什么没有画面 / 不能操作；之后权限有变化时再发

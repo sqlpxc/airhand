@@ -262,10 +262,8 @@ mod tests {
     #[test]
     fn commands_parse() {
         // 和桌面版、网页版共用的命令样例（crates/airhand-link/tests/protocol.json）
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../airhand-link/tests/protocol.json"
-        ))
-        .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../airhand-link/tests/protocol.json")).unwrap();
         for c in fixture["commands"].as_array().unwrap() {
             let parsed: Cmd =
                 serde_json::from_value(c.clone()).unwrap_or_else(|e| panic!("{c}: {e}"));

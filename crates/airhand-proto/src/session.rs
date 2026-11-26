@@ -372,6 +372,14 @@ pub enum Notice {
         #[n(0)]
         active: bool,
     },
+    /// 被控端（Windows）被标记成了 Windows To Go：注册表 `HKLM\SYSTEM\CurrentControlSet\Control` 的
+    /// `PortableOperatingSystem` 不为 0。Media Foundation 这时一个硬件编码器也不列出来，只能软件编码（OpenH264），
+    /// 帧率低、占 CPU。它只看这个值，不管系统是不是真的从 U 盘、移动硬盘启动：不是的电脑上这个值多半是装机工具、
+    /// 克隆系统、“优化”软件留下的，改成 0 再重启就能用硬件编码了。
+    ///
+    /// 会话开始时是这样就发一次（重启之前不会变）
+    #[n(8)]
+    WindowsToGo,
 }
 
 open_enum! {

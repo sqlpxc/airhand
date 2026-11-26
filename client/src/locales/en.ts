@@ -305,6 +305,8 @@ const en: Record<MsgKey, Msg> = {
         : "The remote Mac hasn't allowed Airhand Screen & System Audio Recording, so there's no picture or sound. Someone at that Mac needs to allow Airhand in System Settings → Privacy & Security → Screen & System Audio Recording, then reopen Airhand",
   "notice.awdl":
     "The remote Mac is on Wi-Fi, and AirDrop, AirPlay and similar features keep borrowing its wireless card, so the picture may stutter now and then. Plug it into Ethernet, or turn on “Pause AirDrop during remote control” in Airhand's menu bar menu on that Mac",
+  "notice.windowsToGo":
+    "The remote computer's Windows is marked as Windows To Go, so Windows won't let apps use the graphics card to encode: the picture is software-encoded, with a low frame rate and high CPU use. If it doesn't boot from a USB drive (setup tools and cloned systems often leave this mark), set PortableOperatingSystem under HKLM\\SYSTEM\\CurrentControlSet\\Control to 0 in that computer's registry, then restart it",
   "notice.h264Undecodable": "This computer can't decode the H.264 video",
   "notice.codecFallback": "This computer can't decode {codec} video. Switched to {to}",
   "notice.noOpus": "This computer can't decode Opus, so remote sound can't be played",

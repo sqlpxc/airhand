@@ -478,6 +478,7 @@
     <string name="notice_mac_no_screen_input">The other Mac hasn\'t allowed Airhand “Screen &amp; System Audio Recording” and “Accessibility”: no picture, no sound and no control</string>
     <string name="notice_mac_no_input">The other Mac hasn\'t allowed Airhand “Accessibility”, so the keyboard and mouse can\'t be controlled</string>
     <string name="notice_mac_awdl">The other Mac is on Wi-Fi, and AirDrop, AirPlay and similar features keep borrowing its wireless card, so the picture may stutter now and then. Plug it into Ethernet, or turn on “Pause AirDrop during remote control” in Airhand\'s menu bar menu on that Mac</string>
+    <string name="notice_windows_to_go">The other computer\'s Windows is marked as Windows To Go, so Windows won\'t let apps use the graphics card to encode: the picture is software-encoded, with a low frame rate. If it doesn\'t boot from a USB drive (setup tools and cloned systems often leave this mark), set PortableOperatingSystem under HKLM\\SYSTEM\\CurrentControlSet\\Control to 0 in its registry, then restart it</string>
     <string name="notice_mac_no_screen">The other Mac hasn\'t allowed Airhand “Screen &amp; System Audio Recording”: no picture and no sound</string>
 
     <!-- Problems (types, see problem.rs in Rust) -->

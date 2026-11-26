@@ -22,7 +22,7 @@ mod vt;
 
 use std::sync::OnceLock;
 
-use airhand_proto::session::{Codec, EncoderInfo, QualitySettings};
+use airhand_proto::session::{Codec, EncoderInfo, Notice, QualitySettings};
 use anyhow::{Context, Result, anyhow, bail};
 use fast_image_resize as fir;
 use tracing::info;
@@ -188,6 +188,37 @@ pub fn available_codecs() -> Vec<Codec> {
             list
         })
         .clone()
+}
+
+/// 会话开始时要告诉控制端的、和编码有关的情况：Windows 被标记成了 Windows To Go，因此一个硬件编码器也列不出来
+/// （[`Notice::WindowsToGo`]，控制端提示怎么办）。和 [`available_codecs`] 一样只算一次：要重启才会变
+pub fn environment_notice() -> Option<Notice> {
+    #[cfg(windows)]
+    {
+        static HIDDEN: OnceLock<bool> = OnceLock::new();
+        let hidden = *HIDDEN.get_or_init(|| {
+            // 有硬件编码器的话就没受影响（哪天 Windows 不再这样了也不乱报）
+            let hidden = mf::windows_to_go() && !mf::has_hardware(Codec::H264);
+            if hidden {
+                warn!(
+                    "Windows is marked as Windows To Go (HKLM\\SYSTEM\\CurrentControlSet\\Control\\PortableOperatingSystem), \
+                     so Media Foundation lists no hardware encoders: software encoding only"
+                );
+            }
+            hidden
+        });
+        hidden.then_some(Notice::WindowsToGo)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Windows 被标记成了 Windows To Go，用不了硬件编码（见 `mf::windows_to_go`）。只读注册表，托盘建菜单时也能马上用
+#[cfg(windows)]
+pub fn windows_to_go() -> bool {
+    mf::windows_to_go()
 }
 
 #[cfg(windows)]

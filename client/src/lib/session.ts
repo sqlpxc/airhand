@@ -103,6 +103,8 @@ const GIVE_UP = new Set<Problem["kind"]>([
 ]);
 /** 与服务器（网页版还有控制端服务）的连接断了：等重新连上再试，不计入重试次数 */
 const NO_SERVER = new Set<Problem["kind"]>(["notConnected", "serverLost", "serverUnreachable", "consoleLost"]);
+/** 只是建议的提示：不盖住别的提示，关掉过就不再提示 */
+type TipKind = "awdl" | "windowsToGo";
 
 let nextId = 1;
 
@@ -137,8 +139,8 @@ export class RemoteSession {
   stats: Stats = { fps: 0, kbps: 0, rttMs: null, width: 0, height: 0, decodeMs: 0, direct: false };
   /** 画面上方的提示（显示时才变成文字，见 messages.ts） */
   notice: SessionNotice | null = null;
-  /** 关掉过"对方 Mac 走 Wi-Fi"的提示：这个标签页里不再提示（重连之后对方会再说一遍） */
-  private awdlDismissed = false;
+  /** 关掉过的建议（对方 Mac 走 Wi-Fi、对方电脑被标记成 Windows To Go）：这个标签页里不再提示（重连之后对方会再说一遍） */
+  private dismissedTips = new Set<TipKind>();
   /** 被控端为什么采集不到声音（英文技术信息）；正常、或者没开声音时为 null */
   audioError: string | null = null;
   settings: QualitySettings;
@@ -683,9 +685,12 @@ export class RemoteSession {
           // 只是建议：不盖住正在显示的其它提示，关掉过就不再提示；对方插上网线、暂停了 AWDL 时撤下
           if (!n.active) {
             if (this.notice?.kind === "awdl") this.notice = null;
-          } else if (!this.notice && !this.awdlDismissed) {
+          } else if (!this.notice && !this.dismissedTips.has(n.kind)) {
             this.notice = n;
           }
+        } else if (n.kind === "windowsToGo") {
+          // 同上：只是建议（改对方的注册表、重启），不盖住别的提示，关掉过就不再提示
+          if (!this.notice && !this.dismissedTips.has(n.kind)) this.notice = n;
         } else if (n.kind === "audioFailed") {
           this.audioError = n.detail;
           // 声音的问题不盖住正在显示的其它提示（例如缺少权限、Wayland），原因在声音菜单里一直能看到
@@ -1532,7 +1537,7 @@ export class RemoteSession {
   }
 
   dismissNotice() {
-    if (this.notice?.kind === "awdl") this.awdlDismissed = true;
+    if (this.notice?.kind === "awdl" || this.notice?.kind === "windowsToGo") this.dismissedTips.add(this.notice.kind);
     this.notice = null;
     this.emit();
   }

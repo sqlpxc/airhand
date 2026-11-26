@@ -129,7 +129,9 @@ export type RemoteNotice =
   /** 被控端（macOS）缺少的系统权限；两项都为 false 表示已经全部授予 */
   | { kind: "missingPermissions"; screen: boolean; input: boolean }
   /** 对方 Mac 走 Wi-Fi、AWDL（隔空投送等用的 Wi-Fi 直连）开着，画面可能周期性地卡顿；active 为 false 时撤下 */
-  | { kind: "awdl"; active: boolean };
+  | { kind: "awdl"; active: boolean }
+  /** 对方电脑（Windows）被标记成了 Windows To Go，系统不给用硬件编码器，画面只能软件编码 */
+  | { kind: "windowsToGo" };
 
 export interface AppInfo {
   version: string;

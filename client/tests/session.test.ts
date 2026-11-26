@@ -87,7 +87,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
     view: { setSync() {}, setAudio() {}, setLayout() {}, dispose() {}, addCanvas() {} }, frames: [{ w: 16, h: 9 }],
     input: { reset() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
-    onlineAt: -1, attemptAt: 0, retries: 0,
+    onlineAt: -1, attemptAt: 0, retries: 0, dismissedTips: new Set(),
     emit() {}, syncAudio() {}, syncMic() {}, applySyncState() {}, onConnected() { calls.push("connected"); },
   });
   return { session, calls, timers, store: storeState, event: (ev: any) => sink(ev), resolve: () => resolve({ sid: 7, resume: [], hostName: "host", hostOs: "Android" }) };
@@ -678,4 +678,25 @@ test("对方 Mac 走 Wi-Fi 的提示：不盖住别的提示，撤下时只撤�
   // 别的提示照常显示
   s.onEvent({ type: "notice", notice: { kind: "noDisplays" } });
   assert.equal(s.notice?.kind, "noDisplays");
+});
+
+test("对方电脑被标记成 Windows To Go 的提示：不盖住别的提示，关掉过就不再提示，和 Wi-Fi 的提示各管各的", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  const wtg = () => s.onEvent({ type: "notice", notice: { kind: "windowsToGo" } });
+  s.notice = null;
+  wtg();
+  assert.equal(s.notice?.kind, "windowsToGo");
+  s.dismissNotice();
+  // 关掉了：重连时对方再说一遍也不再提示
+  wtg();
+  assert.equal(s.notice, null);
+  // 关掉它不影响 Wi-Fi 的提示
+  s.onEvent({ type: "notice", notice: { kind: "awdl", active: true } });
+  assert.equal(s.notice?.kind, "awdl");
+  // 正显示着别的提示：不盖住它
+  const other = sessionHarness().session;
+  other.onEvent({ type: "notice", notice: { kind: "noDisplays" } });
+  other.onEvent({ type: "notice", notice: { kind: "windowsToGo" } });
+  assert.equal(other.notice?.kind, "noDisplays");
 });

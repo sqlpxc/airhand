@@ -104,7 +104,7 @@ class MessagesTest {
         assertTrue("带 detail 的 Problem 解析结果不对: $withDetail", "certMismatch" !in withDetail && "incompatible" !in withDetail)
         // 提示的种类变了：除了补文案，还要检查 RemoteSession.handleEvent 对提示的处理（xxxRecovered 撤下 xxxFailed）
         assertEquals(
-            listOf("noDisplays", "wayland", "captureFailed", "captureRecovered", "audioFailed", "audioRecovered", "missingPermissions", "awdl"),
+            listOf("noDisplays", "wayland", "captureFailed", "captureRecovered", "audioFailed", "audioRecovered", "missingPermissions", "awdl", "windowsToGo"),
             notices.map { it.kind },
         )
         assertEquals(listOf("captureFailed", "audioFailed"), notices.filter { it.hasDetail }.map { it.kind })
@@ -167,6 +167,8 @@ class MessagesTest {
         assertEquals(failed, Messages.forViewer(failed))
         // 对方 Mac 走 Wi-Fi 的建议：电视上关不掉，也没法去改，不显示
         assertNull(Messages.forViewer(Notice("awdl", active = true)))
+        // 对方电脑被标记成 Windows To Go：同上
+        assertNull(Messages.forViewer(Notice("windowsToGo")))
     }
 
     /** 从 Rust 源码里取出一个开放枚举（`open_enum!`）在 JSON 里的名字：`Back = 0 => "back",` 里的 "back" */
