@@ -139,7 +139,7 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
 | Item | Where | Notes |
 |---|---|---|
 | Incomplete file transfer | `.airhand-receive-<random ID>` in the selected folder, referenced by `pending-receive-<random ID>` in the configuration directory | Cancelling, quitting or uninstalling cleans up partial transfers and keeps completed items. After a forced quit, cleanup runs at the next launch. Reconnect any drive removed during a transfer first. |
-| Helper that pauses AirDrop | `/Library/PrivilegedHelperTools/app.airhand.awdl`, `/Library/LaunchDaemons/app.airhand.awdl.plist` | Only there if you turned on **Pause AirDrop during remote control**. Owned by root, so removing it needs an administrator password: uninstalling from the menu asks for it |
+| Helper that pauses AirDrop | `/Library/PrivilegedHelperTools/app.airhand.awdl`, `/Library/LaunchDaemons/app.airhand.awdl.plist` | Only there if you turned on **Pause AirDrop during remote control**. Owned by root, so removing it needs an administrator password: uninstalling from the menu asks for it. If `/Library/PrivilegedHelperTools` was created by the install (nothing from other programs is in it), it goes too. The `app.airhand.awdl` entry under System Settings → General → Login Items & Extensions → Allow in the Background is kept by macOS; it usually disappears once the files are gone, sometimes only after a restart |
 | Airhand Microphone | Core Audio input device and its tap | Removed on quit. Startup and the uninstall menu also remove this user’s objects after a forced quit. |
 | Open at login | System Settings → General → Login Items ("Login Items & Extensions" on some versions of macOS), under both "Open at Login" and "App Background Activity" | Has to be unregistered by Airhand itself: if you delete the app first, a dead Airhand entry stays in both places |
 | Permissions | System Settings → Privacy & Security: Screen & System Audio Recording, Accessibility and so on | Can only be cleared while the app is still there; once it's deleted macOS can't find it any more |
@@ -171,16 +171,17 @@ macOS apps have no uninstaller, and moving the app to the Trash only removes the
    rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    ```
 
-   If you turned on **Pause AirDrop during remote control**, also remove its helper (this needs an administrator password; on `bootout` it resumes AWDL if it had paused it, then exits):
+   If you turned on **Pause AirDrop during remote control**, also remove its helper (this needs an administrator password; on `bootout` it resumes AWDL if it had paused it, then exits; the last line only removes the directory if it's empty):
 
    ```bash
    sudo launchctl bootout system/app.airhand.awdl
    sudo rm -f /Library/LaunchDaemons/app.airhand.awdl.plist /Library/PrivilegedHelperTools/app.airhand.awdl
+   sudo rmdir /Library/PrivilegedHelperTools 2>/dev/null
    ```
 
    The first block has one line per item: the configuration, the caches macOS created for it, the crash reports, the menu bar icon settings and the program. Instead of the last line you can also drag Airhand from the Applications folder to the Trash (and empty it). `find` runs into other apps' protected directories; those errors are silenced and don't affect the result. The menu bar icon settings are first deleted through the system's preferences service (`defaults delete`), which leaves an empty file behind for `rm` to delete.
 
-**Check**: if these commands print nothing except WebKit's empty directories in the temporary directory (they can't be removed, see the end), and neither System Settings → General → Login Items nor Privacy & Security → Screen & System Audio Recording / Accessibility lists Airhand, it's all gone.
+**Check**: if these commands print nothing except WebKit's empty directories in the temporary directory (they can't be removed, see the end), and neither System Settings → General → Login Items (including `app.airhand.awdl` under Allow in the Background, which may need a restart to disappear right after removal) nor Privacy & Security → Screen & System Audio Recording / Accessibility lists Airhand, it's all gone.
 
 ```bash
 ls -d ~/Library/Application\ Support/app.airhand.client ~/Library/Preferences/app.airhand.client.plist /Applications/Airhand.app ~/Applications/Airhand.app 2>/dev/null

@@ -139,7 +139,7 @@ macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身。除
 | 项目 | 位置 | 说明 |
 |---|---|---|
 | 未完成的文件接收 | 所选文件夹下的 `.airhand-receive-<随机编号>`，配置目录里对应的 `pending-receive-<随机编号>` 指向它 | 取消、退出或卸载会清理临时内容，保留已接收的项目。强制退出后下次启动会重试。若接收时拔掉了外置盘，请先重新接上。 |
-| 暂停隔空投送的组件 | `/Library/PrivilegedHelperTools/app.airhand.awdl`、`/Library/LaunchDaemons/app.airhand.awdl.plist` | 打开过**远程控制时暂停隔空投送**才有。属于 root：删除要输入管理员密码，用菜单卸载时会弹出输入密码的对话框 |
+| 暂停隔空投送的组件 | `/Library/PrivilegedHelperTools/app.airhand.awdl`、`/Library/LaunchDaemons/app.airhand.awdl.plist` | 打开过**远程控制时暂停隔空投送**才有。属于 root：删除要输入管理员密码，用菜单卸载时会弹出输入密码的对话框。`/Library/PrivilegedHelperTools` 是安装时建的（里面没有别的程序的东西）的话也一起删掉。“系统设置 → 通用 → 登录项与扩展 → 允许在后台”里的 `app.airhand.awdl` 由系统维护，删掉之后一般跟着消失，有时要重新启动一次 |
 | Airhand Microphone | Core Audio 录音设备和对应的音频 tap | 退出时移除；若曾强制退出，下次启动或从菜单卸载时会清理当前用户的残留 |
 | 登录时自动启动 | “系统设置 → 通用 → 登录项”（有的系统版本叫“登录项与扩展”）里“登录时打开”和“后台 App 活动”两处 | 要由 Airhand 自己注销：先删掉 App 的话，两处都会留下一个失效的 Airhand |
 | 权限记录 | “系统设置 → 隐私与安全性”里的“屏幕与系统录音”“辅助功能”等 | 要在 App 还在的时候清除，App 删掉之后系统就找不到它了 |
@@ -171,16 +171,17 @@ macOS 的 App 没有卸载程序，拖进废纸篓只删掉了程序本身。除
    rm -rf /Applications/Airhand.app ~/Applications/Airhand.app
    ```
 
-   打开过**远程控制时暂停隔空投送**的话，还要删掉它的组件（要输入管理员密码；`bootout` 时它把暂停的 AWDL 恢复了再退出）：
+   打开过**远程控制时暂停隔空投送**的话，还要删掉它的组件（要输入管理员密码；`bootout` 时它把暂停的 AWDL 恢复了再退出；最后一行只在目录空了时删掉它）：
 
    ```bash
    sudo launchctl bootout system/app.airhand.awdl
    sudo rm -f /Library/LaunchDaemons/app.airhand.awdl.plist /Library/PrivilegedHelperTools/app.airhand.awdl
+   sudo rmdir /Library/PrivilegedHelperTools 2>/dev/null
    ```
 
    第一段命令一行一项，依次是配置文件、系统为它生成的缓存、崩溃报告、菜单栏图标的设置和程序。最后一行也可以换成在“应用程序”文件夹里把 Airhand 拖进废纸篓（再清空废纸篓）。`find` 会碰到别的 App 受保护的目录，那些报错已经忽略了，不影响结果。菜单栏图标的设置先用 `defaults delete` 经过系统的偏好设置服务删，它会留下一个空文件，再用 `rm` 删掉。
 
-**检查**：下面的命令除了临时目录里 WebKit 的几个空目录（删不掉，见最后）之外什么都不输出，并且“系统设置 → 通用 → 登录项”和“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里都没有 Airhand，就是删干净了。
+**检查**：下面的命令除了临时目录里 WebKit 的几个空目录（删不掉，见最后）之外什么都不输出，并且“系统设置 → 通用 → 登录项”（包括“允许在后台”里的 `app.airhand.awdl`，刚删掉时可能要重新启动一次才消失）和“隐私与安全性 → 屏幕与系统录音 / 辅助功能”里都没有 Airhand，就是删干净了。
 
 ```bash
 ls -d ~/Library/Application\ Support/app.airhand.client ~/Library/Preferences/app.airhand.client.plist /Applications/Airhand.app ~/Applications/Airhand.app 2>/dev/null

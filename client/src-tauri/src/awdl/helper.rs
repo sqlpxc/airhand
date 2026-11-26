@@ -23,6 +23,8 @@ use base64::Engine;
 
 /// launchd 里的名字
 pub const LABEL: &str = "app.airhand.awdl";
+/// 助手所在的目录（很多 Mac 上本来没有，安装时建、卸载时空了就删）
+const TOOLS: &str = "/Library/PrivilegedHelperTools";
 pub const PROGRAM: &str = "/Library/PrivilegedHelperTools/app.airhand.awdl";
 pub const PLIST: &str = "/Library/LaunchDaemons/app.airhand.awdl.plist";
 /// launchd 替助手监听的地方（谁都能连：能做的只有"远程控制期间暂停 AWDL"这一件事）
@@ -209,7 +211,11 @@ fn plist() -> String {
     )
 }
 
-/// 以 root 运行的安装脚本。heredoc 的结束标记不会出现在 base64 和 plist 里
+/// 以 root 运行的安装脚本。heredoc 的结束标记不会出现在 base64 和 plist 里。
+///
+/// 只动卸载时能恢复原样的东西：`/Library/PrivilegedHelperTools` 已经有了就不改它的权限；
+/// 不无条件地 `launchctl enable`（它会在 launchd 的启用 / 禁用记录里写下一项，没有命令能删掉），
+/// 只有被 `launchctl disable` 关掉过（那时记录本来就有了）才打开
 fn install_script(binary: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
     let lines: Vec<&str> = encoded
@@ -222,11 +228,12 @@ fn install_script(binary: &[u8]) -> String {
     format!(
         r#"set -e
 umask 022
-/bin/mkdir -p /Library/PrivilegedHelperTools
-/usr/sbin/chown root:wheel /Library/PrivilegedHelperTools
-/bin/chmod 755 /Library/PrivilegedHelperTools
-new="/Library/PrivilegedHelperTools/.{LABEL}.$$"
-/bin/rm -f "$new"
+if [ ! -d {TOOLS} ]; then
+  /bin/mkdir -m 755 {TOOLS}
+  /usr/sbin/chown root:wheel {TOOLS}
+fi
+new="{TOOLS}/.{LABEL}.$$"
+trap '/bin/rm -f "$new"' EXIT
 /usr/bin/base64 -D -o "$new" <<'AIRHAND_EOF'
 {lines}
 AIRHAND_EOF
@@ -238,7 +245,9 @@ AIRHAND_EOF
 /usr/sbin/chown root:wheel {PLIST}
 /bin/chmod 644 {PLIST}
 /bin/launchctl bootout system/{LABEL} 2>/dev/null || true
-/bin/launchctl enable system/{LABEL}
+if /bin/launchctl print-disabled system | /usr/bin/grep -q '"{LABEL}" => disabled'; then
+  /bin/launchctl enable system/{LABEL}
+fi
 i=0
 while ! /bin/launchctl bootstrap system {PLIST}; do
   i=$((i + 1))
@@ -249,10 +258,14 @@ done
     )
 }
 
+/// 把安装时动过的都恢复原样：launchd 里的任务（拿着的话助手先把 AWDL 恢复了再退出）、两个文件、套接字、
+/// 装到一半留下的临时文件；`/Library/PrivilegedHelperTools` 本来没有、是安装时建的话也删掉（只删空的：
+/// 里面还有别的程序的助手就留着）。安装时不写 launchd 的启用 / 禁用记录（见 [`install_script`]），也就不用删
 fn uninstall_script() -> String {
     format!(
         "/bin/launchctl bootout system/{LABEL} 2>/dev/null || true\n\
-         /bin/rm -f {PLIST} {PROGRAM} {SOCKET}\n"
+         /bin/rm -f {PLIST} {PROGRAM} {SOCKET} {TOOLS}/.{LABEL}.*\n\
+         /bin/rmdir {TOOLS} 2>/dev/null || true\n"
     )
 }
 
@@ -364,6 +377,93 @@ mod tests {
             .success();
         assert!(ok);
         assert!(std::fs::read(&out).unwrap() == BINARY);
+    }
+
+    /// 在一个临时目录里跑安装、卸载脚本（绝对路径换到里面，launchctl、chown 换成只记下参数的替身）：
+    /// 卸载之后文件层面和安装之前一模一样；不写 launchd 的启用记录（不调 `launchctl enable`）
+    #[test]
+    fn uninstall_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        fn tree(root: &Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let p = e.path();
+                    out.push(p.strip_prefix(root).unwrap().display().to_string());
+                    if p.is_dir() {
+                        stack.push(p);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+        // 两种情况：/Library/PrivilegedHelperTools 本来没有；本来就有、里面还有别的程序的助手
+        for others in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(root.join("Library/LaunchDaemons")).unwrap();
+            std::fs::create_dir_all(root.join("var/run")).unwrap();
+            if others {
+                std::fs::create_dir_all(root.join("Library/PrivilegedHelperTools")).unwrap();
+                std::fs::write(
+                    root.join("Library/PrivilegedHelperTools/com.example.helper"),
+                    b"x",
+                )
+                .unwrap();
+            }
+            let log = dir.path().join("launchctl.log");
+            let stub = dir.path().join("launchctl");
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let sandbox = |script: String| {
+                let r = root.display().to_string();
+                script
+                    .replace("/bin/launchctl", &stub.display().to_string())
+                    .replace("/usr/sbin/chown", "/usr/bin/true")
+                    .replace("/Library/", &format!("{r}/Library/"))
+                    .replace("/var/run/", &format!("{r}/var/run/"))
+            };
+            let run = |script: String| {
+                let ok = Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(sandbox(script))
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok);
+            };
+            let before = tree(&root);
+            run(install_script(b"helper"));
+            assert_eq!(
+                std::fs::read(root.join("Library/PrivilegedHelperTools/app.airhand.awdl")).unwrap(),
+                b"helper"
+            );
+            assert!(
+                root.join("Library/LaunchDaemons/app.airhand.awdl.plist")
+                    .is_file()
+            );
+            // launchd 里开着的套接字（替身不会建，模拟一下）、装到一半留下的临时文件
+            std::fs::write(root.join("var/run/app.airhand.awdl.sock"), b"").unwrap();
+            std::fs::write(
+                root.join("Library/PrivilegedHelperTools/.app.airhand.awdl.123"),
+                b"",
+            )
+            .unwrap();
+            run(uninstall_script());
+            assert_eq!(tree(&root), before, "others = {others}");
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(!calls.contains("enable"), "{calls}");
+            assert!(
+                calls.contains("bootstrap system")
+                    && calls.contains("bootout system/app.airhand.awdl")
+            );
+        }
     }
 
     struct Helper {
