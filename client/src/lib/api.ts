@@ -405,6 +405,11 @@ export interface Backend {
   /** 窗口退出了全屏（例如按了系统快捷键） */
   onWindowFullscreenExit(cb: () => void): () => void;
   /**
+   * 把系统指针移到主窗口网页里的 (x, y)（CSS 像素），见 scroll-style.ts 的边缘模式。只有桌面版（网页不能移动系统指针）；
+   * 系统不让移（Linux 的 Wayland）时 reject
+   */
+  readonly warpPointer?: (x: number, y: number) => Promise<void>;
+  /**
    * 弹出窗口（把对方的一个显示器放到单独的窗口里，见 popout.ts）的全屏、关闭：桌面版按窗口的 label 由 Rust 处理
    * （网页全屏不会让 WebView2 的窗口变大，window.close 在 macOS、Linux 上关不掉窗口）；网页版没有，用浏览器自己的
    */

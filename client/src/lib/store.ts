@@ -1,10 +1,11 @@
 // 全局状态：标签（会话 / 新建连接 / 多屏总览）、我的设备、服务器状态等。
-// "我的设备"保存在 config.toml 里（见 actions.ts 的 saveDevices）；画面增强、本地光标是这台电脑自己显示的偏好，
+// "我的设备"保存在 config.toml 里（见 actions.ts 的 saveDevices）；画面增强、本地光标、滚屏方式是这台电脑自己显示的偏好，
 // 和对方无关，存在 WebView / 浏览器的 localStorage 里；其余只在控制台打开期间有效。
 import { useCallback, useSyncExternalStore } from "react";
 import type { AppInfo, Codec, Problem, QualitySettings, SavedDevice, ServerState } from "./api";
 import { fmtCode } from "./devices";
 import { ENHANCE_LEVELS, type EnhanceLevel } from "./enhance";
+import { SCROLL_STYLES, type ScrollStyle } from "./scroll-style";
 import { DEFAULT_PRESET, type PresetId } from "./presets";
 import type { RemoteSession } from "./session";
 
@@ -60,11 +61,14 @@ interface State {
    * 关掉时只看画面里的。所有会话通用，默认打开（见 session.ts 的 applyCursor）
    */
   localCursor: boolean;
+  /** 原始大小显示、画面比窗口大时画面怎么跟着指针移动（所有会话通用，见 scroll-style.ts） */
+  scrollStyle: ScrollStyle;
 }
 
 const MAX_RECENT = 8;
 const ENHANCE_KEY = "airhand.enhance";
 const LOCAL_CURSOR_KEY = "airhand.localCursor";
+const SCROLL_STYLE_KEY = "airhand.scrollStyle";
 
 /** 上次选的画面增强（读不到就是关） */
 export function loadEnhance(): EnhanceLevel {
@@ -82,6 +86,16 @@ export function loadLocalCursor(): boolean {
     return globalThis.localStorage?.getItem(LOCAL_CURSOR_KEY) !== "0";
   } catch {
     return true;
+  }
+}
+
+/** 滚屏方式的设置（读不到就是自动滚动） */
+export function loadScrollStyle(): ScrollStyle {
+  try {
+    const v = globalThis.localStorage?.getItem(SCROLL_STYLE_KEY);
+    return SCROLL_STYLES.find((m) => m === v) ?? "auto";
+  } catch {
+    return "auto";
   }
 }
 
@@ -117,6 +131,7 @@ let state: State = {
   immersive: false,
   enhance: loadEnhance(),
   localCursor: loadLocalCursor(),
+  scrollStyle: loadScrollStyle(),
 };
 
 const listeners = new Set<() => void>();
@@ -188,6 +203,12 @@ export const store = {
     saveLocal(LOCAL_CURSOR_KEY, localCursor ? "1" : "0");
     set({ localCursor });
     for (const s of state.sessions) s.refreshCursor();
+  },
+  /** 滚屏方式：记下来，下一次移动指针时生效 */
+  setScrollStyle: (scrollStyle: ScrollStyle) => {
+    if (scrollStyle === state.scrollStyle) return;
+    saveLocal(SCROLL_STYLE_KEY, scrollStyle);
+    set({ scrollStyle });
   },
 
   // ── 标签 ──

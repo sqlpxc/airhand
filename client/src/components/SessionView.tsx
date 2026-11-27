@@ -5,7 +5,8 @@ import { type MsgKey, t, useT } from "../lib/i18n";
 import { LocalFiles } from "../lib/files";
 import { errorText, noticeText, problemText, sessionStateText } from "../lib/messages";
 import { CODEC_LABEL } from "../lib/presets";
-import type { RemoteSession } from "../lib/session";
+import { SCROLL_STYLES } from "../lib/scroll-style";
+import { SCALE_MODES, type RemoteSession } from "../lib/session";
 import { store, useSession, useSessionTitle, useStore } from "../lib/store";
 import {
   IconChevron,
@@ -38,6 +39,7 @@ import { QualityPanel, fmtKbps } from "./QualityPanel";
 /** 把会话的 canvas 挂到当前位置（同一时刻只会挂在一个地方） */
 export function CanvasHost({ s, interactive }: { s: RemoteSession; interactive: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
+  const scrollStyle = useStore((st) => st.scrollStyle);
   useLayoutEffect(() => {
     const el = ref.current!;
     s.attach(el);
@@ -48,7 +50,9 @@ export function CanvasHost({ s, interactive }: { s: RemoteSession; interactive: 
       s.detach();
     };
   }, [s, interactive]);
-  return <div ref={ref} className={`canvas-host ${interactive && s.scaleMode === "native" ? "native" : ""}`} />;
+  const native = interactive && s.scaleMode === "native";
+  // 自动滚动、边缘滚动时不显示滚动条（见 scroll-style.ts）
+  return <div ref={ref} className={`canvas-host ${native ? "native" : ""} ${native && scrollStyle !== "bar" ? "auto-scroll" : ""}`} />;
 }
 
 type Combo = { label: MsgKey; keys: string[] };
@@ -95,7 +99,7 @@ const combosFor = (platform: Platform | null, os: string) => {
   return os === "" || /windows/i.test(os) ? WINDOWS_COMBOS : /^macos/i.test(os) ? MAC_COMBOS : LINUX_COMBOS;
 };
 
-type Menu = null | "quality" | "mouse" | "keys" | "display" | "clipboard" | "audio" | "mic" | "privacy" | "sessions";
+type Menu = null | "quality" | "mouse" | "scale" | "keys" | "display" | "clipboard" | "audio" | "mic" | "privacy" | "sessions";
 
 /** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
 const MOUSE_ICONS: Record<MouseMode, typeof IconMouse> = { auto: IconMouse, desktop: IconPointer, game: IconGamepad };
@@ -616,16 +620,16 @@ export function SessionView({ s }: { s: RemoteSession }) {
               {menu === "mouse" && <MouseMenu s={s} onClose={closeMenu} />}
             </div>
           )}
-          <button
-            className={`tb-btn icon ${s.scaleMode === "native" ? "on" : ""}`}
-            title={s.scaleMode === "fit" ? t("session.toNative") : t("session.toFit")}
-            onClick={() => {
-              s.setScaleMode(s.scaleMode === "fit" ? "native" : "fit");
-              s.focus();
-            }}
-          >
-            <IconFit size={17} />
-          </button>
+          <div className="menu-anchor">
+            <button
+              className={`tb-btn icon ${menu === "scale" || s.scaleMode === "native" ? "on" : ""}`}
+              title={t("scale.title")}
+              onClick={() => toggleMenu("scale")}
+            >
+              <IconFit size={17} />
+            </button>
+            {menu === "scale" && <ScaleMenu s={s} onClose={closeMenu} />}
+          </div>
           <button
             className={`tb-btn icon ${immersive ? "on" : ""}`}
             title={immersive ? t("session.exitFullscreen") : t("session.fullscreen")}
@@ -806,6 +810,41 @@ function MouseMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
       </label>
       <div className="dd-sep" />
       <div className="dd-foot muted small">{t("mouse.footer")}</div>
+    </Dropdown>
+  );
+}
+
+/** 显示方式：适应窗口 / 原始大小，以及原始大小时的滚屏方式（见 scroll-style.ts） */
+function ScaleMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
+  const scrollStyle = useStore((st) => st.scrollStyle);
+  return (
+    <Dropdown onClose={onClose} className="scale-menu">
+      {SCALE_MODES.map((m) => (
+        <button
+          key={m}
+          className={`dd-item ${s.scaleMode === m ? "active" : ""}`}
+          onClick={() => {
+            s.setScaleMode(m);
+            onClose();
+          }}
+        >
+          {t(`scale.${m}`)}
+        </button>
+      ))}
+      <div className="dd-sep" />
+      <div className="dd-title pop-title">{t("scale.scrollStyle")}</div>
+      {SCROLL_STYLES.map((m) => (
+        <button
+          key={m}
+          className={`dd-item ${scrollStyle === m ? "active" : ""}`}
+          onClick={() => {
+            store.setScrollStyle(m);
+            onClose();
+          }}
+        >
+          {t(`scroll.${m}`)}
+        </button>
+      ))}
     </Dropdown>
   );
 }

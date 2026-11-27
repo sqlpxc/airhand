@@ -9,6 +9,7 @@
 // * 鼠标移动按 8ms 合并，按键/点击立即发送；
 // * 不可见的会话自动降到 5fps，节省带宽与对端 CPU；
 // * 画面只缩放一次：按画面在窗口里显示的大小请求分辨率，收到后按 1:1 显示（见 fit.ts）；
+// * 原始大小显示、画面比窗口大时，画面按滚屏方式跟着指针滚动（自动滚动 / 滚动条 / 边缘滚动，见 scroll-style.ts）；
 // * 多屏（可选，默认只看一个显示器）：同时看对方的好几个显示器，每个显示器一路画面、一个 canvas，
 //   按它们在对方桌面上的位置拼在一起（见 screens.ts），鼠标在哪一块上就操作哪个显示器；
 // * 弹出窗口（可选）：多屏时可以把其中一个显示器放到单独的窗口里（本机也有好几个显示器时一个窗口放一个，各自全屏，
@@ -56,10 +57,12 @@ import { fitSize, viewMaxShort } from "./fit";
 import { renderPlan, type Area, type EnhanceLevel } from "./enhance";
 import { hitTest, layoutTiles, placeDisplays, type Rect } from "./screens";
 import { Popout } from "./popout";
+import { ViewScroll } from "./scroll-style";
 
 /** waiting = 对方掉线了，等它重新上线（服务器会通知，见 hostOnline） */
 export type SessionState = "connecting" | "live" | "reconnecting" | "waiting" | "closed";
 export type ScaleMode = "fit" | "native";
+export const SCALE_MODES: ScaleMode[] = ["fit", "native"];
 
 export interface Stats {
   fps: number;
@@ -258,6 +261,12 @@ export class RemoteSession {
   private interactive = false;
   private visible = true;
   private readonly input: RemoteInput;
+  /** 原始大小显示时画面跟着指针移动（只在主窗口：弹出窗口总是按窗口大小显示） */
+  private readonly scroller = new ViewScroll(
+    () => (this.nativeScale && !this.input.relative && !this.input.gamePaused ? store.get().scrollStyle : "bar"),
+    () => this.input.repoint(),
+    api.warpPointer,
+  );
 
   // 光标
   private cursorRaw: CursorImage | null = null;
@@ -855,6 +864,7 @@ export class RemoteSession {
     this.detach();
     this.hostEl = host;
     host.appendChild(this.screen);
+    this.scroller.attach(host);
     this.resizeObs = new ResizeObserver(() => this.layout());
     this.resizeObs.observe(host);
     this.layout();
@@ -863,6 +873,7 @@ export class RemoteSession {
   detach() {
     this.resizeObs?.disconnect();
     this.resizeObs = null;
+    this.scroller.detach();
     if (this.hostEl && this.screen.parentElement === this.hostEl) this.hostEl.removeChild(this.screen);
     this.hostEl = null;
   }

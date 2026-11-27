@@ -45,6 +45,9 @@
 import type { InputEvent, MouseButton, MouseMode } from "./api";
 import { isPasteKey } from "./files.ts";
 
+/** 指针在网页里的位置 */
+type Point = Pick<MouseEvent, "clientX" | "clientY">;
+
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
 const CTRL_COMMAND_SWAP = new Map([
   ["ControlLeft", "MetaLeft"], ["MetaLeft", "ControlLeft"],
@@ -109,6 +112,8 @@ export class RemoteInput {
   private lastSent = -Infinity;
   private generation = 0;
   private wheel = { x: 0, y: 0 };
+  /** 上一次发绝对坐标时指针的位置（网页坐标），见 repoint */
+  private lastPointer: Point | null = null;
   private pressed = new Set<string>();
   shouldSwapCtrlCommand: (() => boolean) | null = null;
   /** 一组按键全部松开前沿用按下时的映射，避免切换开关后松开了另一个键 */
@@ -246,6 +251,7 @@ export class RemoteInput {
     this.pressed.clear();
     this.buttons = 0;
     this.wheel = { x: 0, y: 0 };
+    this.lastPointer = null;
     this.frac = { x: 0, y: 0 };
     this.remoteHidden = false;
     this.remoteHiddenNow = false;
@@ -263,6 +269,11 @@ export class RemoteInput {
     this.settleRemoteCursor();
   }
   focus() { this.canvas.focus({ preventScroll: true }); }
+  /** 画面在没动的指针下面移动了（原始大小时的滚屏方式，见 scroll-style.ts）：指着的地方变了，按上次的指针位置再发一次 */
+  repoint() {
+    if (!this._interactive || this.relative || this.gamePaused || !this.lastPointer) return;
+    this.enqueue([{ type: "mouseMove", ...this.pos(this.lastPointer) }], false);
+  }
 
   enqueue(events: InputEvent[], urgent: boolean) {
     if (!this.connected()) return;
@@ -412,7 +423,7 @@ export class RemoteInput {
   // ───────────────────────── 事件 ─────────────────────────
 
   /** 绝对坐标：在第几路画面上的哪里（第 0 路不写 stream） */
-  private pos(e: MouseEvent): { x: number; y: number; stream?: number } {
+  private pos(e: Point): { x: number; y: number; stream?: number } {
     if (this.locate) {
       const { x, y, stream } = this.locate(e.clientX, e.clientY);
       return stream ? { x, y, stream } : { x, y };
@@ -465,6 +476,7 @@ export class RemoteInput {
       if (buttons.length) this.enqueue(buttons, true);
     } else {
       // 绝对坐标：先移到按下 / 松开的位置
+      this.lastPointer = { clientX: e.clientX, clientY: e.clientY };
       this.enqueue([{ type: "mouseMove", ...this.pos(e) }, ...buttons], urgent || buttons.length > 0);
     }
     // 松开最后一个键（照上面的方式发出去之后）：按着键期间光标出现了的，现在解除

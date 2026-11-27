@@ -1145,7 +1145,11 @@ kbd {
 .mouse-menu {
   width: 360px;
 }
-.mouse-menu .dd-title {
+.scale-menu {
+  width: 240px;
+}
+.mouse-menu .dd-title,
+.scale-menu .dd-title {
   padding: 6px 11px 4px;
 }
 .dd-item.mode {
@@ -1802,6 +1806,13 @@ kbd {
   overflow: auto;
   align-items: safe center;
   justify-content: safe center;
+}
+/* 画面跟着指针移动（见 scroll-style.ts）：不显示滚动条，位置由指针决定 */
+.canvas-host.auto-scroll {
+  scrollbar-width: none;
+}
+.canvas-host.auto-scroll::-webkit-scrollbar {
+  display: none;
 }
 /* 一个会话的画面：每一路画面一个 canvas（同时看对方的好几个显示器时按它们在对方桌面上的位置拼在一起，见 session.ts 的 layout）。
    键盘焦点、鼠标事件、锁定指针都在它上面 */
