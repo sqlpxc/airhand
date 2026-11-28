@@ -30,6 +30,7 @@ mod fullscreen;
 pub mod host;
 #[cfg(target_os = "macos")]
 mod login_item;
+mod pointer;
 mod popout;
 mod single_instance;
 pub mod status;
@@ -646,6 +647,12 @@ fn window_fullscreen(window: tauri::WebviewWindow) -> Result<bool, Problem> {
     fullscreen::is_on(&window).map_err(Problem::failed)
 }
 
+/// 把系统指针移到控制台网页里的 (x, y)（物理像素）。移不了时返回错误，界面改为持续滚动（见 [`pointer`]）
+#[tauri::command]
+fn warp_pointer(window: tauri::WebviewWindow, x: f64, y: f64) -> Result<(), Problem> {
+    pointer::warp(&window, x, y).map_err(|e| Problem::failed(format!("{e:#}")))
+}
+
 /// 弹出窗口进入 / 退出全屏（控制台调用，按 label 找窗口，见 [`popout`]）
 #[tauri::command]
 fn popout_set_fullscreen(app: AppHandle, label: String, on: bool) -> Result<(), Problem> {
@@ -795,6 +802,7 @@ pub fn run() {
             clipboard_text,
             set_fullscreen,
             window_fullscreen,
+            warp_pointer,
             popout_set_fullscreen,
             popout_fullscreen,
             popout_focus,

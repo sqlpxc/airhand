@@ -269,8 +269,12 @@ export class RemoteInput {
     this.settleRemoteCursor();
   }
   focus() { this.canvas.focus({ preventScroll: true }); }
-  /** 画面在没动的指针下面移动了（原始大小时的滚屏方式，见 scroll-style.ts）：指着的地方变了，按上次的指针位置再发一次 */
-  repoint() {
+  /**
+   * 画面在指针下面移动了（原始大小时的滚屏方式，见 scroll-style.ts）：指着的地方变了，按指针现在的位置再发一次。
+   * `at`：指针现在在哪（被推回去了），不给就是没动
+   */
+  repoint(at?: Point) {
+    if (at) this.lastPointer = { clientX: at.clientX, clientY: at.clientY };
     if (!this._interactive || this.relative || this.gamePaused || !this.lastPointer) return;
     this.enqueue([{ type: "mouseMove", ...this.pos(this.lastPointer) }], false);
   }

@@ -2,14 +2,15 @@
 // * auto 自动滚动（默认）：指针在窗口里的位置对应画面上的位置。指针到窗口最左边看到画面最左边，到最右边看到最右边，一路跟着移；
 // * edge 边缘滚动：指针进到窗口边上的一圈（EDGE_PX）才往那边移，到画面的边为止。
 //   指针从窗口外面进来（例如从工具栏往下移）时先不算：要先进过里面一次，免得一进来就移。两种移法：
-//   - 推（桌面版）：进去多深，画面就马上移多深，系统指针同时被推回那一圈的里沿。指针下面还是画面上的同一个地方，
+//   - 推（桌面版，用鼠标时）：进去多深，画面就马上移多深，系统指针同时被推回那一圈的里沿。指针下面还是画面上的同一个地方，
 //     像是推着画面走；窗口贴着屏幕边（最大化、全屏）时指针也有地方继续推；
-//   - 持续移动（网页版不能移动系统指针；桌面版移不了时，例如 Linux 的 Wayland，第一次失败后一直这样）：
-//     越靠外越快，停在边上不动也一直移；
+//   - 持续移动（网页版不能移动系统指针；桌面版移不了时，例如 Linux 的 Wayland，第一次失败后一直这样；
+//     触摸屏、手写笔的位置推不回去）：越靠外越快，停在边上不动也一直移；
 // * bar 滚动条：只用滚动条，不跟随指针。
 // 自动滚动、边缘滚动时不显示滚动条：位置由指针决定，拖滚动条会和它打架（styles.css 的 .canvas-host.auto-scroll）。
 // 指针锁定、发相对移动时，本机指针在哪里没有意义，不跟随。
-// 画面在没动的指针下面移动了（持续移动），指针指着的地方也变了，要按原来的指针位置再发一次（RemoteInput.repoint）。
+// 只跟着移动走，按下时不移：点下去的就是看到的地方（触摸屏点一下之前没有移动，按下时移了就点到别处了）。
+// 画面在指针下面移动了（持续移动、推着走），指针指着的地方也变了，要按指针现在的位置再发一次（RemoteInput.repoint）。
 // 做法参考 RustDesk 的 ScrollAuto / ScrollEdge。
 
 export type ScrollStyle = "auto" | "bar" | "edge";
@@ -36,6 +37,9 @@ export function edgeDepth(p: number, view: number, edge = EDGE_PX): number {
   return 0;
 }
 
+/** 网页里的一个位置 */
+type Point = { clientX: number; clientY: number };
+
 /**
  * 一个可滚动的显示区域（原始大小显示时的 .canvas-host）上的滚屏方式。`mode`：现在怎么跟随，不跟随时返回 "bar"
  * （没有原始大小显示、指针锁定了……）；`moved`：画面在指针下面移动了
@@ -53,13 +57,16 @@ export class ViewScroll {
   private lastTick = 0;
   /** 边缘模式推着画面走时移动系统指针（见文件开头）；移不了时为 null */
   private warp: ((x: number, y: number) => Promise<void>) | null;
-  /** 正在移动系统指针：等它到了再推下一下，不然一次推了两次 */
+  /** 正在移动系统指针：等它到了再推下一下，不然一次推了两次。这时来的移动事件还是移动之前的位置 */
   private warping = false;
   private readonly mode: () => ScrollStyle;
-  private readonly moved: () => void;
+  private readonly moved: (at?: Point) => void;
 
-  /** `mode`：现在怎么跟随，不跟随时返回 "bar"；`moved`：画面在没动的指针下面移动了；`warp`：移动系统指针（只有桌面版） */
-  constructor(mode: () => ScrollStyle, moved: () => void, warp?: (x: number, y: number) => Promise<void>) {
+  /**
+   * `mode`：现在怎么跟随，不跟随时返回 "bar"；`moved`：画面在指针下面移动了，`at` 是指针现在的位置（没给就是没动）；
+   * `warp`：移动系统指针（只有桌面版）
+   */
+  constructor(mode: () => ScrollStyle, moved: (at?: Point) => void, warp?: (x: number, y: number) => Promise<void>) {
     this.mode = mode;
     this.moved = moved;
     this.warp = warp ?? null;
@@ -70,10 +77,12 @@ export class ViewScroll {
     this.host = host;
     this.abort = new AbortController();
     const opts = { signal: this.abort.signal, capture: true };
-    // 捕获阶段：先移好画面，画面上的 RemoteInput 再按移动之后的位置算指针在画面的哪里，不用再发一次
+    // 捕获阶段：先移好画面，画面上的 RemoteInput 再按移动之后的位置算指针在画面的哪里，不用再发一次。
+    // 只跟着移动走，按下时不移（见文件开头）
     host.addEventListener("pointermove", (e) => this.onMove(e), opts);
-    host.addEventListener("pointerdown", (e) => this.onMove(e), opts);
-    host.addEventListener("pointerleave", () => this.leave(), opts);
+    // 捕获阶段也会收到里面的元素的 pointerleave（按下时 RemoteInput 捕获指针、多屏时从一块画面移到另一块……），
+    // 只算离开了 host 的
+    host.addEventListener("pointerleave", (e) => { if (e.target === host) this.leave(); }, opts);
   }
 
   detach() {
@@ -103,7 +112,11 @@ export class ViewScroll {
       if (depth.x || depth.y) return;
       this.armed = true;
     }
-    if (this.warp) return this.push(e, depth);
+    // 推得回去的只有鼠标指针：触摸、手写笔的位置就是手指、笔尖在的地方
+    if (this.warp && e.pointerType === "mouse") {
+      this.stop();
+      return this.push(e, depth);
+    }
     this.depth = depth;
     if (depth.x || depth.y) this.start();
     else this.stop();
@@ -113,23 +126,37 @@ export class ViewScroll {
   private push(e: PointerEvent, depth: { x: number; y: number }) {
     const host = this.host!;
     const warp = this.warp!;
-    if (this.warping) return;
+    // 单纯的移动（button 是 -1：没有按下、松开别的键；拖动时也一样）不发给对方：画面移了、指针还没退回来，
+    // 指着的地方不对。指针退回来之后按退回的位置发
+    const hold = () => {
+      if (!(e.button >= 0)) e.stopPropagation();
+    };
+    if (this.warping) return hold();
     const before = { x: host.scrollLeft, y: host.scrollTop };
     if (!this.scrollTo(before.x + depth.x, before.y + depth.y)) return;
+    hold();
     const dx = host.scrollLeft - before.x;
     const dy = host.scrollTop - before.y;
-    // 这一下不发给对方：画面移了、指针还没退回来，指着的地方差了 depth。指针退回来之后的那次移动再发
-    // （按着键时照常发：可能带着按键的变化）
-    if (e.type === "pointermove" && e.buttons === 0) e.stopPropagation();
-    this.warping = true;
+    const at = { clientX: e.clientX, clientY: e.clientY };
     // 多退一个像素：换算成设备像素取整之后也落在那一圈外面
-    warp(e.clientX - dx - Math.sign(dx), e.clientY - dy - Math.sign(dy)).then(
-      () => { this.warping = false; },
+    const to = { clientX: at.clientX - dx - Math.sign(dx), clientY: at.clientY - dy - Math.sign(dy) };
+    this.warping = true;
+    warp(to.clientX, to.clientY).then(
       () => {
-        // 移不了：以后都用持续移动；这一下已经移了画面，指着的地方变了
+        this.warping = false;
+        // 指针退回来了，指着画面上原来那个地方。有的系统（macOS）移动指针不产生移动事件，在这里发
+        if (this.host === host) this.moved(to);
+      },
+      () => {
+        // 移不了：以后都用持续移动。指针还在原处，画面已经移了，指着的地方变了
         this.warping = false;
         this.warp = null;
-        this.moved();
+        if (this.host !== host) return;
+        this.moved(at);
+        if (this.armed && this.mode() === "edge") {
+          this.depth = depth;
+          this.start();
+        }
       },
     );
   }

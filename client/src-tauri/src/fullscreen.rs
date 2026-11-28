@@ -30,6 +30,16 @@ pub fn is_on(window: &WebviewWindow) -> tauri::Result<bool> {
     window.is_fullscreen()
 }
 
+/// 网页在窗口内容区里往里缩了多少（pt，四边一样）：只有 macOS 上自己铺满屏幕的全屏时有，见 [`mac`]
+#[cfg(target_os = "macos")]
+pub fn webview_inset() -> f64 {
+    if mac::ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        mac::OVERSCAN
+    } else {
+        0.0
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn set(window: &WebviewWindow, on: bool) -> tauri::Result<()> {
     if on {
@@ -155,7 +165,7 @@ mod mac {
     }
 
     /// 全屏时窗口比屏幕四周各大出多少（pt），要比窗口的圆角大（macOS 27 上控制台窗口的圆角实测约 16pt）
-    const OVERSCAN: f64 = 24.0;
+    pub(super) const OVERSCAN: f64 = 24.0;
 
     const BUTTONS: [NSWindowButton; 3] = [
         NSWindowButton::CloseButton,

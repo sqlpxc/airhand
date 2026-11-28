@@ -264,7 +264,7 @@ export class RemoteSession {
   /** 原始大小显示时画面跟着指针移动（只在主窗口：弹出窗口总是按窗口大小显示） */
   private readonly scroller = new ViewScroll(
     () => (this.nativeScale && !this.input.relative && !this.input.gamePaused ? store.get().scrollStyle : "bar"),
-    () => this.input.repoint(),
+    (at) => this.input.repoint(at),
     api.warpPointer,
   );
 
