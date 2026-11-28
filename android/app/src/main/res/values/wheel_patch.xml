@@ -1,0 +1,7 @@
+<resources>
+    <string name="wheel_patch_title">Huawei tablet wheel compatibility</string>
+    <string name="wheel_patch_description">Convert vendor mouse-wheel swipes to PC scroll events. Normal mouse and finger input keep working. Use Reverse wheel above to change direction.</string>
+    <string name="wheel_patch_scale">Wheel calibration: %1$d dp per notch (lower = faster)</string>
+    <string name="wheel_patch_diagnostics_off">Input diagnostics: off · tap to enable</string>
+    <string name="wheel_patch_diagnostics_on">Input diagnostics: on · tap to disable (logs first 120 touch events per session)</string>
+</resources>

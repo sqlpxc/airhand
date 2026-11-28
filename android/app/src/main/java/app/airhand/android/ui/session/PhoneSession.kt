@@ -1,5 +1,7 @@
 package app.airhand.android.ui.session
 
+import app.airhand.android.wheelpatch.TabletWheelSettings
+
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -1071,6 +1073,7 @@ private fun MouseTouchCategoryPage(
         checked = settings.localCursor,
     ) { v -> onUpdate { it.copy(localCursor = v) } }
 
+    TabletWheelSettings()
     MenuSection(stringResource(R.string.scroll_section_mouse))
     PercentSliderRow(
         label = stringResource(R.string.wheel_speed),

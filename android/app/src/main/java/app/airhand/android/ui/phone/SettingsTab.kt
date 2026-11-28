@@ -1,5 +1,7 @@
 package app.airhand.android.ui.phone
 
+import app.airhand.android.wheelpatch.TabletWheelSettings
+
 import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
@@ -231,6 +233,7 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
                     Toggle(Icons.Outlined.Gesture, stringResource(R.string.smooth_wheel), stringResource(R.string.smooth_wheel_desc), s.smoothWheel) { v ->
                         app.updateSettings { it.copy(smoothWheel = v) }
                     }
+                    TabletWheelSettings()
                     Toggle(Icons.Outlined.SwapVert, stringResource(R.string.reverse_wheel), stringResource(R.string.reverse_wheel_desc), s.reverseWheel) { v ->
                         app.updateSettings { it.copy(reverseWheel = v) }
                     }

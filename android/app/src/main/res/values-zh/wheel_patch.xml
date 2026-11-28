@@ -1,0 +1,7 @@
+<resources>
+    <string name="wheel_patch_title">华为平板滚轮兼容</string>
+    <string name="wheel_patch_description">将特殊鼠标滚轮滑动转为电脑滚轮。普通鼠标和手指照常使用。方向不合习惯时可切换“反转滚轮”。</string>
+    <string name="wheel_patch_scale">滚轮校准：每格 %1$d dp（越小越快）</string>
+    <string name="wheel_patch_diagnostics_off">输入诊断：关闭 · 点此开启</string>
+    <string name="wheel_patch_diagnostics_on">输入诊断：开启 · 点此关闭（每次会话最多记录前 120 个触摸事件）</string>
+</resources>

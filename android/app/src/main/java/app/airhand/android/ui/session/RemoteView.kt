@@ -1,5 +1,7 @@
 package app.airhand.android.ui.session
 
+import app.airhand.android.wheelpatch.TabletWheelCompat
+
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
@@ -168,6 +170,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             if (field === v) return
             field = v
             if (v != null) {
+                tabletWheelCompat.reset()
                 game.releaseAll()
                 gestures.cancel()
                 freeIds.clear()
@@ -580,6 +583,9 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
     // ───────────────────────────── 触摸 / 鼠标 ─────────────────────────────
 
+    // Airhand wheel patch: intercept vendor-generated unknown-tool swipes before Gestures.
+    private val tabletWheelCompat = TabletWheelCompat(context) { scroll(it) }
+
     private var mouseButtons = 0
 
     @SuppressLint("ClickableViewAccessibility")
@@ -589,6 +595,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             edit(it, e)
             return true
         }
+        if (tabletWheelCompat.onTouchEvent(e)) return true
         if (e.isFromSource(InputDevice.SOURCE_MOUSE)) return mouse(e)
         val wasPressing = gestures.pressing
         if (game.layout != null) split(e) else touch(e)
@@ -854,6 +861,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         // 菜单、通知栏、切到后台：游戏按键按着的都松开（手指的抬起不一定会送到这里），切换着的也松开，
         // 不然角色会一直走下去；外接键盘按着的键也一样
         if (!hasWindowFocus) {
+            tabletWheelCompat.reset()
             smooth.cancel()
             game.releaseAll()
             host.keyboard.releaseKeys()
