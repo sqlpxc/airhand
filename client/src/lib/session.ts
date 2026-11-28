@@ -8,7 +8,7 @@
 // * 解码器 optimizeForLatency，帧解码后立即绘制到 desynchronized Canvas，不排队等 vsync；
 // * 鼠标移动按 8ms 合并，按键/点击立即发送；
 // * 不可见的会话自动降到 5fps，节省带宽与对端 CPU；
-// * 画面只缩放一次：按画面在窗口里显示的大小请求分辨率，收到后按 1:1 显示（见 fit.ts）；
+// * 自适应模式尽量只缩放一次：按窗口大小请求分辨率（见 fit.ts）；用户选本地放大时才二次缩放；
 // * 原始大小显示、画面比窗口大时，画面按滚屏方式跟着指针滚动（自动滚动 / 滚动条 / 边缘滚动，见 scroll-style.ts）；
 // * 多屏（可选，默认只看一个显示器）：同时看对方的好几个显示器，每个显示器一路画面、一个 canvas，
 //   按它们在对方桌面上的位置拼在一起（见 screens.ts），鼠标在哪一块上就操作哪个显示器；
@@ -148,6 +148,8 @@ export class RemoteSession {
   audioError: string | null = null;
   settings: QualitySettings;
   scaleMode: ScaleMode = "fit";
+  /** 本地放大收到的画面；不改变被控端的编码分辨率 */
+  zoom = 1;
   /** 双向同步剪贴板文本 */
   clipboardSync = true;
   /** 播放远程声音（用户开关；实际只在当前查看的会话上播放） */
@@ -263,7 +265,7 @@ export class RemoteSession {
   private readonly input: RemoteInput;
   /** 原始大小显示时画面跟着指针移动（只在主窗口：弹出窗口总是按窗口大小显示） */
   private readonly scroller = new ViewScroll(
-    () => (this.nativeScale && !this.input.relative && !this.input.gamePaused ? store.get().scrollStyle : "bar"),
+    () => (this.nativeScale && this.zoom === 1 && !this.input.relative && !this.input.gamePaused ? store.get().scrollStyle : "bar"),
     (at) => this.input.repoint(at),
     api.warpPointer,
   );
@@ -878,9 +880,31 @@ export class RemoteSession {
     this.hostEl = null;
   }
 
-  setScaleMode(m: ScaleMode) {
+  setScaleMode(m: ScaleMode, zoom = 1) {
+    const nextZoom = m === "native" && Number.isFinite(zoom) ? Math.max(1, Math.min(4, zoom)) : 1;
+    if (this.scaleMode === m && this.zoom === nextZoom) return;
+    const host = this.hostEl;
+    const beforeHost = host?.getBoundingClientRect();
+    const before = host && this.screen.getBoundingClientRect();
+    // 切换倍率时保持窗口中心指向同一处画面，避免每次放大都跳回左上角。
+    const clamp = (v: number) => Math.min(1, Math.max(0, v));
+    const focus = beforeHost && before && before.width > 0 && before.height > 0
+      ? {
+          x: clamp((beforeHost.left + beforeHost.width / 2 - before.left) / before.width),
+          y: clamp((beforeHost.top + beforeHost.height / 2 - before.top) / before.height),
+        }
+      : null;
     this.scaleMode = m;
+    this.zoom = nextZoom;
+    host?.classList.toggle("native", this.nativeScale);
     this.layout();
+    if (host && m === "fit") {
+      host.scrollLeft = host.scrollTop = 0;
+    } else if (host && beforeHost && focus) {
+      const after = this.screen.getBoundingClientRect();
+      host.scrollLeft += after.left + focus.x * after.width - (beforeHost.left + beforeHost.width / 2);
+      host.scrollTop += after.top + focus.y * after.height - (beforeHost.top + beforeHost.height / 2);
+    }
     this.emit();
   }
 
@@ -919,8 +943,9 @@ export class RemoteSession {
     const dpr = devicePixelRatio || 1;
     const r = host.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) this.viewport = { w: Math.floor(r.width * dpr), h: Math.floor(r.height * dpr) };
-    // 画面的显示区域（设备像素；原始大小显示时不按窗口缩放）
+    // 画面的显示区域（设备像素；原始大小和本地放大时不按窗口缩小）
     const area = this.nativeScale ? null : this.viewport;
+    const zoom = this.nativeScale ? this.zoom : 1;
     const enhance = this.enhanceLevel;
     // 在主窗口里的是第几路；每一路占的那一块（设备像素，相对整个画面的左上角）、整个画面的大小，以及要不要对齐到设备像素
     const main = this.mainStreams;
@@ -931,7 +956,7 @@ export class RemoteSession {
     if (main.length === 1) {
       const m = main[0];
       const { w: fw, h: fh } = this.frameSize(m);
-      const size = area ? fitSize(fw, fh, area.w, area.h) : { w: fw, h: fh, exact: true };
+      const size = area ? fitSize(fw, fh, area.w, area.h) : { w: Math.round(fw * zoom), h: Math.round(fh * zoom), exact: zoom === 1 };
       tiles = [{ x: 0, y: 0, w: size.w, h: size.h }];
       box = size;
       // 1:1 显示，或者画面增强时 canvas 就是显示的大小（Worker 按同样的算法放大好了）：不能再让浏览器插值
@@ -939,8 +964,17 @@ export class RemoteSession {
       this.sendLayout(m, area, enhance);
     } else if (main.length > 1) {
       const placed = layoutTiles(placeDisplays(main.map((i) => this.displays[this.shown[i]])), area);
-      tiles = placed.tiles;
-      box = placed;
+      if (area) {
+        tiles = placed.tiles;
+        box = placed;
+      } else {
+        // 对齐每块的两条边，放大后相邻显示器仍然无缝。
+        tiles = placed.tiles.map((t) => {
+          const x = Math.round(t.x * zoom), y = Math.round(t.y * zoom);
+          return { x, y, w: Math.round((t.x + t.w) * zoom) - x, h: Math.round((t.y + t.h) * zoom) - y };
+        });
+        box = { w: Math.round(placed.w * zoom), h: Math.round(placed.h * zoom) };
+      }
     }
     const ss = this.screen.style;
     ss.width = `${box.w / dpr}px`;

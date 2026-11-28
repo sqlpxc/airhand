@@ -305,6 +305,48 @@ test("画面增强：只给正在操作的会话，关着时不发显示区域�
   assert.deepEqual(plain(layouts.at(-1)), [null, "medium"]);
 });
 
+test("720p 本地放大保留可见区域中心，不要求被控端改传 4K", () => {
+  const h = sessionHarness();
+  const s = h.session;
+  const style: any = {};
+  const host: any = {
+    scrollLeft: 0, scrollTop: 0, classList: { toggle() {} },
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 1200, height: 800 }),
+  };
+  const size = (v: string | undefined) => parseFloat(v ?? "0") || 0;
+  const screen: any = {
+    style,
+    getBoundingClientRect: () => {
+      const width = size(style.width), height = size(style.height);
+      return {
+        left: width > 1200 ? -host.scrollLeft : (1200 - width) / 2,
+        top: height > 800 ? -host.scrollTop : (800 - height) / 2,
+        width, height,
+      };
+    },
+  };
+  Object.assign(s, {
+    sid: 7, scaleMode: "native", zoom: 1, interactive: true, hostEl: host, screen,
+    frames: [{ w: 1152, h: 720 }],
+    displays: [{ index: 0, name: "A", width: 3456, height: 2160 }],
+    settings: { fps: 30, bitrateKbps: 1200, maxShort: 720, adaptive: true, codec: "h264" },
+    applyCursor() {},
+  });
+  s.layout();
+  assert.equal(style.width, "1152px");
+  s.setScaleMode("native", 3);
+  assert.equal(style.width, "3456px");
+  assert.equal(style.height, "2160px");
+  assert.equal(host.scrollLeft, 1128);
+  assert.equal(host.scrollTop, 680);
+  assert.deepEqual(plain(s.wantedView()), [{ display: 0, maxShort: 0 }]);
+  assert.equal(s.settings.maxShort, 720);
+  assert.equal(h.calls.some((c) => c[0] === "settings"), false);
+  s.setScaleMode("fit");
+  assert.equal(host.scrollLeft, 0);
+  assert.equal(host.scrollTop, 0);
+});
+
 const granted = { sid: 7, resume: [9], hostName: "host", hostOs: "Windows", hostKey: "ab".repeat(32), safety: "123-456" };
 
 test("开始时的画质和要不要声音在连接选项里（对方在握手里就知道），连上之后不再另外发", async () => {

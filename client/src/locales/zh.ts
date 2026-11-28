@@ -207,6 +207,7 @@ export default {
   "scale.title": "显示方式",
   "scale.fit": "适应窗口",
   "scale.native": "原始大小（1:1）",
+  "scale.zoomPercent": "放大 {percent}%",
   "scale.scrollStyle": "滚屏方式",
   "scroll.auto": "自动滚动",
   "scroll.bar": "滚动条",

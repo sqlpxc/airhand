@@ -52,7 +52,7 @@ export function CanvasHost({ s, interactive }: { s: RemoteSession; interactive: 
   }, [s, interactive]);
   const native = interactive && s.scaleMode === "native";
   // 自动滚动、边缘滚动时不显示滚动条（见 scroll-style.ts）
-  return <div ref={ref} className={`canvas-host ${native ? "native" : ""} ${native && scrollStyle !== "bar" ? "auto-scroll" : ""}`} />;
+  return <div ref={ref} className={`canvas-host ${native ? "native" : ""} ${native && s.zoom === 1 && scrollStyle !== "bar" ? "auto-scroll" : ""}`} />;
 }
 
 type Combo = { label: MsgKey; keys: string[] };
@@ -100,6 +100,7 @@ const combosFor = (platform: Platform | null, os: string) => {
 };
 
 type Menu = null | "quality" | "mouse" | "scale" | "keys" | "display" | "clipboard" | "audio" | "mic" | "privacy" | "sessions";
+const ZOOM_LEVELS = [1.5, 2, 2.5, 3, 3.5, 4] as const;
 
 /** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
 const MOUSE_ICONS: Record<MouseMode, typeof IconMouse> = { auto: IconMouse, desktop: IconPointer, game: IconGamepad };
@@ -814,7 +815,7 @@ function MouseMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
   );
 }
 
-/** 显示方式：适应窗口 / 原始大小，以及原始大小时的滚屏方式（见 scroll-style.ts） */
+/** 显示方式：适应窗口 / 原始大小 / 本地放大，以及原始大小时的滚屏方式（见 scroll-style.ts） */
 function ScaleMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
   const scrollStyle = useStore((st) => st.scrollStyle);
   return (
@@ -822,7 +823,8 @@ function ScaleMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
       {SCALE_MODES.map((m) => (
         <button
           key={m}
-          className={`dd-item ${s.scaleMode === m ? "active" : ""}`}
+          className={`dd-item ${s.scaleMode === m && (m === "fit" || s.zoom === 1) ? "active" : ""}`}
+          aria-pressed={s.scaleMode === m && (m === "fit" || s.zoom === 1)}
           onClick={() => {
             s.setScaleMode(m);
             onClose();
@@ -832,11 +834,26 @@ function ScaleMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
         </button>
       ))}
       <div className="dd-sep" />
+      {ZOOM_LEVELS.map((zoom) => (
+        <button
+          key={zoom}
+          className={`dd-item ${s.scaleMode === "native" && s.zoom === zoom ? "active" : ""}`}
+          aria-pressed={s.scaleMode === "native" && s.zoom === zoom}
+          onClick={() => {
+            s.setScaleMode("native", zoom);
+            onClose();
+          }}
+        >
+          {t("scale.zoomPercent", { percent: zoom * 100 })}
+        </button>
+      ))}
+      <div className="dd-sep" />
       <div className="dd-title pop-title">{t("scale.scrollStyle")}</div>
       {SCROLL_STYLES.map((m) => (
         <button
           key={m}
           className={`dd-item ${scrollStyle === m ? "active" : ""}`}
+          disabled={s.scaleMode === "native" && s.zoom !== 1}
           onClick={() => {
             store.setScrollStyle(m);
             onClose();
