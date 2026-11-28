@@ -200,6 +200,7 @@ const en: Record<MsgKey, Msg> = {
   "scale.title": "View style",
   "scale.fit": "Fit window",
   "scale.native": "Actual size (1:1)",
+  "scale.zoomPercent": "Zoom {percent}%",
   "scale.scrollStyle": "Scroll style",
   "scroll.auto": "Auto scroll",
   "scroll.bar": "Scrollbar",
