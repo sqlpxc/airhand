@@ -123,6 +123,8 @@ fn run() {
                 // 不是这里启用的（进程启动之前就启用着）：从现在算起
                 let since = *enabled_at.get_or_insert(now);
                 if wants.privacy && now.duration_since(since) > APPEAR {
+                    // 看得出是没出来，还是出来了没认出来（#50）
+                    info!("displays: {}", topology::describe());
                     fail("the virtual display didn't show up".into());
                 }
             }
@@ -181,6 +183,7 @@ fn run() {
                     Ok(()) => failures > MAX_FAILURES,
                 };
                 if give_up {
+                    info!("displays: {}", topology::describe());
                     fail(match r {
                         Err(e) => crate::host::capture::wire_detail(&e),
                         Ok(()) => "Windows keeps putting the local displays back".into(),

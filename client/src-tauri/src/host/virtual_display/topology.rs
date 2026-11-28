@@ -1,7 +1,10 @@
 //! 显示设置（Windows 的 CCD：`QueryDisplayConfig` / `SetDisplayConfig`）：哪些显示器是虚拟的、哪些在桌面上，
 //! 只留虚拟显示器（防窥），按 Windows 记着的设置恢复。
 //!
-//! * 虚拟屏可能和内屏共用同一个 CCD 显卡 ID。除了独立的虚拟显卡，也按每个显示目标的 PnP 父设备识别；
+//! * 认虚拟显示器先看显卡：多数电脑上虚拟显示器的"显卡"就是 Airhand 建的那个设备，它的设备路径里有设备的实例 ID
+//!   （`\\?\ROOT#AIRHANDVIRTUALDISPLAY#0000#{...}`）。有的电脑上看显卡认不出来（#50：核显停用、内屏接在 NVIDIA 上
+//!   的笔记本，虚拟显示器和内屏列在同一块显卡下），再一个个输出看显示器：显示器的设备节点挂在报告它的显卡下面，
+//!   虚拟显示器的就挂在 Airhand 建的设备下面（见 [`monitor`]）；
 //! * 改设置一律不存进 Windows 的显示设置数据库（不带 `SDC_SAVE_TO_DATABASE`）：Windows 按"接着哪些显示器"记着
 //!   各自的设置，存进去的话，下次接着同样的显示器时它自己就会套用"本机的显示器不在桌面上"——开机就黑屏。
 //!   恢复时用的正是这个数据库（`SDC_USE_DATABASE_CURRENT`）；
@@ -90,18 +93,27 @@ fn source_name(adapter: LUID, id: u32) -> Option<String> {
     (r == 0).then(|| wide_str(&name.viewGdiDeviceName))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// 接在一个输出上的显示器（见 [`monitor`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Monitor {
+    /// Airhand 的虚拟显示器：设备节点挂在 Airhand 建的设备下面
     Airhand,
+    /// 别的显示器，设备节点在
     Other,
+    /// 拔掉了：设备节点没了
     Missing,
+    /// 看不出来（算在、不是虚拟的）
     Unknown,
 }
 
-/// 缓存只用在一次 CCD 快照里。共享显卡上的两个目标可以分别是内屏和虚拟屏。
+/// 认得出哪些输出接着虚拟显示器、显示器还在不在。每次查询显示设置用一个新的：每块显卡、每个输出只问一次
+/// （同一个输出在好几条路径上：每个源配每个输出），记下的只对这次查到的有效
 struct Displays {
+    /// Airhand 建的设备的设备节点（不在时为 `None`）
     airhand_node: Option<u32>,
+    /// 按 LUID：这块显卡就是 Airhand 建的设备
     adapters: HashMap<i64, bool>,
+    /// 按输出：接着的显示器
     monitors: HashMap<Target, Monitor>,
 }
 
@@ -114,12 +126,15 @@ impl Displays {
         }
     }
 
+    /// 接在这条路径的输出上的显示器
     fn monitor(&mut self, p: &DISPLAYCONFIG_PATH_INFO) -> Monitor {
-        *self.monitors.entry(target(p)).or_insert_with(|| {
-            monitor(p.targetInfo.adapterId, p.targetInfo.id, self.airhand_node)
-        })
+        *self
+            .monitors
+            .entry(target(p))
+            .or_insert_with(|| monitor(p.targetInfo.adapterId, p.targetInfo.id, self.airhand_node))
     }
 
+    /// 这条路径的输出接着虚拟显示器：显卡就是 Airhand 建的设备，或者显示器挂在它下面（见模块说明）
     fn is_virtual(&mut self, p: &DISPLAYCONFIG_PATH_INFO) -> bool {
         let adapter = p.targetInfo.adapterId;
         let dedicated = *self.adapters.entry(luid_key(adapter)).or_insert_with(|| {
@@ -155,22 +170,27 @@ fn source_mode(cfg: &Config, p: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFI
     Some(unsafe { m.Anonymous.sourceMode })
 }
 
-/// 查目标显示器是否还在，以及它是否是 Airhand 设备的子节点。
+/// 接在这个输出上的显示器的设备接口路径（查不到时为 `None`；显示器拔掉了的时候是空的，见 [`monitor`]）
+fn monitor_path(adapter: LUID, id: u32) -> Option<String> {
+    let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    name.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+    name.header.adapterId = adapter;
+    name.header.id = id;
+    let r = unsafe { DisplayConfigGetDeviceInfo(&mut name.header) };
+    (r == 0).then(|| wide_str(&name.monitorDevicePath))
+}
+
+/// 接在这个输出上的显示器：是不是 Airhand 的虚拟显示器（设备节点的父节点是 `airhand_node`），还在不在。
 ///
 /// 拔掉最后一个显示器时 Windows 可能什么都不改（实测：合着盖的笔记本拔掉接在 NVIDIA 上的 HDMI）：那条路径照样
 /// 在桌面上，`targetAvailable` 照样是真的，名字也照样查得到，DXGI 也还列着它，只是再也没有新画面。这时显示器的
 /// 设备节点没了（Kernel-PnP 1010：surprise removed），查到的 `monitorDevicePath` 是空的（实测如此）；
 /// 不是空的也再看一眼设备节点在不在
 fn monitor(adapter: LUID, id: u32, airhand_node: Option<u32>) -> Monitor {
-    let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-    name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-    name.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-    name.header.adapterId = adapter;
-    name.header.id = id;
-    if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } != 0 {
+    let Some(path) = monitor_path(adapter, id) else {
         return Monitor::Unknown;
-    }
-    let path = wide_str(&name.monitorDevicePath);
+    };
     if path.is_empty() {
         return Monitor::Missing;
     }
@@ -380,6 +400,41 @@ fn virtual_source() -> Option<(String, u32, u32)> {
     })
 }
 
+/// 接着的、在桌面上的输出一个一行：显卡和输出编号，接着没有、在不在桌面上，显卡和显示器的设备路径，认成了什么。
+/// 防窥没打开时写进日志（见 `super::manager`）：看得出虚拟显示器出来了没有、认没认出来
+pub(super) fn describe() -> String {
+    let cfg = match query(QDC_ALL_PATHS) {
+        Ok(cfg) => cfg,
+        Err(e) => return format!("{e:#}"),
+    };
+    let mut displays = Displays::new();
+    let mut out = format!("airhand device node: {:?}", displays.airhand_node);
+    let mut seen: HashSet<Target> = HashSet::new();
+    for p in &cfg.paths {
+        let t = target(p);
+        // 同一个输出在好几条路径上：在桌面上的是其中一条
+        let on = cfg.paths.iter().any(|q| target(q) == t && active(q));
+        let available = p.targetInfo.targetAvailable.as_bool();
+        if (!available && !on) || !seen.insert(t) {
+            continue;
+        }
+        let (adapter, id) = (p.targetInfo.adapterId, p.targetInfo.id);
+        let monitor = displays.monitor(p);
+        let kind = if displays.is_virtual(p) {
+            "virtual"
+        } else {
+            "local"
+        };
+        out.push_str(&format!(
+            "\n{:x}/{id} {kind}: available {available}, active {on}, adapter {:?}, monitor {:?} ({monitor:?})",
+            t.0,
+            adapter_path(adapter),
+            monitor_path(adapter, id),
+        ));
+    }
+    out
+}
+
 /// 桌面上的第一个虚拟显示器的名字，和 `DisplayInfo::name` 一样（`DISPLAY19`，没有前面的 `\\.\`）
 pub(super) fn virtual_name() -> Option<String> {
     virtual_source().map(|(name, ..)| name.trim_start_matches(r"\\.\").to_string())
@@ -422,10 +477,11 @@ pub(super) fn apply_mode(mode: Mode) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 虚拟显示器和本机的显示器在同一块显卡下（显卡不是 Airhand 建的设备）：一个个输出各认各的
     #[test]
     fn virtual_and_physical_targets_on_the_same_gpu() {
-        use super::*;
-
         let mut panel = DISPLAYCONFIG_PATH_INFO::default();
         panel.targetInfo.id = 1;
         let mut vdd = panel;
@@ -447,6 +503,7 @@ mod tests {
     #[test]
     #[ignore]
     fn list_displays() {
+        println!("{}", describe());
         let f = super::facts(false).unwrap();
         println!("{f:#?}");
         println!("primary: {:?}", super::primary_mode());
